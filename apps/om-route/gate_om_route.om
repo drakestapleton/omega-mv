@@ -1,0 +1,1486 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note apps/om-route/gate_om_route.om: Pure seeded-OM-2 End-to-End Verification Gate for om_route.om.
+note
+note Build:
+note   seed/out/omc < apps/om-route/gate_om_route.om > gate_om_route && chmod +x gate_om_route
+note Run:
+note   gate_om_route OMC_BIN REPO_ROOT SCRATCH_DIR
+note
+note Spins up two pure-OM-2 loopback mock backends (fast + slow-SSE), launches om_route.om against
+note a declarative models.tsv, and verifies:
+note   - 2x deterministic compilation of om_route.om (0 stderr, bit-identical SHA-256)
+note   - GET /health reading live Spark /sys/class/thermal/thermal_zone5/temp (TGPU) & zone0 (TSOC)
+note   - GET /v1/models declarative catalog
+note   - POST /v1/chat/completions: OpenAI string content, Open WebUI array-of-parts content, live SSE stream
+note   - POST /v1/messages: Anthropic JSON (with system + content blocks) and Anthropic live SSE translation
+note   - Non-blocking multi-client pollfds concurrency (fast client overtakes slow-streaming client!)
+note   - Structured local-only TY-4+ telemetry lines in router stdout
+note   - 6 fail-closed negative controls: live thermal 503 thermal_budget_exceeded, unknown model 404,
+note     path traversal 400, bad HTTP verbs 405, malformed non-loopback config exit 2, malformed cols exit 2.
+
+note ---- Embedded FIPS 180-4 SHA-256
+global s2_ok ulong 1
+global s2_k uint 64
+global s2_h uint 8
+global s2_w uint 64
+global s2_buf uchar 64
+global s2_n ulong 1
+global s2_tot ulong 1
+global s2_out uchar 32
+
+note ---- Buffers
+global g_omc uchar 4096
+global g_root uchar 4096
+global g_scr uchar 4096
+global g_pa uchar 4096
+global g_pin uchar 64
+global g_d1 uchar 32
+global g_d2 uchar 32
+global g_av uchar 16384
+global g_stb uchar 4
+global g_fbuf uchar 65536
+global g_wbuf uchar 65536
+global g_rbuf uchar 131072
+global g_rbuf2 uchar 65536
+global g_mbuf uchar 65536
+global g_echo uchar 4096
+global g_std uchar 65536
+global g_n ulong 32
+note g_n:
+note   0=omc_len 1=root_len 2=scr_len 3=pa_len 4=av_bytes 5=av_argc
+note   6=wbuf_len 7=rbuf_len 8=rbuf2_len 9=std_len 10=checks 11=ctrls
+note   12=caught 13=fails 14=p_route 15=p_fast 16=p_slow
+note   17=pid_fast 18=pid_slow 19=pid_route 20=echo_len
+
+text t_usage "usage: gate_om_route OMC_BIN REPO_ROOT SCRATCH_DIR\n"
+text t_badpin "OM_ROUTE_GATE INVALID: cannot read 64-hex pin from seed/out/omc.sha256\n"
+text t_refpin "OM_ROUTE_GATE REFUSED: compiler digest differs from seed/out/omc.sha256 (exit 69)\n"
+text t_badscr "OM_ROUTE_GATE INVALID: cannot create SCRATCH_DIR\n"
+
+text p_pin "/seed/out/omc.sha256"
+text p_src "/apps/om-route/om_route.om"
+text s_b1 "/om_route.1"
+text s_b2 "/om_route.2"
+text s_e1 "/om_route.1.err"
+text s_e2 "/om_route.2.err"
+text s_cfg "/models_test.tsv"
+text s_bad1 "/models_bad_url.tsv"
+text s_bad2 "/models_bad_cols.tsv"
+text s_rlog "/router.log"
+text s_rerr "/router.err"
+text s_null "/dev/null"
+
+text cfg_hdr "model_id\tbackend_url\tkind\tidle_unload_s\tmax_watts\tmax_tgpu_mc\tlaunch_cmd\n"
+text cfg_m1a "gpu-ok\thttp://127.0.0.1:"
+text cfg_m1b "\tgpu\t1200\t80\t95000\t-\n"
+text cfg_m2a "gpu-slow\thttp://127.0.0.1:"
+text cfg_m2b "\tgpu\t1200\t80\t95000\t-\n"
+text cfg_m3a "gpu-hot\thttp://127.0.0.1:"
+text cfg_m3b "\tgpu\t1200\t80\t15000\t-\n"
+text cfg_m4a "cpu-fast\thttp://127.0.0.1:"
+text cfg_m4b "\tcpu\t0\t25\t95000\t-\n"
+text cfg_bad1 "evil\thttp://evil.example.com:80\tgpu\t60\t50\t80000\t-\n"
+text cfg_bad2 "broken\thttp://127.0.0.1:18091\tgpu\t60\n"
+
+text rq_health "GET /health HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n"
+text rq_models "GET /v1/models HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n"
+text rq_trav "GET /../../etc/passwd HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n"
+text rq_del "DELETE /v1/models HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n"
+text rq_getm "GET /v1/messages HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n"
+
+text post_chat "POST /v1/chat/completions HTTP/1.1\nHost: 127.0.0.1\nContent-Type: application/json\nContent-Length: "
+text post_anth "POST /v1/messages HTTP/1.1\nHost: 127.0.0.1\nContent-Type: application/json\nContent-Length: "
+text post_end "\nConnection: close\n\n"
+
+text j_oa_str "{\"model\":\"gpu-ok\",\"messages\":[{\"role\":\"user\",\"content\":\"hello-openai-str\"}]}"
+text j_oa_arr "{\"model\":\"gpu-ok\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"partA-\"},{\"type\":\"text\",\"text\":\"partB\"}]}]}"
+text j_oa_sse "{\"model\":\"gpu-ok\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"sse-ok\"}]}"
+text j_an_jsn "{\"model\":\"cpu-fast\",\"max_tokens\":64,\"system\":\"sys-ok\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"anth-msg\"}]}]}"
+text j_an_sse "{\"model\":\"gpu-ok\",\"max_tokens\":64,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"anth-sse\"}]}"
+text j_slow "{\"model\":\"gpu-slow\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"slow-done\"}]}"
+text j_fast "{\"model\":\"cpu-fast\",\"messages\":[{\"role\":\"user\",\"content\":\"fast-overtake\"}]}"
+text j_hot "{\"model\":\"gpu-hot\",\"messages\":[{\"role\":\"user\",\"content\":\"should-503\"}]}"
+text j_unk "{\"model\":\"no-such-model\",\"messages\":[{\"role\":\"user\",\"content\":\"should-404\"}]}"
+
+text mh_json "HTTP/1.1 200 OK\nContent-Type: application/json\nConnection: close\n\n"
+text mh_sse "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\nConnection: close\n\n"
+text mb_j0 "{\"id\":\"cmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""
+text mb_j1 "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n"
+text mb_s0 "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"c1:\"}}]}\n\n"
+text mb_s1 "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+text mb_s2 "\"}}]}\n\ndata: [DONE]\n\n"
+text mk_cnt "\"content\""
+text mk_str "\"stream\":true"
+text mk_str2 "\"stream\": true"
+
+text x_200 "HTTP/1.1 200"
+text x_400 "HTTP/1.1 400"
+text x_404 "HTTP/1.1 404"
+text x_405 "HTTP/1.1 405"
+text x_503 "HTTP/1.1 503"
+text x_thok "\"thermal_ok\":true"
+text x_tg "\"tgpu_mc\":"
+text x_ts "\"tsoc_mc\":"
+text x_m1 "gpu-ok"
+text x_m2 "gpu-slow"
+text x_m3 "gpu-hot"
+text x_m4 "cpu-fast"
+text x_oastr "hello-openai-str"
+text x_oaarr "partA-partB"
+text x_sse_c1 "c1:"
+text x_sse_ok "sse-ok"
+text x_done "data: [DONE]"
+text x_an_t "\"type\":\"message\""
+text x_an_r "\"stop_reason\":\"end_turn\""
+text x_an_b "sys-ok|anth-msg"
+text x_an_u "\"input_tokens\":12,\"output_tokens\":7"
+text x_as0 "event: message_start"
+text x_as1 "event: content_block_start"
+text x_as2 "event: content_block_delta"
+text x_as3 "anth-sse"
+text x_as4 "event: content_block_stop"
+text x_as5 "event: message_delta"
+text x_as6 "event: message_stop"
+text x_fast "fast-overtake"
+text x_slow "slow-done"
+text x_th503 "thermal_budget_exceeded"
+text x_m404 "model_not_found"
+text x_ty4 "TY-4+"
+text x_ty_oa "api=openai"
+text x_ty_an "api=anthropic"
+text x_ty_503 "status=503"
+text x_ty_tg "tgpu_mc="
+text x_ty_rdy "OM_ROUTE_READY"
+
+text l_ok "PASS "
+text l_fl "FAIL "
+text l_ct "CTRL_CAUGHT "
+text l_ce "CTRL_ESCAPED "
+text l_sum "OM_ROUTE_GATE "
+text l_ps "PASS"
+text l_fa "FAIL"
+text l_ck " checks="
+text l_co " controls="
+text l_ca " caught="
+text l_hw " hardware=HOST_THERMAL_LIVE\n"
+
+text n_c1 "compile_2x_om_route"
+text n_t1 "health_live_spark_thermal_zone5"
+text n_t2 "v1_models_declarative_catalog"
+text n_t3 "openai_string_content"
+text n_t4 "openai_array_of_parts_normalized"
+text n_t5 "openai_live_sse_streaming"
+text n_t6 "anthropic_messages_json_translation"
+text n_t7 "anthropic_messages_live_sse_translation"
+text n_t8 "concurrent_nonblocking_poll_overtake"
+text n_t9 "ty4_local_telemetry_logged"
+text n_k1 "ctrl_live_spark_thermal_503"
+text n_k2 "ctrl_unknown_model_404"
+text n_k3 "ctrl_path_traversal_400"
+text n_k4 "ctrl_disallowed_http_verbs_405"
+text n_k5 "ctrl_malformed_config_nonloopback_refused"
+text n_k6 "ctrl_malformed_config_bad_cols_refused"
+
+note ---- SHA-256
+fn s2_setup to void
+if eq get s2_ok 0 1
+ret
+end
+put s2_k 0 1116352408
+put s2_k 1 1899447441
+put s2_k 2 3049323471
+put s2_k 3 3921009573
+put s2_k 4 961987163
+put s2_k 5 1508970993
+put s2_k 6 2453635748
+put s2_k 7 2870763221
+put s2_k 8 3624381080
+put s2_k 9 310598401
+put s2_k 10 607225278
+put s2_k 11 1426881987
+put s2_k 12 1925078388
+put s2_k 13 2162078206
+put s2_k 14 2614888103
+put s2_k 15 3248222580
+put s2_k 16 3835390401
+put s2_k 17 4022224774
+put s2_k 18 264347078
+put s2_k 19 604807628
+put s2_k 20 770255983
+put s2_k 21 1249150122
+put s2_k 22 1555081692
+put s2_k 23 1996064986
+put s2_k 24 2554220882
+put s2_k 25 2821834349
+put s2_k 26 2952996808
+put s2_k 27 3210313671
+put s2_k 28 3336571891
+put s2_k 29 3584528711
+put s2_k 30 113926993
+put s2_k 31 338241895
+put s2_k 32 666307205
+put s2_k 33 773529912
+put s2_k 34 1294757372
+put s2_k 35 1396182291
+put s2_k 36 1695183700
+put s2_k 37 1986661051
+put s2_k 38 2177026350
+put s2_k 39 2456956037
+put s2_k 40 2730485921
+put s2_k 41 2820302411
+put s2_k 42 3259730800
+put s2_k 43 3345764771
+put s2_k 44 3516065817
+put s2_k 45 3600352804
+put s2_k 46 4094571909
+put s2_k 47 275423344
+put s2_k 48 430227734
+put s2_k 49 506948616
+put s2_k 50 659060556
+put s2_k 51 883997877
+put s2_k 52 958139571
+put s2_k 53 1322822218
+put s2_k 54 1537002063
+put s2_k 55 1747873779
+put s2_k 56 1955562222
+put s2_k 57 2024104815
+put s2_k 58 2227730452
+put s2_k 59 2361852424
+put s2_k 60 2428436474
+put s2_k 61 2756734187
+put s2_k 62 3204031479
+put s2_k 63 3329325298
+put s2_ok 0 1
+end
+
+fn s2_init to void
+s2_setup
+put s2_h 0 1779033703
+put s2_h 1 3144134277
+put s2_h 2 1013904242
+put s2_h 3 2773480762
+put s2_h 4 1359893119
+put s2_h 5 2600822924
+put s2_h 6 528734635
+put s2_h 7 1541459225
+put s2_n 0 0
+put s2_tot 0 0
+end
+
+fn s2_rounds to void
+a = get s2_h 0
+b = get s2_h 1
+c = get s2_h 2
+d = get s2_h 3
+e = get s2_h 4
+f = get s2_h 5
+g = get s2_h 6
+h = get s2_h 7
+for r2 ulong 64
+x2 = or shr e 6 shl e 26
+x2 = xor x2 or shr e 11 shl e 21
+x2 = xor x2 or shr e 25 shl e 7
+x2 = add x2 h
+x2 = add x2 xor and e f and not e g
+x2 = add x2 get s2_k r2
+x2 = add x2 get s2_w r2
+h = g
+g = f
+f = e
+e = add d x2
+d = c
+c = b
+b = a
+y2 = or shr b 2 shl b 30
+y2 = xor y2 or shr b 13 shl b 19
+y2 = xor y2 or shr b 22 shl b 10
+x2 = add x2 y2
+y2 = xor and b c and b d
+y2 = xor y2 and c d
+a = add x2 y2
+end
+put s2_h 0 add get s2_h 0 a
+put s2_h 1 add get s2_h 1 b
+put s2_h 2 add get s2_h 2 c
+put s2_h 3 add get s2_h 3 d
+put s2_h 4 add get s2_h 4 e
+put s2_h 5 add get s2_h 5 f
+put s2_h 6 add get s2_h 6 g
+put s2_h 7 add get s2_h 7 h
+end
+
+fn s2_compress to void
+for t ulong 16
+p = mul t 4
+v = or shl uint get s2_buf p 24 shl uint get s2_buf add p 1 16
+v = or v or shl uint get s2_buf add p 2 8 uint get s2_buf add p 3
+put s2_w t v
+end
+for u ulong 48
+i = add u 16
+x = get s2_w sub i 2
+s = or shr x 17 shl x 15
+s = xor s or shr x 19 shl x 13
+s = xor s shr x 10
+y = get s2_w sub i 15
+r = or shr y 7 shl y 25
+r = xor r or shr y 18 shl y 14
+r = xor r shr y 3
+s = add s get s2_w sub i 7
+r = add r get s2_w sub i 16
+put s2_w i add s r
+end
+s2_rounds
+end
+
+fn s2_byte b uchar to void
+n = get s2_n 0
+put s2_buf n b
+n = add n 1
+if eq n 64
+s2_compress
+n = ulong 0
+end
+put s2_n 0 n
+put s2_tot 0 add get s2_tot 0 1
+end
+
+fn s2_fin to void
+bits = mul get s2_tot 0 8
+n = get s2_n 0
+put s2_buf n 128
+n = add n 1
+if gt n 56
+while lt n 64 bound 64
+put s2_buf n 0
+n = add n 1
+end
+s2_compress
+n = ulong 0
+end
+while lt n 56 bound 64
+put s2_buf n 0
+n = add n 1
+end
+for k ulong 8
+put s2_buf add 56 k uchar and shr bits mul sub 7 k 8 255
+end
+s2_compress
+put s2_n 0 0
+for j ulong 8
+w = ulong get s2_h j
+o = mul j 4
+put s2_out o uchar and shr w 24 255
+put s2_out add o 1 uchar and shr w 16 255
+put s2_out add o 2 uchar and shr w 8 255
+put s2_out add o 3 uchar and w 255
+end
+end
+
+fn hexd v ulong to uchar
+if lt v 10
+ret uchar add v 48
+end
+ret uchar add v 87
+end
+
+fn is_lhex c uchar to bool
+d = and ge c 48 le c 57
+h = and ge c 97 le c 102
+ret or d h
+end
+
+note ---- Output helpers
+fn sflush to void
+n = get g_n 9
+p = ulong 0
+while lt p n bound 65537
+k = write 1 g_std p sub n p
+if le k 0
+break
+end
+p = add p ulong k
+end
+put g_n 9 0
+end
+
+fn sc c uchar to void
+n = get g_n 9
+put g_std n c
+put g_n 9 add n 1
+end
+
+fn st t view uchar * to void
+for i ulong len t bound 4096
+sc get t i
+end
+end
+
+fn snum v ulong to void
+if ge v 10
+snum div v 10
+end
+sc uchar add 48 rem v 10
+end
+
+fn rec_check ok bool name view uchar * to void
+if ok
+st l_ok
+st name
+sc 10
+put g_n 10 add get g_n 10 1
+else
+st l_fl
+st name
+sc 10
+put g_n 13 add get g_n 13 1
+end
+sflush
+end
+
+fn rec_ctrl ok bool name view uchar * to void
+put g_n 11 add get g_n 11 1
+if ok
+st l_ct
+st name
+sc 10
+put g_n 12 add get g_n 12 1
+else
+st l_ce
+st name
+sc 10
+put g_n 13 add get g_n 13 1
+end
+sflush
+end
+
+note ---- Path & file helpers
+fn pclr to void
+put g_n 3 0
+end
+
+fn pc c uchar to void
+n = get g_n 3
+put g_pa n c
+put g_n 3 add n 1
+end
+
+fn pt t view uchar * to void
+for i ulong len t bound 4096
+pc get t i
+end
+end
+
+fn pnum v ulong to void
+if ge v 10
+pnum div v 10
+end
+pc uchar add 48 rem v 10
+end
+
+fn proot to void
+for i ulong get g_n 1 bound 4096
+pc get g_root i
+end
+end
+
+fn pscr to void
+for i ulong get g_n 2 bound 4096
+pc get g_scr i
+end
+end
+
+fn pomc to void
+for i ulong get g_n 0 bound 4096
+pc get g_omc i
+end
+end
+
+fn pset_r suf view uchar * to void
+pclr
+proot
+pt suf
+end
+
+fn pset_s suf view uchar * to void
+pclr
+pscr
+pt suf
+end
+
+fn fclo fd int to void
+if ge fd 0
+z = fclose fd
+end
+end
+
+fn frd to int
+r = fopen g_pa 0 get g_n 3 524288 0
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn fwr to int
+r = fopen g_pa 0 get g_n 3 524865 420
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn fexe to int
+z = unlink g_pa 0 get g_n 3
+r = fopen g_pa 0 get g_n 3 524865 448
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn hash_pa to bool
+fd = frd
+if lt fd 0
+ret false
+end
+s2_init
+while true bound 1048576
+k = read fd g_fbuf 0 65536
+if lt k 0
+fclo fd
+ret false
+end
+if eq k 0
+break
+end
+for i ulong ulong k bound 65536
+s2_byte get g_fbuf i
+end
+end
+fclo fd
+s2_fin
+ret true
+end
+
+fn fsize_pa to ulong
+fd = frd
+if lt fd 0
+ret shl ulong 1 63
+end
+tot = ulong 0
+while true bound 1048576
+k = read fd g_fbuf 0 65536
+if lt k 0
+fclo fd
+ret shl ulong 1 63
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+fclo fd
+ret tot
+end
+
+fn s2_eq_pin to bool
+for j ulong 32
+b = ulong get s2_out j
+if ne get g_pin mul j 2 hexd shr b 4
+ret false
+end
+if ne get g_pin add mul j 2 1 hexd and b 15
+ret false
+end
+end
+ret true
+end
+
+note ---- Write buffer g_wbuf
+fn wclr to void
+put g_n 6 0
+end
+
+fn wc c uchar to void
+n = get g_n 6
+put g_wbuf n c
+put g_n 6 add n 1
+end
+
+fn wt t view uchar * to void
+for i ulong len t bound 8192
+wc get t i
+end
+end
+
+fn wt_crlf t view uchar * to void
+for i ulong len t bound 8192
+c = get t i
+if eq c 10
+wc 13
+end
+wc c
+end
+end
+
+fn wnum v ulong to void
+if ge v 10
+wnum div v 10
+end
+wc uchar add 48 rem v 10
+end
+
+fn wsave_s suf view uchar * to bool
+pset_s suf
+fd = fwr
+if lt fd 0
+ret false
+end
+n = get g_n 6
+p = ulong 0
+while lt p n bound 65537
+k = write fd g_wbuf p sub n p
+if le k 0
+fclo fd
+ret false
+end
+p = add p ulong k
+end
+fclo fd
+ret true
+end
+
+note ---- Process exec helpers
+fn aclr to void
+put g_n 4 2
+put g_n 5 0
+put g_av 0 0
+put g_av 1 0
+end
+
+fn apa to void
+p = get g_n 4
+n = get g_n 3
+for j ulong n bound 4096
+put g_av add add p 2 j get g_pa j
+end
+put g_av p uchar and n 255
+put g_av add p 1 uchar shr n 8
+put g_n 4 add p add n 2
+c = add get g_n 5 1
+put g_n 5 c
+put g_av 0 uchar and c 255
+put g_av 1 uchar shr c 8
+end
+
+fn redir s int d int to void
+if ne dupfd s d 0 long d
+exit 127
+end
+end
+
+fn spawn_sync fi int fo int fe int to ulong
+if or lt fi 0 or lt fo 0 lt fe 0
+fclo fi
+fclo fo
+fclo fe
+ret 512
+end
+pid = fork
+if lt pid 0
+exit 2
+end
+if eq pid 0
+redir fi 0
+redir fo 1
+redir fe 2
+z = execprog g_av 0 get g_n 4
+exit 127
+end
+fclo fi
+fclo fo
+fclo fe
+t0 = monons
+while true bound 1000000000
+r = waitpid int pid g_stb 0 len g_stb 1
+if eq r pid
+x = ulong get g_stb 0
+if ne x 0
+ret add 256 x
+end
+ret ulong get g_stb 1
+end
+if lt r 0
+exit 2
+end
+if gt sub monons t0 60000000000
+z = killpid int pid 9
+z = waitpid int pid g_stb 0 len g_stb 0
+ret 1000
+end
+z = sleepns 200000
+end
+exit 2
+end
+
+fn compile_om_route out_s view uchar * err_s view uchar * to ulong
+pset_r p_src
+fi = frd
+aclr
+pclr
+pomc
+apa
+pset_s out_s
+fo = fexe
+pset_s err_s
+fe = fwr
+ret spawn_sync fi fo fe
+end
+
+fn test_compile_2x to bool
+r1 = compile_om_route s_b1 s_e1
+r2 = compile_om_route s_b2 s_e2
+if or ne r1 0 ne r2 0
+ret false
+end
+pset_s s_e1
+if ne fsize_pa 0
+ret false
+end
+pset_s s_e2
+if ne fsize_pa 0
+ret false
+end
+pset_s s_b1
+if not hash_pa
+ret false
+end
+for j ulong 32
+put g_d1 j get s2_out j
+end
+pset_s s_b2
+if not hash_pa
+ret false
+end
+for j ulong 32
+if ne get g_d1 j get s2_out j
+ret false
+end
+end
+ret true
+end
+
+note ---- Pure-OM-2 Loopback Mock OpenAI Backend Server (forked child)
+fn m_has n ulong pat view uchar * to bool
+pn = len pat
+if or eq pn 0 gt pn n
+ret false
+end
+lim = add sub n pn 1
+for i ulong lim bound 65536
+ok = true
+for j ulong pn bound 64
+if ne get g_mbuf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn m_extract_echo n ulong to void
+put g_n 20 0
+p = ulong 0
+kn = len mk_cnt
+while lt p n bound 65536
+if and eq get g_mbuf p 34 le add p kn n
+ok = true
+for j ulong kn bound 32
+if ne get g_mbuf add p j get mk_cnt j
+ok = false
+break
+end
+end
+if ok
+q = add p kn
+while lt q n bound 32
+c = get g_mbuf q
+if or eq c 32 or eq c 9 eq c 58
+q = add q 1
+else
+break
+end
+end
+if lt q n
+if eq get g_mbuf q 34
+q = add q 1
+if gt get g_n 20 0
+el = get g_n 20
+if lt el 4000
+put g_echo el 124
+put g_n 20 add el 1
+end
+end
+while lt q n bound 2048
+c = get g_mbuf q
+if eq c 34
+break
+end
+el = get g_n 20
+if lt el 4000
+put g_echo el c
+put g_n 20 add el 1
+end
+q = add q 1
+end
+p = add q 1
+continue
+end
+end
+end
+end
+p = add p 1
+end
+end
+
+fn mock_send_wbuf fd int to void
+n = get g_n 6
+p = ulong 0
+while lt p n bound 65537
+k = write fd g_wbuf p sub n p
+if le k 0
+break
+end
+p = add p ulong k
+end
+end
+
+fn mock_handle_conn cfd int slow bool to void
+tot = ulong 0
+for it ulong 64
+k = read cfd g_mbuf tot sub 65500 tot
+if le k 0
+break
+end
+tot = add tot ulong k
+if gt tot 8
+if eq get g_mbuf sub tot 1 125
+break
+end
+end
+end
+m_extract_echo tot
+is_s = or m_has tot mk_str m_has tot mk_str2
+if is_s
+wclr
+wt_crlf mh_sse
+wt mb_s0
+mock_send_wbuf cfd
+if slow
+z = sleepns 250000000
+end
+wclr
+wt mb_s1
+for i ulong get g_n 20 bound 4096
+wc get g_echo i
+end
+wt mb_s2
+mock_send_wbuf cfd
+else
+wclr
+wt_crlf mh_json
+wt mb_j0
+for i ulong get g_n 20 bound 4096
+wc get g_echo i
+end
+wt mb_j1
+mock_send_wbuf cfd
+end
+z = fclose cfd
+end
+
+fn run_mock_backend port ulong slow bool to void
+addr = new uchar 16 0
+one = new uchar 4 0
+put addr 0 2
+put addr 2 uchar and shr port 8 255
+put addr 3 uchar and port 255
+put addr 4 127
+put addr 5 0
+put addr 6 0
+put addr 7 1
+put one 0 1
+lfd = socknew 2 524289 0
+if lt lfd 0
+exit 91
+end
+r = sockopt int lfd 1 2 one 0 4
+r = bind int lfd addr 0 16
+if ne r 0
+exit 92
+end
+r = listen int lfd 16
+if ne r 0
+exit 93
+end
+while true bound 10000
+ev = waitio int lfd 1 5000000000
+if gt ev 0
+cfd = accept int lfd 524288
+if ge cfd 0
+mock_handle_conn int cfd slow
+end
+end
+end
+exit 0
+end
+
+note ---- TCP client helpers for gate tests
+fn dial_local port ulong to long
+sa = new uchar 16 0
+fd = socknew 2 524289 0
+if lt fd 0
+ret fd
+end
+put sa 0 2
+put sa 1 0
+put sa 2 uchar and shr port 8 255
+put sa 3 uchar and port 255
+put sa 4 127
+put sa 5 0
+put sa 6 0
+put sa 7 1
+r = connect int fd sa 0 16
+if lt r 0
+z = fclose int fd
+ret r
+end
+ret fd
+end
+
+fn send_wbuf_fd fd int to bool
+n = get g_n 6
+p = ulong 0
+while lt p n bound 65537
+k = write fd g_wbuf p sub n p
+if le k 0
+ret false
+end
+p = add p ulong k
+end
+ret true
+end
+
+fn read_all_rbuf fd int to ulong
+tot = ulong 0
+while lt tot 131000 bound 4096
+k = read fd g_rbuf tot sub 131000 tot
+if eq k -4
+continue
+end
+if le k 0
+break
+end
+tot = add tot ulong k
+end
+put g_n 7 tot
+ret tot
+end
+
+fn http_raw raw view uchar * to bool
+fd = dial_local get g_n 14
+if lt fd 0
+put g_n 7 0
+ret false
+end
+wclr
+wt_crlf raw
+ok = send_wbuf_fd int fd
+z1 = read_all_rbuf int fd
+z2 = fclose int fd
+ret ok
+end
+
+fn http_post hdr view uchar * body view uchar * to bool
+fd = dial_local get g_n 14
+if lt fd 0
+put g_n 7 0
+ret false
+end
+wclr
+wt_crlf hdr
+wnum len body
+wt_crlf post_end
+wt body
+ok = send_wbuf_fd int fd
+z1 = read_all_rbuf int fd
+z2 = fclose int fd
+ret ok
+end
+
+fn rbuf_has pat view uchar * to bool
+pn = len pat
+cn = get g_n 7
+if or eq pn 0 gt pn cn
+ret false
+end
+lim = add sub cn pn 1
+for i ulong lim bound 131072
+ok = true
+for j ulong pn bound 512
+if ne get g_rbuf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn rbuf2_has pat view uchar * to bool
+pn = len pat
+cn = get g_n 8
+if or eq pn 0 gt pn cn
+ret false
+end
+lim = add sub cn pn 1
+for i ulong lim bound 65536
+ok = true
+for j ulong pn bound 512
+if ne get g_rbuf2 add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+note Parse integer value right after pat in g_rbuf
+fn rbuf_u64_after pat view uchar * to ulong
+pn = len pat
+cn = get g_n 7
+if or eq pn 0 gt pn cn
+ret 0
+end
+lim = add sub cn pn 1
+for i ulong lim bound 131072
+ok = true
+for j ulong pn bound 64
+if ne get g_rbuf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+p = add i pn
+v = ulong 0
+while lt p cn bound 16
+c = get g_rbuf p
+if and ge c 48 le c 57
+v = add mul v 10 ulong sub c 48
+p = add p 1
+else
+break
+end
+end
+ret v
+end
+end
+ret 0
+end
+
+note ---- Launch router & cleanup
+fn spawn_router cfg_s view uchar * to long
+aclr
+pset_s s_b1
+apa
+pset_s cfg_s
+apa
+pclr
+pnum get g_n 14
+apa
+pid = fork
+if eq pid 0
+pclr
+pt s_null
+fi = frd
+pset_s s_rlog
+fo = fwr
+pset_s s_rerr
+fe = fwr
+redir fi 0
+redir fo 1
+redir fe 2
+z = execprog g_av 0 get g_n 4
+exit 127
+end
+ret pid
+end
+
+fn run_bad_config cfg_s view uchar * to ulong
+aclr
+pset_s s_b1
+apa
+pset_s cfg_s
+apa
+pclr
+pnum add get g_n 14 5
+apa
+pclr
+pt s_null
+fi = frd
+pset_s s_rerr
+fo = fwr
+fe = fwr
+ret spawn_sync fi fo fe
+end
+
+fn kill_children to void
+p1 = get g_n 19
+p2 = get g_n 17
+p3 = get g_n 18
+if gt p1 0
+z1 = killpid int p1 15
+z2 = waitpid int p1 g_stb 0 4 0
+end
+if gt p2 0
+z3 = killpid int p2 9
+z4 = waitpid int p2 g_stb 0 4 0
+end
+if gt p3 0
+z5 = killpid int p3 9
+z6 = waitpid int p3 g_stb 0 4 0
+end
+end
+
+note ---- Concurrent non-blocking poll test: fast client overtakes slow-streaming client
+fn test_concurrent_overtake to bool
+fd1 = dial_local get g_n 14
+if lt fd1 0
+ret false
+end
+wclr
+wt_crlf post_chat
+wnum len j_slow
+wt_crlf post_end
+wt j_slow
+if not send_wbuf_fd int fd1
+z = fclose int fd1
+ret false
+end
+note Read chunk 1 from slow stream (arrives immediately before 250ms backend sleep)
+tot1 = ulong 0
+for it ulong 64
+ev = waitio int fd1 1 1000000000
+if le ev 0
+break
+end
+k = read int fd1 g_rbuf tot1 sub 65500 tot1
+if le k 0
+break
+end
+tot1 = add tot1 ulong k
+put g_n 7 tot1
+if rbuf_has x_sse_c1
+break
+end
+end
+got_c1 = rbuf_has x_sse_c1
+if not got_c1
+z = fclose int fd1
+ret false
+end
+
+note While fd1 is STILL open mid-stream (backend sleeping 250ms), send fast request on fd2!
+t0 = ulong monons
+fd2 = dial_local get g_n 14
+if lt fd2 0
+z = fclose int fd1
+ret false
+end
+wclr
+wt_crlf post_chat
+wnum len j_fast
+wt_crlf post_end
+wt j_fast
+z = send_wbuf_fd int fd2
+tot2 = ulong 0
+while lt tot2 65500 bound 1024
+k2 = read int fd2 g_rbuf2 tot2 sub 65500 tot2
+if le k2 0
+break
+end
+tot2 = add tot2 ulong k2
+end
+t1 = ulong monons
+zc2 = fclose int fd2
+put g_n 8 tot2
+fast_ok = and rbuf2_has x_200 rbuf2_has x_fast
+fast_ms = div sub t1 t0 1000000
+
+note Now finish reading slow stream fd1 to EOF
+while lt tot1 131000 bound 1024
+k3 = read int fd1 g_rbuf tot1 sub 131000 tot1
+if le k3 0
+break
+end
+tot1 = add tot1 ulong k3
+end
+zc1 = fclose int fd1
+put g_n 7 tot1
+slow_ok = and rbuf_has x_slow rbuf_has x_done
+ret and fast_ok and slow_ok lt fast_ms 180
+end
+
+note ---- Read router.log into g_rbuf for TY-4+ verification
+fn check_ty4_log to bool
+pset_s s_rlog
+fd = frd
+if lt fd 0
+ret false
+end
+n = ulong 0
+while lt n 131000 bound 1024
+k = read fd g_rbuf n sub 131000 n
+if le k 0
+break
+end
+n = add n ulong k
+end
+fclo fd
+put g_n 7 n
+ok = and rbuf_has x_ty_rdy rbuf_has x_ty4
+ok = and ok and rbuf_has x_ty_oa rbuf_has x_ty_an
+ok = and ok and rbuf_has x_ty_503 rbuf_has x_ty_tg
+ret ok
+end
+
+fn write_test_configs to void
+wclr
+wt cfg_hdr
+wt cfg_m1a
+wnum get g_n 15
+wt cfg_m1b
+wt cfg_m2a
+wnum get g_n 16
+wt cfg_m2b
+wt cfg_m3a
+wnum get g_n 15
+wt cfg_m3b
+wt cfg_m4a
+wnum get g_n 15
+wt cfg_m4b
+z1 = wsave_s s_cfg
+
+wclr
+wt cfg_hdr
+wt cfg_bad1
+z2 = wsave_s s_bad1
+
+wclr
+wt cfg_hdr
+wt cfg_bad2
+z3 = wsave_s s_bad2
+end
+
+fn read_omc_pin to bool
+pset_r p_pin
+fd = frd
+if lt fd 0
+ret false
+end
+k = read fd g_fbuf 0 128
+fclo fd
+if lt k 64
+ret false
+end
+for j ulong 64
+c = get g_fbuf j
+if not is_lhex c
+ret false
+end
+put g_pin j c
+end
+ret true
+end
+
+fn run_live_suite to void
+ok = http_raw rq_health
+tg = rbuf_u64_after x_tg
+ts = rbuf_u64_after x_ts
+h_ok = and ok and rbuf_has x_200 and rbuf_has x_thok and gt tg 15000 and lt tg 120000 gt ts 15000
+rec_check h_ok n_t1
+
+ok = http_raw rq_models
+m_ok = and ok and rbuf_has x_200 and rbuf_has x_m1 and rbuf_has x_m2 and rbuf_has x_m3 rbuf_has x_m4
+rec_check m_ok n_t2
+
+ok = http_post post_chat j_oa_str
+rec_check and ok and rbuf_has x_200 rbuf_has x_oastr n_t3
+
+ok = http_post post_chat j_oa_arr
+rec_check and ok and rbuf_has x_200 rbuf_has x_oaarr n_t4
+
+ok = http_post post_chat j_oa_sse
+s_ok = and ok and rbuf_has x_200 and rbuf_has x_sse_c1 and rbuf_has x_sse_ok rbuf_has x_done
+rec_check s_ok n_t5
+
+ok = http_post post_anth j_an_jsn
+a_ok = and ok and rbuf_has x_200 and rbuf_has x_an_t and rbuf_has x_an_r and rbuf_has x_an_b rbuf_has x_an_u
+rec_check a_ok n_t6
+
+ok = http_post post_anth j_an_sse
+as_ok = and ok and rbuf_has x_200 and rbuf_has x_as0 and rbuf_has x_as1 rbuf_has x_as2
+as_ok = and as_ok and rbuf_has x_as3 and rbuf_has x_as4 and rbuf_has x_as5 rbuf_has x_as6
+rec_check as_ok n_t7
+
+rec_check test_concurrent_overtake n_t8
+
+note Negative controls against live router
+ok = http_post post_chat j_hot
+rec_ctrl and ok and rbuf_has x_503 rbuf_has x_th503 n_k1
+
+ok = http_post post_chat j_unk
+rec_ctrl and ok and rbuf_has x_404 rbuf_has x_m404 n_k2
+
+ok = http_raw rq_trav
+rec_ctrl and ok rbuf_has x_400 n_k3
+
+ok1 = http_raw rq_del
+v1 = and ok1 rbuf_has x_405
+ok2 = http_raw rq_getm
+v2 = and ok2 rbuf_has x_405
+rec_ctrl and v1 v2 n_k4
+
+rc1 = run_bad_config s_bad1
+rec_ctrl eq rc1 2 n_k5
+
+rc2 = run_bad_config s_bad2
+rec_ctrl eq rc2 2 n_k6
+end
+
+fn main to int
+if ne argcnt 4
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+r1 = argread 1 g_omc 0 4094
+r2 = argread 2 g_root 0 4094
+r3 = argread 3 g_scr 0 4094
+if or le r1 0 or le r2 0 le r3 0
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+put g_n 0 ulong r1
+put g_n 1 ulong r2
+put g_n 2 ulong r3
+
+if not read_omc_pin
+w = write 2 t_badpin 0 len t_badpin
+ret 2
+end
+pclr
+pomc
+if not hash_pa
+w = write 2 t_refpin 0 len t_refpin
+ret 69
+end
+if not s2_eq_pin
+w = write 2 t_refpin 0 len t_refpin
+ret 69
+end
+
+mr = makedir g_scr 0 get g_n 2 493
+if and ne mr 0 ne mr -17
+w = write 2 t_badscr 0 len t_badscr
+ret 2
+end
+
+rec_check test_compile_2x n_c1
+if ne get g_n 13 0
+st l_sum
+st l_fa
+sc 10
+sflush
+ret 1
+end
+
+bp = add 22000 mul rem ulong getpid 1000 10
+put g_n 14 bp
+put g_n 15 add bp 1
+put g_n 16 add bp 2
+write_test_configs
+
+pf = fork
+if eq pf 0
+run_mock_backend get g_n 15 false
+end
+put g_n 17 ulong pf
+
+ps = fork
+if eq ps 0
+run_mock_backend get g_n 16 true
+end
+put g_n 18 ulong ps
+
+z = sleepns 100000000
+
+pr = spawn_router s_cfg
+put g_n 19 ulong pr
+
+note Wait up to 3s for om_route to accept /health
+rdy = false
+for it ulong 60
+if http_raw rq_health
+if rbuf_has x_200
+rdy = true
+break
+end
+end
+z2 = sleepns 50000000
+end
+
+if rdy
+run_live_suite
+end
+
+kill_children
+rec_check check_ty4_log n_t9
+
+fl = get g_n 13
+st l_sum
+if eq fl 0
+st l_ps
+else
+st l_fa
+end
+st l_ck
+snum get g_n 10
+st l_co
+snum get g_n 11
+st l_ca
+snum get g_n 12
+st l_hw
+sflush
+
+if ne fl 0
+ret 1
+end
+if ne get g_n 11 get g_n 12
+ret 1
+end
+ret 0
+end
