@@ -28,6 +28,7 @@
  * full SHA-256 digests outside the store.
  */
 #include "rx_jspace.h"
+#include "omega_fs.h"
 #include "sha256.h"
 #include "aien_machine_id.h"
 
@@ -621,6 +622,7 @@ void js_limits_default(JsLimits *lim) {
 static int space_setup(JsSpace *s, const JsLimits *lim) {
     memset(s, 0, sizeof *s);
     s->spill_fd = -1;
+    s->dir_fd = -1;
     if (lim) s->limits = *lim; else js_limits_default(&s->limits);
     if (!s->limits.max_reals || !s->limits.max_branches ||
         s->limits.max_branches > JS_MAX_BRANCHES) return JS_ERR_ARG;
@@ -641,9 +643,9 @@ static int space_setup(JsSpace *s, const JsLimits *lim) {
 int js_space_init_limits(JsSpace *s, const char *spill_path, const JsLimits *lim) {
     int rc = space_setup(s, lim);
     if (rc) return rc;
-    s->spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    s->spill_fd = omega_fs_open_regular(spill_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (s->spill_fd < 0) { js_space_destroy(s); return JS_ERR_IO; }
-    unlink(spill_path);   /* anonymous from here on */
+    omega_fs_unlink_at(AT_FDCWD, spill_path, 0);   /* anonymous from here on */
     return JS_OK;
 }
 
@@ -657,6 +659,8 @@ void js_space_destroy(JsSpace *s) {
         if (s->branches[i]) release_u(s, i);
     if (s->spill_fd >= 0) close(s->spill_fd);
     s->spill_fd = -1;
+    if (s->dir_fd >= 0) close(s->dir_fd);
+    s->dir_fd = -1;
     free(s->cache_bytes);
     s->cache_bytes = NULL;
     s->cache_r = NULL;
@@ -1533,13 +1537,6 @@ static uint64_t rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0;
 static void put32(Buf *b, uint32_t v) { uint8_t o[4]; le32(o, v); buf_put(b, o, 4); }
 static void put64(Buf *b, uint64_t v) { uint8_t o[8]; le64(o, v); buf_put(b, o, 8); }
 
-static char *path_in(const char *dir, const char *name) {
-    size_t n = strlen(dir) + strlen(name) + 2;
-    char *p = malloc(n);
-    if (p) snprintf(p, n, "%s/%s", dir, name);
-    return p;
-}
-
 static int write_all(int fd, const uint8_t *p, size_t n) {
     while (n) {
         ssize_t w = write(fd, p, n);
@@ -1663,21 +1660,23 @@ static int commit_u(JsSpace *s) {
     sha256_hash(h, 96, h + 96);
 
     /* 4. Temporary file, fsync, atomic rename, directory fsync. */
-    char *tmp = path_in(s->dir, "jspace.meta.tmp"), *fin = path_in(s->dir, "jspace.meta");
-    int fd = tmp && fin ? open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+    if (omega_fs_replace_ok_at(s->dir_fd, "jspace.meta") != 0) {
+        free(body.p);
+        return JS_ERR_IO;
+    }
+    char tmp[OMEGA_FS_NAME_MAX + 1] = { 0 };
+    int fd = omega_fs_temp_name(tmp, sizeof tmp, "jspace.meta.tmp") == 0
+                 ? omega_fs_open_regular_at(s->dir_fd, tmp, O_WRONLY | O_CREAT | O_EXCL, 0600)
+                 : -1;
     rc = fd < 0 ? JS_ERR_IO : JS_OK;
     if (rc == JS_OK) rc = write_all(fd, h, sizeof h);
     if (rc == JS_OK && body.n) rc = write_all(fd, body.p, body.n);
     if (rc == JS_OK && fsync(fd)) rc = JS_ERR_IO;
     if (fd >= 0) close(fd);
-    if (rc == JS_OK && rename(tmp, fin)) rc = JS_ERR_IO;
-    if (rc == JS_OK) {
-        int dfd = open(s->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (dfd < 0 || fsync(dfd)) rc = JS_ERR_IO;
-        if (dfd >= 0) close(dfd);
-    }
-    if (rc != JS_OK && tmp) unlink(tmp);
-    free(tmp); free(fin); free(body.p);
+    if (rc == JS_OK && omega_fs_rename_at(s->dir_fd, tmp, "jspace.meta")) rc = JS_ERR_IO;
+    if (rc == JS_OK && fsync(s->dir_fd)) rc = JS_ERR_IO;
+    if (rc != JS_OK && tmp[0]) omega_fs_unlink_at(s->dir_fd, tmp, 0);
+    free(body.p);
     if (rc != JS_OK) return rc;
 
     /* 5. The new checkpoint names none of the quarantined extents. */
@@ -1915,23 +1914,26 @@ static int load_u(JsSpace *s, const uint8_t *f, size_t fn,
     return rc;
 }
 
-int js_space_open(JsSpace *s, const char *dir, const JsRealizer *const *realizers,
-                  uint32_t n_realizers, const JsLimits *lim, const JsHome *local_home) {
-    if (!dir) return JS_ERR_ARG;
+static int space_open_fd(JsSpace *s, int dir_fd, const char *dir,
+                         const JsRealizer *const *realizers, uint32_t n_realizers,
+                         const JsLimits *lim, const JsHome *local_home) {
     int rc = space_setup(s, lim);
-    if (rc) return rc;
+    if (rc) { close(dir_fd); return rc; }
+    s->dir_fd = dir_fd;
     if (local_home) s->local_home = *local_home;
     s->local_home.locality = JS_HOME_LOCAL;
     s->durable = true;
-    if (mkdir(dir, 0700) && errno != EEXIST) { js_space_destroy(s); return JS_ERR_IO; }
     s->dir = strdup(dir);
-    char *data = path_in(dir, "jspace.data"), *meta = path_in(dir, "jspace.meta");
-    char *tmp = path_in(dir, "jspace.meta.tmp");
-    if (!s->dir || !data || !meta || !tmp) { rc = JS_ERR_NOMEM; goto out; }
-    unlink(tmp);   /* a torn temporary checkpoint is never authoritative */
-    s->spill_fd = open(data, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (!s->dir) { rc = JS_ERR_NOMEM; goto out; }
+    /* Legacy fixed-name temporary checkpoints are non-authoritative. Removing
+     * the directory entry cannot follow a planted symlink. */
+    if (omega_fs_unlink_at(s->dir_fd, "jspace.meta.tmp", 0) != 0 && errno != ENOENT) {
+        rc = JS_ERR_IO;
+        goto out;
+    }
+    s->spill_fd = omega_fs_open_regular_at(s->dir_fd, "jspace.data", O_RDWR | O_CREAT, 0600);
     if (s->spill_fd < 0) { rc = JS_ERR_IO; goto out; }
-    int mfd = open(meta, O_RDONLY | O_CLOEXEC);
+    int mfd = omega_fs_open_regular_at(s->dir_fd, "jspace.meta", O_RDONLY, 0);
     if (mfd < 0) {
         if (errno != ENOENT) { rc = JS_ERR_IO; goto out; }
         /* No checkpoint yet: nothing in the data file is named. */
@@ -1955,9 +1957,25 @@ int js_space_open(JsSpace *s, const char *dir, const JsRealizer *const *realizer
     free(f);
     close(mfd);
 out:
-    free(data); free(meta); free(tmp);
     if (rc) js_space_destroy(s);
     return rc;
+}
+
+int js_space_open(JsSpace *s, const char *dir, const JsRealizer *const *realizers,
+                  uint32_t n_realizers, const JsLimits *lim, const JsHome *local_home) {
+    if (!dir) return JS_ERR_ARG;
+    int dir_fd = omega_fs_root_open(dir, 1, 0700);
+    if (dir_fd < 0) return JS_ERR_IO;
+    return space_open_fd(s, dir_fd, dir, realizers, n_realizers, lim, local_home);
+}
+
+int js_space_open_at(JsSpace *s, int root_fd, const char *name,
+                     const JsRealizer *const *realizers, uint32_t n_realizers,
+                     const JsLimits *lim, const JsHome *local_home) {
+    if (root_fd < 0 || !name || strchr(name, '/')) return JS_ERR_ARG;
+    int dir_fd = omega_fs_subdir_open(root_fd, name, 1, 0700);
+    if (dir_fd < 0) return JS_ERR_IO;
+    return space_open_fd(s, dir_fd, name, realizers, n_realizers, lim, local_home);
 }
 
 int js_branch_info(JsSpace *s, JsBranchRef ref, JsBranchInfo *out) {

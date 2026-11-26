@@ -520,6 +520,24 @@ static void test_durable(void) {
     verify_reopen(&sv, "leftover temp file");
     CHECK(access(tmp, F_OK) != 0, "temp checkpoint not removed");
 
+    /* A planted durable data symlink is refused without touching its target. */
+    char bad[] = "/tmp/jspace_symlink_XXXXXX";
+    CHECK(mkdtemp(bad) != NULL, "symlink directory");
+    char bad_data[160], victim[160], safe[5] = { 0 };
+    snprintf(bad_data, sizeof bad_data, "%s/jspace.data", bad);
+    snprintf(victim, sizeof victim, "%s/victim", bad);
+    fd = open(victim, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    CHECK(fd >= 0 && write(fd, "SAFE", 4) == 4, "symlink victim");
+    if (fd >= 0) close(fd);
+    CHECK(symlink(victim, bad_data) == 0, "data symlink");
+    CHECK(js_space_open(&s, bad, RZS, 2, NULL, NULL) == JS_ERR_IO,
+          "symlinked durable data file accepted");
+    fd = open(victim, O_RDONLY);
+    CHECK(fd >= 0 && read(fd, safe, 4) == 4 && memcmp(safe, "SAFE", 4) == 0,
+          "durable data symlink target modified");
+    if (fd >= 0) close(fd);
+    unlink(bad_data); unlink(victim); rmdir(bad);
+
     /* Commit, reopen, commit again: sequence advances, state holds; released
      * extents are reused only after the commit that stops naming them. */
     CHECK(js_space_open(&s, g_dir, RZS, 2, NULL, NULL) == JS_OK, "open");

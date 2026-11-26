@@ -237,8 +237,9 @@ typedef struct {
  * that already holds machine.id must hold this machine (RXC_HOST_E_IDENTITY
  * otherwise). `info` (may be NULL) is filled on success and on
  * RXC_HOST_E_TORN / RXC_HOST_E_IDENTITY. `flags` must be 0. `dir` must
- * pass src/omega_path_check.h (omega_path_copy) and be under 184 bytes;
- * otherwise RXC_HOST_E_ARG and nothing is created. */
+ * pass src/omega_path_check.h (omega_path_copy) and be under 184 bytes. An
+ * existing root must be owned by this uid, not group/other-writable, and have
+ * no symlink component; otherwise RXC_HOST_E_ARG and nothing is created. */
 int rxc_host_open(const char *dir, uint32_t root_kind, const uint8_t *root, size_t root_len,
                   uint64_t session, uint32_t flags, RxcHost **out, RxcHostInfo *info);
 

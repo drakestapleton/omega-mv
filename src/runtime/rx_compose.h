@@ -184,6 +184,7 @@ enum {
 
 typedef struct RxCompose {
     char dir[200];
+    int dir_fd;                         /* retained validated composition root */
     AienMachineId self;
     RxWorld w;                         /* storage of the World rx_compose_open owns */
     RxWorld *world;                    /* the World it runs in: &w (open) or the caller's (attach) */
@@ -261,7 +262,9 @@ typedef struct RxCompose {
  * World is built with `n_workers` (the composition owns it; see
  * rx_compose_attach to run inside an existing World), state is recovered
  * OLD-or-NEW. `dir` must pass src/omega_path_check.h (omega_path_copy) and
- * be under 168 bytes; otherwise RX_ERR_ARG and nothing is created. */
+ * be under 168 bytes. An existing root must be owned by this uid, not
+ * group/other-writable, and have no symlink component; its descriptor is
+ * retained until close. Otherwise RX_ERR_ARG and nothing is created. */
 int  rx_compose_open(RxCompose *c, const char *dir, const AienMachineId *self, uint64_t session,
                      const SrRouter *router, RxcContract contract, AienosCapAdmin *admin,
                      AienosCapView *view, uint32_t n_workers);

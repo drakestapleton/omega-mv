@@ -22,7 +22,7 @@
 #include "runtime/rx_generation.h"
 #include "runtime/rx_argus.h"
 #include "sha256.h"
-#include "omega_path_check.h"
+#include "omega_fs.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -111,6 +111,7 @@ typedef struct {
 
 struct RxGenStore {
     char dir[384];
+    int dir_fd;                     /* retained validated store root */
     uint64_t active_id;
     uint64_t active_lineage;
     uint64_t next_id;
@@ -215,8 +216,16 @@ static int write_full(RxGenStore *store, int fd, const uint8_t *p, size_t n) {
     return 0;
 }
 
-static int read_full(const char *path, uint8_t *buf, size_t n) {
-    int fd = open(path, O_RDONLY);
+static const char *store_rel(const RxGenStore *store, const char *path) {
+    size_t n = strlen(store->dir);
+    if (strcmp(path, store->dir) == 0) return ".";
+    return strncmp(path, store->dir, n) == 0 && path[n] == '/' ? path + n + 1 : NULL;
+}
+
+static int read_full(const RxGenStore *store, const char *path, uint8_t *buf, size_t n) {
+    const char *rel = store_rel(store, path);
+    if (!rel || strcmp(rel, ".") == 0) return -1;
+    int fd = omega_fs_open_regular_at(store->dir_fd, rel, O_RDONLY, 0);
     if (fd < 0) return -1;
     size_t off = 0;
     while (off < n) {
@@ -243,16 +252,24 @@ static int fsync_fd(RxGenStore *store, int fd) {
 }
 
 static int fsync_path(RxGenStore *store, const char *path) {
-    int fd = open(path, O_RDONLY);
+    const char *rel = store_rel(store, path);
+    if (!rel) return -1;
+    int fd = strcmp(rel, ".") == 0 ? omega_fs_dupfd(store->dir_fd)
+                                    : omega_fs_subdir_open(store->dir_fd, rel, 0, 0);
     if (fd < 0) return -1;
     int rc = fsync_fd(store, fd);
     close(fd);
     return rc;
 }
 
-static int ensure_dir(const char *path) {
-    if (mkdir(path, 0755) == 0 || errno == EEXIST) return 0;
-    return -1;
+static int ensure_dir(RxGenStore *store, const char *path) {
+    const char *rel = store_rel(store, path);
+    if (!rel) return -1;
+    int fd = strcmp(rel, ".") == 0 ? omega_fs_dupfd(store->dir_fd)
+                                    : omega_fs_subdir_open(store->dir_fd, rel, 1, 0755);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
 }
 
 static void crash_now(void) { _exit(86); }
@@ -434,10 +451,14 @@ static int decode_journal(const uint8_t in[JRN_BYTES], uint32_t *phase, uint64_t
 
 static int commit_file(RxGenStore *store, const char *final_path, const uint8_t *buf,
                        size_t n, int during_step) {
-    char tmp[512];
-    if (snprintf(tmp, sizeof tmp, "%s/tmp/write.partial", store->dir) >= (int)sizeof tmp)
+    const char *final_rel = store_rel(store, final_path);
+    char tmp[OMEGA_FS_NAME_MAX + 1];
+    if (!final_rel || strcmp(final_rel, ".") == 0 ||
+        omega_fs_temp_name(tmp, sizeof tmp, "tmp/write.partial") != 0)
         return RX_GEN_ERR_IO;
-    int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (omega_fs_replace_ok_at(store->dir_fd, final_rel) != 0) return RX_GEN_ERR_IO;
+    int fd = omega_fs_open_regular_at(store->dir_fd, tmp,
+                                      O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) return RX_GEN_ERR_IO;
     if (during_step != RX_CRASH_NONE && store->crash_step == during_step) {
         size_t half = n / 2;
@@ -445,6 +466,7 @@ static int commit_file(RxGenStore *store, const char *final_path, const uint8_t 
         if (half > n) half = n;
         if (write_full(store, fd, buf, half) != 0) {
             close(fd);
+            omega_fs_unlink_at(store->dir_fd, tmp, 0);
             return RX_GEN_ERR_IO;
         }
         fsync_fd(store, fd);
@@ -453,10 +475,13 @@ static int commit_file(RxGenStore *store, const char *final_path, const uint8_t 
     }
     if (write_full(store, fd, buf, n) != 0 || fsync_fd(store, fd) != 0) {
         close(fd);
+        omega_fs_unlink_at(store->dir_fd, tmp, 0);
         return RX_GEN_ERR_IO;
     }
-    close(fd);
-    if (rename(tmp, final_path) != 0) return RX_GEN_ERR_IO;
+    if (close(fd) != 0 || omega_fs_rename_at(store->dir_fd, tmp, final_rel) != 0) {
+        omega_fs_unlink_at(store->dir_fd, tmp, 0);
+        return RX_GEN_ERR_IO;
+    }
     char parent[512];
     snprintf(parent, sizeof parent, "%s", final_path);
     char *slash = strrchr(parent, '/');
@@ -472,20 +497,23 @@ static int gen_dir(const char *dir, uint64_t id, char *out, size_t n) {
     return 0;
 }
 
-static int load_root_file(const char *dir, uint64_t id, RootView *view, uint8_t digest[32]) {
+static int load_root_file(const RxGenStore *store, uint64_t id, RootView *view, uint8_t digest[32]) {
     char folder[512], path[512];
-    if (gen_dir(dir, id, folder, sizeof folder) != 0) return RX_GEN_ERR_IO;
+    if (gen_dir(store->dir, id, folder, sizeof folder) != 0) return RX_GEN_ERR_IO;
     if (path_join(path, sizeof path, folder, "root") != 0) return RX_GEN_ERR_IO;
     uint8_t raw[ROOT_BYTES];
-    if (read_full(path, raw, sizeof raw) != 0) return RX_GEN_ERR_MISSING;
+    if (read_full(store, path, raw, sizeof raw) != 0) return RX_GEN_ERR_MISSING;
     int rc = decode_root(raw, view);
     if (rc != RX_GEN_OK) return rc;
     checksum(raw, ROOT_BYTES, digest);
     return RX_GEN_OK;
 }
 
-static int file_matches(const char *path, const uint8_t expect[32], uint64_t expect_len) {
-    int fd = open(path, O_RDONLY);
+static int file_matches(const RxGenStore *store, const char *path, const uint8_t expect[32],
+                        uint64_t expect_len) {
+    const char *rel = store_rel(store, path);
+    if (!rel || strcmp(rel, ".") == 0) return RX_GEN_ERR_IO;
+    int fd = omega_fs_open_regular_at(store->dir_fd, rel, O_RDONLY, 0);
     if (fd < 0) return RX_GEN_ERR_MISSING;
     sha256_ctx ctx;
     sha256_init(&ctx);
@@ -513,43 +541,48 @@ static const char *BLOB_NAME[DIG_COUNT] = {
     "objects", "evidence", "model", "realization", "config", "provenance"
 };
 
-static int root_reachable(const char *dir, const RootView *view) {
+static int root_reachable(const RxGenStore *store, const RootView *view) {
     char folder[512], path[512];
-    if (gen_dir(dir, view->id, folder, sizeof folder) != 0) return RX_GEN_ERR_IO;
+    if (gen_dir(store->dir, view->id, folder, sizeof folder) != 0) return RX_GEN_ERR_IO;
     for (int i = 0; i < DIG_COUNT; i++) {
         if (path_join(path, sizeof path, folder, BLOB_NAME[i]) != 0) return RX_GEN_ERR_IO;
-        int rc = file_matches(path, view->digest[i], view->lengths[i]);
+        int rc = file_matches(store, path, view->digest[i], view->lengths[i]);
         if (rc != RX_GEN_OK) return rc;
     }
     if (view->work_len) {
         if (path_join(path, sizeof path, folder, "work") != 0) return RX_GEN_ERR_IO;
-        int rc = file_matches(path, view->work_digest, view->work_len);
+        int rc = file_matches(store, path, view->work_digest, view->work_len);
         if (rc != RX_GEN_OK) return rc;
     }
     return RX_GEN_OK;
 }
 
-static int read_pointer(const char *dir, uint64_t *id, uint64_t *lineage, uint8_t digest[32]) {
+static int read_pointer(const RxGenStore *store, uint64_t *id, uint64_t *lineage,
+                        uint8_t digest[32]) {
     char path[512];
-    if (path_join(path, sizeof path, dir, "active") != 0) return RX_GEN_ERR_IO;
+    if (path_join(path, sizeof path, store->dir, "active") != 0) return RX_GEN_ERR_IO;
     uint8_t raw[PTR_BYTES];
-    if (read_full(path, raw, sizeof raw) != 0) return RX_GEN_ERR_MISSING;
+    if (read_full(store, path, raw, sizeof raw) != 0) return RX_GEN_ERR_MISSING;
     return decode_pointer(raw, id, lineage, digest);
 }
 
-static int read_journal(const char *dir, uint32_t *phase, uint64_t *parent, uint64_t *candidate,
+static int read_journal(const RxGenStore *store, uint32_t *phase, uint64_t *parent,
+                        uint64_t *candidate,
                         uint64_t *parent_lineage, uint8_t digest[32]) {
     char path[512];
-    if (path_join(path, sizeof path, dir, "journal") != 0) return RX_GEN_ERR_IO;
+    if (path_join(path, sizeof path, store->dir, "journal") != 0) return RX_GEN_ERR_IO;
     uint8_t raw[JRN_BYTES];
-    if (read_full(path, raw, sizeof raw) != 0) return RX_GEN_ERR_MISSING;
+    if (read_full(store, path, raw, sizeof raw) != 0) return RX_GEN_ERR_MISSING;
     return decode_journal(raw, phase, parent, candidate, parent_lineage, digest);
 }
 
-static int event_has(const char *dir, uint64_t id) {
+static int event_has(const RxGenStore *store, uint64_t id) {
     char path[512];
-    if (path_join(path, sizeof path, dir, "events") != 0) return 0;
-    FILE *f = fopen(path, "r");
+    if (path_join(path, sizeof path, store->dir, "events") != 0) return 0;
+    const char *rel = store_rel(store, path);
+    int fd = rel ? omega_fs_open_regular_at(store->dir_fd, rel, O_RDONLY, 0) : -1;
+    FILE *f = fd >= 0 ? fdopen(fd, "r") : NULL;
+    if (!f && fd >= 0) close(fd);
     if (!f) return 0;
     unsigned long long seen = 0, lineage = 0;
     int found = 0;
@@ -561,10 +594,12 @@ static int event_has(const char *dir, uint64_t id) {
 }
 
 static int append_event(RxGenStore *store, uint64_t id, uint64_t lineage) {
-    if (event_has(store->dir, id)) return RX_GEN_OK;
+    if (event_has(store, id)) return RX_GEN_OK;
     char path[512];
     if (path_join(path, sizeof path, store->dir, "events") != 0) return RX_GEN_ERR_IO;
-    int fd = open(path, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    const char *rel = store_rel(store, path);
+    int fd = rel ? omega_fs_open_regular_at(store->dir_fd, rel,
+                                            O_CREAT | O_WRONLY | O_APPEND, 0644) : -1;
     if (fd < 0) return RX_GEN_ERR_IO;
     char line[64];
     int n = snprintf(line, sizeof line, "%llu %llu\n", (unsigned long long)id,
@@ -591,11 +626,15 @@ static void fill_record(const RootView *view, int receipt, int event, RxRecovery
     memcpy(out->excluded_ids, view->excluded_ids, sizeof view->excluded_ids);
 }
 
-static int receipt_exists(const char *dir, uint64_t id) {
+static int receipt_exists(const RxGenStore *store, uint64_t id) {
     char folder[512], path[512];
-    if (gen_dir(dir, id, folder, sizeof folder) != 0) return 0;
+    if (gen_dir(store->dir, id, folder, sizeof folder) != 0) return 0;
     if (path_join(path, sizeof path, folder, "receipt") != 0) return 0;
-    return access(path, R_OK) == 0;
+    const char *rel = store_rel(store, path);
+    int fd = rel ? omega_fs_open_regular_at(store->dir_fd, rel, O_RDONLY, 0) : -1;
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
 }
 
 static int write_receipt_file(RxGenStore *store, const RootView *view, uint32_t subject,
@@ -611,7 +650,7 @@ static int write_receipt_file(RxGenStore *store, const RootView *view, uint32_t 
     if (gen_dir(store->dir, view->id, folder, sizeof folder) != 0) return RX_GEN_ERR_IO;
     if (path_join(root_path, sizeof root_path, folder, "root") != 0) return RX_GEN_ERR_IO;
     uint8_t root_raw[ROOT_BYTES];
-    if (read_full(root_path, root_raw, sizeof root_raw) != 0) return RX_GEN_ERR_MISSING;
+    if (read_full(store, root_path, root_raw, sizeof root_raw) != 0) return RX_GEN_ERR_MISSING;
     checksum(root_raw, ROOT_BYTES, root_digest);
     memcpy(raw + 32, root_digest, 32);
     put_u32(raw + 64, subject);
@@ -692,16 +731,14 @@ static int release_lock(RxGenStore *store) {
         close(store->lock_fd);
         store->lock_fd = -1;
     }
-    char path[512];
-    if (path_join(path, sizeof path, store->dir, "barrier.lock") != 0) return RX_GEN_ERR_IO;
-    if (unlink(path) != 0 && errno != ENOENT) return RX_GEN_ERR_IO;
+    if (omega_fs_unlink_at(store->dir_fd, "barrier.lock", 0) != 0 && errno != ENOENT)
+        return RX_GEN_ERR_IO;
     return RX_GEN_OK;
 }
 
 static int take_lock(RxGenStore *store) {
-    char path[512];
-    if (path_join(path, sizeof path, store->dir, "barrier.lock") != 0) return RX_GEN_ERR_IO;
-    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    int fd = omega_fs_open_regular_at(store->dir_fd, "barrier.lock",
+                                      O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) return RX_GEN_ERR_BUSY;
     char pid[32];
     int n = snprintf(pid, sizeof pid, "%ld\n", (long)getpid());
@@ -735,7 +772,7 @@ static int install_genesis(RxGenStore *store) {
     }
     char folder[512];
     if (gen_dir(store->dir, 1, folder, sizeof folder) != 0) return RX_GEN_ERR_IO;
-    if (ensure_dir(folder) != 0) return RX_GEN_ERR_IO;
+    if (ensure_dir(store, folder) != 0) return RX_GEN_ERR_IO;
     RootView view;
     memset(&view, 0, sizeof view);
     view.id = 1;
@@ -787,53 +824,58 @@ static int install_genesis(RxGenStore *store) {
 
 int rx_gen_open(const char *dir, RxGenStore **out) {
     if (!dir || !out) return RX_GEN_ERR_ARG;
+    *out = NULL;
     RxGenStore *store = calloc(1, sizeof(*store));
     if (!store) return RX_GEN_ERR_IO;
     pthread_mutex_init(&store->active_mu, NULL);
-    /* The caller's directory, checked (src/omega_path_check.h), is the only one this store opens. */
+    store->dir_fd = -1;
+    int rc = RX_GEN_ERR_IO;
+    /* Retain one validated root; every child operation is relative to it. */
     if (omega_path_copy(store->dir, sizeof store->dir, dir) != 0) {
-        free(store);
-        return RX_GEN_ERR_ARG;
+        rc = RX_GEN_ERR_ARG;
+        goto fail;
     }
+    store->dir_fd = omega_fs_root_open(store->dir, 1, 0700);
+    if (store->dir_fd < 0) goto fail;
     store->lock_fd = -1;
     char gdir[512], tmp[512];
     if (path_join(gdir, sizeof gdir, store->dir, "g") != 0 ||
         path_join(tmp, sizeof tmp, store->dir, "tmp") != 0) {
-        free(store);
-        return RX_GEN_ERR_IO;
+        goto fail;
     }
-    if (ensure_dir(store->dir) != 0 || ensure_dir(gdir) != 0 || ensure_dir(tmp) != 0) {
-        free(store);
-        return RX_GEN_ERR_IO;
-    }
-    char active[512];
-    path_join(active, sizeof active, store->dir, "active");
-    if (access(active, R_OK) != 0) {
-        int rc = install_genesis(store);
+    if (ensure_dir(store, gdir) != 0 || ensure_dir(store, tmp) != 0) goto fail;
+    struct stat st;
+    if (omega_fs_lstat_at(store->dir_fd, "active", &st) != 0) {
+        if (errno != ENOENT) goto fail;
+        rc = install_genesis(store);
         if (rc != RX_GEN_OK) {
-            free(store);
-            return rc;
+            goto fail;
         }
     } else {
         uint8_t digest[32];
-        int rc = read_pointer(store->dir, &store->active_id, &store->active_lineage, digest);
-        if (rc != RX_GEN_OK) {
-            free(store);
-            return rc;
-        }
+        rc = read_pointer(store, &store->active_id, &store->active_lineage, digest);
+        if (rc != RX_GEN_OK) goto fail;
         FILE *f = NULL;
-        char nextp[512];
-        path_join(nextp, sizeof nextp, store->dir, "nextid");
-        f = fopen(nextp, "r");
         unsigned long long next = store->active_id + 1;
-        if (f) {
+        if (omega_fs_lstat_at(store->dir_fd, "nextid", &st) == 0) {
+            int fd = omega_fs_open_regular_at(store->dir_fd, "nextid", O_RDONLY, 0);
+            if (fd < 0 || !(f = fdopen(fd, "r"))) {
+                if (fd >= 0) close(fd);
+                goto fail;
+            }
             if (fscanf(f, "%llu", &next) != 1) next = store->active_id + 1;
             fclose(f);
-        }
+        } else if (errno != ENOENT) goto fail;
         store->next_id = (uint64_t)next;
     }
     *out = store;
     return RX_GEN_OK;
+fail:
+    if (rc == RX_GEN_OK) rc = RX_GEN_ERR_IO;
+    if (store->dir_fd >= 0) close(store->dir_fd);
+    pthread_mutex_destroy(&store->active_mu);
+    free(store);
+    return rc;
 }
 
 static void exec_stop(RxGenStore *store);
@@ -845,6 +887,7 @@ void rx_gen_close(RxGenStore *store) {
         for (int b = 0; b < DIG_COUNT; b++) free(store->cand[i].blob[b]);
     }
     if (store->lock_fd >= 0) close(store->lock_fd);
+    if (store->dir_fd >= 0) close(store->dir_fd);
     pthread_mutex_destroy(&store->active_mu);
     free(store);
 }
@@ -869,7 +912,7 @@ int rx_gen_read_blob(const RxGenStore *store, uint64_t id, const char *name, uin
     if (which < 0 && !work) return RX_GEN_ERR_ARG;
     RootView view;
     uint8_t root_digest[32];
-    int rc = load_root_file(store->dir, id, &view, root_digest);
+    int rc = load_root_file(store, id, &view, root_digest);
     if (rc != RX_GEN_OK) return rc;
     if (view.id != id) return RX_GEN_ERR_TORN;
     uint64_t length = work ? view.work_len : view.lengths[which];
@@ -880,9 +923,9 @@ int rx_gen_read_blob(const RxGenStore *store, uint64_t id, const char *name, uin
     /* stored_name comes from a fixed table/literal, never from the input. */
     if (gen_dir(store->dir, id, folder, sizeof folder) != 0 ||
         path_join(path, sizeof path, folder, stored_name) != 0) return RX_GEN_ERR_IO;
-    rc = file_matches(path, digest, length);
+    rc = file_matches(store, path, digest, length);
     if (rc != RX_GEN_OK) return rc;
-    if (length && read_full(path, buf, (size_t)length) != 0)
+    if (length && read_full(store, path, buf, (size_t)length) != 0)
         return RX_GEN_ERR_IO;
     /* The bytes read must be the bytes the root names, not whatever the file
      * became after the check above. */
@@ -902,11 +945,9 @@ static int caller_refusal(int crc) {
 /* R16 G6: the durable mark of an operator stop in the store directory. 0 none,
  * RX_GEN_ERR_HALTED present, RX_GEN_ERR_IO when it cannot be told (refuse). */
 static int halt_marked(const RxGenStore *store) {
-    char p[512];
-    if (snprintf(p, sizeof p, "%s/%s", store->dir, RX_GEN_HALT_MARK) >= (int)sizeof p)
-        return RX_GEN_ERR_IO;
     struct stat st;
-    if (lstat(p, &st) == 0) return RX_GEN_ERR_HALTED;
+    if (omega_fs_lstat_at(store->dir_fd, RX_GEN_HALT_MARK, &st) == 0)
+        return RX_GEN_ERR_HALTED;
     return errno == ENOENT ? 0 : RX_GEN_ERR_IO;
 }
 
@@ -1225,7 +1266,7 @@ int rx_gen_promote(RxGenStore *store, const RxPromotionRequest *request, RxGenAu
     int rc = RX_GEN_OK;
     uint64_t disk_id = 0, disk_lineage = 0;
     uint8_t disk_digest[32];
-    rc = read_pointer(store->dir, &disk_id, &disk_lineage, disk_digest);
+    rc = read_pointer(store, &disk_id, &disk_lineage, disk_digest);
     if (rc != RX_GEN_OK) goto done;
     set_active(store, disk_id, disk_lineage);
     if (c->parent_id != store->active_id) {
@@ -1280,7 +1321,7 @@ int rx_gen_promote(RxGenStore *store, const RxPromotionRequest *request, RxGenAu
         rc = RX_GEN_ERR_IO;
         goto done;
     }
-    if (ensure_dir(folder) != 0) {
+    if (ensure_dir(store, folder) != 0) {
         rc = RX_GEN_ERR_IO;
         goto done;
     }
@@ -1329,7 +1370,7 @@ int rx_gen_promote(RxGenStore *store, const RxPromotionRequest *request, RxGenAu
     if (store->crash_step == RX_CRASH_AFTER_CANDIDATE_WRITE) crash_now();
     store->phases.candidate_ns = monotonic_ns();
     if (store->disk_hook) store->disk_hook(folder, store->disk_ctx);
-    rc = root_reachable(store->dir, &view);
+    rc = root_reachable(store, &view);
     if (rc != RX_GEN_OK) goto done;
     store->phases.reachable_ns = monotonic_ns();
     if (store->crash_step == RX_CRASH_BEFORE_ROOT_FLIP) crash_now();
@@ -1405,78 +1446,84 @@ done:
 int rx_gen_recover(const char *dir, RxRecoveryRecord *out) {
     if (!dir || !out) return RX_GEN_ERR_ARG;
     memset(out, 0, sizeof(*out));
-    /* From here dir is the checked copy (src/omega_path_check.h): no other path is opened. */
-    char checked[sizeof ((RxGenStore *)0)->dir];
-    if (omega_path_copy(checked, sizeof checked, dir) != 0) return RX_GEN_ERR_ARG;
-    dir = checked;
-    char lock[512];
-    if (path_join(lock, sizeof lock, dir, "barrier.lock") == 0) unlink(lock);
+    RxGenStore scratch;
+    memset(&scratch, 0, sizeof scratch);
+    scratch.lock_fd = -1;
+    scratch.dir_fd = -1;
+    if (omega_path_copy(scratch.dir, sizeof scratch.dir, dir) != 0) return RX_GEN_ERR_ARG;
+    scratch.dir_fd = omega_fs_root_open(scratch.dir, 0, 0);
+    if (scratch.dir_fd < 0) return RX_GEN_ERR_IO;
+    if (omega_fs_unlink_at(scratch.dir_fd, "barrier.lock", 0) != 0 && errno != ENOENT) {
+        close(scratch.dir_fd);
+        return RX_GEN_ERR_IO;
+    }
 
     uint64_t id = 0, lineage = 0;
     uint8_t pointer_digest[32];
-    int pointer_rc = read_pointer(dir, &id, &lineage, pointer_digest);
+    int pointer_rc = read_pointer(&scratch, &id, &lineage, pointer_digest);
     uint32_t phase = PHASE_NONE;
     uint64_t parent = 0, candidate = 0, parent_lineage = 0;
     uint8_t journal_digest[32];
-    int journal_rc =
-        read_journal(dir, &phase, &parent, &candidate, &parent_lineage, journal_digest);
+    int journal_rc = read_journal(&scratch, &phase, &parent, &candidate, &parent_lineage,
+                                  journal_digest);
+    int rc = RX_GEN_OK;
 
     if (pointer_rc != RX_GEN_OK && journal_rc == RX_GEN_OK && phase >= PHASE_FLIPPED) {
         RootView repaired;
         uint8_t got[32];
-        int rc = load_root_file(dir, candidate, &repaired, got);
-        if (rc != RX_GEN_OK) return rc;
-        if (memcmp(got, journal_digest, 32) != 0) return RX_GEN_ERR_TORN;
-        if (root_reachable(dir, &repaired) != RX_GEN_OK) return RX_GEN_ERR_TORN;
-        RxGenStore scratch;
-        memset(&scratch, 0, sizeof scratch);
-        scratch.lock_fd = -1;
-        snprintf(scratch.dir, sizeof scratch.dir, "%s", dir);
+        rc = load_root_file(&scratch, candidate, &repaired, got);
+        if (rc != RX_GEN_OK) goto done;
+        if (memcmp(got, journal_digest, 32) != 0 ||
+            root_reachable(&scratch, &repaired) != RX_GEN_OK) {
+            rc = RX_GEN_ERR_TORN;
+            goto done;
+        }
         uint8_t pointer[PTR_BYTES];
         encode_pointer(repaired.id, repaired.lineage, got, pointer);
         char active[512];
-        if (path_join(active, sizeof active, dir, "active") != 0) return RX_GEN_ERR_IO;
+        if (path_join(active, sizeof active, scratch.dir, "active") != 0) {
+            rc = RX_GEN_ERR_IO;
+            goto done;
+        }
         rc = commit_file(&scratch, active, pointer, sizeof pointer, RX_CRASH_NONE);
-        if (rc != RX_GEN_OK) return rc;
+        if (rc != RX_GEN_OK) goto done;
         id = repaired.id;
         lineage = repaired.lineage;
         memcpy(pointer_digest, got, 32);
         pointer_rc = RX_GEN_OK;
     }
-    if (pointer_rc != RX_GEN_OK) return pointer_rc;
+    if (pointer_rc != RX_GEN_OK) { rc = pointer_rc; goto done; }
 
     RootView view;
     uint8_t root_digest[32];
-    int rc = load_root_file(dir, id, &view, root_digest);
-    if (rc != RX_GEN_OK) return rc;
-    if (view.id != id || view.lineage != lineage || memcmp(root_digest, pointer_digest, 32) != 0)
-        return RX_GEN_ERR_TORN;
-    rc = root_reachable(dir, &view);
-    if (rc != RX_GEN_OK) return rc;
+    rc = load_root_file(&scratch, id, &view, root_digest);
+    if (rc != RX_GEN_OK) goto done;
+    if (view.id != id || view.lineage != lineage || memcmp(root_digest, pointer_digest, 32) != 0) {
+        rc = RX_GEN_ERR_TORN;
+        goto done;
+    }
+    rc = root_reachable(&scratch, &view);
+    if (rc != RX_GEN_OK) goto done;
 
-    int receipt = receipt_exists(dir, id);
+    int receipt = receipt_exists(&scratch, id);
     if (view.parent != 0 && journal_rc == RX_GEN_OK && candidate == id && !receipt) {
-        RxGenStore scratch;
-        memset(&scratch, 0, sizeof scratch);
-        scratch.lock_fd = -1;
-        scratch.crash_step = RX_CRASH_NONE;
-        snprintf(scratch.dir, sizeof scratch.dir, "%s", dir);
         rc = write_receipt_file(&scratch, &view, 0, 0, 0);
-        if (rc != RX_GEN_OK) return rc;
+        if (rc != RX_GEN_OK) goto done;
         rc = append_event(&scratch, view.id, view.lineage);
-        if (rc != RX_GEN_OK) return rc;
+        if (rc != RX_GEN_OK) goto done;
         receipt = 1;
     }
-    fill_record(&view, receipt, event_has(dir, id) || view.parent == 0, out);
+    fill_record(&view, receipt, event_has(&scratch, id) || view.parent == 0, out);
     if (view.parent != 0 && !out->event_present) {
-        RxGenStore scratch;
-        memset(&scratch, 0, sizeof scratch);
-        scratch.lock_fd = -1;
-        snprintf(scratch.dir, sizeof scratch.dir, "%s", dir);
-        if (append_event(&scratch, view.id, view.lineage) != RX_GEN_OK) return RX_GEN_ERR_IO;
+        if (append_event(&scratch, view.id, view.lineage) != RX_GEN_OK) {
+            rc = RX_GEN_ERR_IO;
+            goto done;
+        }
         out->event_present = 1;
     }
-    return RX_GEN_OK;
+done:
+    close(scratch.dir_fd);
+    return rc;
 }
 
 int rx_gen_reject_replay(const char *dir, uint64_t effect_id) {

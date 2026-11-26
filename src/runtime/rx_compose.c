@@ -25,7 +25,7 @@
 #include "rx_compose.h"
 #include "rx_cortex_record.h"
 #include "sha256.h"
-#include "omega_path_check.h"
+#include "omega_fs.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -58,10 +58,6 @@ static void rxc_derive(const uint8_t *prev, uint64_t token, uint8_t *out, size_t
 const JsRealizer RXC_REALIZER = { JS_REAL_WORLD_PROJECTION, "rxc_state", RXC_UNIT, rxc_derive };
 
 /* ---- small helpers -------------------------------------------------------- */
-
-static void path_in(char *out, size_t n, const char *dir, const char *name) {
-    snprintf(out, n, "%s/%s", dir, name);
-}
 
 static uint64_t ref_pack(JsBranchRef r) { return js_branch_ref_pack(r); }
 static JsBranchRef ref_unpack(uint64_t v) { return js_branch_ref_unpack(v); }
@@ -865,6 +861,7 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
     hooks.fault_hit = 0;
     hooks.held = hooks.release = hooks.hold_done = 0;
     memset(c, 0, sizeof *c);
+    c->dir_fd = -1;
     c->test = hooks;
     c->wait_ms = RXC_WAIT_MS_DEFAULT;
     snprintf(c->dir, sizeof c->dir, "%s", dir);
@@ -873,24 +870,33 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
     c->router = router;
     c->contract = contract;
     c->admin = admin;
-    /* Check before mkdir (src/omega_path_check.h): a refused dir is an argument error and creates nothing. */
+    /* Check and retain the root before any child is inspected or created. */
     char checked[sizeof c->dir];
     if (omega_path_copy(checked, sizeof checked, dir) != 0) return RX_ERR_ARG;
-    if (mkdir(checked, 0700) && errno != EEXIST) return RX_ERR_ARG;
+    c->dir_fd = omega_fs_root_open(checked, 1, 0700);
+    if (c->dir_fd < 0) return RX_ERR_ARG;
 
-    char p[256];
-    path_in(p, sizeof p, dir, "machine.id");
-    if (access(p, F_OK) == 0) {
+    struct stat st;
+    if (omega_fs_lstat_at(c->dir_fd, "machine.id", &st) == 0) {
         AienMachineId stored;
-        if (aien_mid_load(p, &stored) != AIEN_MID_OK || !aien_mid_equal(&stored, self))
+        if (aien_mid_load_at(c->dir_fd, "machine.id", &stored) != AIEN_MID_OK ||
+            !aien_mid_equal(&stored, self)) {
+            close(c->dir_fd);
+            c->dir_fd = -1;
             return RX_ERR_IDENTITY;
-    } else if (aien_mid_store(p, self) != AIEN_MID_OK) {
+        }
+    } else if (errno != ENOENT || aien_mid_store_at(c->dir_fd, "machine.id", self) != AIEN_MID_OK) {
+        close(c->dir_fd);
+        c->dir_fd = -1;
         return RX_ERR_IDENTITY;
     }
 
-    path_in(p, sizeof p, dir, "cortex.cx");
-    if (cx_open(&c->cx, p, RX_CORTEX_SUBJECTS, CX_OPEN_SYNC | CX_OPEN_REPAIR_TAIL) != CX_OK)
+    if (cx_open_at(&c->cx, c->dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS,
+                   CX_OPEN_SYNC | CX_OPEN_REPAIR_TAIL) != CX_OK) {
+        close(c->dir_fd);
+        c->dir_fd = -1;
         return RX_ERR_REPLAY;
+    }
     /* cx_open already verified every record and rebuilt the chain (see rx_cortex.h). */
 
     JsHome home;
@@ -898,9 +904,10 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
     aien_mid_to_slot(self, home.machine);
     home.locality = JS_HOME_LOCAL;
     const JsRealizer *rz[1] = { &RXC_REALIZER };
-    path_in(p, sizeof p, dir, "jspace");
-    if (js_space_open(&c->js, p, rz, 1, NULL, &home) != JS_OK) {
+    if (js_space_open_at(&c->js, c->dir_fd, "jspace", rz, 1, NULL, &home) != JS_OK) {
         cx_close(&c->cx);
+        close(c->dir_fd);
+        c->dir_fd = -1;
         return RX_ERR_REPLAY;
     }
     /* A Cortex journal cut exactly at a record boundary opens cleanly in cx_open
@@ -921,6 +928,8 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
         if (c->cx.n < cnt || (cnt > 0 && (!head || memcmp(head->digest, an + 8, 32) != 0))) {
             js_space_destroy(&c->js);
             cx_close(&c->cx);
+            close(c->dir_fd);
+            c->dir_fd = -1;
             return RX_ERR_REPLAY;
         }
     } else {
@@ -930,6 +939,8 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
     if (rc != RX_OK) {
         js_space_destroy(&c->js);
         cx_close(&c->cx);
+        close(c->dir_fd);
+        c->dir_fd = -1;
     }
     return rc;
 }
@@ -1025,6 +1036,8 @@ int rx_compose_open(RxCompose *c, const char *dir, const AienMachineId *self, ui
         c->world = NULL;
         js_space_destroy(&c->js);
         cx_close(&c->cx);
+        close(c->dir_fd);
+        c->dir_fd = -1;
         return rc;
     }
     return RX_OK;
@@ -1125,6 +1138,8 @@ int rx_compose_attach(RxCompose *c, RxWorld *w, const RxCallerKeyring *keys, con
         c->world = NULL;
         js_space_destroy(&c->js);
         cx_close(&c->cx);
+        close(c->dir_fd);
+        c->dir_fd = -1;
     }
     pthread_mutex_unlock(&g_attach_mu);
     return rc;
@@ -1294,6 +1309,8 @@ void rx_compose_close(RxCompose *c) {
     c->world = NULL;
     js_space_destroy(&c->js);    /* never commits: durable state is what settle made durable */
     cx_close(&c->cx);
+    if (c->dir_fd >= 0) close(c->dir_fd);
+    c->dir_fd = -1;
 }
 
 void rx_compose_record_digest(const CxStore *s, uint8_t out[32]) {
