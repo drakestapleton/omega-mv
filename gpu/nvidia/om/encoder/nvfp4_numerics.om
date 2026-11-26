@@ -1,0 +1,413 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/encoder/nvfp4_numerics.om: SM121 (Blackwell GB10) NVFP4 numerics SASS emitters
+note and pure-Omega CPU f64 reference oracles. Composes after bw_enc_sm121_v2.om under om2.
+note Provides:
+note   - nv4_emit_rht16: 4-stage SHFL.BFLY 16x16 symmetric Random Hadamard Transform (D*H16*D) + 0.25 scale
+note   - nv4_emit_philox_sr_e2m1: counter-based Philox4x32 dither + block-16 absmax + F2FP E4M3/E2M1 pack
+note   - nv4_emit_quant_2d_16x16: full 256-thread 1024B-SMEM 2D 16x16 NVFP4 weight quantizer (L2_EF->L2_EL)
+note   - CPU f64 references: nv4_ref_philox_u32, nv4_ref_rht16, nv4_ref_e2m1_sr,
+note     nv4_ref_ue4m3_quant, nv4_ref_quant_2d_16x16
+
+const NV4_PHILOX_M0 ulong 0xd2511f53
+const NV4_PHILOX_M1 ulong 0xcd9e8d57
+const NV4_PHILOX_W0 ulong 0x9e3779b9
+const NV4_PHILOX_W1 ulong 0xbb67ae85
+
+const NV4_F32_QUARTER ulong 0x3e800000
+const NV4_F32_INV6 ulong 0x3e2aaaab
+const NV4_F32_UE4M3_MIN ulong 0x3b000000
+const NV4_F32_HALF ulong 0x3f000000
+const NV4_F32_ONE ulong 0x3f800000
+const NV4_F32_ONE_HALF ulong 0x3fc00000
+
+const NV4_SR_LANEID ulong 0
+const NV4_SR_TID_X ulong 33
+const NV4_SR_CTAID_X ulong 37
+
+const NV4_LUT_XOR ulong 60
+const NV4_LUT_XOR3 ulong 150
+const NV4_LUT_OR ulong 252
+
+note ---- SM121 SASS Emitters ----
+
+fn nv4_emit_bfly_stage r_val ulong r_tmp ulong delta ulong to void
+v2_s2r r_tmp NV4_SR_LANEID
+v2_andi r_tmp r_tmp delta
+v2_isetp 0 r_tmp V2_RZ CMP_NE
+v2_shfl SHFL_BFLY r_tmp r_val delta 31
+v2_wait 1
+v2_set_guard 2
+v2_fadd r_val r_val r_tmp
+v2_set_guard 1
+v2_fsub r_val r_tmp r_val
+end
+
+note 4-stage warp SHFL.BFLY (deltas 1,2,4,8) 16-pt symmetric RHT (D * H16 * D) + 0.25f32 scale.
+fn nv4_emit_rht16 r_val ulong r_tmp ulong r_sgn ulong to void
+v2_andi r_tmp r_sgn 0x80000000
+v2_lop3 r_val r_val r_tmp V2_RZ NV4_LUT_XOR
+nv4_emit_bfly_stage r_val r_tmp 1
+nv4_emit_bfly_stage r_val r_tmp 2
+nv4_emit_bfly_stage r_val r_tmp 4
+nv4_emit_bfly_stage r_val r_tmp 8
+v2_movi r_tmp NV4_F32_QUARTER
+v2_fmul r_val r_val r_tmp
+v2_andi r_tmp r_sgn 0x80000000
+v2_lop3 r_val r_val r_tmp V2_RZ NV4_LUT_XOR
+end
+
+fn nv4_emit_absmax16 r_dst ulong r_src ulong r_tmp ulong to void
+v2_andi r_dst r_src 0x7fffffff
+v2_shfl SHFL_BFLY r_tmp r_dst 8 31
+v2_fmax r_dst r_dst r_tmp
+v2_shfl SHFL_BFLY r_tmp r_dst 4 31
+v2_fmax r_dst r_dst r_tmp
+v2_shfl SHFL_BFLY r_tmp r_dst 2 31
+v2_fmax r_dst r_dst r_tmp
+v2_shfl SHFL_BFLY r_tmp r_dst 1 31
+v2_fmax r_dst r_dst r_tmp
+end
+
+fn nv4_emit_philox_round r_lo ulong r_hi ulong r_key ulong to void
+v2_imadi r_lo r_lo NV4_PHILOX_M0 r_hi
+v2_shr r_hi r_lo 16
+v2_lop3 r_lo r_lo r_hi r_key NV4_LUT_XOR3
+v2_imadi r_hi r_hi NV4_PHILOX_M1 r_lo
+v2_shr r_hi r_hi 13
+v2_lop3 r_lo r_lo r_hi V2_RZ NV4_LUT_XOR
+end
+
+note Counter-based Philox4x32 dither + block-16 absmax + F2FP.SATFINITE.E4M3 scale + E2M1 SR pack.
+fn nv4_emit_philox_sr_e2m1 r_val ulong r_ctr ulong r_key ulong r_out ulong r_sc ulong to void
+nv4_emit_absmax16 r_sc r_val r_out
+v2_movi r_out NV4_F32_INV6
+v2_fmul r_sc r_sc r_out
+v2_movi r_out NV4_F32_UE4M3_MIN
+v2_fmax r_out r_sc r_out
+v2_f2fp_e4m3 r_sc r_sc V2_RZ V2_RZ
+v2_mufu r_out r_out MUFU_RCP
+v2_fmul r_val r_val r_out
+v2_lop3 r_out r_ctr r_key V2_RZ NV4_LUT_XOR
+v2_imadi r_ctr r_ctr NV4_PHILOX_W0 r_key
+nv4_emit_philox_round r_out r_ctr r_key
+nv4_emit_philox_round r_out r_ctr r_key
+nv4_emit_philox_round r_out r_ctr r_key
+nv4_emit_philox_round r_out r_ctr r_key
+v2_andi r_out r_out 0x007fffff
+v2_movi r_ctr NV4_F32_ONE
+v2_lop3 r_out r_out r_ctr V2_RZ NV4_LUT_OR
+v2_movi r_ctr NV4_F32_ONE_HALF
+v2_fsub r_out r_out r_ctr
+v2_movi r_ctr NV4_F32_HALF
+v2_fmul r_out r_out r_ctr
+v2_andi r_ctr r_val 0x7f800000
+v2_isge 0 r_ctr NV4_F32_ONE
+v2_set_guard 2
+v2_movi r_ctr NV4_F32_ONE
+v2_fmul r_out r_out r_ctr
+v2_fadd r_val r_val r_out
+v2_shfl SHFL_BFLY r_ctr r_val 1 31
+v2_f2fp_e2m1 r_out r_ctr r_val V2_RZ
+end
+
+fn nv4_emit_q2d_load to void
+v2_s2r 0 NV4_SR_TID_X
+v2_s2r 1 NV4_SR_CTAID_X
+v2_ldc64 2 896
+v2_ldc64 4 904
+v2_ldc64 6 912
+v2_ldc 8 920
+v2_ldc 9 924
+v2_ldc 10 928
+v2_isetp 0 1 8 CMP_GE
+v2_exit_p 0
+v2_imadi 11 1 256 0
+v2_imadw 12 11 4 2
+v2_ldg_pol 14 12 V2_URZ 0 SZ_32 L2_EF
+v2_andi 15 0 15
+v2_imadi 16 15 NV4_PHILOX_W0 10
+v2_andi 16 16 0x80000000
+nv4_emit_rht16 14 17 16
+end
+
+fn nv4_emit_q2d_reduce to void
+v2_imadi 18 0 4 V2_RZ
+v2_sts 18 14 0 SZ_32
+v2_bar
+nv4_emit_absmax16 19 14 17
+v2_shr 18 0 4
+v2_imadi 18 18 4 V2_RZ
+v2_sts 18 19 0 SZ_32
+v2_bar
+v2_andi 18 0 15
+v2_imadi 18 18 4 V2_RZ
+v2_lds 19 18 0 SZ_32
+nv4_emit_absmax16 19 19 17
+end
+
+fn nv4_emit_q2d_store to void
+v2_iadd3 20 11 0 V2_RZ
+nv4_emit_philox_sr_e2m1 14 20 9 21 22
+v2_movi 17 NV4_F32_INV6
+v2_fmul 19 19 17
+v2_f2fp_e4m3 22 19 V2_RZ V2_RZ
+v2_shfl SHFL_BFLY 17 21 2 31
+v2_prmt 21 21 0x5410 17
+v2_shfl SHFL_BFLY 17 21 4 31
+v2_prmt 21 21 0x5410 17
+v2_andi 17 0 7
+v2_isetp 0 17 V2_RZ CMP_EQ
+v2_shr 18 11 1
+v2_imadw 24 18 1 4
+v2_set_guard 1
+v2_stg_pol 24 21 V2_URZ 0 SZ_32 L2_EL
+v2_isetp 0 0 V2_RZ CMP_EQ
+v2_imadw 26 1 4 6
+v2_set_guard 1
+v2_stg_pol 26 22 V2_URZ 0 SZ_32 L2_EL
+v2_exit
+end
+
+note Emit complete SM121 2D 16x16 block-scaled NVFP4 quantizer kernel into slot (256 threads, 1024 B SMEM).
+fn nv4_emit_quant_2d_16x16 slot ulong to ulong
+v2_begin slot 256 1024
+nv4_emit_q2d_load
+nv4_emit_q2d_reduce
+nv4_emit_q2d_store
+ret v2_end 28
+end
+
+note ---- Pure-Omega CPU f64 Reference Oracles ----
+
+note Deterministic Philox4x32-10 mixer returning uniform 32-bit unsigned integer in ulong.
+fn nv4_ref_philox_u32 ctr ulong key ulong to ulong
+st = new ulong 6 0
+put st 0 and ctr 0xffffffff
+put st 1 and shr ctr 32 0xffffffff
+put st 2 0
+put st 3 0
+put st 4 and key 0xffffffff
+put st 5 and shr key 32 0xffffffff
+for r ulong 10
+p0 = mul NV4_PHILOX_M0 get st 0
+p1 = mul NV4_PHILOX_M1 get st 2
+nc0 = xor xor shr p1 32 get st 1 get st 4
+nc1 = and p1 0xffffffff
+nc2 = xor xor shr p0 32 get st 3 get st 5
+nc3 = and p0 0xffffffff
+put st 0 and nc0 0xffffffff
+put st 1 nc1
+put st 2 and nc2 0xffffffff
+put st 3 nc3
+put st 4 and add get st 4 NV4_PHILOX_W0 0xffffffff
+put st 5 and add get st 5 NV4_PHILOX_W1 0xffffffff
+end
+ret get st 0
+end
+
+fn nv4_ref_rht_stage dst edit f64 16 step ulong to void
+for i ulong 16
+if eq and i step 0
+j = add i step
+a = get dst i
+b = get dst j
+put dst i add a b
+put dst j sub a b
+end
+end
+end
+
+note Exact 16-pt normalized symmetric Walsh-Hadamard transform (D * H16 * D): H^T H = I_16,
+note and applying twice with the same sgn_mask recovers inp exactly.
+fn nv4_ref_rht16 inp view f64 16 dst edit f64 16 sgn_mask ulong to void
+for i ulong 16
+v = get inp i
+if ne and shr sgn_mask i 1 0
+v = neg v
+end
+put dst i v
+end
+nv4_ref_rht_stage dst 1
+nv4_ref_rht_stage dst 2
+nv4_ref_rht_stage dst 4
+nv4_ref_rht_stage dst 8
+for i ulong 16
+v = mul get dst i 0.25f64
+if ne and shr sgn_mask i 1 0
+v = neg v
+end
+put dst i v
+end
+end
+
+fn nv4_e2m1_lo a f64 to f64
+if lt a 0.5f64
+ret 0.0f64
+end
+if lt a 1.0f64
+ret 0.5f64
+end
+if lt a 1.5f64
+ret 1.0f64
+end
+if lt a 2.0f64
+ret 1.5f64
+end
+if lt a 3.0f64
+ret 2.0f64
+end
+if lt a 4.0f64
+ret 3.0f64
+end
+ret 4.0f64
+end
+
+fn nv4_e2m1_hi a f64 to f64
+if lt a 0.5f64
+ret 0.5f64
+end
+if lt a 1.0f64
+ret 1.0f64
+end
+if lt a 1.5f64
+ret 1.5f64
+end
+if lt a 2.0f64
+ret 2.0f64
+end
+if lt a 3.0f64
+ret 3.0f64
+end
+if lt a 4.0f64
+ret 4.0f64
+end
+ret 6.0f64
+end
+
+note Unbiased stochastic rounding to canonical E2M1 {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} with sign.
+fn nv4_ref_e2m1_sr val f64 rng_u32 ulong to f64
+is_neg = lt val 0.0f64
+a = fabs val
+res = 6.0f64
+if lt a 6.0f64
+lo = nv4_e2m1_lo a
+hi = nv4_e2m1_hi a
+u = div add f64 and rng_u32 0xffffffff 0.5f64 4294967296.0f64
+if lt mul u sub hi lo sub a lo
+res = hi
+else
+res = lo
+end
+end
+if and is_neg gt res 0.0f64
+ret neg res
+end
+ret res
+end
+
+fn nv4_round_even scaled f64 to ulong
+fl = ulong scaled
+frac = sub scaled f64 fl
+if gt frac 0.5f64
+ret add fl 1
+end
+if eq frac 0.5f64
+if eq and fl 1 1
+ret add fl 1
+end
+end
+ret fl
+end
+
+note Quantizes amax / 6.0 to UE4M3 positive representable value (min subnormal 2^-9, max 448.0).
+fn nv4_ref_ue4m3_quant amax f64 to f64
+s = div fabs amax 6.0f64
+if le s 0.001953125f64
+ret 0.001953125f64
+end
+if ge s 448.0f64
+ret 448.0f64
+end
+if lt s 0.015625f64
+k = nv4_round_even mul s 512.0f64
+if lt k 1
+k = ulong 1
+end
+ret mul f64 k 0.001953125f64
+end
+bits = bitcast ulong s
+exp_b = shr bits 52
+step = bitcast f64 shl sub exp_b 3 52
+inv_s = bitcast f64 shl sub 2049 exp_b 52
+q = nv4_round_even mul s inv_s
+res = mul f64 q step
+if gt res 448.0f64
+ret 448.0f64
+end
+ret res
+end
+
+note Deterministic round-to-nearest-even E2M1 for 2D weight block quantization.
+fn nv4_ref_e2m1_rtn val f64 to f64
+is_neg = lt val 0.0f64
+a = fabs val
+res = 6.0f64
+if le a 0.25f64
+res = 0.0f64
+else
+if lt a 0.75f64
+res = 0.5f64
+else
+if le a 1.25f64
+res = 1.0f64
+else
+if lt a 1.75f64
+res = 1.5f64
+else
+if le a 2.5f64
+res = 2.0f64
+else
+if lt a 3.5f64
+res = 3.0f64
+else
+if le a 5.0f64
+res = 4.0f64
+end
+end
+end
+end
+end
+end
+end
+if and is_neg gt res 0.0f64
+ret neg res
+end
+ret res
+end
+
+note Single 2D 16x16 UE4M3 block scale + E2M1 quantize/dequantize; returns relative L2 error.
+fn nv4_ref_quant_2d_16x16 w_in view f64 256 w_out edit f64 256 to f64
+amax = 0.0f64
+norm2 = 0.0f64
+for i ulong 256
+v = get w_in i
+amax = fmax amax fabs v
+norm2 = add norm2 mul v v
+end
+if eq norm2 0.0f64
+for i ulong 256
+put w_out i 0.0f64
+end
+ret 0.0f64
+end
+sc = nv4_ref_ue4m3_quant amax
+err2 = 0.0f64
+for i ulong 256
+v = get w_in i
+dq = mul nv4_ref_e2m1_rtn div v sc sc
+put w_out i dq
+d = sub dq v
+err2 = add err2 mul d d
+end
+ret div fsqrt err2 fsqrt norm2
+end

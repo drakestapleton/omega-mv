@@ -1,0 +1,728 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/encoder/bw_enc_sm121_v2.om: Extended pure-OM-2 SM121 (Blackwell GB10) SASS emitter
+note and static auditor. Extends (never modifies) the seed/ng/cudapp.lock-pinned bw_enc_sm121.om with:
+note   - Verified OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X (NVFP4 Tensor Core, 0x747f)
+note   - Verified HMMA.16816.F32.BF16 (BF16 Tensor Core, 0x723c)
+note   - Verified F2FP.{BF16, E4M3, E2M1} packing (0x723e)
+note   - Verified PRMT, LOP3.LUT, SHFL.{IDX,UP,DOWN,BFLY}, VOTE.{ALL,ANY}, POPC, MEMBAR.SC.SYS
+note   - Explicit L2 cache-eviction policy modifiers on LDG.E/STG.E.{32,64,128}:
+note       L2_NORM (0), L2_EF (1, evict-first, verified 0x0c0e/0x0c11),
+note       L2_EL   (2, evict-last for 24 MiB L2-pinned spiral weights/grad accum),
+note       L2_LU   (3, last-use for consumed backward scratch)
+note   - Wide shared memory STS.128 / LDS.128, plus LDGSTS.128 & LDSM.x4/.trans descriptors
+note     (LDGSTS/LDSM/L2_EL/L2_LU bitfields carry VERIFY_NVDISASM_SM121 tags for Spark gate).
+note   - Built-in static SASS auditor enforcing Byte-Traceability Lock 1 (zero FP atomics),
+note     GPR <= 125 headroom (declared <= 128), EXIT presence, and L2 .EL/.EF policy coverage.
+
+const V2_MAX_SLOTS ulong 16
+const V2_SLOT_BYTES ulong 16384
+const V2_MAX_INSNS ulong 1024
+const V2_RZ ulong 255
+const V2_PT ulong 7
+const V2_URZ ulong 63
+
+const L2_NORM ulong 0
+const L2_EF ulong 1
+const L2_EL ulong 2
+const L2_LU ulong 3
+
+const SZ_32 ulong 0
+const SZ_64 ulong 1
+const SZ_128 ulong 2
+
+const SHFL_IDX ulong 0
+const SHFL_UP ulong 1
+const SHFL_DOWN ulong 2
+const SHFL_BFLY ulong 3
+
+const MUFU_EX2 ulong 2048
+const MUFU_LG2 ulong 3072
+const MUFU_RCP ulong 4096
+const MUFU_RSQ ulong 5120
+
+const CMP_LT ulong 1
+const CMP_EQ ulong 2
+const CMP_LE ulong 3
+const CMP_GT ulong 4
+const CMP_NE ulong 5
+const CMP_GE ulong 6
+
+note 16 kernel slots x 16 KiB = 262,144 bytes
+global v2_code uchar 262144
+note Per-slot metadata (slot * 8 + k): 0=insns, 1=bytes, 2=gpr_max, 3=gpr_decl,
+note 4=smem_bytes, 5=threads, 6=el_loads, 7=ef_loads
+global v2_meta ulong 128
+note Active emitter cursor: 0=slot, 1=pc, 2=pend_wait, 3=guard(0=PT,1=@P0,2=@!P0),
+note 4=err, 5=gpr_max, 6=el_cnt, 7=ef_cnt
+global v2_cur ulong 8
+note Audit summary from last v2_audit_slot: 0=flags, 1=insns, 2=el_ldg, 3=ef_ldg,
+note 4=omma_cnt, 5=hmma_cnt, 6=fp_atomic_cnt, 7=has_exit
+global v2_aud ulong 8
+
+fn v2_cw st ulong wb ulong rb ulong wt ulong yld ulong to ulong
+a = or shl and st 15 9 shl and yld 1 13
+b = or shl and wb 7 14 shl and rb 7 17
+ret or or a b shl and wt 63 20
+end
+
+fn v2_take_cw st ulong wb ulong rb ulong yld ulong to ulong
+wt = get v2_cur 2
+put v2_cur 2 0
+ret v2_cw st wb rb wt yld
+end
+
+fn v2_track_reg r ulong to void
+if lt r 254
+if gt r get v2_cur 5
+put v2_cur 5 r
+end
+end
+end
+
+fn v2_w32 byte_off ulong val ulong to void
+put v2_code byte_off uchar and val 255
+put v2_code add byte_off 1 uchar and shr val 8 255
+put v2_code add byte_off 2 uchar and shr val 16 255
+put v2_code add byte_off 3 uchar and shr val 24 255
+end
+
+fn v2_rd32 slot ulong byte_off ulong to ulong
+base = add mul slot V2_SLOT_BYTES byte_off
+b0 = ulong get v2_code base
+b1 = shl ulong get v2_code add base 1 8
+b2 = shl ulong get v2_code add base 2 16
+b3 = shl ulong get v2_code add base 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn v2_pc to ulong
+ret get v2_cur 1
+end
+
+fn v2_set_guard g ulong to void
+put v2_cur 3 g
+end
+
+fn v2_apply_guard w0 ulong to ulong
+g = get v2_cur 3
+put v2_cur 3 0
+if eq g 0
+ret w0
+end
+p = ulong 0
+if eq g 2
+p = 8
+end
+ret or and w0 4294905855 shl p 12
+end
+
+fn v2_emit4 w0 ulong w1 ulong w2 ulong w3 ulong to void
+sl = get v2_cur 0
+pc = get v2_cur 1
+if or ge sl V2_MAX_SLOTS ge pc V2_MAX_INSNS
+put v2_cur 4 1
+ret
+end
+off = add mul sl V2_SLOT_BYTES mul pc 16
+g0 = v2_apply_guard w0
+v2_w32 off g0
+v2_w32 add off 4 w1
+v2_w32 add off 8 w2
+v2_w32 add off 12 w3
+put v2_cur 1 add pc 1
+end
+
+fn v2_begin slot ulong thr ulong smem ulong to void
+if ge slot V2_MAX_SLOTS
+put v2_cur 4 2
+ret
+end
+base = mul slot V2_SLOT_BYTES
+for i ulong V2_SLOT_BYTES
+put v2_code add base i uchar 0
+end
+put v2_cur 0 slot
+put v2_cur 1 0
+put v2_cur 2 0
+put v2_cur 3 0
+put v2_cur 4 0
+put v2_cur 5 0
+put v2_cur 6 0
+put v2_cur 7 0
+m = mul slot 8
+for k ulong 8
+put v2_meta add m k 0
+end
+put v2_meta add m 4 smem
+put v2_meta add m 5 thr
+end
+
+fn v2_nop to void
+v2_emit4 31000 0 0 1032192
+end
+
+fn v2_wait mask ulong to void
+v2_emit4 31000 0 0 v2_cw 6 7 7 and mask 63 0
+end
+
+fn v2_end gpr_hint ulong to ulong
+sl = get v2_cur 0
+if ne get v2_cur 4 0
+ret 0
+end
+n = get v2_cur 1
+cnt = mul div add n 7 8 8
+if lt cnt 32
+cnt = 32
+end
+if gt cnt V2_MAX_INSNS
+put v2_cur 4 3
+ret 0
+end
+while lt get v2_cur 1 cnt bound 1024
+v2_nop
+end
+gm = get v2_cur 5
+if gt gpr_hint gm
+gm = gpr_hint
+end
+note Blackwell HW reserves 2 GPRs for PC: declared >= round_up_8(max_gpr + 3)
+need = add gm 3
+decl = mul div add need 7 8 8
+if lt decl 16
+decl = 16
+end
+m = mul sl 8
+put v2_meta m cnt
+put v2_meta add m 1 mul cnt 16
+put v2_meta add m 2 gm
+put v2_meta add m 3 decl
+put v2_meta add m 6 get v2_cur 6
+put v2_meta add m 7 get v2_cur 7
+ret mul cnt 16
+end
+
+fn v2_w0 op ulong d ulong a ulong to ulong
+v2_track_reg d
+v2_track_reg a
+ret or or op shl and d 255 16 shl and a 255 24
+end
+
+note ---- Control, Synchronization, System & Constant Loads ----
+
+fn v2_bar to void
+w = v2_take_cw 6 7 7 0
+v2_emit4 31517 0 65536 w
+end
+
+fn v2_membar_sys to void
+w = v2_take_cw 6 7 7 0
+v2_emit4 31122 0 12288 w
+end
+
+fn v2_exit to void
+w = or v2_take_cw 5 7 7 0 8192
+v2_emit4 31053 0 58720256 w
+v2_emit4 16546119 4294967292 58982399 1032192
+end
+
+fn v2_exit_p p ulong to void
+w = or v2_take_cw 5 7 7 0 8192
+v2_emit4 or 2381 shl and p 15 12 0 58720256 w
+end
+
+fn v2_bra_rel p ulong rel ulong to void
+r = and sub rel 1 4294967295
+w1 = shl shr r 6 2
+w2 = ulong 58720256
+if ge r 2147483648
+w1 = or w1 4026531840
+w2 = 58982399
+end
+w0 = or or 2375 shl and p 15 12 shl and r 63 18
+w3 = v2_take_cw 5 7 7 0
+v2_emit4 w0 w1 w2 w3
+end
+
+fn v2_bra_to p ulong tgt ulong to void
+here = get v2_cur 1
+rel = and sub tgt here 4294967295
+v2_bra_rel p rel
+end
+
+fn v2_s2r d ulong sr ulong to void
+v2_track_reg d
+w = v2_cw 4 0 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 3
+v2_emit4 or 31001 shl and d 255 16 0 shl and sr 255 8 w
+end
+
+fn v2_ldc d ulong off ulong to void
+v2_track_reg d
+w = v2_cw 4 0 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 3
+v2_emit4 or 4278221698 shl and d 255 16 shl div off 4 8 2048 w
+end
+
+fn v2_ldc64 d ulong off ulong to void
+v2_track_reg d
+v2_track_reg add d 1
+w = v2_cw 4 0 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 3
+v2_emit4 or 4278221698 shl and d 255 16 shl div off 4 8 2560 w
+end
+
+fn v2_ldcu64 ud ulong off ulong to void
+w = v2_cw 4 2 7 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 4
+v2_emit4 or 4278220716 shl and ud 255 16 and shl off 5 16776960 134220288 w
+end
+
+note ---- Integer ALU, Logic, Bit/Byte Permute, Warp Shuffles ----
+
+fn v2_movz d ulong to void
+v2_track_reg d
+v2_emit4 or 29186 shl and d 255 16 255 3840 v2_take_cw 2 7 7 0
+end
+
+fn v2_movi d ulong imm ulong to void
+v2_track_reg d
+v2_emit4 or 30722 shl and d 255 16 and imm 4294967295 3840 v2_take_cw 2 7 7 0
+end
+
+fn v2_iadd3 d ulong a ulong b ulong c ulong to void
+v2_track_reg b
+v2_track_reg c
+v2_emit4 v2_w0 29200 d a and b 255 or 134209536 and c 255 v2_take_cw 2 7 7 0
+end
+
+fn v2_imad d ulong a ulong b ulong c ulong to void
+v2_track_reg b
+v2_track_reg c
+v2_emit4 v2_w0 29220 d a and b 255 or 126747136 and c 255 v2_take_cw 4 7 7 0
+end
+
+fn v2_imadi d ulong a ulong imm ulong c ulong to void
+v2_track_reg c
+v2_emit4 v2_w0 30756 d a and imm 4294967295 or 126747136 and c 255 v2_take_cw 4 7 7 0
+end
+
+fn v2_imadw d ulong a ulong imm ulong c ulong to void
+v2_track_reg add d 1
+v2_track_reg c
+v2_emit4 v2_w0 30757 d a and imm 4294967295 or 126746624 and c 255 v2_take_cw 4 7 7 0
+end
+
+fn v2_imadwr d ulong a ulong b ulong c ulong to void
+v2_track_reg add d 1
+v2_track_reg b
+v2_track_reg c
+v2_emit4 v2_w0 29221 d a and b 255 or 126746624 and c 255 v2_take_cw 4 7 7 0
+end
+
+fn v2_shr d ulong a ulong n ulong to void
+v2_track_reg d
+v2_track_reg a
+v2_emit4 or 4278220825 shl and d 255 16 and n 31 or 71168 and a 255 v2_take_cw 2 7 7 0
+end
+
+fn v2_andi d ulong a ulong imm ulong to void
+v2_emit4 v2_w0 30738 d a and imm 4294967295 126796031 v2_take_cw 2 7 7 0
+end
+
+fn v2_lop3 d ulong a ulong b ulong c ulong lut ulong to void
+v2_track_reg b
+v2_track_reg c
+w2 = or or 126746624 shl and lut 255 8 and c 255
+v2_emit4 v2_w0 29202 d a and b 255 w2 v2_take_cw 4 7 7 0
+end
+
+fn v2_prmt d ulong a ulong sel ulong c ulong to void
+v2_track_reg c
+v2_emit4 v2_w0 30742 d a and sel 4294967295 and c 255 v2_take_cw 4 7 7 0
+end
+
+fn v2_isetp p ulong a ulong b ulong cc ulong to void
+v2_track_reg a
+v2_track_reg b
+w2 = or or 66060400 shl and cc 7 12 shl and p 7 17
+v2_emit4 or 29196 shl and a 255 24 and b 255 w2 v2_take_cw 14 7 7 0
+end
+
+fn v2_isge p ulong a ulong imm ulong to void
+v2_track_reg a
+w2 = or 66085488 shl and p 7 17
+v2_emit4 or 30732 shl and a 255 24 and imm 4294967295 w2 v2_take_cw 14 7 7 0
+end
+
+fn v2_shfl mode ulong d ulong a ulong lane ulong mask ulong to void
+w1 = or or shl and mode 3 26 shl and lane 31 21 shl and mask 31 8
+w3 = v2_cw 4 0 7 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 1
+v2_emit4 v2_w0 32649 d a w1 917504 w3
+end
+
+fn v2_vote d ulong pd ulong ps ulong mode ulong to void
+v2_track_reg d
+w2 = or or shl and ps 7 23 shl and pd 7 17 shl and mode 3 8
+v2_emit4 or 30726 shl and d 255 16 0 w2 v2_take_cw 4 7 7 0
+end
+
+fn v2_popc d ulong a ulong to void
+v2_track_reg d
+v2_track_reg a
+w3 = v2_cw 4 0 7 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 1
+v2_emit4 or 29449 shl and d 255 16 and a 255 0 w3
+end
+
+note ---- Floating Point & SFU ----
+
+fn v2_fadd d ulong a ulong b ulong to void
+v2_track_reg b
+v2_emit4 v2_w0 29217 d a and b 255 0 v2_take_cw 4 7 7 0
+end
+
+fn v2_fsub d ulong a ulong b ulong to void
+v2_track_reg b
+v2_emit4 v2_w0 29217 d a or and b 255 2147483648 0 v2_take_cw 4 7 7 0
+end
+
+fn v2_fmul d ulong a ulong b ulong to void
+v2_track_reg b
+v2_emit4 v2_w0 29216 d a and b 255 4194304 v2_take_cw 4 7 7 0
+end
+
+fn v2_ffma d ulong a ulong b ulong c ulong to void
+v2_track_reg b
+v2_track_reg c
+v2_emit4 v2_w0 29219 d a and b 255 and c 255 v2_take_cw 4 7 7 0
+end
+
+fn v2_fmax d ulong a ulong b ulong to void
+v2_track_reg b
+v2_emit4 v2_w0 29193 d a and b 255 125829120 v2_take_cw 4 7 7 0
+end
+
+fn v2_fsetp p ulong a ulong b ulong cc ulong to void
+v2_track_reg a
+v2_track_reg b
+w2 = or or 66060288 shl and cc 15 12 shl and p 7 17
+v2_emit4 or 29195 shl and a 255 24 and b 255 w2 v2_take_cw 14 7 7 0
+end
+
+fn v2_fsel d ulong a ulong b ulong p ulong to void
+v2_track_reg b
+v2_emit4 v2_w0 29192 d a and b 255 shl and p 7 23 v2_take_cw 4 7 7 0
+end
+
+fn v2_mufu d ulong a ulong func ulong to void
+v2_track_reg d
+v2_track_reg a
+w3 = v2_cw 4 0 7 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 1
+v2_emit4 or 29448 shl and d 255 16 and a 255 func w3
+end
+
+note ---- Global Memory with Explicit L2 Cache Eviction Policy (.NORM / .EF / .EL / .LU) ----
+
+fn v2_sz_bits sz_code ulong to ulong
+if eq sz_code SZ_64
+ret 2560
+end
+if eq sz_code SZ_128
+ret 3072
+end
+ret 2048
+end
+
+fn v2_ldg_pol_bits pol ulong to ulong
+note Verified SM121 LDG.E word2 cache policy (bits 21:20):
+note   L2_EF   (0x0c0e1100): evict-first (verified nvdisasm 0x0c0e1900 = LDG.E.EF)
+note   L2_NORM (0x0c1e1100): evict-normal (verified 0x0c1e1900 = LDG.E)
+note   L2_EL   (0x0c2e1100): evict-last (pins active spiral core in 24 MiB L2; VERIFY_NVDISASM_SM121)
+note   L2_LU   (0x0c3e1100): last-use (transient backward scratch; VERIFY_NVDISASM_SM121)
+if eq pol L2_EF
+ret 202248448
+end
+if eq pol L2_EL
+ret 204345600
+end
+if eq pol L2_LU
+ret 205394176
+end
+ret 203297024
+end
+
+fn v2_ldg_pol d ulong addr ulong ureg ulong off ulong sz_code ulong pol ulong to void
+if eq sz_code SZ_64
+v2_track_reg add d 1
+end
+if eq sz_code SZ_128
+v2_track_reg add d 3
+end
+v2_track_reg add addr 1
+if eq pol L2_EL
+put v2_cur 6 add get v2_cur 6 1
+end
+if eq pol L2_EF
+put v2_cur 7 add get v2_cur 7 1
+end
+w1 = or and ureg 255 shl and off 16777215 8
+w2 = or v2_ldg_pol_bits pol v2_sz_bits sz_code
+w3 = v2_cw 2 0 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 3
+v2_emit4 v2_w0 31105 d addr w1 w2 w3
+end
+
+fn v2_stg_pol_bits pol ulong to ulong
+note Verified SM121 STG.E word2 cache policy:
+note   L2_NORM (0x0c101100): normal (verified 0x0c101900 = STG.E)
+note   L2_EF   (0x0c111100): evict-first (verified 0x0c111900 = STG.E.EF)
+note   L2_EL   (0x0c201100): evict-last (L2 grad accum writeback; VERIFY_NVDISASM_SM121)
+if eq pol L2_EF
+ret 202445056
+end
+if eq pol L2_EL
+ret 203428096
+end
+ret 202379520
+end
+
+fn v2_stg_pol addr ulong src ulong ureg ulong off ulong sz_code ulong pol ulong to void
+v2_track_reg add addr 1
+v2_track_reg src
+if eq sz_code SZ_64
+v2_track_reg add src 1
+end
+if eq sz_code SZ_128
+v2_track_reg add src 3
+end
+w0 = or 31110 shl and addr 255 24
+w1 = or and src 255 shl and off 16777215 8
+w2 = or or v2_stg_pol_bits pol v2_sz_bits sz_code and ureg 255
+w3 = v2_cw 2 7 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 2
+v2_emit4 w0 w1 w2 w3
+end
+
+note ---- Shared Memory (32/128-bit) & Async/Matrix Bypass (LDGSTS / LDSM) ----
+
+fn v2_lds d ulong addr ulong off ulong sz_code ulong to void
+if eq sz_code SZ_128
+v2_track_reg add d 3
+end
+w1 = shl and off 16777215 8
+w2 = v2_sz_bits sz_code
+w3 = v2_cw 2 0 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 3
+v2_emit4 v2_w0 31108 d addr w1 w2 w3
+end
+
+fn v2_sts addr ulong src ulong off ulong sz_code ulong to void
+v2_track_reg addr
+v2_track_reg src
+if eq sz_code SZ_128
+v2_track_reg add src 3
+end
+w0 = or 31112 shl and addr 255 24
+w1 = or and src 255 shl and off 16777215 8
+w2 = or or 134217728 v2_sz_bits sz_code 255
+w3 = v2_cw 2 7 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 2
+v2_emit4 w0 w1 w2 w3
+end
+
+note LDGSTS.E.BYPASS.LTC128B.128 [smem], desc[UR][gmem.64] (VERIFY_NVDISASM_SM121 on Spark before launch)
+fn v2_ldgsts128 smem_r ulong gmem_r ulong ureg ulong pol ulong to void
+v2_track_reg smem_r
+v2_track_reg add gmem_r 1
+if eq pol L2_EL
+put v2_cur 6 add get v2_cur 6 1
+end
+if eq pol L2_EF
+put v2_cur 7 add get v2_cur 7 1
+end
+w0 = or or 31150 shl and smem_r 255 16 shl and gmem_r 255 24
+w1 = and ureg 255
+w2 = or v2_ldg_pol_bits pol 3072
+w3 = v2_cw 2 1 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 2
+v2_emit4 w0 w1 w2 w3
+end
+
+note LDSM.16.M88.4 / LDSM.16.MT88.4 Rd..Rd+3, [smem_r+off] (VERIFY_NVDISASM_SM121 on Spark before launch)
+fn v2_ldsm4 d ulong smem_r ulong off ulong trans ulong to void
+v2_track_reg add d 3
+w1 = shl and off 16777215 8
+w2 = ulong 3072
+if ne trans 0
+w2 = or w2 1024
+end
+w3 = v2_cw 2 0 1 get v2_cur 2 1
+put v2_cur 2 or get v2_cur 2 3
+v2_emit4 v2_w0 31147 d smem_r w1 w2 w3
+end
+
+note ---- Verified Blackwell SM121 Tensor Core & Quantization Instructions ----
+
+note HMMA.16816.F32.BF16 Rd..Rd+3, Ra..Ra+3, Rb..Rb+1, Rc..Rc+3 (verified nvdisasm -b SM121)
+fn v2_hmma_bf16 d ulong a ulong b ulong c ulong stall ulong to void
+v2_track_reg add d 3
+v2_track_reg add a 3
+v2_track_reg add b 1
+v2_track_reg add c 3
+w2 = or 268288 and c 255
+v2_emit4 v2_w0 29244 d a and b 255 w2 v2_take_cw stall 7 7 0
+end
+
+note OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X Rd, Ra, Rb, Rd, Rsa, Rsb, URZ (silicon-verified GB10)
+fn v2_omma_nvfp4 d ulong a ulong b ulong rsa ulong rsb ulong stall ulong to void
+v2_track_reg add d 3
+v2_track_reg add a 3
+v2_track_reg add b 1
+v2_track_reg rsa
+v2_track_reg rsb
+w1 = or 1879048192 and b 255
+w1 = or w1 shl and rsa 255 8
+w1 = or w1 shl and rsb 255 20
+w2 = or 278016 and d 255
+w0 = v2_w0 29823 d a
+w3 = v2_take_cw stall 7 7 0
+v2_emit4 w0 w1 w2 w3
+end
+
+note F2FP.BF16.F32.PACK_AB Rd, Ra, Rb (verified nvdisasm -b SM121)
+fn v2_f2fp_bf16 d ulong a ulong b ulong to void
+v2_track_reg b
+v2_emit4 v2_w0 29246 d a and b 255 4351 v2_take_cw 2 7 7 0
+end
+
+note F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C Rd, Ra, Rb, Rc (silicon-verified GB10)
+fn v2_f2fp_e4m3 d ulong a ulong b ulong c ulong to void
+v2_track_reg b
+v2_track_reg c
+v2_emit4 v2_w0 29246 d a and b 255 or 75526144 and c 255 v2_take_cw 4 7 7 0
+end
+
+note F2FP.SATFINITE.E2M1.F32.PACK_AB_MERGE_C Rd, Ra, Rb, Rc (silicon-verified GB10)
+fn v2_f2fp_e2m1 d ulong a ulong b ulong c ulong to void
+v2_track_reg b
+v2_track_reg c
+v2_emit4 v2_w0 29246 d a and b 255 or 69234688 and c 255 v2_take_cw 4 7 7 0
+end
+
+note ---- Byte-Traceability Lock 1 & L2 Policy Static SASS Auditor ----
+
+fn v2_is_fp_atomic op12 ulong to bool
+note Reject ATOMG.E.ADD.F32 (0x9a3 / 0x3a3), ATOM / ATOMG / ATOMS FP atomics (0x3a8..0x9aa, 0x38a..0x98b)
+if or eq op12 2467 eq op12 931
+ret true
+end
+if or eq op12 936 or eq op12 2472 or eq op12 938 eq op12 2474
+ret true
+end
+if or eq op12 937 or eq op12 2473 or eq op12 906 eq op12 2442
+ret true
+end
+if or eq op12 907 eq op12 2443
+ret true
+end
+ret false
+end
+
+fn v2_audit_insn slot ulong i ulong to ulong
+off = mul i 16
+w0 = v2_rd32 slot off
+w2 = v2_rd32 slot add off 8
+op12 = and w0 4095
+fl = ulong 0
+if v2_is_fp_atomic op12
+put v2_aud 6 add get v2_aud 6 1
+fl = or fl 4
+end
+if eq op12 2381
+put v2_aud 7 1
+end
+if eq op12 2433
+pol = and shr w2 20 3
+if eq pol 2
+put v2_aud 2 add get v2_aud 2 1
+end
+if eq pol 0
+put v2_aud 3 add get v2_aud 3 1
+end
+end
+if eq op12 1151
+put v2_aud 4 add get v2_aud 4 1
+end
+if eq op12 572
+put v2_aud 5 add get v2_aud 5 1
+end
+ret fl
+end
+
+note Audit emitted slot: req_el=1 requires >=1 L2_EL load; returns 0 on PASS, bitmask on FAIL:
+note   bit 0: empty/bad slot, bit 1: GPR decl > 128, bit 2: FP atomic detected (Lock 1),
+note   bit 3: missing EXIT, bit 4: missing L2 .EL pinned load when req_el == 1
+fn v2_audit_slot slot ulong req_el ulong to ulong
+for k ulong 8
+put v2_aud k 0
+end
+if ge slot V2_MAX_SLOTS
+put v2_aud 0 1
+ret 1
+end
+m = mul slot 8
+cnt = get v2_meta m
+decl = get v2_meta add m 3
+if or eq cnt 0 gt cnt V2_MAX_INSNS
+put v2_aud 0 1
+ret 1
+end
+put v2_aud 1 cnt
+fl = ulong 0
+if gt decl 128
+fl = or fl 2
+end
+for i ulong cnt bound 1024
+fl = or fl v2_audit_insn slot i
+end
+if eq get v2_aud 7 0
+fl = or fl 8
+end
+if and ne req_el 0 eq get v2_aud 2 0
+fl = or fl 16
+end
+put v2_aud 0 fl
+ret fl
+end
+
+note Negative-control mutant M3: strip all LDG.E.EL hints down to LDG.E.EF in slot
+fn v2_mutant_strip_el slot ulong to ulong
+m = mul slot 8
+cnt = get v2_meta m
+hit = ulong 0
+for i ulong cnt bound 1024
+off = mul i 16
+w0 = v2_rd32 slot off
+if eq and w0 4095 2433
+w2 = v2_rd32 slot add off 8
+if eq and shr w2 20 3 2
+nw2 = and w2 4291821567
+v2_w32 add mul slot V2_SLOT_BYTES add off 8 nw2
+hit = add hit 1
+end
+end
+end
+ret hit
+end
+
+note Negative-control mutant M4: inject forbidden ATOMG.E.ADD.F32 (0x79a3) into slot
+fn v2_mutant_inject_fp_atomic slot ulong insn_idx ulong to void
+off = add mul slot V2_SLOT_BYTES mul insn_idx 16
+v2_w32 off 31139
+v2_w32 add off 4 2147483648
+v2_w32 add off 8 203379456
+v2_w32 add off 12 3284480
+end

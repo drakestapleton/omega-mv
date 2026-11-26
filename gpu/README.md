@@ -26,7 +26,7 @@ see [`gpu/UNITS.md`](UNITS.md) and [`gpu/nvidia/README.md`](nvidia/README.md) fo
 | `gpu/adapters/` | Pure-Omega hardware accelerator adapter and provider router (converted from `spark-adapters`, `da269adf5ff1`, 3 `.om` files). |
 | `gpu/head-to-head/` | Pure-Omega paired A/B GPU benchmark comparator and parity verifier (converted from `gpu-head-to-head`, `48e331f2cf5e`, 3 `.om` files). |
 | `gpu/forge/` | Pure-Omega FORGE hardware descriptor, envelope, provider and realization engine (converted from `physics-mv`, `29039514eaf8`, 6 `.om` files). |
-| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 49 units) for `gpu/driver/`, `gpu/cuda-crack/`, `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, `gpu/turing/`, `gpu/nvidia/coder/`, `gpu/nvidia/moe-wide/`, `gpu/nvidia/compat/`, `gpu/nvidia/lib/`, `gpu/nvidia/tools/{c5,omtrace,prof,tilelab,sm121dis,doctor,dagsim}/`, `gpu/nvidia/driver/device.om`, and `gpu/qual/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
+| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 51 units) for `gpu/driver/`, `gpu/cuda-crack/`, `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, `gpu/turing/`, `gpu/nvidia/coder/`, `gpu/nvidia/moe-wide/`, `gpu/nvidia/compat/`, `gpu/nvidia/lib/`, `gpu/nvidia/tools/{c5,omtrace,prof,tilelab,sm121dis,doctor,dagsim}/`, `gpu/nvidia/driver/device.om`, `gpu/nvidia/om/{encoder/bw_enc_sm121_v2,encoder/nvfp4_numerics,qmd/l2_policy,blas/*,dnn/*,spiral/*}.om`, and `gpu/qual/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
 | `gpu/qual/` | Pure-Omega physical hardware qualification kit (`x86linux_qual.om`, `non_nvidia_qual.om`, `qual_test.om`, `gate.sh`) for x86-64 Linux and non-NVIDIA GPUs (AMD KFD, Intel Xe, OpenCL/SPIR-V), strictly separating `EMULATED`/`HOST_TESTED` from physical hardware qualification (`BLOCKED_HARDWARE` when target hardware is absent). |
 
 A moved back end keeps the history of its Omega files: `git log --follow gpu/amd/gfx942/hsaco.om` shows
@@ -42,7 +42,7 @@ anything. The digest is read from `seed/out/omc.sha256`. No back end carries a c
 
 - `tests/gates/run.sh gpu-amd` (manifest `tests/gates/omega-gpu-amd.gate`) builds and runs `gpu/amd/gate.om`. See `gpu/amd/README.md`.
 - `tests/gates/run.sh gpu-units` (`OMEGA-GPU-UNITS`) builds and runs `gpu/units-gate.om` over the 405 units in `gpu/units.tsv`. See `gpu/UNITS.md`.
-- `gpu/extra-units-gate.om` (`OMEGA-GPU-EXTRA-UNITS`) checks the 49 units in `gpu/extra-units.tsv`.
+- `gpu/extra-units-gate.om` (`OMEGA-GPU-EXTRA-UNITS`) checks the 51 units in `gpu/extra-units.tsv`.
 - `tests/gates/run.sh gpu-driver`, `gpu-runtime`, `gpu-checks`, and `gpu-amd-rest` run the corresponding Omega gates under `gpu/nvidia/driver/`, `gpu/runtime/`, `gpu/nvidia/checks/`, and `gpu/amd/rest/`.
 - `OMC=seed/out/omc sh gpu/spirv/check.sh` runs pure-Omega SPIR-V validation (`val.om`), execution (`run.om`), mutant, and host-conform (`conform.om`) checks over `gpu/spirv/` (also run by `./uxl-run.sh`).
 - `OMC=seed/out/omc sh gpu/intel/gate.sh` compiles and checks the pure-Omega Intel Xe2/Xe3 (Panther Lake) backend under `gpu/intel/` (`records.om`, `batch.om`, `isa.om`, `plan.om`, `launch.om`, 11-ioctl `drm/xe` kernel `-EBADF` selftest, and `x86linux` cross-compile).

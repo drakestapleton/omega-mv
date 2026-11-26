@@ -1,0 +1,546 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/dnn/fused_norm_mlp.om: Pure seeded-OM-2 SM121 fused zero-DRAM-spill training blocks.
+note Composes after gpu/nvidia/om/encoder/bw_enc_sm121_v2.om (no om2 directive here).
+note Emits three fused SM121 training block kernels supporting both BF16 (HMMA.16816) and NVFP4 (OMMA.SF.16864):
+note   - dnn_emit_rmsnorm_qkv(slot, use_nvfp4):
+note       X2 -> SMEM once, 5-step SHFL.BFLY + MUFU.RSQ + pinned g1 (L2_EL), quantize directly in SMEM
+note       (F2FP.BF16 or F2FP.E4M3+E2M1), pinned W_qkv (L2_EL) HMMA/OMMA projection. ZERO norm DRAM spill.
+note   - dnn_emit_mlp_rev_fwd(slot, use_nvfp4, q32_lock4):
+note       Pre-RMSNorm + W1 (L2_EL) + ReLU (1-bit VOTE mask in SMEM) + W2 (L2_EL) + reversible residual
+note       coupling Y2 = X2 + G(Y1) (IADD3 Q32 fixed-point when q32_lock4==1, FADD when 0). ZERO COPY/FP/RL spills.
+note   - dnn_emit_rev_bwd_step(slot, use_nvfp4, q32_lock4):
+note       Algebraic reversible reconstruction X2 = Y2 - G(Y1), X1 = Y1 - F(X2) (exact Q32 integer subtract
+note       when q32_lock4==1, FSUB when 0) + local recomputed backward dX + deterministic L2 dW accumulation
+note       (L2_EL weight/grad loads & stores, L2_LU transient scratch, ZERO FP atomics, Lock 1 compliant).
+
+const FNM_SR_TIDX ulong 33
+const FNM_SR_CTAX ulong 37
+const FNM_SR_CTAY ulong 38
+const FNM_UR_DESC ulong 4
+const FNM_DESC_OFF ulong 856
+const FNM_PARAM_BASE ulong 896
+const FNM_THREADS ulong 128
+
+const FNM_ABS_MASK ulong 2147483647
+const FNM_INV6 ulong 1042983595
+const FNM_E4M3_MIN ulong 989855744
+const FNM_E4M3_MAX ulong 1138753536
+const FNM_Q32_SCALE ulong 1266679808
+const FNM_EPS ulong 897988541
+const FNM_ONE ulong 1065353216
+const FNM_LUT_NOT_A ulong 15
+
+fn fnm_zero_regs base ulong cnt ulong to void
+for i ulong cnt bound 32
+v2_movz add base i
+end
+end
+
+fn fnm_warp_bfly_sum acc ulong tmp ulong to void
+v2_shfl SHFL_BFLY tmp acc 16 31
+v2_fadd acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 8 31
+v2_fadd acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 4 31
+v2_fadd acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 2 31
+v2_fadd acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 1 31
+v2_fadd acc acc tmp
+end
+
+fn fnm_warp_bfly_max16 acc ulong tmp ulong to void
+v2_shfl SHFL_BFLY tmp acc 8 31
+v2_fmax acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 4 31
+v2_fmax acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 2 31
+v2_fmax acc acc tmp
+v2_shfl SHFL_BFLY tmp acc 1 31
+v2_fmax acc acc tmp
+end
+
+note Quantize 4 FP32 activations in src..src+3 directly into SMEM[smem_dst] (ZERO DRAM spill!).
+note BF16 path (use_nvfp4==0): F2FP.BF16 -> STS.64.
+note NVFP4 path (use_nvfp4!=0): block-16 amax -> F2FP.E4M3 scale + RCP + F2FP.E2M1 pack -> STS.32.
+note Clobbers R40..R47. Reads R12 (tid).
+fn fnm_quant4_to_smem src ulong smem_dst ulong use_nvfp4 ulong to void
+if eq use_nvfp4 0
+v2_f2fp_bf16 40 add src 1 src
+v2_f2fp_bf16 41 add src 3 add src 2
+v2_imadi 44 12 8 V2_RZ
+if ne smem_dst 0
+v2_movi 45 smem_dst
+v2_iadd3 44 44 45 V2_RZ
+end
+v2_sts 44 40 0 SZ_64
+v2_bar
+ret
+end
+note NVFP4 block-16 quantization directly into SMEM: compute |x| max across 4 regs + 4-step SHFL.BFLY
+v2_andi 42 src FNM_ABS_MASK
+v2_andi 43 add src 1 FNM_ABS_MASK
+v2_fmax 42 42 43
+v2_andi 43 add src 2 FNM_ABS_MASK
+v2_fmax 42 42 43
+v2_andi 43 add src 3 FNM_ABS_MASK
+v2_fmax 42 42 43
+fnm_warp_bfly_max16 42 43
+note scale = clamp(amax * (1/6), 2^-9, 448.0) -> UE4M3 scale byte in R46 via F2FP.E4M3
+v2_movi 43 FNM_INV6
+v2_fmul 42 42 43
+v2_movi 43 FNM_E4M3_MIN
+v2_fmax 42 42 43
+v2_movi 43 FNM_E4M3_MAX
+v2_fsetp 0 42 43 CMP_GT
+v2_fsel 42 43 42 0
+v2_f2fp_e4m3 46 42 42 V2_RZ
+note Normalize 4 floats by 1/scale and pack E2M1 nibbles via F2FP.E2M1 into R40
+v2_mufu 43 42 MUFU_RCP
+v2_fmul 44 src 43
+v2_fmul 45 add src 1 43
+v2_f2fp_e2m1 40 45 44 V2_RZ
+v2_fmul 44 add src 2 43
+v2_fmul 45 add src 3 43
+v2_f2fp_e2m1 40 45 44 40
+note Combine neighbor lane's 4 nibbles into full 8x E2M1 u32 word in R40 via SHFL.BFLY + IMAD
+v2_shfl SHFL_BFLY 41 40 1 31
+v2_imadi 40 41 65536 40
+note Store packed NVFP4 data at smem_dst + tid*4 and UE4M3 scale at smem_dst + 1024 + (tid>>2)*4
+v2_imadi 44 12 4 V2_RZ
+if ne smem_dst 0
+v2_movi 45 smem_dst
+v2_iadd3 44 44 45 V2_RZ
+end
+v2_sts 44 40 0 SZ_32
+v2_shr 45 12 2
+v2_imadi 45 45 4 V2_RZ
+v2_movi 47 add smem_dst 1024
+v2_iadd3 45 45 47 V2_RZ
+v2_sts 45 46 0 SZ_32
+v2_bar
+end
+
+note Fused RMSNorm -> direct SMEM quantization (ZERO DRAM write of normalized activations!).
+note Loads X row once from x_ptr (L2_NORM) into smem_x, computes inv_rms = rsqrt(mean(x^2)+eps)
+note via 5-step SHFL.BFLY + cross-warp SMEM reduce + MUFU.RSQ, multiplies pinned gain g_ptr (L2_EL),
+note quantizes directly into smem_q (BF16 or NVFP4). Preserves inv_rms in R22 and x_norm in R32..35.
+note Reads: R10 (D), R12 (tid), R13 (ctaid_x=row), R15 (warp), R16 (lane), R18 (inv_D), R19 (eps).
+fn fnm_rmsnorm_to_smem x_ptr ulong g_ptr ulong smem_x ulong smem_q ulong use_nvfp4 ulong to void
+note Global row element offset R20 = ctaid_x * D + tid * 4
+v2_imad 20 13 10 V2_RZ
+v2_imadi 21 12 4 V2_RZ
+v2_iadd3 20 20 21 V2_RZ
+v2_imadw 38 20 4 x_ptr
+v2_ldg_pol 32 38 FNM_UR_DESC 0 SZ_128 L2_NORM
+note Stage X once into SMEM[smem_x + tid*16]
+v2_imadi 44 12 16 V2_RZ
+if ne smem_x 0
+v2_movi 45 smem_x
+v2_iadd3 44 44 45 V2_RZ
+end
+v2_sts 44 32 0 SZ_128
+note Sum of squares across 4 elems + 5-step warp butterfly reduction
+v2_movz 22
+v2_ffma 22 32 32 22
+v2_ffma 22 33 33 22
+v2_ffma 22 34 34 22
+v2_ffma 22 35 35 22
+fnm_warp_bfly_sum 22 42
+note Cross-warp reduction across 4 warps in SMEM[smem_q - 64]
+v2_movi 44 sub smem_q 64
+v2_imadi 45 15 4 44
+v2_isetp 0 16 V2_RZ CMP_EQ
+v2_set_guard 1
+v2_sts 45 22 0 SZ_32
+v2_bar
+v2_lds 40 44 0 SZ_32
+v2_lds 41 44 4 SZ_32
+v2_fadd 22 40 41
+v2_lds 40 44 8 SZ_32
+v2_lds 41 44 12 SZ_32
+v2_fadd 40 40 41
+v2_fadd 22 22 40
+note inv_rms (R22) = rsqrt(sum_sq * inv_D(R18) + eps(R19)) via MUFU.RSQ
+v2_fmul 22 22 18
+v2_fadd 22 22 19
+v2_mufu 22 22 MUFU_RSQ
+note Multiply pinned gain g (L2_EL): x_norm[0..3] = X[0..3] * inv_rms * g[0..3]
+v2_imadw 48 21 4 g_ptr
+v2_ldg_pol 36 48 FNM_UR_DESC 0 SZ_128 L2_EL
+v2_fmul 32 32 22
+v2_fmul 32 32 36
+v2_fmul 33 33 22
+v2_fmul 33 33 37
+v2_fmul 34 34 22
+v2_fmul 34 34 38
+v2_fmul 35 35 22
+v2_fmul 35 35 39
+note Quantize directly in SMEM[smem_q] (ZERO DRAM store!)
+fnm_quant4_to_smem 32 smem_q use_nvfp4
+end
+
+note Pinned-weight Tensor Core GEMM tile (L2_EL weights + HMMA.16816 BF16 or OMMA.SF.16864 NVFP4).
+note Reads quantized activations from SMEM[smem_q], pinned weights from w_ptr (c[0x0][w_param_off]),
+note and pinned UE4M3 weight scales from s_param_off when use_nvfp4!=0. Accumulates into acc_base..acc_base+15.
+fn fnm_gemm_pinned w_off ulong s_off ulong smem_q ulong acc_base ulong use_nvfp4 ulong to void
+fnm_zero_regs acc_base 16
+note Load weight base ptr -> R52:53 (and scale base ptr -> R54:55 if NVFP4)
+v2_ldc64 52 add FNM_PARAM_BASE w_off
+if ne use_nvfp4 0
+v2_ldc64 54 add FNM_PARAM_BASE s_off
+end
+note K loop count R24 = 0 .. k_iters (R25 = D >> 4 for BF16, D >> 6 for NVFP4)
+v2_movz 24
+if eq use_nvfp4 0
+v2_shr 25 10 4
+else
+v2_shr 25 10 6
+end
+note SMEM activation offset R44 = smem_q + warp(R15)*64 + lane(R16)*4
+v2_imadi 44 15 64 V2_RZ
+v2_imadi 44 16 4 44
+if ne smem_q 0
+v2_movi 45 smem_q
+v2_iadd3 44 44 45 V2_RZ
+end
+klp = v2_pc
+v2_lds 32 44 0 SZ_128
+if ne use_nvfp4 0
+v2_movi 45 add smem_q 1024
+v2_imadi 45 24 4 45
+v2_lds 46 45 0 SZ_32
+end
+note Compute weight byte address R38:39 = w_ptr + (k_iter*32 + lane) * 8
+v2_imadi 37 24 32 16
+v2_imadw 38 37 8 52
+for nt ulong 4
+v2_ldg_pol 36 38 FNM_UR_DESC mul nt 256 SZ_64 L2_EL
+if eq use_nvfp4 0
+v2_hmma_bf16 add acc_base mul nt 4 32 36 add acc_base mul nt 4 4
+else
+v2_imadw 56 37 4 54
+v2_ldg_pol 47 56 FNM_UR_DESC mul nt 128 SZ_32 L2_EL
+v2_omma_nvfp4 add acc_base mul nt 4 32 36 46 47 8
+end
+end
+v2_movi 37 16
+v2_iadd3 44 44 37 V2_RZ
+v2_movi 37 1
+v2_iadd3 24 24 37 V2_RZ
+v2_isetp 0 24 25 CMP_LT
+v2_bra_to 0 klp
+end
+
+note In-place ReLU on 16 FP32 regs (acc_base..acc_base+15) + store full per-element 1-bit VOTE masks
+note directly in SMEM[smem_mask] (16 ballot words/warp = 256 B total; ZERO FP/RL DRAM spill!).
+fn fnm_relu_mask_smem acc_base ulong smem_mask ulong to void
+v2_imadi 44 15 64 V2_RZ
+if ne smem_mask 0
+v2_movi 45 smem_mask
+v2_iadd3 44 44 45 V2_RZ
+end
+for idx ulong 16
+r = add acc_base idx
+v2_fsetp 0 r V2_RZ CMP_GT
+v2_vote 40 7 0 0
+v2_sts 44 40 mul idx 4 SZ_32
+v2_fmax r r V2_RZ
+end
+v2_bar
+end
+
+note Lock 4 exact Q32 fixed-point reversible coupling: dst[0..3] = x_reg[0..3] + q32(g_reg[0..3]) via IADD3.
+fn fnm_q32_add4 dst ulong x_reg ulong g_reg ulong to void
+v2_movi 42 FNM_Q32_SCALE
+for k ulong 4
+v2_fmul 43 add g_reg k 42
+v2_iadd3 add dst k add x_reg k 43 V2_RZ
+end
+end
+
+note Lock 4 exact Q32 fixed-point reversible inverse: dst[0..3] = y_reg[0..3] - q32(g_reg[0..3])
+note using exact two's-complement integer negation (LOP3 ~A + IADD3 +1 + IADD3 y + (-g)).
+fn fnm_q32_sub4 dst ulong y_reg ulong g_reg ulong to void
+v2_movi 42 FNM_Q32_SCALE
+v2_movi 44 1
+for k ulong 4
+v2_fmul 43 add g_reg k 42
+v2_lop3 43 43 V2_RZ V2_RZ FNM_LUT_NOT_A
+v2_iadd3 43 43 44 V2_RZ
+v2_iadd3 add dst k add y_reg k 43 V2_RZ
+end
+end
+
+note ============================================================================
+note Public API 1: dnn_emit_rmsnorm_qkv(slot, use_nvfp4) -> emitted bytes
+note Params c[0x0][896+]: X2(0:1,+0), g1(2:3,+8), Wqkv(+16), Sqkv(+24), QKV_out(8:9,+32),
+note   D(+40), N_qkv(+44), inv_D(+48), eps(+52)
+note Grid: (M, ceil(N_qkv/32), 1), Block: (128, 1, 1), SMEM: 16384 B
+note ============================================================================
+fn dnn_emit_rmsnorm_qkv slot ulong use_nvfp4 ulong to ulong
+v2_begin slot FNM_THREADS 16384
+v2_ldcu64 FNM_UR_DESC FNM_DESC_OFF
+v2_ldc64 0 FNM_PARAM_BASE
+v2_ldc64 2 add FNM_PARAM_BASE 8
+v2_ldc64 8 add FNM_PARAM_BASE 32
+v2_ldc 10 add FNM_PARAM_BASE 40
+v2_ldc 11 add FNM_PARAM_BASE 44
+v2_ldc 18 add FNM_PARAM_BASE 48
+v2_ldc 19 add FNM_PARAM_BASE 52
+v2_s2r 12 FNM_SR_TIDX
+v2_s2r 13 FNM_SR_CTAX
+v2_s2r 14 FNM_SR_CTAY
+v2_shr 15 12 5
+v2_andi 16 12 31
+note 1. Load X2 once -> SMEM[0], 5-step SHFL.BFLY + MUFU.RSQ + pinned g1 (L2_EL) -> quantize in SMEM[8192]
+fnm_rmsnorm_to_smem 0 2 0 8192 use_nvfp4
+note 2. Immediately execute pinned-weight QKV projection (L2_EL Wqkv + HMMA/OMMA -> R64..R79)
+fnm_gemm_pinned 16 24 8192 64 use_nvfp4
+note 3. Pack QKV output to BF16 and write ONLY QKV_out (ZERO normalized activation DRAM write!)
+v2_imad 37 13 11 V2_RZ
+v2_imadi 36 14 32 V2_RZ
+v2_iadd3 37 37 36 V2_RZ
+v2_imadi 37 12 4 37
+v2_imadw 38 37 2 8
+v2_f2fp_bf16 32 65 64
+v2_f2fp_bf16 33 67 66
+v2_f2fp_bf16 34 69 68
+v2_f2fp_bf16 35 71 70
+v2_stg_pol 38 32 FNM_UR_DESC 0 SZ_128 L2_NORM
+v2_f2fp_bf16 32 73 72
+v2_f2fp_bf16 33 75 74
+v2_f2fp_bf16 34 77 76
+v2_f2fp_bf16 35 79 78
+v2_stg_pol 38 32 FNM_UR_DESC 16 SZ_128 L2_NORM
+v2_exit
+ret v2_end 0
+end
+
+note ============================================================================
+note Public API 2: dnn_emit_mlp_rev_fwd(slot, use_nvfp4, q32_lock4) -> emitted bytes
+note Fuses: Pre-RMSNorm(Y1) + W1(L2_EL) + ReLU(1-bit SMEM mask) + W2(L2_EL) + Y2 = X2 + G(Y1).
+note Params c[0x0][896+]: Y1(0:1,+0), g2(2:3,+8), X2(4:5,+16), Y2_out(8:9,+24),
+note   W1(+32), S1(+40), W2(+48), S2(+56), D(+64), D_ff(+68), inv_D(+72), eps(+76)
+note Grid: (M, 1, 1), Block: (128, 1, 1), SMEM: 24576 B
+note ============================================================================
+fn dnn_emit_mlp_rev_fwd slot ulong use_nvfp4 ulong q32_lock4 ulong to ulong
+v2_begin slot FNM_THREADS 24576
+v2_ldcu64 FNM_UR_DESC FNM_DESC_OFF
+v2_ldc64 0 FNM_PARAM_BASE
+v2_ldc64 2 add FNM_PARAM_BASE 8
+v2_ldc64 4 add FNM_PARAM_BASE 16
+v2_ldc64 8 add FNM_PARAM_BASE 24
+v2_ldc 10 add FNM_PARAM_BASE 64
+v2_ldc 11 add FNM_PARAM_BASE 68
+v2_ldc 18 add FNM_PARAM_BASE 72
+v2_ldc 19 add FNM_PARAM_BASE 76
+v2_s2r 12 FNM_SR_TIDX
+v2_s2r 13 FNM_SR_CTAX
+v2_s2r 14 FNM_SR_CTAY
+v2_shr 15 12 5
+v2_andi 16 12 31
+note 1. Pre-RMSNorm on Y1 -> quantized Y1_norm directly in SMEM[8192] (pinned g2 L2_EL)
+fnm_rmsnorm_to_smem 0 2 0 8192 use_nvfp4
+note 2. W1 projection (L2_EL weights + HMMA/OMMA) -> H in R64..R79
+fnm_gemm_pinned 32 40 8192 64 use_nvfp4
+note 3. ReLU + 1-bit VOTE mask in SMEM[16384] (ZERO FP/RL DRAM spills!)
+fnm_relu_mask_smem 64 16384
+note 4. Quantize post-ReLU H directly in SMEM[17408]
+fnm_quant4_to_smem 64 17408 use_nvfp4
+note 5. W2 projection (L2_EL weights + HMMA/OMMA) -> G(Y1) in R80..R95
+fnm_gemm_pinned 48 56 17408 80 use_nvfp4
+note 6. Reversible residual coupling Y2 = X2 + G(Y1) (ZERO COPY kernel!)
+v2_imad 20 13 10 V2_RZ
+v2_imadi 21 12 4 V2_RZ
+v2_iadd3 20 20 21 V2_RZ
+v2_imadw 38 20 4 4
+v2_ldg_pol 96 38 FNM_UR_DESC 0 SZ_128 L2_NORM
+v2_imadw 38 20 4 8
+if ne q32_lock4 0
+fnm_q32_add4 96 96 80
+v2_stg_pol 38 96 FNM_UR_DESC 0 SZ_128 L2_NORM
+else
+v2_fadd 96 96 80
+v2_fadd 97 97 81
+v2_fadd 98 98 82
+v2_fadd 99 99 83
+v2_f2fp_bf16 32 97 96
+v2_f2fp_bf16 33 99 98
+v2_f2fp_bf16 34 85 84
+v2_f2fp_bf16 35 87 86
+v2_stg_pol 38 32 FNM_UR_DESC 0 SZ_128 L2_NORM
+end
+v2_exit
+ret v2_end 0
+end
+
+note ---- Reversible Backward Step Helpers ----
+
+note Apply per-element 1-bit ReLU VOTE masks stored in SMEM[smem_mask] to dH in R64..R79.
+fn fnm_apply_relu_mask smem_mask ulong to void
+v2_imadi 44 15 64 V2_RZ
+if ne smem_mask 0
+v2_movi 45 smem_mask
+v2_iadd3 44 44 45 V2_RZ
+end
+for idx ulong 16
+v2_lds 40 44 mul idx 4 SZ_32
+v2_andi 41 40 shl 1 and idx 15
+v2_isetp 0 41 V2_RZ CMP_NE
+r = add 64 idx
+v2_fsel r r V2_RZ 0
+end
+end
+
+note Algebraic reversible reconstruction X2 = Y2 - G(Y1) and X1 = Y1 - F(X2).
+note Uses exact Q32 two's-complement integer subtract when q32_lock4!=0, else FSUB.
+note Reads transient F(X2) scratch via L2_LU (last-use eviction!).
+fn fnm_rev_reconstruct q32_lock4 ulong to void
+v2_imad 20 13 10 V2_RZ
+v2_imadi 21 12 4 V2_RZ
+v2_iadd3 20 20 21 V2_RZ
+note Load Y2 from c[0x0][896 + 16] (R4:5) -> R96..R99; reconstruct X2 = Y2 - G(Y1) (R80..R83)
+v2_imadw 38 20 4 4
+v2_ldg_pol 96 38 FNM_UR_DESC 0 SZ_128 L2_NORM
+if ne q32_lock4 0
+fnm_q32_sub4 96 96 80
+else
+v2_fsub 96 96 80
+v2_fsub 97 97 81
+v2_fsub 98 98 82
+v2_fsub 99 99 83
+end
+note Store reconstructed X2 -> X2_out (c[0x0][896 + 80])
+v2_ldc64 52 add FNM_PARAM_BASE 80
+v2_imadw 38 20 4 52
+v2_stg_pol 38 96 FNM_UR_DESC 0 SZ_128 L2_NORM
+note Load transient F(X2) scratch from c[0x0][896 + 88] via L2_LU and reconstruct X1 = Y1 - F(X2)
+v2_ldc64 52 add FNM_PARAM_BASE 88
+v2_imadw 38 20 4 52
+v2_ldg_pol 100 38 FNM_UR_DESC 0 SZ_128 L2_LU
+v2_imadw 38 20 4 0
+v2_ldg_pol 96 38 FNM_UR_DESC 0 SZ_128 L2_NORM
+if ne q32_lock4 0
+fnm_q32_sub4 96 96 100
+else
+v2_fsub 96 96 100
+v2_fsub 97 97 101
+v2_fsub 98 98 102
+v2_fsub 99 99 103
+end
+v2_ldc64 52 add FNM_PARAM_BASE 96
+v2_imadw 38 20 4 52
+v2_stg_pol 38 96 FNM_UR_DESC 0 SZ_128 L2_NORM
+end
+
+note RMSNorm backward VJP in warp regs + reversible gradient coupling dY1_out = dY1_in + dX.
+note Inputs: dX_norm in R80..R83, inv_rms in R22, raw X in SMEM[0], g2 in R2:3, dY1_in in R6:7.
+fn fnm_rmsnorm_vjp_couple to void
+v2_imadi 44 12 16 V2_RZ
+v2_lds 96 44 0 SZ_128
+note Recompute exact x_norm[0..3] = X[0..3] * inv_rms(R22)
+v2_fmul 96 96 22
+v2_fmul 97 97 22
+v2_fmul 98 98 22
+v2_fmul 99 99 22
+v2_imadi 21 12 4 V2_RZ
+v2_imadw 38 21 4 2
+v2_ldg_pol 100 38 FNM_UR_DESC 0 SZ_128 L2_EL
+note dot = sum(dX_norm * g * x_norm) across 4 elems + 5-step SHFL.BFLY
+v2_movz 26
+for k ulong 4
+v2_fmul 43 add 80 k add 100 k
+v2_ffma 26 43 add 96 k 26
+end
+fnm_warp_bfly_sum 26 42
+v2_fmul 26 26 18
+note dX[k] = inv_rms(R22) * (dX_norm[k]*g[k] - x_norm[k]*dot)
+for k ulong 4
+v2_fmul 43 add 80 k add 100 k
+v2_fmul 44 add 96 k 26
+v2_fsub 43 43 44
+v2_fmul add 80 k 43 22
+end
+note Couple reversible gradient dY1_out = dY1_in + dX -> store via STG.E.128.NORM
+v2_imad 20 13 10 V2_RZ
+v2_iadd3 20 20 21 V2_RZ
+v2_imadw 38 20 4 6
+v2_ldg_pol 96 38 FNM_UR_DESC 0 SZ_128 L2_NORM
+v2_fadd 96 96 80
+v2_fadd 97 97 81
+v2_fadd 98 98 82
+v2_fadd 99 99 83
+v2_ldc64 52 add FNM_PARAM_BASE 104
+v2_imadw 38 20 4 52
+v2_stg_pol 38 96 FNM_UR_DESC 0 SZ_128 L2_NORM
+end
+
+note Deterministic L2 dW accumulation (ZERO FP atomics! Single owner CTA per weight tile).
+note Reads L2-pinned dW_acc via LDG.E.128.EL, adds tile dW (R64..67), writes via STG.E.128.EL.
+fn fnm_det_dw_accum dw_off ulong to void
+v2_ldc64 52 add FNM_PARAM_BASE dw_off
+v2_imad 20 13 11 V2_RZ
+v2_imadi 21 12 4 V2_RZ
+v2_iadd3 20 20 21 V2_RZ
+v2_imadw 38 20 4 52
+v2_ldg_pol 96 38 FNM_UR_DESC 0 SZ_128 L2_EL
+v2_fadd 96 96 64
+v2_fadd 97 97 65
+v2_fadd 98 98 66
+v2_fadd 99 99 67
+v2_stg_pol 38 96 FNM_UR_DESC 0 SZ_128 L2_EL
+end
+
+note ============================================================================
+note Public API 3: dnn_emit_rev_bwd_step(slot, use_nvfp4, q32_lock4) -> emitted bytes
+note Fuses: local recompute G(Y1) + exact reversible reconstruction X2=Y2-G(Y1), X1=Y1-F(X2) +
+note   recomputed backward dX (1-bit SMEM ReLU mask, L2_LU scratch) + deterministic L2 dW accum (L2_EL).
+note Params c[0x0][896+]: Y1(0:1,+0), g2(2:3,+8), Y2(4:5,+16), dY1(6:7,+24), dY2(8:9,+32),
+note   W1(+40), S1(+48), W2(+56), S2(+64), dW_acc(+72), X2_out(+80), F_scr(+88), X1_out(+96),
+note   dY1_out(+104), D(+112), D_ff(+116), inv_D(+120), eps(+124)
+note Grid: (M, 1, 1), Block: (128, 1, 1), SMEM: 24576 B
+note ============================================================================
+fn dnn_emit_rev_bwd_step slot ulong use_nvfp4 ulong q32_lock4 ulong to ulong
+v2_begin slot FNM_THREADS 24576
+v2_ldcu64 FNM_UR_DESC FNM_DESC_OFF
+v2_ldc64 0 FNM_PARAM_BASE
+v2_ldc64 2 add FNM_PARAM_BASE 8
+v2_ldc64 4 add FNM_PARAM_BASE 16
+v2_ldc64 6 add FNM_PARAM_BASE 24
+v2_ldc64 8 add FNM_PARAM_BASE 32
+v2_ldc 10 add FNM_PARAM_BASE 112
+v2_ldc 11 add FNM_PARAM_BASE 116
+v2_ldc 18 add FNM_PARAM_BASE 120
+v2_ldc 19 add FNM_PARAM_BASE 124
+v2_s2r 12 FNM_SR_TIDX
+v2_s2r 13 FNM_SR_CTAX
+v2_s2r 14 FNM_SR_CTAY
+v2_shr 15 12 5
+v2_andi 16 12 31
+note 1. Recompute G(Y1) locally (Pre-RMSNorm -> W1 -> ReLU 1-bit SMEM mask -> W2)
+fnm_rmsnorm_to_smem 0 2 0 8192 use_nvfp4
+fnm_gemm_pinned 40 48 8192 64 use_nvfp4
+fnm_relu_mask_smem 64 16384
+fnm_quant4_to_smem 64 17408 use_nvfp4
+fnm_gemm_pinned 56 64 17408 80 use_nvfp4
+note 2. Algebraic reversible reconstruction X2 = Y2 - G(Y1), X1 = Y1 - F(X2) (Q32 or FSUB)
+fnm_rev_reconstruct q32_lock4
+note 3. Local backward dX: load dY2 -> quantize in SMEM[8192] -> dH = dY2 @ W2^T -> mask -> dX_norm
+v2_imad 20 13 10 V2_RZ
+v2_imadi 21 12 4 V2_RZ
+v2_iadd3 20 20 21 V2_RZ
+v2_imadw 38 20 4 8
+v2_ldg_pol 32 38 FNM_UR_DESC 0 SZ_128 L2_NORM
+fnm_quant4_to_smem 32 8192 use_nvfp4
+fnm_gemm_pinned 56 64 8192 64 use_nvfp4
+fnm_apply_relu_mask 16384
+fnm_quant4_to_smem 64 17408 use_nvfp4
+fnm_gemm_pinned 40 48 17408 80 use_nvfp4
+fnm_rmsnorm_vjp_couple
+note 4. Deterministic L2 dW accumulation (dW_tile = dY2^T @ H_relu -> L2_EL load+add+store, ZERO FP atomics!)
+fnm_gemm_pinned 56 64 17408 64 use_nvfp4
+fnm_det_dw_accum 72
+v2_exit
+ret v2_end 0
+end

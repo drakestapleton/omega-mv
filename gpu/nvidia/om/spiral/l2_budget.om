@@ -1,0 +1,264 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/spiral/l2_budget.om: GB10 24 MiB L2 residency budget & roofline planner
+note for L2-pinned reversible Spiral (looped) transformer macro-steps.
+note Enforces a 22 MiB (23,068,672 B) hard L2 ceiling inside GB10's 24 MiB L2 and models
+note BF16 (100 TF), NVFP4 (350 TF), and Ternary (350 TF) throughput for 6P and 8P reversible.
+note Standalone OM-2 library (composes after om2 directive; no duplicate om2 line).
+
+const SP_FMT_BF16 ulong 0
+const SP_FMT_NVFP4 ulong 1
+const SP_FMT_TERNARY ulong 2
+
+const SP_L2_TOTAL_BYTES ulong 25165824
+const SP_L2_HARD_CAP ulong 23068672
+const SP_GB10_BW_GBS ulong 273
+const SP_TF_BF16 ulong 100
+const SP_TF_NVFP4 ulong 350
+const SP_TF_TERNARY ulong 350
+
+note Input config l2b_cfg[0..13]:
+note   0=V, 1=T, 2=D, 3=H, 4=F, 5=L, 6=LP, 7=LC, 8=NP, 9=B_mb, 10=G,
+note   11=fmt (0=BF16, 1=NVFP4, 2=TERNARY), 12=rev_mode (1=rev, 0=full-act),
+note   13=core_only_pin (1=pin LC core only, 0=pin all L layers)
+global l2b_cfg ulong 16
+
+note Output plan l2b_out[0..16]:
+note   0=status (0=OK, 1=BAD_SHAPE, 2=OVER_L2_CAP), 1=phys_params, 2=core_params,
+note   3=eff_params, 4=w_pinned_bytes, 5=x_pair_bytes, 6=dx_pair_bytes, 7=lse_bytes,
+note   8=grad_l2_bytes, 9=scratch_bytes, 10=total_l2_bytes, 11=dram_macro_bytes,
+note   12=opa_saved_bytes, 13=tile_ai_x100, 14=modeled_tok_s_6p, 15=modeled_tok_s_8p_rev,
+note   16=l2_util_milli
+global l2b_out ulong 24
+
+fn l2b_wbytes params ulong fmt ulong to ulong
+if eq fmt SP_FMT_BF16
+ret mul params 2
+end
+if eq fmt SP_FMT_NVFP4
+ret div add mul params 9 15 16
+end
+ret div add params 4 5
+end
+
+fn l2b_gbytes params ulong fmt ulong to ulong
+if eq fmt SP_FMT_BF16
+ret mul params 2
+end
+ret params
+end
+
+fn l2b_peak_tf fmt ulong to ulong
+if eq fmt SP_FMT_BF16
+ret SP_TF_BF16
+end
+if eq fmt SP_FMT_NVFP4
+ret SP_TF_NVFP4
+end
+ret SP_TF_TERNARY
+end
+
+fn l2b_validate to bool
+if or eq get l2b_cfg 0 0 or eq get l2b_cfg 1 0 eq get l2b_cfg 2 0
+ret false
+end
+if or eq get l2b_cfg 3 0 or eq get l2b_cfg 4 0 eq get l2b_cfg 5 0
+ret false
+end
+if or eq get l2b_cfg 7 0 or eq get l2b_cfg 8 0 eq get l2b_cfg 9 0
+ret false
+end
+if eq get l2b_cfg 10 0
+ret false
+end
+if or gt get l2b_cfg 11 2 or gt get l2b_cfg 12 1 gt get l2b_cfg 13 1
+ret false
+end
+if ne rem get l2b_cfg 2 get l2b_cfg 3 0
+ret false
+end
+if gt add get l2b_cfg 6 get l2b_cfg 7 get l2b_cfg 5
+ret false
+end
+ret true
+end
+
+fn l2b_eff_layers to ulong
+l_tot = get l2b_cfg 5
+lc = get l2b_cfg 7
+np = get l2b_cfg 8
+ret add sub l_tot lc mul np lc
+end
+
+fn l2b_fill_params to ulong
+v = get l2b_cfg 0
+t = get l2b_cfg 1
+d = get l2b_cfg 2
+f = get l2b_cfg 4
+l_tot = get l2b_cfg 5
+lc = get l2b_cfg 7
+layer_p = add add mul mul 4 d d mul mul 2 d f mul 2 d
+io_p = add add mul v d mul t d d
+phys_p = add io_p mul l_tot layer_p
+core_p = mul lc layer_p
+eff_p = add io_p mul l2b_eff_layers layer_p
+put l2b_out 1 phys_p
+put l2b_out 2 core_p
+put l2b_out 3 eff_p
+ret layer_p
+end
+
+fn l2b_fill_l2_wg layer_p ulong to void
+fmt = get l2b_cfg 11
+pin_p = mul get l2b_cfg 5 layer_p
+if eq get l2b_cfg 13 1
+pin_p = get l2b_out 2
+end
+put l2b_out 4 l2b_wbytes pin_p fmt
+put l2b_out 8 l2b_gbytes pin_p fmt
+end
+
+fn l2b_fill_l2_act to void
+d = get l2b_cfg 2
+bt = mul get l2b_cfg 9 get l2b_cfg 1
+eff_l = l2b_eff_layers
+x_b = mul mul mul eff_l bt d 2
+dx_b = mul mul bt d 2
+if eq get l2b_cfg 12 1
+x_b = mul mul bt d 4
+dx_b = mul mul bt d 4
+end
+put l2b_out 5 x_b
+put l2b_out 6 dx_b
+put l2b_out 7 mul mul mul eff_l bt get l2b_cfg 3 4
+end
+
+fn l2b_fill_l2_scr to void
+bt = mul get l2b_cfg 9 get l2b_cfg 1
+m_tile = bt
+if gt m_tile 128
+m_tile = ulong 128
+end
+scr_b = mul m_tile add mul 2 get l2b_cfg 4 mul 4 get l2b_cfg 2
+if lt scr_b 262144
+scr_b = ulong 262144
+end
+put l2b_out 9 scr_b
+end
+
+fn l2b_fill_l2 layer_p ulong to ulong
+l2b_fill_l2_wg layer_p
+l2b_fill_l2_act
+l2b_fill_l2_scr
+tot = add get l2b_out 4 get l2b_out 5
+tot = add tot get l2b_out 6
+tot = add tot get l2b_out 7
+tot = add tot get l2b_out 8
+tot = add tot get l2b_out 9
+put l2b_out 10 tot
+put l2b_out 16 div mul tot 1000 SP_L2_TOTAL_BYTES
+ret tot
+end
+
+fn l2b_fill_opa nc_p ulong to void
+fmt = get l2b_cfg 11
+g_acc = get l2b_cfg 10
+w_reads = add 2 get l2b_cfg 12
+wc = l2b_wbytes get l2b_out 2 fmt
+gc = l2b_gbytes get l2b_out 2 fmt
+naive = mul mul g_acc get l2b_cfg 8 add mul w_reads wc mul 2 gc
+if and eq get l2b_cfg 13 0 gt nc_p 0
+wn = l2b_wbytes nc_p fmt
+gn = l2b_gbytes nc_p fmt
+naive = add naive mul g_acc add mul w_reads wn mul 2 gn
+end
+pin_act = add get l2b_out 4 get l2b_out 8
+saved = ulong 0
+if gt naive pin_act
+saved = sub naive pin_act
+end
+put l2b_out 12 saved
+end
+
+fn l2b_fill_dram layer_p ulong to ulong
+fmt = get l2b_cfg 11
+g_acc = get l2b_cfg 10
+nc_p = mul sub get l2b_cfg 5 get l2b_cfg 7 layer_p
+dram = add get l2b_out 4 get l2b_out 8
+if eq get l2b_cfg 13 1
+w_reads = add 2 get l2b_cfg 12
+uw = l2b_wbytes nc_p fmt
+ug = l2b_gbytes nc_p fmt
+dram = add dram mul g_acc add mul w_reads uw mul 2 ug
+end
+dram = add dram mul mul mul g_acc get l2b_cfg 9 get l2b_cfg 1 mul get l2b_cfg 2 4
+dram = add dram mul 2 l2b_wbytes mul get l2b_cfg 0 get l2b_cfg 2 fmt
+dram = add dram mul get l2b_out 1 8
+put l2b_out 11 dram
+l2b_fill_opa nc_p
+ret dram
+end
+
+fn l2b_roofline_tok_s eff_p ulong tok ulong dram ulong k_p ulong peak_tf ulong to ulong
+flops = mul mul k_p eff_p tok
+t_comp = div flops mul peak_tf 1000
+t_mem = div dram SP_GB10_BW_GBS
+t_ns = t_comp
+if gt t_mem t_ns
+t_ns = t_mem
+end
+if eq t_ns 0
+t_ns = ulong 1
+end
+if le tok 10000000
+ret div mul tok 1000000000 t_ns
+end
+t_us = div t_ns 1000
+if eq t_us 0
+t_us = ulong 1
+end
+ret div mul tok 1000000 t_us
+end
+
+fn l2b_fill_roofline dram ulong to void
+eff_p = get l2b_out 3
+tok = mul mul get l2b_cfg 10 get l2b_cfg 9 get l2b_cfg 1
+peak_tf = l2b_peak_tf get l2b_cfg 11
+k_act = ulong 6
+if eq get l2b_cfg 12 1
+k_act = ulong 8
+end
+flops_act = mul mul k_act eff_p tok
+ai_x100 = ulong 0
+if ne dram 0
+if le flops_act 180000000000000000
+ai_x100 = div mul flops_act 100 dram
+else
+ai_x100 = mul div flops_act dram 100
+end
+end
+put l2b_out 13 ai_x100
+put l2b_out 14 l2b_roofline_tok_s eff_p tok dram 6 peak_tf
+put l2b_out 15 l2b_roofline_tok_s eff_p tok dram 8 peak_tf
+end
+
+note Compute L2 residency budget and roofline plan from l2b_cfg[0..13] into l2b_out[0..16].
+note Returns status: 0=OK, 1=BAD_SHAPE, 2=OVER_L2_CAP (fails closed above 22 MiB hard ceiling).
+fn l2b_plan to ulong
+for i ulong 24
+put l2b_out i 0
+end
+if not l2b_validate
+put l2b_out 0 1
+ret 1
+end
+layer_p = l2b_fill_params
+tot_l2 = l2b_fill_l2 layer_p
+dram = l2b_fill_dram layer_p
+l2b_fill_roofline dram
+if gt tot_l2 SP_L2_HARD_CAP
+put l2b_out 0 2
+ret 2
+end
+put l2b_out 0 0
+ret 0
+end

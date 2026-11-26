@@ -1,0 +1,291 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/qmd/l2_policy.om: Blackwell GB10 (SM121) 24 MiB L2 persistence policy,
+note RM way-partitioning control packer, QMD V05_00 builder with dynamic SMEM carveout
+note (32/64/100 KiB -> hw target 9/17/26), and zero-flush spiral pushbuffer chainer/auditor.
+note Standalone OM-2 library (composes after om2 directive; no duplicate om2 line).
+
+const L2P_TOTAL_BYTES ulong 25165824
+const L2P_SAFE_CAP ulong 23068672
+const L2P_RM_SET_WAYS ulong 0x20801334
+const L2P_MEM_OP_FLUSH_DIRTY ulong 0x80000000
+const L2P_MEM_OP_INVAL_SYSMEM ulong 0x88000000
+
+const L2P_PB_CAP ulong 4096
+const L2P_MAX_GPR ulong 128
+const L2P_MAX_SMEM ulong 102400
+const L2P_MTHD_TAG ulong 0x20000000
+const L2P_MTHD_MEM_OP_A ulong 0x0028
+const L2P_MTHD_SEM_A ulong 0x005c
+const L2P_MTHD_INVAL_SHADER ulong 0x021c
+const L2P_MTHD_INLINE_QMD ulong 0x0318
+const L2P_SEM_REL_WFI ulong 0x00100001
+const L2P_MARKER1 ulong 0x44444444
+const L2P_MARKER2 ulong 0x46464646
+
+global l2p_qmd ulong 96
+global l2p_pb ulong 4096
+global l2p_pb_len ulong 1
+global l2p_rm ulong 16
+global l2p_win ulong 8
+global l2p_aud ulong 8
+
+fn l2p_mthd subch ulong off ulong cnt ulong to ulong
+a = or L2P_MTHD_TAG shl and cnt 0x1fff 16
+b = or shl and subch 7 13 and shr off 2 0xfff
+ret or a b
+end
+
+fn l2p_pb_push w ulong to void
+idx = get l2p_pb_len 0
+if lt idx L2P_PB_CAP
+put l2p_pb idx and w 0xffffffff
+put l2p_pb_len 0 add idx 1
+end
+end
+
+fn l2p_smem_cfg sb ulong to ulong
+if le sb 32768
+ret 9
+end
+if le sb 65536
+ret 17
+end
+ret 26
+end
+
+note Configure persisting L2 access-policy window descriptor in l2p_win[0..7].
+note Validates bytes <= L2P_SAFE_CAP (22 MiB), 128B alignment, non-zero range, hit_milli in 1..1000.
+fn l2p_set_window base_va ulong bytes ulong hit_milli ulong to ulong
+for i ulong 8
+put l2p_win i 0
+end
+if or eq bytes 0 gt bytes L2P_SAFE_CAP
+ret 1
+end
+if or ne and base_va 127 0 ne and bytes 127 0
+ret 2
+end
+if or eq base_va 0 lt add base_va bytes base_va
+ret 3
+end
+if or eq hit_milli 0 gt hit_milli 1000
+ret 4
+end
+put l2p_win 0 1
+put l2p_win 1 base_va
+put l2p_win 2 bytes
+put l2p_win 3 hit_milli
+put l2p_win 4 shr base_va 7
+put l2p_win 5 shr bytes 7
+put l2p_win 6 2
+put l2p_win 7 0
+ret 0
+end
+
+note Pack NV2080_CTRL_CMD_FB_SET_L2_MAX_WAYS_EVICT_LAST (0x20801334) into l2p_rm[0..15].
+note Validates 1 <= ways <= 14 out of 16 GB10 L2 ways (leaving >= 2 ways for streaming traffic).
+fn l2p_rm_set_ways ways ulong to ulong
+for i ulong 16
+put l2p_rm i 0
+end
+if or lt ways 1 gt ways 14
+ret 1
+end
+put l2p_rm 0 1
+put l2p_rm 1 L2P_RM_SET_WAYS
+put l2p_rm 2 4
+put l2p_rm 3 ways
+put l2p_rm 4 16
+put l2p_rm 5 mul div L2P_TOTAL_BYTES 16 ways
+put l2p_rm 6 sub 16 ways
+ret 0
+end
+
+fn l2p_qmd_init_hdr code_va ulong to void
+for i ulong 96
+put l2p_qmd i 0
+end
+put l2p_qmd 4 0x013f0000
+put l2p_qmd 9 0x00000003
+put l2p_qmd 10 0x00190000
+put l2p_qmd 14 0x2f5003a4
+put l2p_qmd 17 0x00000006
+put l2p_qmd 19 0x81810000
+put l2p_qmd 20 0x00000038
+put l2p_qmd 22 0x04000000
+put l2p_qmd 32 and shr code_va 4 0xffffffff
+put l2p_qmd 33 or and shr code_va 36 0x1fffff shl ulong 0xa 21
+put l2p_qmd 58 0x10300011
+put l2p_qmd 59 and shr code_va 8 0xffffffff
+end
+
+fn l2p_qmd_embed_win to void
+if eq get l2p_win 0 1
+put l2p_qmd 64 and get l2p_win 1 0xffffffff
+put l2p_qmd 65 and shr get l2p_win 1 32 0xffffffff
+put l2p_qmd 66 and get l2p_win 2 0xffffffff
+w67 = or shl get l2p_win 3 16 or shl get l2p_win 6 4 get l2p_win 7
+put l2p_qmd 67 and w67 0xffffffff
+end
+end
+
+note Build Blackwell QMD V05_00 words in l2p_qmd[0..95] with dynamic SMEM carveout (9/17/26),
+note verifying gpr_decl <= 128 and smem_bytes <= 102400, and embedding L2 access-policy window words.
+fn l2p_build_qmd code_va ulong thr ulong gpr_decl ulong smem_bytes ulong gx ulong gy ulong to ulong
+if or eq code_va 0 ne and code_va 15 0
+ret 1
+end
+if or eq thr 0 gt thr 1024
+ret 2
+end
+if or eq gpr_decl 0 gt gpr_decl L2P_MAX_GPR
+ret 3
+end
+if gt smem_bytes L2P_MAX_SMEM
+ret 4
+end
+if or eq gx 0 eq gy 0
+ret 5
+end
+l2p_qmd_init_hdr code_va
+put l2p_qmd 34 or and thr 0xffff shl ulong 1 16
+gpr = gpr_decl
+if lt gpr 16
+gpr = ulong 16
+end
+put l2p_qmd 35 or or ulong 1 shl and gpr 0x1ff 8 shl ulong 1 17
+s7 = ulong 8
+if ne smem_bytes 0
+s7 = div add smem_bytes 127 128
+end
+sc = l2p_smem_cfg smem_bytes
+w36 = or or or shl sc 23 shl ulong 26 17 shl sc 11 s7
+put l2p_qmd 36 and w36 0xffffffff
+put l2p_qmd 37 0
+put l2p_qmd 39 and gx 0xffffffff
+put l2p_qmd 40 and gy 0xffffffff
+put l2p_qmd 41 1
+l2p_qmd_embed_win
+ret 0
+end
+
+note Begin a new zero-flush spiral pushbuffer in l2p_pb.
+fn l2p_pb_begin to void
+put l2p_pb_len 0 0
+for i ulong 8
+put l2p_aud i 0
+end
+end
+
+fn l2p_pb_emit_wfi_sem va ulong val ulong to void
+l2p_pb_push l2p_mthd 0 L2P_MTHD_SEM_A 5
+l2p_pb_push and va 0xffffffff
+l2p_pb_push and shr va 32 0xffffffff
+l2p_pb_push and val 0xffffffff
+l2p_pb_push 0
+l2p_pb_push L2P_SEM_REL_WFI
+end
+
+note Append inline QMD + WFI release seam WITHOUT inter-kernel INVALL and WITHOUT L2_FLUSH_DIRTY.
+fn l2p_pb_chain_qmd qmd_va ulong sem_va ulong sem_val ulong to ulong
+if or eq qmd_va 0 ne and qmd_va 255 0
+ret 1
+end
+if or eq sem_va 0 ne and sem_va 3 0
+ret 2
+end
+if gt add get l2p_pb_len 0 105 L2P_PB_CAP
+ret 3
+end
+l2p_pb_push l2p_mthd 1 L2P_MTHD_INLINE_QMD 98
+l2p_pb_push or 0x40000000 and shr qmd_va 40 0x1ff
+l2p_pb_push and shr qmd_va 8 0xffffffff
+for i ulong 96
+l2p_pb_push get l2p_qmd i
+end
+l2p_pb_emit_wfi_sem sem_va sem_val
+ret 0
+end
+
+note Emit macro-step completion tail: marker1 -> L2_FLUSH_DIRTY -> marker2 strictly ONCE.
+fn l2p_pb_macro_tail mark_va ulong to ulong
+if or eq mark_va 0 ne and mark_va 3 0
+ret 1
+end
+if gt add get l2p_pb_len 0 17 L2P_PB_CAP
+ret 2
+end
+l2p_pb_emit_wfi_sem mark_va L2P_MARKER1
+l2p_pb_push l2p_mthd 0 L2P_MTHD_MEM_OP_A 4
+l2p_pb_push 0
+l2p_pb_push 0
+l2p_pb_push 0
+l2p_pb_push L2P_MEM_OP_FLUSH_DIRTY
+l2p_pb_emit_wfi_sem add mark_va 16 L2P_MARKER2
+ret 0
+end
+
+fn l2p_aud_classify pos ulong hdr ulong cnt ulong to void
+subch = and shr hdr 13 7
+mthd = shl and hdr 0xfff 2
+if and eq subch 1 and eq mthd L2P_MTHD_INLINE_QMD eq cnt 98
+put l2p_aud 1 add get l2p_aud 1 1
+end
+if and eq subch 1 eq mthd L2P_MTHD_INVAL_SHADER
+put l2p_aud 3 add get l2p_aud 3 1
+end
+if and eq subch 0 and eq mthd L2P_MTHD_MEM_OP_A eq cnt 4
+op = get l2p_pb add pos 4
+if eq op L2P_MEM_OP_FLUSH_DIRTY
+put l2p_aud 2 add get l2p_aud 2 1
+end
+if eq op L2P_MEM_OP_INVAL_SYSMEM
+put l2p_aud 6 add get l2p_aud 6 1
+end
+end
+if and eq subch 0 and eq mthd L2P_MTHD_SEM_A eq cnt 5
+put l2p_aud 4 add get l2p_aud 4 1
+end
+end
+
+note Audit pushbuffer in l2p_pb[0..l2p_pb_len): populates l2p_aud[0..6] and returns 0 on PASS.
+note Bitmask on FAIL: bit 0=empty/malformed, bit 1=zero QMDs, bit 2=flush_count!=1, bit 3=invall_count!=0.
+fn l2p_pb_audit to ulong
+for i ulong 8
+put l2p_aud i 0
+end
+n = get l2p_pb_len 0
+put l2p_aud 5 n
+if or eq n 0 gt n L2P_PB_CAP
+put l2p_aud 0 1
+ret 1
+end
+pos = ulong 0
+bad = ulong 0
+while lt pos n bound 4096
+hdr = get l2p_pb pos
+tag = shr hdr 28
+cnt = and shr hdr 16 0x1fff
+if or and ne tag 2 ne tag 6 or eq cnt 0 gt add add pos 1 cnt n
+bad = 1
+break
+end
+l2p_aud_classify pos hdr cnt
+pos = add add pos 1 cnt
+end
+err = ulong 0
+if ne bad 0
+err = or err 1
+end
+if eq get l2p_aud 1 0
+err = or err 2
+end
+if ne get l2p_aud 2 1
+err = or err 4
+end
+if ne get l2p_aud 3 0
+err = or err 8
+end
+put l2p_aud 0 err
+ret err
+end
