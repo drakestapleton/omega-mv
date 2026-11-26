@@ -20,7 +20,7 @@ Run these strictly read-only / local-build checks on DGX Spark before walking up
 ### 1.1 Verify Pinned `seed/out/omc`
 ```sh
 sha256sum -c seed/out/omc.sha256
-# Expected at 7130bd1e: 180323d7dc549360c351621f4969dec1e7778cff5a30b01298bc21911b0842e2  seed/out/omc
+# Expected at unified SI 1.0 omc pin: 85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134  seed/out/omc
 ```
 
 ### 1.2 Build & Verify `SPARK.EFI` (`PLAT=gb10` PE32+ ARM64)
@@ -33,7 +33,7 @@ ls -lh build/spark/SPARK.EFI
 ```
 
 ### 1.3 Build & Verify Standalone CPU UEFI LLM (`ollm_a64efi`)
-> **Prerequisite (recorded in `si/release-1.0/aienux_boot_audit.md`):** Confirm the `train/omega-llm/native/cli.om` `fn cmdtrainfc` register-pressure fix (`error 12` under `target a64efi`) has landed before building `ollm_a64efi`.
+> **Status:** `train/omega-llm/native/cli.om` `fn cmdtrainfc` register-pressure fix (`error 12` under `target a64efi`) landed in commit `28f10d173` (`OMEGA-TRAIN-UNITS PASS units=81` on unified `omc` `85b84c6d...`).
 
 ```sh
 # Compile standalone CPU UEFI LLM unit (read-only verification build)

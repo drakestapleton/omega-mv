@@ -1,8 +1,8 @@
 # Bare-Metal Aienux & `target a64efi` Readiness Audit (Sovereign Intelligence 1.0)
 
 - **Audit date:** 2026-11-26
-- **Audited `omega-mv` commit:** `7130bd1e94d10d59699b75406732d67329dac524`
-- **Pinned `seed/out/omc` SHA-256:** `180323d7dc549360c351621f4969dec1e7778cff5a30b01298bc21911b0842e2`
+- **Unified `stage/si-1.0-unified` re-check (2026-11-26):** Pinned `seed/out/omc` moved to `85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134`; Finding #1 (`ollm_a64efi` `error 12` in `train/omega-llm/native/cli.om` `fn cmdtrainfc`) was **FIXED** in commit `28f10d173` and re-verified on Spark with `OMEGA-TRAIN-UNITS PASS units=81 controls=1 caught=1 hardware=NOT_RUN`! Physical DGX Spark cold-boot (`DRA-938`) remains `PHYSICAL_SILICON=NOT_RUN` / `BLOCKED_HARDWARE`.
+- **Original audit commit:** `7130bd1e94d10d59699b75406732d67329dac524` (`seed/out/omc` `180323d7...`)
 - **Audit host:** DGX Spark (`aarch64` Linux, QEMU + EDK2 `QEMU_EFI.fd`, KVM enabled) in isolated `/tmp/om_sw_si10/repo`
 - **Safety invariant:** Strictly read-only + QEMU/EDK2 only. Zero physical UEFI NVRAM (`efibootmgr` / `efivars`), zero `/boot/efi`, zero SPI/MTD, and zero `/dev/nvidia*` writes or opens.
 
