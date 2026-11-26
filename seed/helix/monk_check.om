@@ -14,15 +14,15 @@ note   [8..39]  expected SHA-256 of REF_SASS (32 bytes)
 note   [40..71] expected SHA-256 of CAND_SASS (32 bytes)
 note   [72..72+4*N-1] perm[0..N-1] u32 LE (cand pc i -> ref pc perm[i])
 note
-note Mechanically enforces all SM121 Antibodies (seed/helix/proofs/HelixAntibodies.lean):
-note   exit 0: MONK PASS (all antibodies satisfied, 0 CFG scoreboard hazards, fixed-latency RAW preserved)
+note Mechanically enforces all SM121 Antibodies (HelixAntibodies.lean + Antibody17.lean):
+note   exit 0: MONK PASS (Antibodies #1-#17 satisfied, 0 CFG scoreboard hazards, all-consumer RAW preserved)
 note   exit 11: Antibody 7 -- length / format / OOB perm mismatch
 note   exit 12: Antibody 1 -- SHA-256 digest spoof (REF or CAND mismatch)
 note   exit 13: Antibody 2 -- non-bijection (duplicate or missing perm entry)
 note   exit 14: Antibody 3 -- functional SM121 opcode/operand smuggling (outside 17-bit ctrl word w3[9..25])
-note   exit 15: Antibody 4 -- anchor escape (BRA/EXIT/BAR/MEMBAR/BSSY/BSYNC/ISETP/FSETP/mem/pred moved)
+note   exit 15: Antibodies 4/13/17c -- anchor escape (BRA/EXIT/BAR/MEMBAR/BSSY/BSYNC/ISETP/FSETP/SEL/mem/pred/BB-leader) or cross-anchor segment violation
 note   exit 16: Antibody 5 -- RAW/WAR/WAW register dependency inversion
-note   exit 17: Antibody 6 -- SM121 CFG scoreboard hazard OR fixed-latency RAW stall underflow
+note   exit 17: Antibodies 6/14/15/16/17a/17b/17d -- SM121 64-bit hz_kill CFG hazard OR all-consumer RAW stall underflow (ALU>=6, HMMA/QMMA>=22, OMMA>=29)
 note   exit 90: usage / file I/O error
 
 global mkRef uchar 32768
@@ -32,14 +32,16 @@ global mkPath uchar 4096
 global mkPerm ulong 2048
 global mkInv ulong 2048
 global mkSeen ulong 2048
+global mkSeg ulong 2048
 global mkTarget uchar 2048
 global mkRefRec ulong 49152
 global mkCndRec ulong 49152
-global mkWbar uchar 512
-global mkRbar uchar 512
-note Full CFG fixed-point dataflow scoreboard state (2048 PCs x 512 regs x 6-bit barrier mask = 1 MB each)
-global mkHzInW uchar 1048576
-global mkHzInR uchar 1048576
+note Antibody #17d: exact 64-bit multi-barrier power-set masks (zero rbar collapse!)
+global mkWbar ulong 512
+global mkRbar ulong 512
+note Full CFG fixed-point dataflow scoreboard state (2048 PCs x 512 regs x 64-bit barrier power-set)
+global mkHzInW ulong 1048576
+global mkHzInR ulong 1048576
 global mkHzSeen ulong 2048
 global mkHzQu ulong 2048
 global mkHzWk ulong 2048
@@ -211,6 +213,35 @@ rw = and mkRdU32Ref add ro 12 ulong 4227858943
 ret eq cw rw
 end
 
+fn mkDecOmma w0 ulong w1 ulong w2 ulong w3 ulong rec edit ulong 24 to bool
+if ne and w0 4095 1151
+ret false
+end
+wb = and shr w3 14 7
+rbr = and shr w3 17 7
+if or eq wb 6 eq rbr 6
+ret false
+end
+for i ulong 24
+put rec i 0
+end
+put rec 0 1151
+put rec 1 and shr w0 12 15
+put rec 2 and shr w3 9 15
+put rec 3 and shr w3 13 1
+put rec 4 wb
+put rec 5 rbr
+put rec 6 and shr w3 20 63
+hz_w rec 0 and shr w0 16 255 4 0
+hz_r rec 0 shr w0 24 4 0
+hz_r rec 0 and w1 255 2 0
+hz_r rec 0 and w2 255 4 0
+hz_r rec 0 and shr w1 8 255 1 0
+hz_r rec 0 and shr w1 20 255 1 0
+hz_nm rec 0 38 0 0
+ret true
+end
+
 fn mkDecodeAll src ulong n ulong to bool
 ins = new uchar 16 0
 rec = new ulong 24 0
@@ -225,7 +256,13 @@ end
 end
 r = hx_dec_sm121 ins rec
 if ne r 0
+w0 = hz_rd32 ins 0
+w1 = hz_rd32 ins 4
+w2 = hz_rd32 ins 8
+w3 = hz_rd32 ins 12
+if not mkDecOmma w0 w1 w2 w3 rec
 ret false
+end
 end
 db = mul pc 24
 for j ulong 24
@@ -261,8 +298,9 @@ end
 end
 end
 
-note Anchor predicate: basic-block leaders/branch targets, control flow (flow != 0), predicated guard (guard != 7),
-note barriers/sync/NOP/reconvergence (nm <= 8), predicate writers (ISETP 16, FSETP 25), or memory ops (nm >= 33).
+note Anchor predicate (Antibodies #4, #13, #17c): basic-block leaders/branch targets, control flow (flow != 0),
+note predicated guard (guard != 7), barriers/sync/NOP/reconvergence (nm <= 8), predicate writers (ISETP 16, FSETP 25),
+note predicate reader SEL (26, op 520), or memory ops (nm 33..37).
 fn mkIsAnchor pc ulong to bool
 if ne get mkTarget pc 0
 ret true
@@ -275,10 +313,10 @@ if ne get mkRefRec add db 1 7
 ret true
 end
 nm = get mkRefRec add db 19
-if or le nm 8 ge nm 33
+if or le nm 8 and ge nm 33 le nm 37
 ret true
 end
-if or eq nm 16 eq nm 25
+if or eq nm 16 or eq nm 25 eq nm 26
 ret true
 end
 ret false
@@ -355,6 +393,9 @@ fn mkChkOpnd opnd ulong chkR bool to bool
 reg = and opnd 255
 cnt = and shr opnd 8 255
 uni = and shr opnd 16 1
+if eq reg 255
+ret true
+end
 base = add mul uni 256 reg
 for k ulong cnt bound 4
 idx = add base k
@@ -372,74 +413,91 @@ end
 ret true
 end
 
-note Helper: mark one operand in mkWbar (isR=false) or mkRbar (isR=true) with barrier bit
+note Helper: mark one operand in mkWbar (isR=false) or mkRbar (isR=true) with exact 64-bit barrier power-set bit
 fn mkMarkOpnd opnd ulong bit ulong isR bool to void
 reg = and opnd 255
 cnt = and shr opnd 8 255
 uni = and shr opnd 16 1
+if eq reg 255
+ret
+end
 base = add mul uni 256 reg
-b8 = uchar bit
 for k ulong cnt bound 4
 idx = add base k
 if lt idx 512
 if isR
-put mkRbar idx or get mkRbar idx b8
+put mkRbar idx or get mkRbar idx bit
 else
-put mkWbar idx or get mkWbar idx b8
+put mkWbar idx or get mkWbar idx bit
 end
+end
+end
+end
+
+note Antibody #17d: exact 64-bit multi-barrier power-set tracking (hz_kill) -- zero rbar collapse!
+fn mkStepWait db ulong to void
+wt = get mkCndRec add db 6
+if ne wt 0
+km = xor hz_kill wt ulong 18446744073709551615
+for i ulong 512
+put mkWbar i and get mkWbar i km
+put mkRbar i and get mkRbar i km
+end
+end
+end
+
+fn mkStepMarkW db ulong to void
+nw = get mkCndRec add db 10
+if eq nw 0
+ret
+end
+wb = get mkCndRec add db 4
+if lt wb 6
+wbit = shl ulong 1 shl ulong 1 wb
+mkMarkOpnd get mkCndRec add db 16 wbit false
+end
+end
+
+fn mkStepMarkR db ulong to void
+rbr = get mkCndRec add db 5
+if and eq get mkCndRec add db 8 0 eq rbr 7
+ret
+end
+wb = get mkCndRec add db 4
+lm = ulong 0
+if lt rbr 6
+lm = or lm shl ulong 1 rbr
+end
+if lt wb 6
+lm = or lm shl ulong 1 wb
+end
+if ne lm 0
+rbit = shl ulong 1 lm
+nr = get mkCndRec add db 9
+for j ulong nr bound 5
+mkMarkOpnd get mkCndRec add add db 11 j rbit true
 end
 end
 end
 
 fn mkStepHazard pc ulong check bool to bool
 db = mul pc 24
-wt = get mkCndRec add db 6
-if ne wt 0
-clear = uchar and not wt 255
-w8 = uchar and wt 255
-for i ulong 512
-put mkWbar i and get mkWbar i clear
-if ne and get mkRbar i w8 0
-put mkRbar i 0
-end
-end
-end
-nr = get mkCndRec add db 9
-nw = get mkCndRec add db 10
+mkStepWait db
 if check
+nr = get mkCndRec add db 9
 for j ulong nr bound 5
 if not mkChkOpnd get mkCndRec add add db 11 j false
 ret false
 end
 end
-if ne nw 0
+if ne get mkCndRec add db 10 0
 if not mkChkOpnd get mkCndRec add db 16 true
 ret false
 end
 end
 end
-if and ne get mkCndRec add db 7 0 ne nw 0
-wb = get mkCndRec add db 4
-if lt wb 6
-mkMarkOpnd get mkCndRec add db 16 shl ulong 1 wb false
-end
-end
-if ne get mkCndRec add db 8 0
-rb = get mkCndRec add db 5
-wb2 = get mkCndRec add db 4
-lmask = ulong 0
-if lt rb 6
-lmask = or lmask shl ulong 1 rb
-end
-if lt wb2 6
-lmask = or lmask shl ulong 1 wb2
-end
-if ne lmask 0
-for j ulong nr bound 5
-mkMarkOpnd get mkCndRec add add db 11 j lmask true
-end
-end
-end
+mkStepMarkW db
+mkStepMarkR db
 ret true
 end
 
@@ -586,6 +644,17 @@ end
 ret tot
 end
 
+note Antibody #17b: SM121 pipeline RAW latency floor (6 ALU, 22 HMMA/QMMA, 29 OMMA.SF.16864)
+fn mkPipeFloor nm ulong to ulong
+if or eq nm 18 eq nm 19
+ret 22
+end
+if eq nm 38
+ret 29
+end
+ret 6
+end
+
 fn mkRawSpanOk u ulong v ulong inclV bool flr ulong to bool
 hiRef = v
 hiCnd = get mkInv v
@@ -595,11 +664,9 @@ hiCnd = add hiCnd 1
 end
 rcyc = mkSumRange 0 u hiRef
 eff = flr
-nm = get mkRefRec add mul u 24 19
-if or eq nm 14 eq nm 29
-if lt eff 6
-eff = ulong 6
-end
+pf = mkPipeFloor get mkRefRec add mul u 24 19
+if lt eff pf
+eff = pf
 end
 req = rcyc
 if gt req eff
@@ -608,6 +675,8 @@ end
 ret ge mkSumRange 1 get mkInv u hiCnd req
 end
 
+note Antibody #17a/#17b Fixed-latency RAW verification: scans ALL live RAW consumers (never early-returns
+note on first ref consumer v1!) up to distance 32, enforcing ALU>=6, HMMA/QMMA>=22, OMMA>=29!
 fn mkCheckRawOne u ulong n ulong flr ulong to bool
 du = mul u 24
 if or eq get mkRefRec add du 10 0 ne get mkRefRec add du 7 0
@@ -623,14 +692,16 @@ if lt get mkCndRec add mul get mkInv u 24 2 rst
 ret false
 end
 end
-lim = add u 16
+lim = add u 32
 if gt lim n
 lim = n
 end
 v = add u 1
-while lt v lim bound 16
+while lt v lim bound 32
 if mkHasRaw u v
-ret mkRawSpanOk u v false flr
+if not mkRawSpanOk u v false flr
+ret false
+end
 end
 if mkHasWaw u v
 ret true
@@ -640,7 +711,9 @@ if ne get mkRefRec add dbv 17 0
 ret mkRawSpanOk u v true flr
 end
 if mkIsAnchor v
-ret mkRawSpanOk u v true flr
+if not mkRawSpanOk u v true flr
+ret false
+end
 end
 v = add v 1
 end
@@ -756,10 +829,23 @@ end
 ret true
 end
 
+note Antibodies #4/#13/#17c: anchor pinning + O(n) anchor-segment preservation (no non-anchor crosses ANY anchor!)
 fn mkCheckAnchors n ulong to bool
+seg = ulong 0
 for i ulong n bound 2048
 if mkIsAnchor i
-if ne get mkPerm i i
+seg = add seg 1
+end
+put mkSeg i seg
+end
+for i ulong n bound 2048
+r = get mkPerm i
+if mkIsAnchor i
+if ne r i
+ret false
+end
+else
+if ne get mkSeg r get mkSeg i
 ret false
 end
 end
