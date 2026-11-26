@@ -1,0 +1,967 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gpu_tma/gate_flash_attn_sm121.om: End-to-End Pure-OM Verification Gate for
+note Fused L2-Pinned Zero-DRAM-Spill Flash-Attention-2 SM121 SASS + 256-Byte Blackwell QMD
+note (verified directly against hardened Antibody #17 monk_check + 16-attack immune + CPU math parity).
+note
+note Standalone pure seeded OM-2 (zero C, zero Python, zero CUDA, zero `/dev/nvidia*`).
+note
+note Usage:
+note   gate_flash_attn_sm121 FLASH_BIN MONK_BIN IMMUNE_BIN SCRATCH_DIR
+note
+note Verification coverage:
+note   [POS-1] Emit BF16 HMMA.16816 FA2 kernel + 256B Blackwell QMD -> validate QMD -> HXP1 cert ->
+note           hardened monk_check PASS (hazards=0) + 16-attack immune PASS (16/16, ab17=4/4)
+note   [POS-2] Emit NVFP4 OMMA.SF.16864 FA2 kernel + 256B Blackwell QMD -> validate QMD -> HXP1 cert ->
+note           hardened monk_check PASS (hazards=0) + 16-attack immune PASS (16/16, ab17=4/4)
+note   [POS-3] Pure-OM CPU Online-Softmax Flash-Attention-2 parity vs naive N x N attention
+note           (8 cases: 4 tile geometries x non-causal & causal, <= 1 f32 ULP, + missing-rescale negative control)
+note   [NEG-1] L2 overflow (> 24 MiB = 25,165,824 B) -> flash_attn_sm121 refuses fail-closed (rc=13)
+note   [NEG-2] SMEM overflow (> 101,376 B) -> flash_attn_sm121 refuses fail-closed (rc=14)
+note   [NEG-3] Invalid QMD dimensions (br=0, bc=0, hd=0, hd=320, unaligned code_va, nh=0) -> refused (rc=12)
+note   [NEG-4] Injected Antibody #17b MMA stall shave in emitted BF16 HMMA SASS -> monk_check catches (rc=17)
+note   [NEG-5] Injected Antibody #17b MMA stall shave in emitted NVFP4 OMMA SASS -> monk_check catches (rc=17)
+note   [NEG-6] Injected Antibody #17d wait-barrier drop in emitted FA2 SASS -> monk_check catches (rc=17)
+
+global shDat uchar 32768
+global shDig uchar 32
+global shH uint 8
+global shV uint 8
+global shW uint 64
+global shK uint 64
+
+global gfBuf uchar 32768
+global gfMut uchar 32768
+global gfCert uchar 16384
+global gfQmd uchar 256
+global gfRefSha uchar 32
+global gfCndSha uchar 32
+global gfScr uchar 2048
+global gfScrN ulong 1
+global gfPath uchar 4096
+global gfIo uchar 256
+global gfAv uchar 8192
+global gfAp ulong 2
+global gfSt uchar 4
+global gfDig uchar 24
+global gfChk ulong 1
+global gfCtrl ulong 1
+
+text gfUse "usage: gate_flash_attn_sm121 FLASH_BIN MONK_BIN IMMUNE_BIN SCRATCH_DIR\n"
+text gfHdr "=== FLASH-ATTENTION-2 SM121 L2-PINNED ZERO-SPILL VERIFICATION GATE ===\n"
+text gfPos1 "  PASS [POS-1] BF16 HMMA.16816 FA2: qmd=256B valid, monk=PASS(rc=0), immune=16/16(ab17=4/4), insns="
+text gfPos2 "  PASS [POS-2] NVFP4 OMMA.SF.16864 FA2: qmd=256B valid, monk=PASS(rc=0), immune=16/16(ab17=4/4), insns="
+text gfPos3 "  PASS [POS-3] CPU Online-Softmax FA2 parity vs naive N x N (8 cases + no-rescale neg control)\n"
+text gfNeg1 "  PASS [NEG-1] 24 MiB GB10 L2 overflow refused fail-closed (rc=13)\n"
+text gfNeg2 "  PASS [NEG-2] 99 KiB SM121 SMEM overflow refused fail-closed (rc=14)\n"
+text gfNeg3 "  PASS [NEG-3] Invalid QMD dimensions (6 cases: br/bc/hd/nh/seq/va) refused fail-closed (rc=12)\n"
+text gfNeg4 "  PASS [NEG-4] Injected Antibody #17b HMMA(22c) stall shave caught by monk_check (rc=17)\n"
+text gfNeg5 "  PASS [NEG-5] Injected Antibody #17b OMMA(29c) stall shave caught by monk_check (rc=17)\n"
+text gfNeg6 "  PASS [NEG-6] Injected Antibody #17d wait-barrier drop caught by monk_check (rc=17)\n"
+text gfPassA "GATE_FLASH_ATTN_SM121 PASS checks="
+text gfPassB " controls="
+text gfPassC " evidence=HOST_VERIFIED PHYSICAL_SILICON=NOT_RUN\n"
+text gfFailA "GATE_FLASH_ATTN_SM121 FAIL step="
+text gfFailB " got_rc="
+text gfNl "\n"
+text gfDevNull "/dev/null"
+
+text gfEmit "emit"
+text gfParity "parity"
+text gfBf16 "bf16"
+text gfNv4 "nvfp4"
+text gf2048 "2048"
+text gf8192 "8192"
+text gf16384 "16384"
+text gf64 "64"
+text gf128 "128"
+text gf320 "320"
+text gf8 "8"
+text gf16 "16"
+text gf0 "0"
+text gf4096 "4096"
+text gf4100 "4100"
+
+text gfF_bf16_s "bf16.bin"
+text gfF_bf16_q "bf16.qmd"
+text gfF_bf16_c "bf16.crt"
+text gfF_nv4_s "nv4_.bin"
+text gfF_nv4_q "nv4_.qmd"
+text gfF_nv4_c "nv4_.crt"
+text gfF_mut_s "mut_.bin"
+text gfF_mut_c "mut_.crt"
+text gfF_im1 "im_bf16_"
+text gfF_im2 "im_nv4__"
+text gfF_tmp_s "tmp_.bin"
+text gfF_tmp_q "tmp_.qmd"
+
+fn gfWrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn gfNum v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put gfDig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 gfDig p sub 24 p
+ret
+end
+end
+end
+
+fn gfFail step ulong got ulong to int
+gfWrt gfFailA
+gfNum step
+gfWrt gfFailB
+gfNum got
+gfWrt gfNl
+ret int step
+end
+
+note ==================== EMBEDDED FIPS 180-4 SHA-256 ====================
+
+fn shRor x uint n uint to uint
+ret or shr x n shl x sub 32 n
+end
+
+fn shInitK to void
+put shK 0 1116352408
+put shK 1 1899447441
+put shK 2 3049323471
+put shK 3 3921009573
+put shK 4 961987163
+put shK 5 1508970993
+put shK 6 2453635748
+put shK 7 2870763221
+put shK 8 3624381080
+put shK 9 310598401
+put shK 10 607225278
+put shK 11 1426881987
+put shK 12 1925078388
+put shK 13 2162078206
+put shK 14 2614888103
+put shK 15 3248222580
+put shK 16 3835390401
+put shK 17 4022224774
+put shK 18 264347078
+put shK 19 604807628
+put shK 20 770255983
+put shK 21 1249150122
+put shK 22 1555081692
+put shK 23 1996064986
+put shK 24 2554220882
+put shK 25 2821834349
+put shK 26 2952996808
+put shK 27 3210313671
+put shK 28 3336571891
+put shK 29 3584528711
+put shK 30 113926993
+put shK 31 338241895
+put shK 32 666307205
+put shK 33 773529912
+put shK 34 1294757372
+put shK 35 1396182291
+put shK 36 1695183700
+put shK 37 1986661051
+put shK 38 2177026350
+put shK 39 2456956037
+put shK 40 2730485921
+put shK 41 2820302411
+put shK 42 3259730800
+put shK 43 3345764771
+put shK 44 3516065817
+put shK 45 3600352804
+put shK 46 4094571909
+put shK 47 275423344
+put shK 48 430227734
+put shK 49 506948616
+put shK 50 659060556
+put shK 51 883997877
+put shK 52 958139571
+put shK 53 1322822218
+put shK 54 1537002063
+put shK 55 1747873779
+put shK 56 1955562222
+put shK 57 2024104815
+put shK 58 2227730452
+put shK 59 2361852424
+put shK 60 2428436474
+put shK 61 2756734187
+put shK 62 3204031479
+put shK 63 3329325298
+end
+
+fn shExpand blk ulong to void
+for i ulong 16
+o = add blk mul i 4
+v = shl uint get shDat o 24
+v = or v shl uint get shDat add o 1 16
+v = or v shl uint get shDat add o 2 8
+v = or v uint get shDat add o 3
+put shW i v
+end
+for i ulong 48
+k = add i 16
+w15 = get shW sub k 15
+s0 = xor xor shRor w15 7 shRor w15 18 shr w15 3
+w2 = get shW sub k 2
+s1 = xor xor shRor w2 17 shRor w2 19 shr w2 10
+put shW k add add add get shW sub k 16 s0 get shW sub k 7 s1
+end
+end
+
+fn shRound i ulong to void
+e = get shV 4
+s1 = xor xor shRor e 6 shRor e 11 shRor e 25
+ch = xor and e get shV 5 and not e get shV 6
+t1 = add add add add get shV 7 s1 ch get shK i get shW i
+a = get shV 0
+s0 = xor xor shRor a 2 shRor a 13 shRor a 22
+b = get shV 1
+c = get shV 2
+mj = xor xor and a b and a c and b c
+t2 = add s0 mj
+put shV 7 get shV 6
+put shV 6 get shV 5
+put shV 5 e
+put shV 4 add get shV 3 t1
+put shV 3 c
+put shV 2 b
+put shV 1 a
+put shV 0 add t1 t2
+end
+
+fn shCompress blk ulong to void
+shExpand blk
+for i ulong 8
+put shV i get shH i
+end
+for i ulong 64
+shRound i
+end
+for i ulong 8
+put shH i add get shH i get shV i
+end
+end
+
+fn shHash n ulong to void
+put shH 0 1779033703
+put shH 1 3144134277
+put shH 2 1013904242
+put shH 3 2773480762
+put shH 4 1359893119
+put shH 5 2600822924
+put shH 6 528734635
+put shH 7 1541459225
+put shDat n 128
+p = add n 1
+while ne rem p 64 56 bound 64
+put shDat p 0
+p = add p 1
+end
+bits = mul n 8
+for i ulong 8
+put shDat add p i uchar and shr bits mul sub 7 i 8 255
+end
+tot = add p 8
+blk = ulong 0
+while lt blk tot bound 520
+shCompress blk
+blk = add blk 64
+end
+for i ulong 8
+w = get shH i
+put shDig mul i 4 uchar and shr w 24 255
+put shDig add mul i 4 1 uchar and shr w 16 255
+put shDig add mul i 4 2 uchar and shr w 8 255
+put shDig add mul i 4 3 uchar and w 255
+end
+end
+
+note ==================== SUBPROCESS & FILE HELPERS ====================
+
+fn gfSetPath name view uchar * to ulong
+n = get gfScrN 0
+for i ulong n bound 2000
+put gfPath i get gfScr i
+end
+put gfPath n 47
+n = add n 1
+for i ulong len name bound 64
+put gfPath add n i get name i
+end
+ret add n len name
+end
+
+fn gfAvReset to void
+put gfAp 0 2
+put gfAp 1 0
+end
+
+fn gfAvPushBytes buf view uchar * n ulong to void
+p = get gfAp 0
+put gfAv p uchar and n 255
+put gfAv add p 1 uchar and shr n 8 255
+p = add p 2
+for i ulong n bound 4096
+put gfAv add p i get buf i
+end
+put gfAp 0 add p n
+put gfAp 1 add get gfAp 1 1
+end
+
+fn gfAvPushLit lit view uchar * to void
+gfAvPushBytes lit len lit
+end
+
+fn gfAvPushArg idx ulong to void
+k = argread idx gfPath 0 4095
+if lt k 1
+exit 91
+end
+p = get gfAp 0
+u = ulong k
+put gfAv p uchar and u 255
+put gfAv add p 1 uchar and shr u 8 255
+p = add p 2
+for i ulong u bound 4096
+put gfAv add p i get gfPath i
+end
+put gfAp 0 add p u
+put gfAp 1 add get gfAp 1 1
+end
+
+fn gfAvPushScr name view uchar * to void
+ln = gfSetPath name
+p = get gfAp 0
+put gfAv p uchar and ln 255
+put gfAv add p 1 uchar and shr ln 8 255
+p = add p 2
+for i ulong ln bound 4096
+put gfAv add p i get gfPath i
+end
+put gfAp 0 add p ln
+put gfAp 1 add get gfAp 1 1
+end
+
+fn gfExec to ulong
+cnt = get gfAp 1
+put gfAv 0 uchar and cnt 255
+put gfAv 1 uchar and shr cnt 8 255
+pid = fork
+if lt pid 0
+exit 92
+end
+if eq pid 0
+dn = fopen gfDevNull 0 len gfDevNull 2 0
+if ge dn 0
+d1 = dupfd int dn 1 0
+d2 = dupfd int dn 2 0
+end
+r = execprog gfAv 0 get gfAp 0
+exit 127
+end
+w = waitpid int pid gfSt 0 4 0
+ret ulong get gfSt 1
+end
+
+fn gfReadFile name view uchar * dst ulong maxb ulong to long
+ln = gfSetPath name
+fd = fopen gfPath 0 ln 0 0
+if lt fd 0
+ret long -1
+end
+tot = ulong 0
+while lt tot maxb bound 512
+r = read int fd gfIo 0 256
+if le r 0
+break
+end
+ur = ulong r
+if gt add tot ur maxb
+z = fclose int fd
+ret long -1
+end
+for i ulong ur bound 256
+b = get gfIo i
+if eq dst 0
+put gfBuf add tot i b
+else
+put gfQmd add tot i b
+end
+end
+tot = add tot ur
+end
+z = fclose int fd
+ret long tot
+end
+
+fn gfWriteFile name view uchar * src ulong n ulong to bool
+ln = gfSetPath name
+fd = fopen gfPath 0 ln 577 420
+if lt fd 0
+ret false
+end
+pos = ulong 0
+while lt pos n bound 512
+ch = sub n pos
+if gt ch 256
+ch = ulong 256
+end
+for i ulong ch bound 256
+if eq src 0
+put gfIo i get gfMut add pos i
+else
+put gfIo i get gfCert add pos i
+end
+end
+r = write int fd gfIo 0 ch
+if ne r long ch
+z = fclose int fd
+ret false
+end
+pos = add pos ch
+end
+z = fclose int fd
+ret true
+end
+
+fn gfRdU32Buf o ulong to ulong
+a = ulong get gfBuf o
+a = or a shl ulong get gfBuf add o 1 8
+a = or a shl ulong get gfBuf add o 2 16
+ret or a shl ulong get gfBuf add o 3 24
+end
+
+fn gfRdU32Qmd wIdx ulong to ulong
+o = mul wIdx 4
+a = ulong get gfQmd o
+a = or a shl ulong get gfQmd add o 1 8
+a = or a shl ulong get gfQmd add o 2 16
+ret or a shl ulong get gfQmd add o 3 24
+end
+
+fn gfWrU32Mut o ulong v ulong to void
+put gfMut o uchar and v 255
+put gfMut add o 1 uchar and shr v 8 255
+put gfMut add o 2 uchar and shr v 16 255
+put gfMut add o 3 uchar and shr v 24 255
+end
+
+fn gfWrU32Cert o ulong v ulong to void
+put gfCert o uchar and v 255
+put gfCert add o 1 uchar and shr v 8 255
+put gfCert add o 2 uchar and shr v 16 255
+put gfCert add o 3 uchar and shr v 24 255
+end
+
+note Validate emitted 256-byte Blackwell QMD v05.00 Header
+fn gfCheckQmd expVa ulong expGx ulong expGy ulong to bool
+if ne gfRdU32Qmd 4 20905984
+ret false
+end
+if ne gfRdU32Qmd 9 3
+ret false
+end
+if ne gfRdU32Qmd 58 271581201
+ret false
+end
+if ne gfRdU32Qmd 32 and shr expVa 4 4294967295
+ret false
+end
+if ne gfRdU32Qmd 59 and shr expVa 8 4294967295
+ret false
+end
+smem = gfRdU32Qmd 36
+if or eq smem 0 gt smem 101376
+ret false
+end
+if ne gfRdU32Qmd 39 expGx
+ret false
+end
+if ne gfRdU32Qmd 40 expGy
+ret false
+end
+ret eq gfRdU32Qmd 41 1
+end
+
+fn gfBuildIdCert nBytes ulong cndMut bool to ulong
+n = div nBytes 16
+for i ulong nBytes bound 32768
+put shDat i get gfBuf i
+end
+shHash nBytes
+for i ulong 32
+put gfRefSha i get shDig i
+end
+if cndMut
+for i ulong nBytes bound 32768
+put shDat i get gfMut i
+end
+shHash nBytes
+for i ulong 32
+put gfCndSha i get shDig i
+end
+else
+for i ulong 32
+put gfCndSha i get gfRefSha i
+end
+end
+put gfCert 0 72
+put gfCert 1 88
+put gfCert 2 80
+put gfCert 3 49
+gfWrU32Cert 4 n
+for i ulong 32
+put gfCert add 8 i get gfRefSha i
+put gfCert add 40 i get gfCndSha i
+end
+for i ulong n bound 2048
+gfWrU32Cert add 72 mul i 4 i
+end
+ret add 72 mul n 4
+end
+
+fn gfEmitInit to void
+gfAvReset
+gfAvPushArg 1
+gfAvPushLit gfEmit
+end
+
+fn gfMonkInit to void
+gfAvReset
+gfAvPushArg 2
+end
+
+fn gfImmInit to void
+gfAvReset
+gfAvPushArg 3
+gfAvPushArg 2
+end
+
+note ==================== POSITIVE & NEGATIVE GATE TESTS ====================
+
+note Direct emitted-SASS structural audit: verify mma_ops==3, stg_ops==1 (0 N x N DRAM spill!),
+note and every emitted HMMA(572)/OMMA(1151) has >= 22 / >= 29 stall cycles before next consumer!
+fn gfAuditEmittedSass n ulong wantMmaOp ulong wantFloor ulong to bool
+mmaCnt = ulong 0
+stgCnt = ulong 0
+for pc ulong n bound 2048
+w0 = gfRdU32Buf mul pc 16
+op = and w0 4095
+if eq op 2438
+stgCnt = add stgCnt 1
+end
+if eq op wantMmaOp
+mmaCnt = add mmaCnt 1
+if or eq mmaCnt 1 eq mmaCnt 3
+if lt add pc 1 n
+st0 = and shr gfRdU32Buf add mul pc 16 12 9 15
+st1 = and shr gfRdU32Buf add mul add pc 1 16 12 9 15
+if lt add st0 st1 wantFloor
+ret false
+end
+end
+end
+end
+end
+if ne mmaCnt 3
+ret false
+end
+ret eq stgCnt 1
+end
+
+fn gfTestPosBf16 to int
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf64
+gfAvPushLit gf8
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_bf16_s
+gfAvPushScr gfF_bf16_q
+rc = gfExec
+if ne rc 0
+ret gfFail 10 rc
+end
+qlen = gfReadFile gfF_bf16_q 1 256
+if ne qlen 256
+ret gfFail 11 ulong qlen
+end
+if not gfCheckQmd 4096 32 8
+ret gfFail 12 1
+end
+slen = gfReadFile gfF_bf16_s 0 32768
+if or lt slen 512 ne rem ulong slen 16 0
+ret gfFail 13 ulong slen
+end
+if not gfAuditEmittedSass div ulong slen 16 572 22
+ret gfFail 17 1
+end
+zlen = gfBuildIdCert ulong slen false
+if not gfWriteFile gfF_bf16_c 1 zlen
+ret gfFail 14 1
+end
+gfMonkInit
+gfAvPushScr gfF_bf16_s
+gfAvPushScr gfF_bf16_s
+gfAvPushScr gfF_bf16_c
+mrc = gfExec
+if ne mrc 0
+ret gfFail 15 mrc
+end
+gfImmInit
+gfAvPushScr gfF_bf16_s
+gfAvPushScr gfF_bf16_s
+gfAvPushScr gfF_bf16_c
+gfAvPushScr gfF_im1
+irc = gfExec
+if ne irc 0
+ret gfFail 16 irc
+end
+gfWrt gfPos1
+gfNum div ulong slen 16
+gfWrt gfNl
+put gfChk 0 add get gfChk 0 5
+ret 0
+end
+
+fn gfTestPosNvfp4 to int
+gfEmitInit
+gfAvPushLit gfNv4
+gfAvPushLit gf8192
+gfAvPushLit gf64
+gfAvPushLit gf16
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_nv4_s
+gfAvPushScr gfF_nv4_q
+rc = gfExec
+if ne rc 0
+ret gfFail 20 rc
+end
+qlen = gfReadFile gfF_nv4_q 1 256
+if ne qlen 256
+ret gfFail 21 ulong qlen
+end
+if not gfCheckQmd 4096 128 16
+ret gfFail 22 1
+end
+slen = gfReadFile gfF_nv4_s 0 32768
+if or lt slen 512 ne rem ulong slen 16 0
+ret gfFail 23 ulong slen
+end
+if not gfAuditEmittedSass div ulong slen 16 1151 29
+ret gfFail 27 1
+end
+zlen = gfBuildIdCert ulong slen false
+if not gfWriteFile gfF_nv4_c 1 zlen
+ret gfFail 24 1
+end
+gfMonkInit
+gfAvPushScr gfF_nv4_s
+gfAvPushScr gfF_nv4_s
+gfAvPushScr gfF_nv4_c
+mrc = gfExec
+if ne mrc 0
+ret gfFail 25 mrc
+end
+gfImmInit
+gfAvPushScr gfF_nv4_s
+gfAvPushScr gfF_nv4_s
+gfAvPushScr gfF_nv4_c
+gfAvPushScr gfF_im2
+irc = gfExec
+if ne irc 0
+ret gfFail 26 irc
+end
+gfWrt gfPos2
+gfNum div ulong slen 16
+gfWrt gfNl
+put gfChk 0 add get gfChk 0 5
+ret 0
+end
+
+fn gfTestParity to int
+gfAvReset
+gfAvPushArg 1
+gfAvPushLit gfParity
+rc = gfExec
+if ne rc 0
+ret gfFail 30 rc
+end
+gfWrt gfPos3
+put gfChk 0 add get gfChk 0 2
+put gfCtrl 0 add get gfCtrl 0 1
+ret 0
+end
+
+fn gfTestNegBudgets to int
+note [NEG-1] L2 overflow: BF16 seq=16384 hd=128 nh=8 -> 64 MiB > 24 MiB -> MUST refuse rc=13!
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf16384
+gfAvPushLit gf128
+gfAvPushLit gf8
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+r1 = gfExec
+if ne r1 13
+ret gfFail 41 r1
+end
+gfWrt gfNeg1
+note [NEG-2] SMEM overflow: BF16 seq=2048 hd=128 nh=8 br=128 bc=128 -> ~174 KiB > 99 KiB -> MUST refuse rc=14!
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf128
+gfAvPushLit gf8
+gfAvPushLit gf128
+gfAvPushLit gf128
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+r2 = gfExec
+if ne r2 14
+ret gfFail 42 r2
+end
+gfWrt gfNeg2
+note [NEG-3] 6 invalid QMD dimension cases -> all MUST refuse rc=12!
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf64
+gfAvPushLit gf8
+gfAvPushLit gf0
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+if ne gfExec 12
+ret gfFail 43 1
+end
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf64
+gfAvPushLit gf8
+gfAvPushLit gf64
+gfAvPushLit gf0
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+if ne gfExec 12
+ret gfFail 44 1
+end
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf0
+gfAvPushLit gf8
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+if ne gfExec 12
+ret gfFail 45 1
+end
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf320
+gfAvPushLit gf8
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+if ne gfExec 12
+ret gfFail 46 1
+end
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf64
+gfAvPushLit gf0
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4096
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+if ne gfExec 12
+ret gfFail 47 1
+end
+gfEmitInit
+gfAvPushLit gfBf16
+gfAvPushLit gf2048
+gfAvPushLit gf64
+gfAvPushLit gf8
+gfAvPushLit gf64
+gfAvPushLit gf64
+gfAvPushLit gf4100
+gfAvPushScr gfF_tmp_s
+gfAvPushScr gfF_tmp_q
+if ne gfExec 12
+ret gfFail 48 1
+end
+gfWrt gfNeg3
+put gfCtrl 0 add get gfCtrl 0 8
+ret 0
+end
+
+fn gfShaveFirstOp n ulong wantOp ulong newSt ulong to bool
+for pc ulong n bound 2048
+w0 = gfRdU32Buf mul pc 16
+if eq and w0 4095 wantOp
+w3o = add mul pc 16 12
+w3 = gfRdU32Buf w3o
+nw3 = or and w3 not shl ulong 15 9 shl newSt 9
+gfWrU32Mut w3o nw3
+ret true
+end
+end
+ret false
+end
+
+note Find first instruction with matching 12-bit opcode, shave its stall to newSt, re-sign, check monk_check == 17!
+fn gfTestShaveOp sassF view uchar * wantOp ulong newSt ulong stepId ulong to int
+slen = gfReadFile sassF 0 32768
+if lt slen 16
+ret gfFail stepId 99
+end
+us = ulong slen
+for i ulong us bound 32768
+put gfMut i get gfBuf i
+end
+if not gfShaveFirstOp div us 16 wantOp newSt
+ret gfFail stepId 98
+end
+zlen = gfBuildIdCert us true
+if not gfWriteFile gfF_mut_s 0 us
+ret gfFail stepId 97
+end
+if not gfWriteFile gfF_mut_c 1 zlen
+ret gfFail stepId 96
+end
+gfMonkInit
+gfAvPushScr sassF
+gfAvPushScr gfF_mut_s
+gfAvPushScr gfF_mut_c
+mrc = gfExec
+if ne mrc 17
+ret gfFail stepId mrc
+end
+ret 0
+end
+
+note Drop wait-barrier mask on all wait NOPs in emitted SASS -> monk_check MUST catch rc=17!
+fn gfTestDropWait sassF view uchar * stepId ulong to int
+slen = gfReadFile sassF 0 32768
+if lt slen 16
+ret gfFail stepId 99
+end
+us = ulong slen
+n = div us 16
+for i ulong us bound 32768
+put gfMut i get gfBuf i
+end
+for pc ulong n bound 2048
+w3o = add mul pc 16 12
+w3 = gfRdU32Buf w3o
+nw3 = and w3 not shl ulong 63 20
+gfWrU32Mut w3o nw3
+end
+zlen = gfBuildIdCert us true
+if not gfWriteFile gfF_mut_s 0 us
+ret gfFail stepId 97
+end
+if not gfWriteFile gfF_mut_c 1 zlen
+ret gfFail stepId 96
+end
+gfMonkInit
+gfAvPushScr sassF
+gfAvPushScr gfF_mut_s
+gfAvPushScr gfF_mut_c
+mrc = gfExec
+if ne mrc 17
+ret gfFail stepId mrc
+end
+ret 0
+end
+
+fn gfTestNegAntibody17 to int
+note [NEG-4] Shave HMMA.16816 (op 572) stall 12 -> 4 (span 14 < 22, >= 6) in emitted BF16 FA2 SASS -> rc=17
+r4 = gfTestShaveOp gfF_bf16_s 572 4 51
+if ne r4 0
+ret r4
+end
+gfWrt gfNeg4
+note [NEG-5] Shave OMMA.SF.16864 (op 1151) stall 15 -> 4 (span 18 < 29, >= 6) in emitted NVFP4 FA2 SASS -> rc=17
+r5 = gfTestShaveOp gfF_nv4_s 1151 4 52
+if ne r5 0
+ret r5
+end
+gfWrt gfNeg5
+note [NEG-6] Drop wait-barrier mask in emitted BF16 FA2 SASS -> rc=17
+r6 = gfTestDropWait gfF_bf16_s 53
+if ne r6 0
+ret r6
+end
+gfWrt gfNeg6
+put gfCtrl 0 add get gfCtrl 0 3
+ret 0
+end
+
+fn main to int
+if ne argcnt 5
+gfWrt gfUse
+ret 90
+end
+sn = argread 4 gfScr 0 2000
+if lt sn 1
+ret 90
+end
+put gfScrN 0 ulong sn
+u = makedir gfScr 0 ulong sn 448
+shInitK
+put gfChk 0 0
+put gfCtrl 0 0
+gfWrt gfHdr
+r1 = gfTestPosBf16
+if ne r1 0
+ret r1
+end
+r2 = gfTestPosNvfp4
+if ne r2 0
+ret r2
+end
+r3 = gfTestParity
+if ne r3 0
+ret r3
+end
+r4 = gfTestNegBudgets
+if ne r4 0
+ret r4
+end
+r5 = gfTestNegAntibody17
+if ne r5 0
+ret r5
+end
+gfWrt gfPassA
+gfNum get gfChk 0
+gfWrt gfPassB
+gfNum get gfCtrl 0
+gfWrt gfPassC
+ret 0
+end

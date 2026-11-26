@@ -1,0 +1,1175 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gpu_tma/flash_attn_sm121.om: Fused L2-Pinned Zero-DRAM-Spill Flash-Attention-2
+note SM121 SASS + 256-Byte Blackwell QMD v05.00 Emitter (Pure Seeded OM-2, zero C/Python/CUDA).
+note
+note Emits a complete fused Flash-Attention-2 SM121 kernel supporting BOTH:
+note   - bf16  : HMMA.16816.F32.BF16 (op 572, nm=18, Antibody #17b >= 22-cycle acc RAW floor)
+note   - nvfp4 : OMMA.SF.16864       (op 1151, nm=38, Antibody #17b >= 29-cycle acc RAW floor)
+note
+note Architecture:
+note   - Multi-stage double-buffered async SMEM (LDG.E.128 -> STS -> BAR.SYNC -> LDS.128/32)
+note     overlapping next-tile K/V global loads with active Q*K^T and P*V Tensor Core MMA waves.
+note   - Online row-max / exp2-sum rescaling completely in registers (FMNMX.MAX, SHFL.BFLY,
+note     MUFU.EX2, FMUL, FADD, F2FP.BF16.F32.PACK_AB) -- ZERO materialized N x N attention matrix
+note     in LPDDR5X DRAM!
+note   - Single final normalized DRAM writeback (STG.E count == 1; dram_spill == 0).
+note   - Fail-closed 24 MiB GB10 L2 working-set ceiling (l2_bytes <= 25,165,824 B), 99 KiB SMEM
+note     ceiling (<= 101,376 B), register ceiling (<= 61 for 64-reg CTA), 256-byte Blackwell QMD
+note     header alignment & dimension validation, and full Antibody #17a-#17d discipline.
+note
+note Usage:
+note   flash_attn_sm121 emit <bf16|nvfp4> <seq_len> <head_dim> <n_heads> <br> <bc> <code_va> <sass_out> <qmd_out>
+note   flash_attn_sm121 parity
+note
+note Exit codes:
+note   0  : PASS (SASS + 256-byte QMD emitted, or CPU online-softmax parity PASS)
+note   11 : invalid mode or CLI usage
+note   12 : invalid QMD / tile dimension (zero, misaligned, out-of-range, or unaligned code_va)
+note   13 : GB10 24 MiB L2 working-set ceiling exceeded (l2_bytes > 25165824)
+note   14 : SM121 99 KiB SMEM ceiling exceeded (smem_bytes > 101376)
+note   15 : internal encode / register ceiling / DRAM-spill invariant refusal
+note   16 : file I/O error
+note   17 : CPU online-softmax math parity failure
+
+const FA_MODE_BF16 ulong 1
+const FA_MODE_NVFP4 ulong 2
+const FA_GB10_L2_CAP ulong 25165824
+const FA_SM121_SMEM_CAP ulong 101376
+const FA_GB10_SMS ulong 48
+const FA_QMD_WORDS ulong 64
+const FA_QMD_BYTES ulong 256
+const FA_MAX_INSNS ulong 2048
+const FA_RZ ulong 255
+
+note Plan fields: 0=mode 1=seqLen 2=headDim 3=nHeads 4=br 5=bc 6=codeVa 7=l2Bytes
+note              8=smemBytes 9=stageStride 10=gridX 11=gridY 12=gridZ 13=threads 14=nRegs 15=insns
+global faPlan ulong 16
+global faMetrics ulong 8
+note faMetrics: 0=mmaCount 1=stgCount 2=overlapStages 3=maxReg 4=errFlag
+
+global faCode ulong 8192
+global faPc ulong 1
+global faQmd uint 64
+global faPath uchar 4096
+global faIo uchar 256
+global faDig uchar 24
+
+note CPU Reference Online-Softmax Flash-Attention-2 Buffers (N<=32, d<=16)
+global faQ f64 512
+global faK f64 512
+global faV f64 512
+global faS f64 1024
+global faONaive f64 512
+global faOFa2 f64 512
+global faRowM f64 32
+global faRowL f64 32
+global faTileS f64 256
+note faParCfg: 0=n 1=d 2=br 3=bc 4=causal(0/1) 5=dropRescale(0/1)
+global faParCfg ulong 8
+global faParScale f64 1
+
+text faUse "usage: flash_attn_sm121 emit <bf16|nvfp4> <seq> <hd> <heads> <br> <bc> <va> <sass> <qmd> | parity\n"
+text faModeBf16 "bf16"
+text faModeNv4 "nvfp4"
+text faCmdEmit "emit"
+text faCmdPar "parity"
+text faEmitA "FA2_EMIT PASS mode="
+text faEmitB " insns="
+text faEmitC " qmd_bytes=256 l2_bytes="
+text faEmitD " smem_bytes="
+text faEmitE " mma_ops="
+text faEmitF " stg_ops="
+text faEmitG " dram_spill=0 max_reg="
+text faEmitH " grid="
+text faEmitX "x"
+text faEmitTail " evidence=HOST_VERIFIED PHYSICAL_SILICON=NOT_RUN\n"
+text faRefA "FA2_EMIT REFUSE code="
+text faRefB " l2_bytes="
+text faRefC " smem_bytes="
+text faParA "FA2_PARITY PASS cases=8 tiles=4x4,8x8,8x4,4x16 max_f32_ulp="
+text faParB " neg_no_rescale_caught=1 evidence=HOST_VERIFIED\n"
+text faParFail "FA2_PARITY FAIL step="
+text faNl "\n"
+
+fn faWrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn faNum v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put faDig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 faDig p sub 24 p
+ret
+end
+end
+end
+
+fn faArgEq idx ulong lit view uchar * to bool
+k = argread idx faPath 0 64
+if ne k long len lit
+ret false
+end
+for i ulong len lit bound 64
+if ne get faPath i get lit i
+ret false
+end
+end
+ret true
+end
+
+fn faParseU64 idx ulong to long
+k = argread idx faPath 0 64
+if lt k 1
+ret long -1
+end
+v = ulong 0
+for i ulong ulong k bound 24
+c = ulong get faPath i
+if or lt c 48 gt c 57
+ret long -1
+end
+v = add mul v 10 sub c 48
+end
+ret long v
+end
+
+note ==================== SM121 128-BIT INSTRUCTION ENCODERS ====================
+
+fn faCtrl st ulong yd ulong wb ulong rbr ulong wt ulong to ulong
+w = or shl st 9 shl yd 13
+w = or w shl wb 14
+w = or w shl rbr 17
+ret or w shl wt 20
+end
+
+fn faAlu6 to ulong
+ret faCtrl 6 0 7 7 0
+end
+
+fn faEmit4 w0 ulong w1 ulong w2 ulong w3 ulong to void
+pc = get faPc 0
+if ge pc FA_MAX_INSNS
+put faMetrics 4 1
+ret
+end
+b = mul pc 4
+put faCode b and w0 4294967295
+put faCode add b 1 and w1 4294967295
+put faCode add b 2 and w2 4294967295
+put faCode add b 3 and w3 4294967295
+put faPc 0 add pc 1
+end
+
+fn faTrackReg r ulong cnt ulong to void
+if eq r FA_RZ
+ret
+end
+hi = sub add r cnt 1
+if gt hi get faMetrics 3
+put faMetrics 3 hi
+end
+end
+
+fn faNop st ulong wt ulong to void
+faEmit4 31000 0 0 faCtrl st 0 7 7 wt
+end
+
+fn faMovImm rd ulong imm ulong st ulong to void
+faTrackReg rd 1
+faEmit4 or 30722 shl and rd 255 16 and imm 4294967295 3840 faCtrl st 0 7 7 0
+end
+
+fn faMovF32 rd ulong x f32 to void
+faMovImm rd ulong bitcast uint x 6
+end
+
+fn faS2r rd ulong sr ulong wb ulong to void
+faTrackReg rd 1
+faEmit4 or 31001 shl and rd 255 16 0 shl and sr 255 8 faCtrl 4 1 wb 7 0
+end
+
+fn faLdc64 rd ulong off ulong wb ulong to void
+faTrackReg rd 2
+w0 = or 4278221698 shl and rd 255 16
+faEmit4 w0 and shl off 6 16776960 2560 faCtrl 4 1 wb 7 0
+end
+
+fn faUldc64 ud ulong off ulong wb ulong to void
+w0 = or 4278220716 shl and ud 255 16
+faEmit4 w0 and shl off 5 16776960 134220288 faCtrl 4 1 wb 7 0
+end
+
+fn faImadImm rd ulong ra ulong imm ulong rc ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg rc 1
+w0 = or or 30756 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and imm 4294967295 or 126747136 and rc 255 faAlu6
+end
+
+fn faImadWide rd ulong ra ulong imm ulong rc ulong to void
+faTrackReg rd 2
+faTrackReg ra 1
+faTrackReg rc 2
+w0 = or or 30757 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and imm 4294967295 or 126746624 and rc 255 faAlu6
+end
+
+fn faIadd3 rd ulong ra ulong r1 ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or or 29200 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and r1 255 134209791 faAlu6
+end
+
+fn faIsetpLt ra ulong r1 ulong to void
+faTrackReg ra 1
+faTrackReg r1 1
+faEmit4 or 29196 shl and ra 255 24 and r1 255 66084976 faCtrl 14 0 7 7 0
+end
+
+fn faFadd rd ulong ra ulong r1 ulong wt ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or or 29217 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and r1 255 0 faCtrl 6 0 7 7 wt
+end
+
+fn faFsub rd ulong ra ulong r1 ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or or 29217 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 or and r1 255 2147483648 0 faAlu6
+end
+
+fn faFmul rd ulong ra ulong r1 ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or or 29216 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and r1 255 4194304 faAlu6
+end
+
+fn faFmax rd ulong ra ulong r1 ulong wt ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or or 29193 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and r1 255 125829120 faCtrl 6 0 7 7 wt
+end
+
+fn faMufuEx2 rd ulong r1 ulong wb ulong to void
+faTrackReg rd 1
+faTrackReg r1 1
+faEmit4 or 29448 shl and rd 255 16 and r1 255 2048 faCtrl 4 1 wb 7 0
+end
+
+fn faMufuRcp rd ulong r1 ulong wb ulong to void
+faTrackReg rd 1
+faTrackReg r1 1
+faEmit4 or 29448 shl and rd 255 16 and r1 255 4096 faCtrl 4 1 wb 7 0
+end
+
+fn faShflBfly rd ulong ra ulong delta ulong wb ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+w0 = or or 32649 shl and rd 255 16 shl and ra 255 24
+w1 = or 201334528 shl and delta 31 21
+faEmit4 w0 w1 917504 faCtrl 4 1 wb 7 0
+end
+
+fn faF2fpPack rd ulong ra ulong r1 ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or or 29246 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and r1 255 4351 faAlu6
+end
+
+fn faBarSync to void
+faEmit4 31517 0 65536 faAlu6
+end
+
+fn faExit to void
+faEmit4 31053 0 58720256 faAlu6
+end
+
+fn faLdg128 rd ulong ra ulong wb ulong rbr ulong to void
+faTrackReg rd 4
+faTrackReg ra 2
+w0 = or or 31105 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 4 203300096 faCtrl 2 1 wb rbr 0
+end
+
+fn faStg32 ra ulong r1 ulong rbr ulong to void
+faTrackReg ra 2
+faTrackReg r1 1
+w0 = or 31110 shl and ra 255 24
+faEmit4 w0 and r1 255 202381572 faCtrl 4 1 7 rbr 0
+put faMetrics 1 add get faMetrics 1 1
+end
+
+fn faLds128 rd ulong ra ulong wb ulong rbr ulong to void
+faTrackReg rd 4
+faTrackReg ra 1
+w0 = or or 31108 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 0 3072 faCtrl 2 1 wb rbr 0
+end
+
+fn faLds32 rd ulong ra ulong wb ulong rbr ulong to void
+faTrackReg rd 1
+faTrackReg ra 1
+w0 = or or 31108 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 255 134219776 faCtrl 2 1 wb rbr 0
+end
+
+fn faSts32 ra ulong r1 ulong rbr ulong to void
+faTrackReg ra 1
+faTrackReg r1 1
+w0 = or 31112 shl and ra 255 24
+faEmit4 w0 and r1 255 134220031 faCtrl 4 1 7 rbr 0
+end
+
+fn faHmma rd ulong ra ulong r1 ulong rc ulong st ulong to void
+faTrackReg rd 4
+faTrackReg ra 4
+faTrackReg r1 2
+faTrackReg rc 4
+w0 = or or 29244 shl and rd 255 16 shl and ra 255 24
+faEmit4 w0 and r1 255 or 268288 and rc 255 faCtrl st 0 7 7 0
+put faMetrics 0 add get faMetrics 0 1
+end
+
+fn faOmma rd ulong ra ulong r1 ulong rsa ulong rsb ulong st ulong to void
+faTrackReg rd 4
+faTrackReg ra 4
+faTrackReg r1 2
+faTrackReg rsa 1
+faTrackReg rsb 1
+w0 = or 29823 shl and rd 255 16
+w0 = or w0 shl and ra 255 24
+w1 = or 1879048192 and r1 255
+w1 = or w1 shl and rsa 255 8
+w1 = or w1 shl and rsb 255 20
+w2 = or 278016 and rd 255
+faEmit4 w0 w1 w2 faCtrl st 0 7 7 0
+put faMetrics 0 add get faMetrics 0 1
+end
+
+fn faBraNotP0 targetPc ulong to void
+cur = get faPc 0
+delta = sub targetPc cur
+rel = and sub delta 1 4294967295
+s = shr rel 6
+c = ulong 58720256
+if ge rel 2147483648
+s = or s 4227858432
+c = ulong 58982399
+end
+w0 = or or 2375 shl ulong 8 12 shl and rel 63 18
+faEmit4 w0 and shl s 2 4294967295 c faAlu6
+end
+
+note ==================== L2 / SMEM / QMD BUDGET & PLANNER ====================
+
+fn faRowBytes mode ulong hd ulong to ulong
+if eq mode FA_MODE_NVFP4
+ret add div hd 2 div hd 16
+end
+ret mul hd 2
+end
+
+fn faValidateDims to ulong
+mode = get faPlan 0
+if and ne mode FA_MODE_BF16 ne mode FA_MODE_NVFP4
+ret 11
+end
+seq = get faPlan 1
+if or eq seq 0 gt seq 1048576
+ret 12
+end
+hd = get faPlan 2
+if or lt hd 16 or gt hd 256 ne rem hd 16 0
+ret 12
+end
+nh = get faPlan 3
+if or eq nh 0 gt nh 1024
+ret 12
+end
+br = get faPlan 4
+if or lt br 16 or gt br 128 ne rem br 16 0
+ret 12
+end
+bc = get faPlan 5
+if or lt bc 16 or gt bc 128 ne rem bc 16 0
+ret 12
+end
+va = get faPlan 6
+if or eq va 0 ne rem va 256 0
+ret 12
+end
+ret 0
+end
+
+fn faCalcSmem rb ulong to void
+br = get faPlan 4
+bc = get faPlan 5
+qSmem = mul br add rb 16
+kvStage = mul mul 2 bc add rb 16
+kvStride = mul div add kvStage 255 256 256
+smemRaw = add qSmem mul 2 kvStride
+smemBytes = mul div add smemRaw 255 256 256
+put faPlan 8 smemBytes
+put faPlan 9 kvStride
+end
+
+fn faCalcL2 rb ulong to void
+seq = get faPlan 1
+nh = get faPlan 3
+br = get faPlan 4
+gx = div add seq sub br 1 br
+activeCtas = mul gx nh
+if gt activeCtas FA_GB10_SMS
+activeCtas = FA_GB10_SMS
+end
+kvL2 = mul mul mul nh 2 seq rb
+qoL2 = mul mul activeCtas 2 mul br rb
+put faPlan 7 add kvL2 qoL2
+put faPlan 10 gx
+put faPlan 11 nh
+put faPlan 12 1
+put faPlan 13 128
+put faPlan 14 64
+end
+
+fn faPlanKernel to ulong
+vrc = faValidateDims
+if ne vrc 0
+ret vrc
+end
+rb = faRowBytes get faPlan 0 get faPlan 2
+faCalcSmem rb
+faCalcL2 rb
+if gt get faPlan 7 FA_GB10_L2_CAP
+ret 13
+end
+if gt get faPlan 8 FA_SM121_SMEM_CAP
+ret 14
+end
+if or eq get faPlan 10 0 gt get faPlan 11 65535
+ret 12
+end
+ret 0
+end
+
+note Emit valid 256-byte (64 u32 words) Blackwell QMD v05.00 Header
+fn faPackQmd to bool
+va = get faPlan 6
+smem = get faPlan 8
+gx = get faPlan 10
+gy = get faPlan 11
+gz = get faPlan 12
+thr = get faPlan 13
+nreg = get faPlan 14
+if or eq va 0 ne rem va 256 0
+ret false
+end
+if or eq smem 0 gt smem FA_SM121_SMEM_CAP
+ret false
+end
+if or eq gx 0 or eq gy 0 eq gz 0
+ret false
+end
+for i ulong FA_QMD_WORDS
+put faQmd i 0
+end
+put faQmd 4 uint 20905984
+put faQmd 9 uint 3
+put faQmd 10 uint 1638400
+put faQmd 32 uint and shr va 4 4294967295
+put faQmd 33 uint or and shr va 36 2097151 20971520
+put faQmd 34 uint or thr 65536
+put faQmd 35 uint or 1 shl nreg 8
+put faQmd 36 uint smem
+put faQmd 39 uint gx
+put faQmd 40 uint gy
+put faQmd 41 uint gz
+put faQmd 58 uint 271581201
+put faQmd 59 uint and shr va 8 4294967295
+ret true
+end
+
+note ==================== FUSED FLASH-ATTENTION-2 SM121 SASS EMITTER ====================
+
+fn faStageStoreLoad srcReg ulong smBaseReg ulong dstFrag ulong isQuad bool to void
+faImadImm 56 14 16 smBaseReg
+faMovImm 59 4 6
+faIadd3 57 56 59
+faIadd3 58 57 59
+faIadd3 59 58 59
+faSts32 56 srcReg 5
+faSts32 57 add srcReg 1 5
+faSts32 58 add srcReg 2 5
+faSts32 59 add srcReg 3 5
+faNop 6 32
+faBarSync
+if isQuad
+faLds128 dstFrag smBaseReg 4 5
+else
+faLds32 dstFrag smBaseReg 4 5
+faLds32 add dstFrag 1 smBaseReg 4 5
+faLds32 46 smBaseReg 4 5
+faLds32 47 smBaseReg 4 5
+end
+faNop 6 48
+end
+
+fn faEmitPrologue to void
+faUldc64 4 856 2
+note R0..1=Q_ptr, R2..3=K_ptr, R4..5=V_ptr, R6..7=O_ptr
+faLdc64 0 896 0
+faLdc64 2 904 0
+faLdc64 4 912 0
+faLdc64 6 920 0
+faS2r 14 33 0
+faS2r 15 37 0
+faS2r 18 38 0
+faNop 6 7
+note SMEM base offsets: R22=Q_slot(0), R23=KV_stage0, R19=KV_stage1
+faMovImm 22 0 6
+faMovImm 23 get faPlan 9 6
+faMovImm 19 mul get faPlan 9 2 6
+note Load Q tile ONCE into SMEM + pin in R40..R43 for entire KV loop
+faImadWide 16 14 16 0
+faLdg128 32 16 0 1
+faNop 6 3
+faStageStoreLoad 32 22 40 true
+note Online softmax state: R10=m_i(-1e30), R11=l_i(0.0), R12=log2(e)/sqrt(d), R24..27=O_acc(0.0)
+faMovF32 10 -1.0e30f32
+faMovF32 11 0.0f32
+faMovF32 12 0.18033688f32
+for j ulong 4
+faMovF32 add 24 j 0.0f32
+faMovF32 add 28 j 0.0f32
+faMovF32 add 48 j 0.0f32
+end
+note K/V tile base pointers (R16..17=K_ptr, R20..21=V_ptr) and KV loop bounds (R9=0, R13=Tc)
+faImadWide 16 14 16 2
+faImadWide 20 14 16 4
+tc = div add get faPlan 1 sub get faPlan 5 1 get faPlan 5
+if lt tc 2
+tc = ulong 2
+end
+faMovImm 9 0 6
+faMovImm 13 tc 6
+note Pre-fetch Stage 0 K tile on wb=0, rbar=1; wait rbar=1 only so wb=0 stays in flight entering loop!
+faLdg128 32 16 0 1
+faNop 6 2
+faMovImm 59 1 6
+faImadWide 16 59 64 16
+end
+
+fn faEmitOnlineSoftmax to void
+note Phase B: Fused register-resident online softmax (ZERO N x N DRAM write!)
+for j ulong 4
+faFmul add 28 j add 28 j 12
+end
+note Tile row max m_ij in R52 + warp butterfly max reduction
+faFmax 52 28 29 0
+faFmax 53 30 31 0
+faFmax 52 52 53 0
+d = ulong 16
+while ge d 1 bound 5
+faShflBfly 53 52 d 0
+faFmax 52 52 53 1
+d = shr d 1
+end
+note m_new = max(m_i, m_ij) in R56; alpha = exp2(m_i - m_new) in R57
+faFmax 56 10 52 0
+faFsub 57 10 56
+faMufuEx2 57 57 0
+faNop 6 1
+note Rescale running l_i and running O_acc[0..3] by alpha
+faFmul 11 11 57
+for j ulong 4
+faFmul add 24 j add 24 j 57
+end
+note P_ij[0..3] = exp2(S_ij[0..3] - m_new) completely in registers R28..R31
+for j ulong 4
+rj = add 28 j
+faFsub rj rj 56
+faMufuEx2 rj rj 0
+faNop 6 1
+end
+note l_ij = sum_warp(P_ij) in R58 -> l_i = l_i + l_ij; update m_i = m_new
+faFadd 58 28 29 0
+faFadd 59 30 31 0
+faFadd 58 58 59 0
+d = ulong 16
+while ge d 1 bound 5
+faShflBfly 59 58 d 0
+faFadd 58 58 59 1
+d = shr d 1
+end
+faFadd 11 11 58 0
+faFmax 10 56 56 0
+note Pack FP32 P_ij (R28..R31) into BF16 MMA fragment registers R48..R51 (0 SMEM/DRAM spill!)
+faF2fpPack 48 28 29
+faF2fpPack 49 30 31
+faF2fpPack 50 28 29
+faF2fpPack 51 30 31
+end
+
+fn faEmitKvLoop to void
+mode = get faPlan 0
+mLoop = get faPc 0
+note Overlap Stage 1 V async load (wb=2, rbar=3) while consuming Stage 0 K (wb=0)
+faLdg128 36 20 2 3
+faNop 6 1
+faStageStoreLoad 32 23 44 false
+note Phase A: Q * K^T Score Tile via Tensor Core (with full Antibody #17b latency floor!)
+if eq mode FA_MODE_NVFP4
+faOmma 28 40 44 46 47 15
+faOmma 48 40 44 46 47 14
+else
+faHmma 28 40 44 28 12
+faHmma 48 40 44 48 10
+end
+note Phase B: Register-resident Online Softmax + P packing
+faEmitOnlineSoftmax
+note Overlap NEXT Stage 0 K async load (wb=0, rbar=1) before consuming Stage 1 V (wb=2, rbar=3)!
+faLdg128 32 16 0 1
+faNop 6 2
+faMovImm 59 1 6
+faImadWide 16 59 64 16
+faNop 6 12
+faMovImm 59 1 6
+faImadWide 20 59 64 20
+faStageStoreLoad 36 19 44 false
+note Phase C: P * V Accumulation directly into O_acc (R24..R27) with full Antibody #17b floor!
+if eq mode FA_MODE_NVFP4
+faOmma 24 48 44 46 47 15
+faMovImm 59 1 14
+else
+faHmma 24 48 44 24 12
+faMovImm 59 1 10
+end
+faIadd3 9 9 59
+faIsetpLt 9 13
+faBraNotP0 mLoop
+note Drain final prefetched K tile (wb=0) cleanly before epilogue
+faNop 6 1
+end
+
+fn faEmitEpilogue to void
+note Final single normalized DRAM writeback: O = O_acc * rcp(l_i) (EXACTLY ONE STG.E!)
+faMufuRcp 56 11 0
+faNop 6 1
+for j ulong 4
+faFmul add 24 j add 24 j 56
+end
+faImadWide 56 14 16 6
+faStg32 56 24 1
+faNop 6 63
+faExit
+while true bound 2048
+p = get faPc 0
+if and ge p 32 eq rem p 8 0
+break
+end
+faNop 6 0
+end
+end
+
+fn faWriteSass idx ulong nInsns ulong to bool
+k = argread idx faPath 0 4095
+if lt k 1
+ret false
+end
+fd = fopen faPath 0 ulong k 577 420
+if lt fd 0
+ret false
+end
+for pc ulong nInsns bound 2048
+b = mul pc 4
+for j ulong 4
+w = get faCode add b j
+o = mul j 4
+put faIo o uchar and w 255
+put faIo add o 1 uchar and shr w 8 255
+put faIo add o 2 uchar and shr w 16 255
+put faIo add o 3 uchar and shr w 24 255
+end
+r = write int fd faIo 0 16
+if ne r 16
+z = fclose int fd
+ret false
+end
+end
+z = fclose int fd
+ret true
+end
+
+fn faWriteQmd idx ulong to bool
+k = argread idx faPath 0 4095
+if lt k 1
+ret false
+end
+fd = fopen faPath 0 ulong k 577 420
+if lt fd 0
+ret false
+end
+for i ulong FA_QMD_WORDS
+w = ulong get faQmd i
+o = mul i 4
+put faIo o uchar and w 255
+put faIo add o 1 uchar and shr w 8 255
+put faIo add o 2 uchar and shr w 16 255
+put faIo add o 3 uchar and shr w 24 255
+end
+r = write int fd faIo 0 256
+z = fclose int fd
+ret eq r 256
+end
+
+fn faCmdDoEmit to int
+if ne argcnt 11
+faWrt faUse
+ret 11
+end
+mode = ulong 0
+if faArgEq 2 faModeBf16
+mode = FA_MODE_BF16
+else
+if faArgEq 2 faModeNv4
+mode = FA_MODE_NVFP4
+else
+ret 11
+end
+end
+put faPlan 0 mode
+for a ulong 6
+v = faParseU64 add 3 a
+if lt v 0
+ret 12
+end
+put faPlan add 1 a ulong v
+end
+rc = faPlanKernel
+if ne rc 0
+faWrt faRefA
+faNum rc
+faWrt faRefB
+faNum get faPlan 7
+faWrt faRefC
+faNum get faPlan 8
+faWrt faNl
+ret int rc
+end
+put faPc 0 0
+for i ulong 8
+put faMetrics i 0
+end
+faEmitPrologue
+faEmitKvLoop
+faEmitEpilogue
+cnt = get faPc 0
+put faPlan 15 cnt
+if or ne get faMetrics 4 0 or gt get faMetrics 3 61 ne get faMetrics 1 1
+ret 15
+end
+if not faPackQmd
+ret 12
+end
+if not faWriteSass 9 cnt
+ret 16
+end
+if not faWriteQmd 10
+ret 16
+end
+faWrt faEmitA
+if eq mode FA_MODE_NVFP4
+faWrt faModeNv4
+else
+faWrt faModeBf16
+end
+faWrt faEmitB
+faNum cnt
+faWrt faEmitC
+faNum get faPlan 7
+faWrt faEmitD
+faNum get faPlan 8
+faWrt faEmitE
+faNum get faMetrics 0
+faWrt faEmitF
+faNum get faMetrics 1
+faWrt faEmitG
+faNum get faMetrics 3
+faWrt faEmitH
+faNum get faPlan 10
+faWrt faEmitX
+faNum get faPlan 11
+faWrt faEmitTail
+ret 0
+end
+
+note ==================== PURE-OM CPU ONLINE-SOFTMAX FLASH-ATTENTION-2 PARITY ====================
+
+note High-precision IEEE-754 f64 exp(x) for x <= 0 (range-reduced degree-11 Horner Taylor, < 1e-14 err)
+fn faExpNeg x f64 to f64
+if lt x -700.0f64
+ret 0.0f64
+end
+if ge x 0.0f64
+ret 1.0f64
+end
+t = mul x 1.4426950408889634f64
+k = long sub t 0.5f64
+if lt k long -1022
+ret 0.0f64
+end
+r = sub x mul f64 k 0.6931471805599453f64
+p = add 1.0f64 div r 11.0f64
+p = add 1.0f64 mul div r 10.0f64 p
+p = add 1.0f64 mul div r 9.0f64 p
+p = add 1.0f64 mul div r 8.0f64 p
+p = add 1.0f64 mul div r 7.0f64 p
+p = add 1.0f64 mul div r 6.0f64 p
+p = add 1.0f64 mul div r 5.0f64 p
+p = add 1.0f64 mul div r 4.0f64 p
+p = add 1.0f64 mul div r 3.0f64 p
+p = add 1.0f64 mul div r 2.0f64 p
+p = add 1.0f64 mul r p
+pw = bitcast f64 shl ulong add k long 1023 52
+ret mul p pw
+end
+
+fn faAbsF64 x f64 to f64
+if lt x 0.0f64
+ret sub 0.0f64 x
+end
+ret x
+end
+
+fn faF32Ulp a f64 b f64 to ulong
+ua = ulong bitcast uint f32 a
+ub = ulong bitcast uint f32 b
+if ge ua ub
+ret sub ua ub
+end
+ret sub ub ua
+end
+
+note Deterministic non-trivial Q, K, V matrices with wide dynamic range (tests extreme online rescaling!)
+fn faSeedMatrices n ulong d ulong to void
+st = ulong 1469598103934665603
+for i ulong mul n d bound 512
+st = add mul st 6364136223846793005 1442695040888963407
+v1 = sub long and shr st 33 2047 long 1024
+put faQ i mul f64 v1 0.0045f64
+st = add mul st 6364136223846793005 1442695040888963407
+v2 = sub long and shr st 33 2047 long 1024
+put faK i mul f64 v2 0.0045f64
+st = add mul st 6364136223846793005 1442695040888963407
+v3 = sub long and shr st 33 2047 long 1024
+put faV i mul f64 v3 0.0020f64
+end
+end
+
+fn faDotQK i ulong j ulong d ulong scale f64 to f64
+acc = 0.0f64
+bi = mul i d
+bj = mul j d
+for k ulong d bound 16
+acc = add acc mul get faQ add bi k get faK add bj k
+end
+ret mul acc scale
+end
+
+note Naive full N x N attention reference
+fn faNaiveRowProbs i ulong n ulong d ulong scale f64 causal bool to f64
+rmax = -1.0e30f64
+for j ulong n bound 32
+s = -1.0e30f64
+if or not causal le j i
+s = faDotQK i j d scale
+end
+put faS add mul i n j s
+if gt s rmax
+rmax = s
+end
+end
+lsum = 0.0f64
+for j ulong n bound 32
+p = 0.0f64
+if or not causal le j i
+p = faExpNeg sub get faS add mul i n j rmax
+end
+put faS add mul i n j p
+lsum = add lsum p
+end
+ret lsum
+end
+
+fn faNaiveRowOutOne i ulong n ulong d ulong k ulong lsum f64 to void
+acc = 0.0f64
+rowBase = mul i n
+for j ulong n bound 32
+s = get faS add rowBase j
+v = get faV add mul j d k
+acc = add acc mul s v
+end
+put faONaive add mul i d k div acc lsum
+end
+
+fn faNaiveRowOut i ulong n ulong d ulong lsum f64 to void
+for k ulong d bound 16
+faNaiveRowOutOne i n d k lsum
+end
+end
+
+fn faRunNaive n ulong d ulong scale f64 causal bool to void
+for i ulong n bound 32
+lsum = faNaiveRowProbs i n d scale causal
+faNaiveRowOut i n d lsum
+end
+end
+
+note Tiled Online-Softmax Flash-Attention-2 (ZERO N x N matrix! Optional dropRescale for negative control)
+fn faTileRowScores ri ulong c0 ulong r ulong to f64
+bc = get faParCfg 3
+d = get faParCfg 1
+causal = ne get faParCfg 4 0
+scale = get faParScale 0
+mBlk = -1.0e30f64
+for c ulong bc bound 16
+cj = add c0 c
+s = -1.0e30f64
+if or not causal le cj ri
+s = faDotQK ri cj d scale
+end
+put faTileS add mul r bc c s
+if gt s mBlk
+mBlk = s
+end
+end
+ret mBlk
+end
+
+fn faAccumPV bi ulong bj ulong p f64 d ulong to void
+for k ulong d bound 16
+oi = add bi k
+cur = get faOFa2 oi
+v = get faV add bj k
+put faOFa2 oi add cur mul p v
+end
+end
+
+fn faScaleRow bi ulong d ulong alpha f64 to void
+for k ulong d bound 16
+oi = add bi k
+put faOFa2 oi mul get faOFa2 oi alpha
+end
+end
+
+fn faTileRowAccum ri ulong c0 ulong r ulong mNew f64 to void
+d = get faParCfg 1
+bc = get faParCfg 3
+bi = mul ri d
+lNew = get faRowL ri
+for c ulong bc bound 16
+cj = add c0 c
+if or eq get faParCfg 4 0 le cj ri
+idx = add mul r bc c
+p = faExpNeg sub get faTileS idx mNew
+lNew = add lNew p
+faAccumPV bi mul cj d p d
+end
+end
+put faRowM ri mNew
+put faRowL ri lNew
+end
+
+fn faRunTiledRow r0 ulong c0 ulong r ulong to void
+ri = add r0 r
+mOld = get faRowM ri
+mBlk = faTileRowScores ri c0 r
+mNew = mOld
+if gt mBlk mNew
+mNew = mBlk
+end
+alpha = faExpNeg sub mOld mNew
+if ne get faParCfg 5 0
+alpha = 1.0f64
+end
+d = get faParCfg 1
+faScaleRow mul ri d d alpha
+put faRowL ri mul get faRowL ri alpha
+faTileRowAccum ri c0 r mNew
+end
+
+fn faRunTiledBlock r0 ulong c0 ulong to void
+br = get faParCfg 2
+for r ulong br bound 16
+faRunTiledRow r0 c0 r
+end
+end
+
+fn faRunTiled to void
+n = get faParCfg 0
+d = get faParCfg 1
+br = get faParCfg 2
+bc = get faParCfg 3
+for i ulong n bound 32
+put faRowM i -1.0e30f64
+put faRowL i 0.0f64
+for k ulong d bound 16
+put faOFa2 add mul i d k 0.0f64
+end
+end
+r0 = ulong 0
+while lt r0 n bound 32
+c0 = ulong 0
+while lt c0 n bound 32
+faRunTiledBlock r0 c0
+c0 = add c0 bc
+end
+r0 = add r0 br
+end
+for i ulong n bound 32
+invL = div 1.0f64 get faRowL i
+faScaleRow mul i d d invL
+end
+end
+
+fn faCheckParityCase n ulong d ulong br ulong bc ulong causal bool to long
+scale = 0.25f64
+faRunNaive n d scale causal
+put faParCfg 0 n
+put faParCfg 1 d
+put faParCfg 2 br
+put faParCfg 3 bc
+if causal
+put faParCfg 4 1
+else
+put faParCfg 4 0
+end
+put faParCfg 5 0
+put faParScale 0 scale
+faRunTiled
+maxUlp = ulong 0
+for i ulong mul n d bound 512
+a = get faONaive i
+b = get faOFa2 i
+if gt faAbsF64 sub a b 0.000000000001f64
+ret long -1
+end
+u = faF32Ulp a b
+if gt u maxUlp
+maxUlp = u
+end
+end
+if gt maxUlp 1
+ret long -2
+end
+ret long maxUlp
+end
+
+fn faCmdDoParity to int
+faSeedMatrices 32 16
+worst = ulong 0
+for c ulong 2
+causal = eq c 1
+r = faCheckParityCase 32 16 4 4 causal
+if lt r 0
+faWrt faParFail
+faNum add mul c 4 1
+faWrt faNl
+ret 17
+end
+if gt ulong r worst
+worst = ulong r
+end
+r = faCheckParityCase 32 16 8 8 causal
+if lt r 0
+faWrt faParFail
+faNum add mul c 4 2
+faWrt faNl
+ret 17
+end
+if gt ulong r worst
+worst = ulong r
+end
+r = faCheckParityCase 32 16 8 4 causal
+if lt r 0
+faWrt faParFail
+faNum add mul c 4 3
+faWrt faNl
+ret 17
+end
+if gt ulong r worst
+worst = ulong r
+end
+r = faCheckParityCase 32 16 4 16 causal
+if lt r 0
+faWrt faParFail
+faNum add mul c 4 4
+faWrt faNl
+ret 17
+end
+if gt ulong r worst
+worst = ulong r
+end
+end
+note Negative control: dropping online exp(m_old - m_new) rescale MUST diverge (> 0.01f64)!
+faRunNaive 32 16 0.25f64 false
+put faParCfg 0 32
+put faParCfg 1 16
+put faParCfg 2 4
+put faParCfg 3 4
+put faParCfg 4 0
+put faParCfg 5 1
+put faParScale 0 0.25f64
+faRunTiled
+maxBad = 0.0f64
+for i ulong 512
+e = faAbsF64 sub get faONaive i get faOFa2 i
+if gt e maxBad
+maxBad = e
+end
+end
+if lt maxBad 0.01f64
+faWrt faParFail
+faNum 99
+faWrt faNl
+ret 17
+end
+faWrt faParA
+faNum worst
+faWrt faParB
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+faWrt faUse
+ret 11
+end
+if faArgEq 1 faCmdEmit
+ret faCmdDoEmit
+end
+if faArgEq 1 faCmdPar
+ret faCmdDoParity
+end
+faWrt faUse
+ret 11
+end
