@@ -1,0 +1,675 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/pack/sem_pack.om: Compile-on-Arrive Semantic Package (OMPK v1) wire codec,
+note fail-closed SHA-256 verifier, content-addressed package store with DFS cycle detection,
+note and TargetDesc-gated Realization Cache integration.
+note
+note Library unit for program mode (no om2 line, no fn main; prefix pk_ / PK_).
+note Expects seed/ng/sha256.om and seed/ng/target/target_desc.om linked before it.
+note
+note OMPK v1 Binary Wire Layout:
+note   [0..3]    magic "OMPK" (79, 77, 80, 75)
+note   [4..7]    version u32 LE (1)
+note   [8..39]   sem_id (32-byte SHA-256 of canonical OIR payload)
+note   [40..71]  func_id (32-byte canonical semantic function digest; equals sem_id when unset)
+note   [72..119] 6x u64 LE physical silicon contract:
+note               [72..79]   req_exec
+note               [80..87]   req_smem
+note               [88..95]   req_regs
+note               [96..103]  req_subgroup
+note               [104..111] req_mma
+note               [112..119] req_feat
+note   [120..123] import_count u32 LE (max 16)
+note   [124..127] ir_len u32 LE (max 4096)
+note   [128 .. 128 + import_count*32) digest-addressed import table (import_sem_ids)
+note   [128 + import_count*32 .. end) raw canonical OIR payload bytes (ir_len bytes)
+
+const PK_MAGIC_0 ulong 79
+const PK_MAGIC_1 ulong 77
+const PK_MAGIC_2 ulong 80
+const PK_MAGIC_3 ulong 75
+const PK_VERSION ulong 1
+const PK_HDR_LEN ulong 128
+const PK_DIGEST_LEN ulong 32
+const PK_MAX_IMPORTS ulong 16
+const PK_MAX_IR_LEN ulong 4096
+const PK_MAX_PKG_LEN ulong 4736
+const PK_BUF_CAP ulong 8192
+
+const PK_STORE_CAP ulong 32
+const PK_STORE_STRIDE ulong 8192
+const PK_NONE ulong 999999
+
+note Status and refusal codes (1..6 mirror TDK_ERR_EXEC..TDK_ERR_FEAT from target_desc.om)
+const PK_OK ulong 0
+const PK_ERR_MAGIC ulong 10
+const PK_ERR_VERSION ulong 11
+const PK_ERR_LENGTH ulong 12
+const PK_ERR_DIGEST ulong 13
+const PK_ERR_IMPORTS ulong 14
+const PK_ERR_STORE_FULL ulong 15
+const PK_ERR_MISSING_IMPORT ulong 16
+const PK_ERR_CYCLE ulong 17
+const PK_ERR_PROOF ulong 18
+const PK_ERR_CACHE_FULL ulong 19
+const PK_ERR_BAD_TARGET ulong 20
+const PK_ERR_NOT_FOUND ulong 21
+
+note Active OMPK wire buffer and exact byte length
+global pk_buf uchar 8192
+global pk_len ulong 1
+
+note Builder staging state for pk_pack
+global pk_ir_in uchar 4096
+global pk_ir_in_len ulong 1
+global pk_fid_in uchar 32
+global pk_req_in ulong 6
+global pk_imp_in uchar 512
+global pk_imp_cnt ulong 1
+
+note Digest query and last-packed / last-stored metadata
+global pk_query_id uchar 32
+global pk_last_sem uchar 32
+global pk_last_fid uchar 32
+global pk_last_slot ulong 1
+
+note Content-addressed in-memory package store (32 slots)
+global pk_store_data uchar 262144
+global pk_store_used ulong 32
+global pk_store_len ulong 32
+global pk_store_sem uchar 1024
+global pk_store_fid uchar 1024
+global pk_store_icnt ulong 32
+global pk_store_imps uchar 16384
+global pk_store_count ulong 1
+
+note 3-color DFS state (0=white, 1=gray, 2=black) and topological order output
+global pk_dfs_state ulong 32
+global pk_topo_order ulong 32
+global pk_topo_len ulong 1
+
+note Compile-on-Arrive realization telemetry:
+note [0]=status, [1]=cache_slot, [2]=cache_hit, [3]=cache_key,
+note [4]=code_ptr, [5]=codegen_count, [6]=dedup_hits, [7]=used_sem_fallback
+global pk_real_out ulong 8
+
+text pk_tag_fn "omega.function.v1:"
+
+note ---- Little-endian wire encoding helpers on pk_buf ----
+
+fn pk_put_u8 off ulong v ulong to void
+put pk_buf off uchar and v 255
+end
+
+fn pk_put_u32 off ulong v ulong to void
+pk_put_u8 off v
+pk_put_u8 add off 1 shr v 8
+pk_put_u8 add off 2 shr v 16
+pk_put_u8 add off 3 shr v 24
+end
+
+fn pk_put_u64 off ulong v ulong to void
+pk_put_u32 off and v 4294967295
+pk_put_u32 add off 4 shr v 32
+end
+
+fn pk_get_u32 off ulong to ulong
+b0 = ulong get pk_buf off
+b1 = shl ulong get pk_buf add off 1 8
+b2 = shl ulong get pk_buf add off 2 16
+b3 = shl ulong get pk_buf add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn pk_get_u64 off ulong to ulong
+lo = pk_get_u32 off
+hi = pk_get_u32 add off 4
+ret or lo shl hi 32
+end
+
+note ---- Reset and builder staging helpers ----
+
+fn pk_clear_func_id to void
+for i ulong 32
+put pk_fid_in i 0
+end
+end
+
+fn pk_ir_reset to void
+put pk_ir_in_len 0 0
+end
+
+fn pk_ir_push ch uchar to ulong
+cur = get pk_ir_in_len 0
+if ge cur PK_MAX_IR_LEN
+ret PK_ERR_LENGTH
+end
+put pk_ir_in cur ch
+put pk_ir_in_len 0 add cur 1
+ret PK_OK
+end
+
+fn pk_set_req reqExec ulong reqSmem ulong reqRegs ulong reqSubg ulong reqMma ulong reqFeat ulong to void
+put pk_req_in 0 reqExec
+put pk_req_in 1 reqSmem
+put pk_req_in 2 reqRegs
+put pk_req_in 3 reqSubg
+put pk_req_in 4 reqMma
+put pk_req_in 5 reqFeat
+end
+
+fn pk_reset_builder to void
+put pk_ir_in_len 0 0
+put pk_imp_cnt 0 0
+pk_clear_func_id
+for i ulong 6
+put pk_req_in i 0
+end
+end
+
+fn pk_store_reset to void
+put pk_store_count 0 0
+put pk_topo_len 0 0
+put pk_last_slot 0 PK_NONE
+for i ulong 32
+put pk_store_used i 0
+put pk_store_len i 0
+put pk_store_icnt i 0
+put pk_dfs_state i 0
+put pk_topo_order i 0
+end
+end
+
+fn pk_reset_all to void
+pk_reset_builder
+pk_store_reset
+put pk_len 0 0
+for i ulong 8
+put pk_real_out i 0
+end
+put pk_real_out 1 PK_NONE
+end
+
+note Compute canonical polynomial FUNCTION_ID via SHA-256("omega.function.v1:" || w || c0 || c1 || c2)
+fn pk_sh_put_u64 off ulong v ulong to void
+for j ulong 8
+s = mul j 8
+put sh_dat add off j uchar and shr v s 255
+end
+end
+
+fn pk_compute_poly_func_id width ulong c0 ulong c1 ulong c2 ulong to void
+tlen = len pk_tag_fn
+for i ulong tlen bound 64
+put sh_dat i get pk_tag_fn i
+end
+pk_sh_put_u64 tlen width
+pk_sh_put_u64 add tlen 8 c0
+pk_sh_put_u64 add tlen 16 c1
+pk_sh_put_u64 add tlen 24 c2
+sh_all add tlen 32
+for i ulong 32
+put pk_fid_in i get sh_dig i
+end
+end
+
+fn pk_add_import_from_query to ulong
+ic = get pk_imp_cnt 0
+if ge ic PK_MAX_IMPORTS
+ret PK_ERR_IMPORTS
+end
+base = mul ic PK_DIGEST_LEN
+for i ulong 32
+put pk_imp_in add base i get pk_query_id i
+end
+put pk_imp_cnt 0 add ic 1
+ret PK_OK
+end
+
+fn pk_add_import_from_store slot ulong to ulong
+if ge slot PK_STORE_CAP
+ret PK_ERR_NOT_FOUND
+end
+if eq get pk_store_used slot 0
+ret PK_ERR_NOT_FOUND
+end
+ic = get pk_imp_cnt 0
+if ge ic PK_MAX_IMPORTS
+ret PK_ERR_IMPORTS
+end
+dstBase = mul ic PK_DIGEST_LEN
+srcBase = mul slot PK_DIGEST_LEN
+for i ulong 32
+put pk_imp_in add dstBase i get pk_store_sem add srcBase i
+end
+put pk_imp_cnt 0 add ic 1
+ret PK_OK
+end
+
+note ---- SHA-256 helpers reusing seed/ng/sha256.om ----
+
+fn pk_sha256_ir_in nbytes ulong to void
+for i ulong nbytes bound 4096
+put sh_dat i get pk_ir_in i
+end
+sh_all nbytes
+end
+
+fn pk_sha256_buf_slice start ulong nbytes ulong to void
+for i ulong nbytes bound 4096
+put sh_dat i get pk_buf add start i
+end
+sh_all nbytes
+end
+
+fn pk_fid_in_is_zero to bool
+acc = ulong 0
+for i ulong 32
+acc = or acc ulong get pk_fid_in i
+end
+ret eq acc 0
+end
+
+note ---- OMPK v1 Packing (pk_pack) ----
+
+fn pk_write_hdr ic ulong irl ulong to void
+pk_put_u8 0 PK_MAGIC_0
+pk_put_u8 1 PK_MAGIC_1
+pk_put_u8 2 PK_MAGIC_2
+pk_put_u8 3 PK_MAGIC_3
+pk_put_u32 4 PK_VERSION
+useSem = pk_fid_in_is_zero
+for i ulong 32
+b = get sh_dig i
+put pk_buf add 8 i b
+put pk_last_sem i b
+if useSem
+put pk_buf add 40 i b
+put pk_last_fid i b
+else
+fb = get pk_fid_in i
+put pk_buf add 40 i fb
+put pk_last_fid i fb
+end
+end
+for k ulong 6
+pk_put_u64 add 72 mul k 8 get pk_req_in k
+end
+pk_put_u32 120 ic
+pk_put_u32 124 irl
+end
+
+fn pk_write_body ic ulong irl ulong to void
+impBytes = mul ic PK_DIGEST_LEN
+for i ulong impBytes bound 512
+put pk_buf add PK_HDR_LEN i get pk_imp_in i
+end
+irOff = add PK_HDR_LEN impBytes
+for i ulong irl bound 4096
+put pk_buf add irOff i get pk_ir_in i
+end
+put pk_len 0 add irOff irl
+end
+
+fn pk_pack to ulong
+ic = get pk_imp_cnt 0
+irl = get pk_ir_in_len 0
+if gt ic PK_MAX_IMPORTS
+ret PK_ERR_IMPORTS
+end
+if gt irl PK_MAX_IR_LEN
+ret PK_ERR_LENGTH
+end
+pk_sha256_ir_in irl
+pk_write_hdr ic irl
+pk_write_body ic irl
+ret PK_OK
+end
+
+note ---- Fail-Closed Verifier (pk_verify) ----
+
+fn pk_check_magic to bool
+if ne ulong get pk_buf 0 PK_MAGIC_0
+ret false
+end
+if ne ulong get pk_buf 1 PK_MAGIC_1
+ret false
+end
+if ne ulong get pk_buf 2 PK_MAGIC_2
+ret false
+end
+if ne ulong get pk_buf 3 PK_MAGIC_3
+ret false
+end
+ret true
+end
+
+fn pk_verify_digest to bool
+diff = ulong 0
+for i ulong 32
+if ne get sh_dig i get pk_buf add 8 i
+diff = add diff 1
+end
+end
+ret eq diff 0
+end
+
+fn pk_verify to ulong
+blen = get pk_len 0
+if lt blen PK_HDR_LEN
+ret PK_ERR_LENGTH
+end
+if gt blen PK_BUF_CAP
+ret PK_ERR_LENGTH
+end
+if not pk_check_magic
+ret PK_ERR_MAGIC
+end
+if ne pk_get_u32 4 PK_VERSION
+ret PK_ERR_VERSION
+end
+ic = pk_get_u32 120
+if gt ic PK_MAX_IMPORTS
+ret PK_ERR_IMPORTS
+end
+irl = pk_get_u32 124
+irOff = add PK_HDR_LEN mul ic PK_DIGEST_LEN
+if ne blen add irOff irl
+ret PK_ERR_LENGTH
+end
+if gt irl PK_MAX_IR_LEN
+ret PK_ERR_LENGTH
+end
+pk_sha256_buf_slice irOff irl
+if not pk_verify_digest
+ret PK_ERR_DIGEST
+end
+ret PK_OK
+end
+
+note ---- Content-Addressed Package Store + DFS Dependency Resolver ----
+
+fn pk_copy_buf_sem_to_query to void
+for i ulong 32
+put pk_query_id i get pk_buf add 8 i
+end
+end
+
+fn pk_copy_store_sem_to_query slot ulong to void
+base = mul slot PK_DIGEST_LEN
+for i ulong 32
+put pk_query_id i get pk_store_sem add base i
+end
+end
+
+fn pk_copy_store_imp_to_query slot ulong impIdx ulong to void
+base = mul add mul slot PK_MAX_IMPORTS impIdx PK_DIGEST_LEN
+for i ulong 32
+put pk_query_id i get pk_store_imps add base i
+end
+end
+
+fn pk_store_match_slot slot ulong to bool
+if eq get pk_store_used slot 0
+ret false
+end
+base = mul slot PK_DIGEST_LEN
+for i ulong 32
+if ne get pk_store_sem add base i get pk_query_id i
+ret false
+end
+end
+ret true
+end
+
+fn pk_store_find_query to ulong
+for s ulong 32
+if pk_store_match_slot s
+ret s
+end
+end
+ret PK_NONE
+end
+
+fn pk_store_has to bool
+ret ne pk_store_find_query PK_NONE
+end
+
+fn pk_store_copy_bytes slot ulong blen ulong to void
+dataBase = mul slot PK_STORE_STRIDE
+for i ulong blen bound 4736
+put pk_store_data add dataBase i get pk_buf i
+end
+put pk_store_len slot blen
+end
+
+fn pk_store_copy_digests slot ulong to void
+digBase = mul slot PK_DIGEST_LEN
+for i ulong 32
+put pk_store_sem add digBase i get pk_buf add 8 i
+put pk_store_fid add digBase i get pk_buf add 40 i
+end
+end
+
+fn pk_store_copy_imps slot ulong to void
+ic = pk_get_u32 120
+put pk_store_icnt slot ic
+impBytes = mul ic PK_DIGEST_LEN
+impBase = mul slot 512
+for i ulong impBytes bound 512
+put pk_store_imps add impBase i get pk_buf add PK_HDR_LEN i
+end
+end
+
+fn pk_store_write_slot slot ulong blen ulong to void
+pk_store_copy_bytes slot blen
+pk_store_copy_digests slot
+pk_store_copy_imps slot
+put pk_store_used slot 1
+end
+
+fn pk_store_put to ulong
+vrc = pk_verify
+if ne vrc PK_OK
+ret vrc
+end
+pk_copy_buf_sem_to_query
+ex = pk_store_find_query
+if ne ex PK_NONE
+put pk_last_slot 0 ex
+ret PK_OK
+end
+freeSlot = PK_NONE
+for s ulong 32
+if eq get pk_store_used s 0
+freeSlot = s
+break
+end
+end
+if eq freeSlot PK_NONE
+ret PK_ERR_STORE_FULL
+end
+blen = get pk_len 0
+pk_store_write_slot freeSlot blen
+put pk_store_count 0 add get pk_store_count 0 1
+put pk_last_slot 0 freeSlot
+ret PK_OK
+end
+
+fn pk_store_load slot ulong to ulong
+if ge slot PK_STORE_CAP
+ret PK_ERR_NOT_FOUND
+end
+if eq get pk_store_used slot 0
+ret PK_ERR_NOT_FOUND
+end
+slen = get pk_store_len slot
+if gt slen PK_MAX_PKG_LEN
+ret PK_ERR_LENGTH
+end
+dataBase = mul slot PK_STORE_STRIDE
+for i ulong slen bound 4736
+put pk_buf i get pk_store_data add dataBase i
+end
+put pk_len 0 slen
+ret PK_OK
+end
+
+fn pk_dfs_visit slot ulong to ulong
+st = get pk_dfs_state slot
+if eq st 1
+ret PK_ERR_CYCLE
+end
+if eq st 2
+ret PK_OK
+end
+put pk_dfs_state slot 1
+ic = get pk_store_icnt slot
+for i ulong ic bound 16
+pk_copy_store_imp_to_query slot i
+dep = pk_store_find_query
+if eq dep PK_NONE
+ret PK_ERR_MISSING_IMPORT
+end
+rc = pk_dfs_visit dep
+if ne rc PK_OK
+ret rc
+end
+end
+put pk_dfs_state slot 2
+tlen = get pk_topo_len 0
+if lt tlen PK_STORE_CAP
+put pk_topo_order tlen slot
+put pk_topo_len 0 add tlen 1
+end
+ret PK_OK
+end
+
+fn pk_resolve_deps to ulong
+root = pk_store_find_query
+if eq root PK_NONE
+ret PK_ERR_NOT_FOUND
+end
+for i ulong 32
+put pk_dfs_state i 0
+put pk_topo_order i 0
+end
+put pk_topo_len 0 0
+ret pk_dfs_visit root
+end
+
+note ---- Compile-on-Arrive Realization (TargetDesc Contract + Proof-Gated Cache) ----
+
+fn pk_rotl64 x ulong r ulong to ulong
+ret or shl x r shr x sub 64 r
+end
+
+fn pk_digest_key64 off ulong to ulong
+w0 = pk_get_u64 off
+w1 = pk_rotl64 pk_get_u64 add off 8 17
+w2 = pk_rotl64 pk_get_u64 add off 16 31
+w3 = pk_rotl64 pk_get_u64 add off 24 47
+k = xor xor w0 w1 xor w2 w3
+if eq k 0
+k = ulong 1
+end
+ret k
+end
+
+fn pk_buf_is_zero32 off ulong to bool
+acc = ulong 0
+for i ulong 32
+acc = or acc ulong get pk_buf add off i
+end
+ret eq acc 0
+end
+
+fn pk_select_cache_key to ulong
+if pk_buf_is_zero32 40
+put pk_real_out 7 1
+ret pk_digest_key64 8
+end
+put pk_real_out 7 0
+ret pk_digest_key64 40
+end
+
+fn pk_load_contract_to_td to void
+r0 = pk_get_u64 72
+r1 = pk_get_u64 80
+r2 = pk_get_u64 88
+r3 = pk_get_u64 96
+r4 = pk_get_u64 104
+r5 = pk_get_u64 112
+tdSetReq r0 r1 r2 r3 r4 r5
+end
+
+fn pk_check_contract tid ulong feat ulong to ulong
+pk_load_contract_to_td
+crc = tdCheckKernelContract tid
+if ne crc TDK_OK
+ret crc
+end
+rf = pk_get_u64 112
+if ne and rf feat rf
+ret TDK_ERR_FEAT
+end
+ret TDK_OK
+end
+
+fn pk_make_code_ptr tid ulong cg ulong to ulong
+ret add 65536 add mul tid 4096 mul cg 64
+end
+
+fn pk_install_realization key ulong tid ulong feat ulong shapeSig ulong proofMask ulong to ulong
+cg = add get pk_real_out 5 1
+codePtr = pk_make_code_ptr tid cg
+ins = tdCacheInstall key tid feat shapeSig codePtr proofMask
+if eq ins PK_NONE
+if ne and proofMask 7 7
+put pk_real_out 0 PK_ERR_PROOF
+ret PK_ERR_PROOF
+end
+put pk_real_out 0 PK_ERR_CACHE_FULL
+ret PK_ERR_CACHE_FULL
+end
+put pk_real_out 5 cg
+put pk_real_out 0 PK_OK
+put pk_real_out 1 ins
+put pk_real_out 2 0
+put pk_real_out 4 codePtr
+ret PK_OK
+end
+
+fn pk_realize_on_arrive tid ulong feat ulong shapeSig ulong proofMask ulong to ulong
+put pk_real_out 0 PK_OK
+put pk_real_out 1 PK_NONE
+put pk_real_out 2 0
+put pk_real_out 3 0
+put pk_real_out 4 0
+put pk_real_out 7 0
+if ge tid get tdCount 0
+put pk_real_out 0 PK_ERR_BAD_TARGET
+ret PK_ERR_BAD_TARGET
+end
+rc = pk_verify
+if ne rc PK_OK
+put pk_real_out 0 rc
+ret rc
+end
+rc = pk_check_contract tid feat
+if ne rc TDK_OK
+put pk_real_out 0 rc
+ret rc
+end
+key = pk_select_cache_key
+put pk_real_out 3 key
+hitSlot = tdCacheLookup key tid feat shapeSig
+if ne hitSlot PK_NONE
+put pk_real_out 0 PK_OK
+put pk_real_out 1 hitSlot
+put pk_real_out 2 1
+put pk_real_out 4 get rcPtr hitSlot
+put pk_real_out 6 add get pk_real_out 6 1
+ret PK_OK
+end
+ret pk_install_realization key tid feat shapeSig proofMask
+end
