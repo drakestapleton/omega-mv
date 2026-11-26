@@ -1,0 +1,540 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/om-codemode/gate_codemode.om:
+note Pure seeded OM-2 verification gate for `apps/om-codemode/codemode.om`.
+note
+note Usage:
+note   gate_codemode <om-codemode-bin> <omc-bin> <omc-sha256-file>
+note
+note Verifies on DGX Spark Linux AArch64:
+note   Positive tests:
+note     1. `x64-bpf-spec` subcommand: AUDIT_ARCH_X86_64 (0xc000003e), 27 insns, 216 B, 9/9 VM kills
+note     2. Pure-compute Fibonacci F(10)=55 in kernel `execpure` (exit 0, status=OK, redacted=0)
+note     3. Pure-compute non-zero exit status preservation (sum(0..5)=15 -> exit 15, status=NONZERO_EXIT)
+note     4. Credential redaction across all 5 patterns (sk-secret123, Bearer, ghp_, AKIA, xoxb- -> [REDACTED])
+note   Negative controls (ALL fail closed):
+note     5. Kernel `execpure` blocks socket() & connect() with -EPERM (trap 8 -> exit 108, no BREACH)
+note     6. Kernel `execpure` blocks fopen("/etc/passwd") with -EPERM (trap 8 -> exit 108, no root:/BREACH)
+note     7. Kernel `execpure` blocks fork() with -EPERM / RLIMIT_NPROC=0 (trap 8 -> exit 108)
+note     8. Infinite loop killed by Omega default loop bound (trap 4 -> exit 104, status=TRAP)
+note     9. Infinite spin loop killed by supervisor wall-clock timeout (150ms -> SIGKILL, exit 124, status=TIMEOUT)
+note    10. Bad compiler SHA-256 pin refused fail-closed before compile (exit 69, omc_pin_mismatch)
+note    11. Malformed .om snippets refused with exact `omc` error codes (error 7 type mismatch, error 16 syntax)
+om2
+
+global g_cm uchar 512
+global g_cml ulong 1
+global g_omc uchar 512
+global g_omcl ulong 1
+global g_pinf uchar 512
+global g_pinfl ulong 1
+global g_snip uchar 128
+global g_snipl ulong 1
+global g_pk uchar 4096
+global g_pkl ulong 1
+global g_pkr ulong 1
+global g_cap uchar 65536
+global g_capl ulong 1
+global g_dig uchar 24
+global g_cnt ulong 4
+
+text t_use "usage: gate_codemode <om-codemode-bin> <omc-bin> <omc-sha256-file>\n"
+text t_hdr "=== OMEGA OM-CODEMODE PURE-COMPUTE SANDBOX GATE ===\n"
+text t_pass "CODEMODE-GATE PASS tests="
+text t_ctrl " controls="
+text t_fail "CODEMODE-GATE FAIL at test="
+text t_rc_lbl " got_rc="
+text t_nl "\n"
+text t_ok_bpf "PASS x64-bpf-spec (AUDIT_ARCH_X86_64 27 insns 9/9 VM kills)\n"
+text t_ok_fib "PASS fib10 execpure (exit=0 status=OK): "
+text t_ok_red "PASS credential redaction (5/5 patterns -> [REDACTED], 0 leaks)\n"
+text t_ok_neg "PASS all 8 fail-closed negative controls (socket/passwd/fork/bound/timeout/pin/err7/err16)\n"
+
+text t_arg_run "run"
+text t_arg_bpf "x64-bpf-spec"
+text t_arg_omc "--omc"
+text t_arg_pin "--pin"
+text t_arg_pinf "--pin-file"
+text t_arg_tmo "--timeout-ms"
+text t_tmo_150 "150"
+text t_bad_pin "0000000000000000000000000000000000000000000000000000000000000000"
+text t_snip_pre "/tmp/omcm-gate-"
+text t_snip_sfx ".om"
+
+note ---- Test .om snippets ----
+text t_sn_fib "om2\ntext pre \"fib(10)=\"\ntext nl \"\\n\"\nfn main to int\n  a = ulong 0\n  b = ulong 1\n  for i ulong 10 bound 10\n    c = add a b\n    a = b\n    b = c\n  end\n  d = new uchar 2 0\n  put d 0 uchar add 48 div a 10\n  put d 1 uchar add 48 rem a 10\n  x = write 1 pre 0 len pre\n  x = write 1 d 0 2\n  x = write 1 nl 0 len nl\n  ret 0\nend\n"
+
+text t_sn_sum "text m \"sum=15\\n\"\nfn main to int\n  s = int 0\n  for i int 6\n    s = add s i\n  end\n  x = write 1 m 0 len m\n  ret s\nend\n"
+
+text t_sn_red "text m \"a=sk-secret123 b=Bearer eyJhbGci.tok.sig c=ghp_0123456789abcdef d=AKIAIOSFODNN7EXAMPLE e=xoxb-111-222-abc\\n\"\nfn main to int\n  x = write 1 m 0 len m\n  ret 0\nend\n"
+
+text t_sn_sock "text ok \"BREACH\\n\"\ntext no \"DENIED_EPERM\\n\"\nfn main to int\n  fd = socknew 2 1 0\n  if ge fd 0\n    x = write 1 ok 0 len ok\n    ret 0\n  end\n  addr = new uchar 16 0\n  c = connect 3 addr 0 16\n  if ge c 0\n    x = write 1 ok 0 len ok\n    ret 0\n  end\n  x = write 1 no 0 len no\n  trap 8\nend\n"
+
+text t_sn_pass "text p \"/etc/passwd\"\ntext ok \"BREACH\\n\"\ntext no \"DENIED_EPERM\\n\"\nfn main to int\n  buf = new uchar 64 0\n  fd = fopen p 0 len p 0 0\n  if ge fd 0\n    n = read int fd buf 0 64\n    x = write 1 ok 0 len ok\n    if gt n 0\n      x = write 1 buf 0 ulong n\n    end\n    ret 0\n  end\n  x = write 1 no 0 len no\n  trap 8\nend\n"
+
+text t_sn_fork "text ok \"BREACH\\n\"\ntext no \"DENIED_FORK\\n\"\nfn main to int\n  p = fork\n  if ge p 0\n    x = write 1 ok 0 len ok\n    ret 0\n  end\n  x = write 1 no 0 len no\n  trap 8\nend\n"
+
+text t_sn_bound "fn main to int\n  x = ulong 0\n  while true\n    x = add x 1\n  end\n  ret int and x 1\nend\n"
+
+text t_sn_spin "fn main to int\n  x = ulong 0\n  while true bound 9000000000\n    x = add x 1\n  end\n  ret int and x 1\nend\n"
+
+text t_sn_err7 "fn main to int\n  ret true\nend\n"
+text t_sn_err16 "// C-style comments are error 16 in Omega\nfn main to int\n  ret 0\nend\n"
+
+note ---- Expected substrings ----
+text t_e_bpf1 "X64_EXECPURE_BPF_SPEC arch=0xc000003e"
+text t_e_bpf2 "X64_EXECPURE_BPF_VM verify=OK allow_ok=6 neg_killed=9"
+text t_e_ok "status=OK"
+text t_e_sbx "sandbox=execpure_aarch64"
+text t_e_fib "fib(10)=55"
+text t_e_sum "sum=15"
+text t_e_nz "status=NONZERO_EXIT"
+text t_e_red5 "redacted=5"
+text t_e_red_out "a=[REDACTED] b=[REDACTED] c=[REDACTED] d=[REDACTED] e=[REDACTED]"
+text t_e_leak1 "sk-secret123"
+text t_e_leak2 "eyJhbGci"
+text t_e_leak3 "ghp_0123"
+text t_e_leak4 "AKIAIOSF"
+text t_e_leak5 "xoxb-111"
+text t_e_trap "status=TRAP"
+text t_e_trap8 "trap_code=8"
+text t_e_trap4 "trap_code=4"
+text t_e_breach "BREACH"
+text t_e_root "root:"
+text t_e_tmo "status=TIMEOUT"
+text t_e_ref "status=REFUSED"
+text t_e_pinmis "omc_pin_mismatch"
+text t_e_cerr "status=COMPILE_ERROR"
+text t_e_err7 "omc_error=7"
+text t_e_err16 "omc_error=16"
+text t_e_x64hdr "x64_bpf_arch=0xc000003e x64_bpf_insns=27"
+
+fn w_num v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put g_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      w = write 1 g_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn fail_t id ulong rc ulong to int
+  w = write 1 t_fail 0 len t_fail
+  w_num id
+  w = write 1 t_rc_lbl 0 len t_rc_lbl
+  w_num rc
+  w = write 1 t_nl 0 len t_nl
+  ret int id
+end
+
+fn pk_reset to void
+  put g_pk 0 0
+  put g_pk 1 0
+  put g_pkl 0 2
+end
+
+fn pk_open to void
+  n = get g_pkl 0
+  put g_pkr 0 n
+  put g_pk n 0
+  put g_pk add n 1 0
+  put g_pkl 0 add n 2
+  c = add or ulong get g_pk 0 shl ulong get g_pk 1 8 1
+  put g_pk 0 uchar and c 255
+  put g_pk 1 uchar shr c 8
+end
+
+fn pk_byte c uchar to void
+  n = get g_pkl 0
+  if lt n 4094
+    put g_pk n c
+    put g_pkl 0 add n 1
+    r = get g_pkr 0
+    k = add or ulong get g_pk r shl ulong get g_pk add r 1 8 1
+    put g_pk r uchar and k 255
+    put g_pk add r 1 uchar shr k 8
+  end
+end
+
+fn pk_txt t view uchar * to void
+  pk_open
+  for i ulong len t bound 512
+    pk_byte get t i
+  end
+end
+
+fn pk_cm to void
+  pk_reset
+  pk_open
+  n = get g_cml 0
+  for i ulong n bound 512
+    pk_byte get g_cm i
+  end
+end
+
+fn pk_omc to void
+  pk_open
+  n = get g_omcl 0
+  for i ulong n bound 512
+    pk_byte get g_omc i
+  end
+end
+
+fn pk_pinf to void
+  pk_open
+  n = get g_pinfl 0
+  for i ulong n bound 512
+    pk_byte get g_pinf i
+  end
+end
+
+fn pk_snip to void
+  pk_open
+  n = get g_snipl 0
+  for i ulong n bound 128
+    pk_byte get g_snip i
+  end
+end
+
+fn make_snip_path idx ulong to void
+  put g_snipl 0 0
+  for i ulong len t_snip_pre bound 32
+    put g_snip get g_snipl 0 get t_snip_pre i
+    put g_snipl 0 add get g_snipl 0 1
+  end
+  pid = ulong getpid
+  buf = new uchar 24 0
+  p = ulong 24
+  x = add mul pid 100 idx
+  while gt x 0 bound 24
+    p = sub p 1
+    put buf p uchar add 48 rem x 10
+    x = div x 10
+  end
+  while lt p 24 bound 24
+    put g_snip get g_snipl 0 get buf p
+    put g_snipl 0 add get g_snipl 0 1
+    p = add p 1
+  end
+  for i ulong len t_snip_sfx bound 8
+    put g_snip get g_snipl 0 get t_snip_sfx i
+    put g_snipl 0 add get g_snipl 0 1
+  end
+end
+
+fn write_snip idx ulong src view uchar * to bool
+  make_snip_path idx
+  fd = fopen g_snip 0 get g_snipl 0 577 384
+  if lt fd 0
+    ret false
+  end
+  w = write int fd src 0 len src
+  cl = fclose int fd
+  ret eq w long len src
+end
+
+fn read_u32 a view uchar * off ulong to int
+  v = or ulong get a off shl ulong get a add off 1 8
+  v = or v shl ulong get a add off 2 16
+  v = or v shl ulong get a add off 3 24
+  ret int v
+end
+
+fn run_pk to ulong
+  put g_capl 0 0
+  pp = new uchar 8 0
+  if lt pipefds pp 0 8 524288 0
+    ret 997
+  end
+  rfd = read_u32 pp 0
+  wfd = read_u32 pp 4
+  pid = fork
+  if lt pid 0
+    x = fclose rfd
+    x = fclose wfd
+    ret 996
+  end
+  if eq pid 0
+    x = dupfd wfd 1 0
+    x = dupfd wfd 2 0
+    x = execprog g_pk 0 get g_pkl 0
+    exit 127
+  end
+  x = fclose wfd
+  while true bound 65536
+    n = get g_capl 0
+    if ge n 65535
+      break
+    end
+    k = read rfd g_cap n sub 65535 n
+    if le k 0
+      break
+    end
+    put g_capl 0 add n ulong k
+  end
+  x = fclose rfd
+  st = new uchar 4 0
+  w = waitpid int pid st 0 4 0
+  s = or ulong get st 0 shl ulong get st 1 8
+  if eq and s 127 0
+    ret and shr s 8 255
+  end
+  ret add 128 and s 127
+end
+
+fn cap_has pat view uchar * to bool
+  bl = get g_capl 0
+  pl = len pat
+  if gt pl bl
+    ret false
+  end
+  lim = add sub bl pl 1
+  for i ulong lim bound 65536
+    ok = true
+    for j ulong pl bound 128
+      if ne get g_cap add i j get pat j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn print_first_line to void
+  n = get g_capl 0
+  endp = n
+  for i ulong n bound 512
+    if eq get g_cap i 10
+      endp = add i 1
+      break
+    end
+  end
+  if gt endp 0
+    w = write 1 g_cap 0 endp
+  end
+end
+
+fn build_run_pk useBadPin bool useTmo150 bool to void
+  pk_cm
+  pk_txt t_arg_run
+  pk_snip
+  pk_txt t_arg_omc
+  pk_omc
+  if useBadPin
+    pk_txt t_arg_pin
+    pk_txt t_bad_pin
+  else
+    pk_txt t_arg_pinf
+    pk_pinf
+  end
+  if useTmo150
+    pk_txt t_arg_tmo
+    pk_txt t_tmo_150
+  end
+end
+
+fn run_case idx ulong src view uchar * useBadPin bool useTmo150 bool to ulong
+  if not write_snip idx src
+    ret 995
+  end
+  build_run_pk useBadPin useTmo150
+  rc = run_pk
+  u = unlink g_snip 0 get g_snipl 0
+  ret rc
+end
+
+fn test_positives to int
+  note Test 1: x64-bpf-spec
+  pk_cm
+  pk_txt t_arg_bpf
+  rc = run_pk
+  if ne rc 0
+    ret fail_t 1 rc
+  end
+  if or not cap_has t_e_bpf1 not cap_has t_e_bpf2
+    ret fail_t 1 901
+  end
+  w = write 1 t_ok_bpf 0 len t_ok_bpf
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 2: Fibonacci F(10)=55 in live execpure
+  rc = run_case 2 t_sn_fib false false
+  if ne rc 0
+    ret fail_t 2 rc
+  end
+  if or not cap_has t_e_ok not cap_has t_e_sbx
+    ret fail_t 2 902
+  end
+  if or not cap_has t_e_fib not cap_has t_e_x64hdr
+    ret fail_t 2 903
+  end
+  w = write 1 t_ok_fib 0 len t_ok_fib
+  print_first_line
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 3: Non-zero exit code preservation (sum(0..5)=15)
+  rc = run_case 3 t_sn_sum false false
+  if ne rc 15
+    ret fail_t 3 rc
+  end
+  if or not cap_has t_e_nz not cap_has t_e_sum
+    ret fail_t 3 904
+  end
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 4: Credential redaction across all 5 patterns
+  rc = run_case 4 t_sn_red false false
+  if ne rc 0
+    ret fail_t 4 rc
+  end
+  if or not cap_has t_e_red5 not cap_has t_e_red_out
+    ret fail_t 4 905
+  end
+  if or cap_has t_e_leak1 or cap_has t_e_leak2 cap_has t_e_leak3
+    ret fail_t 4 906
+  end
+  if or cap_has t_e_leak4 cap_has t_e_leak5
+    ret fail_t 4 907
+  end
+  w = write 1 t_ok_red 0 len t_ok_red
+  put g_cnt 0 add get g_cnt 0 1
+  ret 0
+end
+
+fn test_negatives to int
+  note Control 1 (Test 5): socket/connect escape probe denied by kernel execpure
+  rc = run_case 5 t_sn_sock false false
+  if ne rc 108
+    ret fail_t 5 rc
+  end
+  if or not cap_has t_e_trap or not cap_has t_e_trap8 cap_has t_e_breach
+    ret fail_t 5 910
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 2 (Test 6): fopen("/etc/passwd") escape probe denied by kernel execpure
+  rc = run_case 6 t_sn_pass false false
+  if ne rc 108
+    ret fail_t 6 rc
+  end
+  if or not cap_has t_e_trap or cap_has t_e_breach cap_has t_e_root
+    ret fail_t 6 911
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 3 (Test 7): fork() escape probe denied by kernel execpure
+  rc = run_case 7 t_sn_fork false false
+  if ne rc 108
+    ret fail_t 7 rc
+  end
+  if or not cap_has t_e_trap cap_has t_e_breach
+    ret fail_t 7 912
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 4 (Test 8): Infinite loop killed by Omega default loop bound (trap 4 -> 104)
+  rc = run_case 8 t_sn_bound false false
+  if ne rc 104
+    ret fail_t 8 rc
+  end
+  if or not cap_has t_e_trap not cap_has t_e_trap4
+    ret fail_t 8 913
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 5 (Test 9): Infinite spin loop killed by supervisor wall-clock timeout (150ms -> 124)
+  rc = run_case 9 t_sn_spin false true
+  if ne rc 124
+    ret fail_t 9 rc
+  end
+  if not cap_has t_e_tmo
+    ret fail_t 9 914
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 6 (Test 10): Bad compiler SHA-256 pin refused fail-closed before compile (exit 69)
+  rc = run_case 10 t_sn_fib true false
+  if ne rc 69
+    ret fail_t 10 rc
+  end
+  if or not cap_has t_e_ref not cap_has t_e_pinmis
+    ret fail_t 10 915
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 7 (Test 11): Malformed .om type mismatch -> exact omc error 7
+  rc = run_case 11 t_sn_err7 false false
+  if ne rc 7
+    ret fail_t 11 rc
+  end
+  if or not cap_has t_e_cerr not cap_has t_e_err7
+    ret fail_t 11 916
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 8 (Test 12): Malformed .om syntax error -> exact omc error 16
+  rc = run_case 12 t_sn_err16 false false
+  if ne rc 16
+    ret fail_t 12 rc
+  end
+  if or not cap_has t_e_cerr not cap_has t_e_err16
+    ret fail_t 12 917
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  w = write 1 t_ok_neg 0 len t_ok_neg
+  ret 0
+end
+
+fn main to int
+  if lt argcnt 4
+    w = write 2 t_use 0 len t_use
+    ret 2
+  end
+  l1 = argread 1 g_cm 0 511
+  l2 = argread 2 g_omc 0 511
+  l3 = argread 3 g_pinf 0 511
+  if or le l1 0 or le l2 0 le l3 0
+    w = write 2 t_use 0 len t_use
+    ret 2
+  end
+  put g_cml 0 ulong l1
+  put g_omcl 0 ulong l2
+  put g_pinfl 0 ulong l3
+
+  w = write 1 t_hdr 0 len t_hdr
+  put g_cnt 0 0
+  put g_cnt 1 0
+
+  r = test_positives
+  if ne r 0
+    ret r
+  end
+  r = test_negatives
+  if ne r 0
+    ret r
+  end
+
+  w = write 1 t_pass 0 len t_pass
+  w_num get g_cnt 0
+  w = write 1 t_ctrl 0 len t_ctrl
+  w_num get g_cnt 1
+  w = write 1 t_nl 0 len t_nl
+  ret 0
+end
