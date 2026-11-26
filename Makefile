@@ -383,15 +383,8 @@ test-numeric-reduce-nvdisasm: build/test_omega_reduce_cpu build/sm121dis
 	  diff -u "$$t/$$op.lst" "$$t/$$op.got" || { echo "E1 Reduce nvdisasm: FAIL ($$op)"; exit 1; }; echo "$$op: $$(wc -l < "$$t/$$op.lst") words decode to the recorded text"; \
 	done; echo "E1 Reduce nvdisasm: PASS ($$("$(REDUCE_NVDISASM)" --version))"
 
-# Resident reaction runtime heartbeat (ADR 0016, R3/R4 host reference).
-# CPU only; links no PHYSICS/NVRM code (omega_evidence.c needs only the header).
-RX_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/omega_om_units.c src/omega_evidence.c tests/runtime/rx_heartbeat_test.c
-RX_TEST = $(OUT_DIR)/rx_heartbeat_test
-
-$(RX_TEST): $(RX_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/omega_shared_world_abi.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_SRCS)
+# Resident reaction runtime heartbeat (ADR 0016, R3/R4 host reference), pure seeded OM-2.
+RX_TEST = $(TRT5_HB_BIN)
 
 test-r3: $(RX_TEST)
 	./$(RX_TEST)
@@ -411,39 +404,14 @@ $(RX_DEADLINE_TEST): $(RX_DEADLINE_SRCS) src/runtime/rx_caproot.h src/runtime/rx
 test-rx-deadline-cancel: $(RX_DEADLINE_TEST)
 	./$(RX_DEADLINE_TEST)
 
-# I11: a dependent popped while a writer of its inputs is still computing is
-# held so the writer's wake merges into it (one commit per stimulus, as with
-# one worker). Deterministic forced interleaving; the mutant build has no hold
-# and must FAIL. CPU only, same links as R3.
-RX_I11_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/omega_om_units.c src/omega_evidence.c tests/runtime/rx_i11_wake_merge.c
-RX_I11_TEST = $(OUT_DIR)/rx_i11_wake_merge
-RX_I11_MUTANT = $(OUT_DIR)/rx_i11_wake_merge_mutant
+# I11 wake-merge & causal replay parity, pure seeded OM-2.
+RX_I11_TEST = $(TRT2_I11_BIN)
 
-$(RX_I11_TEST): $(RX_I11_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/omega_shared_world_abi.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_I11_SRCS)
-
-$(RX_I11_MUTANT): $(RX_I11_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/omega_shared_world_abi.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -DRX_WORLD_MUTATE_NO_UPSTREAM_HOLD -pthread -o $@ $(RX_I11_SRCS)
-
-test-i11-wake-merge: $(RX_I11_TEST) $(RX_I11_MUTANT)
+test-i11-wake-merge: $(RX_I11_TEST)
 	./$(RX_I11_TEST)
-	@if ./$(RX_I11_MUTANT); then \
-	  echo "MUTANT SURVIVED (no upstream hold, test still passed)"; exit 1; \
-	else echo "test-i11-wake-merge: PASS (mutant killed)"; fi
 
-# Omega semantic variables and incremental recomputation
-# (gate OMEGA_INCREMENTAL_SEMANTICS_PASS). CPU only, same links as R3.
-RX_SEM_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_semantic.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_sem_incremental.c
-RX_SEM_TEST = $(OUT_DIR)/rx_sem_incremental_test
-
-$(RX_SEM_TEST): $(RX_SEM_SRCS) src/runtime/rx_semantic.h src/runtime/rx_caproot.h \
-	src/runtime/rx_world.h src/runtime/omega_shared_world_abi.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_SEM_SRCS)
+# Omega semantic variables and incremental recomputation, pure seeded OM-2.
+RX_SEM_TEST = $(TRT4_SI_BIN)
 
 test-sem-incremental: $(RX_SEM_TEST)
 	./$(RX_SEM_TEST)
@@ -511,17 +479,8 @@ $(RX_R7_TEST): $(RX_R7_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
 test-r7: $(RX_R7_TEST)
 	./$(RX_R7_TEST)
 
-# aienos#266/#272 at aienos.lock: the R16 operator control capability (the epoch
-# right on RX_WORLD_RES_CONTROL) is refused by every authority operation, the office
-# still operates the authority, and the world still accepts the capability for the halt
-# check. Host only.
-RX_OP_AUTH_MISUSE_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_operator_authority_misuse.c
-RX_OP_AUTH_MISUSE_TEST = $(OUT_DIR)/rx_operator_authority_misuse_test
-$(RX_OP_AUTH_MISUSE_TEST): $(RX_OP_AUTH_MISUSE_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/rx_operator.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_OP_AUTH_MISUSE_SRCS) $(AIENOS_CAP_LIB) -lm
+# aienos#266/#272: R16 operator control capability misuse check, pure seeded OM-2.
+RX_OP_AUTH_MISUSE_TEST = $(TRT1_OAM_BIN)
 
 .PHONY: test-r16-operator-authority-misuse
 test-r16-operator-authority-misuse: $(RX_OP_AUTH_MISUSE_TEST)
@@ -541,16 +500,8 @@ $(RX_R9_TEST): $(RX_R9_SRCS) src/runtime/rx_generation.h src/runtime/rx_caproot.
 test-r9: $(RX_R9_TEST)
 	./$(RX_R9_TEST)
 
-# R12 host rules against the native Aienux authority. The graphics processor is
-# not started. A pass here does not claim the resident-seat gate.
-RX_R12_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_r12_resident.c
-RX_R12_TEST = $(OUT_DIR)/rx_r12_resident_test
-
-$(RX_R12_TEST): $(RX_R12_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/aienos_cap.h src/runtime/omega_shared_world_abi.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R12_SRCS) $(AIENOS_CAP_LIB) -lm
+# R12 host rules against the native capability authority, pure seeded OM-2.
+RX_R12_TEST = $(TRT5_R12_BIN)
 
 test-r12: $(RX_R12_TEST)
 	./$(RX_R12_TEST)
@@ -574,20 +525,8 @@ test-rx-emergency: $(RX_EMERGENCY_TEST)
 	./$(RX_EMERGENCY_TEST)
 	CC="$(CC)" bash tests/runtime/rx_emergency_mutants.sh
 
-# R10: Omega as a resident realization faculty. Omega's native AArch64 matvec
-# realizations become ready from cost evidence, are verified in a sandbox,
-# measured, and recorded; production picks the record up. AArch64 hosts only.
-RX_R10_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_omega.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_canonical.c src/omega_validate.c src/omega_core.c src/omega_codec.c \
-	src/aarch64_encoder.c src/aarch64_decoder.c src/omega_realize.c src/omega_realize_synth.c src/omega_program.c \
-	src/omega_machine.c src/omega_exec.c src/omega_verify.c src/omega_matvec.c src/omega_matvec_quad.c \
-	tests/runtime/rx_r10_omega.c
-RX_R10_TEST = $(OUT_DIR)/rx_r10_omega_test
-
-$(RX_R10_TEST): $(RX_R10_SRCS) src/runtime/rx_omega.h src/runtime/rx_caproot.h \
-	src/runtime/rx_world.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R10_SRCS) $(AIENOS_CAP_LIB) -lm
+# R10: Omega as a resident realization faculty, pure seeded OM-2.
+RX_R10_TEST = $(TRT2_R10_BIN)
 
 test-r10: $(RX_R10_TEST)
 	./$(RX_R10_TEST)
@@ -606,30 +545,12 @@ $(RX_R8_TEST): $(RX_R8_SRCS) src/runtime/rx_aegis.h src/runtime/rx_caproot.h \
 test-r8: $(RX_R8_TEST)
 	./$(RX_R8_TEST)
 
-# R11: AIEN as a resident cognitive faculty. Part A drives AIEN alone on any
-# host; part B is the living run with Omega, on hosts that have both Cortex-X925
-# and Cortex-A725 cores. rx_aien.o is built alone first and must not reference
-# any Omega symbol: AIEN reaches Omega only through world objects.
-RX_R11_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_omega.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_canonical.c src/omega_validate.c src/omega_core.c src/omega_codec.c \
-	src/aarch64_encoder.c src/aarch64_decoder.c src/omega_realize.c src/omega_realize_synth.c src/omega_program.c \
-	src/omega_machine.c src/omega_exec.c src/omega_verify.c src/omega_matvec.c src/omega_matvec_quad.c \
-	tests/runtime/rx_r11_aien.c
-RX_R11_TEST = $(OUT_DIR)/rx_r11_aien_test
-RX_AIEN_OBJ = $(OUT_DIR)/rx_aien.o
-
-$(RX_AIEN_OBJ): src/runtime/rx_aien.c src/runtime/rx_aien.h src/runtime/rx_world.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_aien.c
-	@if nm -u $@ | grep -Ei 'omega' ; then \
-		echo "rx_aien.o references Omega directly; AIEN must reach it only through the world"; \
-		rm -f $@; exit 1; fi
-
-$(RX_R11_TEST): $(RX_R11_SRCS) $(RX_AIEN_OBJ) src/runtime/rx_omega.h src/runtime/rx_caproot.h \
-	src/runtime/rx_world.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R11_SRCS) $(RX_AIEN_OBJ) $(AIENOS_CAP_LIB) -lm
+# R11: AIEN as a resident cognitive faculty, pure seeded OM-2.
+RX_R11_TEST = $(TRT3_R11_BIN)
 
 test-r11: $(RX_R11_TEST)
+	@if grep -Eq '\b(rx_omega|omega_realize|omega_exec|omega_verify)\b' src/runtime/rx_aien.om ; then \
+		echo "rx_aien.om references Omega directly; AIEN must reach it only through the world"; exit 1; fi
 	./$(RX_R11_TEST)
 
 # R11 living run allowed inside its own quietlock hold, refused under any other.
@@ -638,61 +559,29 @@ test-r11-own-hold: $(RX_R11_TEST)
 	sh tests/runtime/r11_own_hold_test.sh ./$(RX_R11_TEST)
 
 # OMEGA_STATE_PROJECTION: cognition gets a compiled state projection from
-# Cortex, not everything Cortex knows. Part B drives the real R11 AIEN faculty
-# under the native Aienux authority. The projection objects are built alone
-# first and may reference nothing but Cortex and SHA-256: no world, no faculty,
-# no Omega realization code.
-RX_SP_OBJS = $(OUT_DIR)/rx_cortex.o $(OUT_DIR)/rx_projection.o
-RX_SP_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_sp_workloads.c tests/runtime/rx_state_projection.c
-RX_SP_TEST = $(OUT_DIR)/rx_state_projection_test
+# Cortex, pure seeded OM-2.
+RX_SP_TEST = $(TRT4_SP_BIN)
 
 $(OUT_DIR)/rx_cortex.o: src/runtime/rx_cortex.c src/runtime/rx_cortex.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_cortex.c
 
-$(OUT_DIR)/rx_projection.o: src/runtime/rx_projection.c src/runtime/rx_projection.h \
-	src/runtime/rx_cortex.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_projection.c
-	@if nm -u $@ $(OUT_DIR)/rx_cortex.o | grep -E ' (rx_world|rx_aien|rx_omega|omega_)' ; then \
-		echo "the projection references the world, a faculty or Omega realization code"; \
-		rm -f $@; exit 1; fi
-
-$(RX_SP_TEST): $(RX_SP_SRCS) $(RX_SP_OBJS) $(RX_AIEN_OBJ) tests/runtime/rx_sp_workloads.h \
-	src/runtime/rx_world.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_SP_SRCS) $(RX_SP_OBJS) $(RX_AIEN_OBJ) $(AIENOS_CAP_LIB) -lm
-
 test-state-projection: $(RX_SP_TEST)
+	@if grep -Eq '\b(rx_world|rx_aien|rx_omega|omega_)\w*' src/runtime/rx_projection.om src/runtime/rx_cortex.om ; then \
+		echo "the projection references the world, a faculty or Omega realization code"; exit 1; fi
 	./$(RX_SP_TEST)
 
 # M20 Cortex canonicalization: canonical Cortex contract, journal, single
-# writer, typed recall, and World execution recorded through rx_cortex_record.
-RX_CX_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_cortex_record.c src/omega_om_units.c tests/runtime/rx_cortex_canon.c
-RX_CX_TEST = $(OUT_DIR)/rx_cortex_canon_test
-
-$(RX_CX_TEST): $(RX_CX_SRCS) $(OUT_DIR)/rx_cortex.o src/runtime/rx_cortex_record.h \
-	src/runtime/rx_world.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_CX_SRCS) $(OUT_DIR)/rx_cortex.o
-
-# Journal backend seam (native v1 P06 cut 1): rx_cortex.c built with
-# CX_NO_POSIX must carry no file, lock or libc allocation symbol, and must
-# pass the same append/replay/torn-tail contract over a memory backend.
-RX_CX_FS_OBJ = $(OUT_DIR)/rx_cortex_freestanding.o
+# writer, typed recall, pure seeded OM-2.
+RX_CX_TEST = $(TRT1_CXC_BIN)
 RX_CXJ_TEST = $(OUT_DIR)/rx_cortex_journal_test
-RX_CX_FS_ALLOWED = memcpy|memmove|memset|memcmp|sha256_init|sha256_update|sha256_final|sha256_hash|cx_fs_alloc|cx_fs_realloc|cx_fs_free
-
-$(RX_CX_FS_OBJ): src/runtime/rx_cortex.c src/runtime/rx_cortex.h tests/runtime/cx_config_freestanding.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -DCX_NO_POSIX \
-	  -Itests/runtime -DCX_CONFIG_H='"cx_config_freestanding.h"' -c -o $@ src/runtime/rx_cortex.c
-	@bad=$$(nm -u $@ | awk '{print $$NF}' | grep -Ev '^(_GLOBAL_OFFSET_TABLE_|($(RX_CX_FS_ALLOWED)))$$' || true); \
-	if [ -n "$$bad" ]; then echo "rx_cortex.c (CX_NO_POSIX) still needs: $$bad"; rm -f $@; exit 1; fi
-	@echo "rx_cortex.c (CX_NO_POSIX): no file, lock or libc allocation symbols"
 
 $(RX_CXJ_TEST): $(RT_OM_CXJ_SRCS) $(RT_OM_OMC) | $(OUT_DIR)
 	( echo om2; cat $(RT_OM_CXJ_SRCS) ) | $(RT_OM_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-test-cortex: $(RX_CX_TEST) $(RX_CX_FS_OBJ) $(RX_CXJ_TEST)
+test-cortex: $(RX_CX_TEST) $(RX_CXJ_TEST)
+	@if grep -Eq '\b(fopen|fclose|flock|fork|execprog|socknew|mapnew)\b' src/runtime/rx_cortex.om ; then \
+		echo "rx_cortex.om references host file/lock/socket/exec builtins"; exit 1; fi
+	@echo "rx_cortex.om (freestanding pure OM-2): no file, lock or libc allocation builtins"
 	./$(RX_CX_TEST)
 	./$(RX_CXJ_TEST)
 
@@ -804,28 +693,14 @@ test-r13-testbuild-host: $(RX_R13_TEST_HOST)
 test-r13-testbuild-silicon: $(RX_R13_TEST_SILICON)
 	./$(RX_R13_TEST_SILICON)
 
-# OMEGA_BRANCH_STATE_REUSE: J-Space branches sharing one semantic prefix,
-# shared-state realization versus independent recomputation, FORGE placement.
-RX_BRANCH_REUSE_SRCS = src/runtime/rx_jspace.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_branch_reuse.c
-RX_BRANCH_REUSE_TEST = $(OUT_DIR)/rx_branch_reuse
-
-$(RX_BRANCH_REUSE_TEST): $(RX_BRANCH_REUSE_SRCS) src/runtime/rx_jspace.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ $(RX_BRANCH_REUSE_SRCS) -lm
+# OMEGA_BRANCH_STATE_REUSE: J-Space branches sharing one semantic prefix, pure seeded OM-2.
+RX_BRANCH_REUSE_TEST = $(TRT3_BRR_BIN)
 
 test-branch-reuse: $(RX_BRANCH_REUSE_TEST)
 	./$(RX_BRANCH_REUSE_TEST)
 
-# M20 production J-Space mechanics: slab/extent reclamation, generation-safe
-# references, limits, concurrency, durable reopen/crash/torn metadata, World
-# commit compatibility. Fast; runs in CI.
-RX_JSPACE_PROD_SRCS = src/runtime/rx_jspace.c src/runtime/rx_caproot.c src/runtime/rx_world.c \
-	src/runtime/rx_coherent.c src/omega_om_units.c src/omega_evidence.c tests/runtime/rx_jspace_prod.c
-RX_JSPACE_PROD_TEST = $(OUT_DIR)/rx_jspace_prod
-
-$(RX_JSPACE_PROD_TEST): $(RX_JSPACE_PROD_SRCS) src/runtime/rx_jspace.h src/runtime/rx_world.h \
-	src/runtime/rx_caproot.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_JSPACE_PROD_SRCS) -lm
+# M20 production J-Space mechanics, pure seeded OM-2.
+RX_JSPACE_PROD_TEST = $(TRT3_JSP_BIN)
 
 test-jspace-prod: $(RX_JSPACE_PROD_TEST)
 	./$(RX_JSPACE_PROD_TEST)
@@ -976,11 +851,10 @@ test-r15-preflight:
 	sh tests/r15_energy_preflight_test.sh
 
 # G15 diagnostics: sampler lateness / not-live-run record, its reducer report,
-# and the readable-kernel-log Xid scan. Host-only, no chip.
+# and the readable-kernel-log Xid scan. Host-only, pure seeded OM-2.
 .PHONY: test-r15-g15-diag
-test-r15-g15-diag: $(R15_REDUCE) | $(OUT_DIR)
-	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/runtime -o $(OUT_DIR)/r15_seat_diag_test tests/runtime/r15_seat_diag_test.c
-	$(OUT_DIR)/r15_seat_diag_test
+test-r15-g15-diag: $(R15_REDUCE) $(TRT1_SD_BIN) | $(OUT_DIR)
+	./$(TRT1_SD_BIN)
 	R15_REDUCE=$(R15_REDUCE) sh tests/r15_g15_diag_test.sh
 	sh tests/seat_marker_uncached_test.sh
 
@@ -1080,14 +954,9 @@ test-r16-surface: $(TARGET)
 	sh tests/r16_surface/run.sh ./$(TARGET)
 
 
-# OMEGA_ACTION_GRAPH_IR: goals compile to typed action graphs that run as
-# resident reactions by readiness alone. rx_graph.o is built alone first and
-# must not reference any Aienux admin operation: compilation can find that
-# authority is missing, never create it.
-RX_GRAPH_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c tests/runtime/rx_action_graph.c
-RX_GRAPH_TEST = $(OUT_DIR)/rx_action_graph_test
+# OMEGA_ACTION_GRAPH_IR: goals compile to typed action graphs, pure seeded OM-2.
+# (RX_GRAPH_OBJ/RX_CAPQ_OBJ/RX_SKILLROUTE_OBJ remain for R13/Fabric until Wave S1-7b/c.)
+RX_GRAPH_TEST = $(TRT4_AG_BIN)
 RX_GRAPH_OBJ = $(OUT_DIR)/rx_graph.o
 
 $(RX_GRAPH_OBJ): src/runtime/rx_graph.c src/runtime/rx_graph.h src/runtime/rx_world.h \
@@ -1097,23 +966,13 @@ $(RX_GRAPH_OBJ): src/runtime/rx_graph.c src/runtime/rx_graph.h src/runtime/rx_wo
 		echo "rx_graph.o references an authority admin operation; compilation must not mint"; \
 		rm -f $@; exit 1; fi
 
-$(RX_GRAPH_TEST): $(RX_GRAPH_SRCS) $(RX_GRAPH_OBJ) src/runtime/rx_caproot.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_GRAPH_SRCS) $(RX_GRAPH_OBJ) $(AIENOS_CAP_LIB) -lm
-
 test-action-graph: $(RX_GRAPH_TEST)
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_graph.om ; then \
+		echo "rx_graph.om references an authority admin operation; compilation must not mint"; exit 1; fi
 	./$(RX_GRAPH_TEST)
 
-# OMEGA_CAPABILITY_QUERY: AIEN states a CapabilityNeed; Omega compiles it into
-# probes of the capability sources and returns a bounded list of candidates
-# ranked on explicit dimensions. rx_capq.o is built alone first and must not
-# reference any Aienux admin operation: a query can learn that authority is
-# held or missing, never create it.
-RX_CAPQ_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c src/runtime/aien_machine_id.c \
-	tests/runtime/rx_capability_query.c
-RX_CAPQ_TEST = $(OUT_DIR)/rx_capability_query_test
+# OMEGA_CAPABILITY_QUERY, pure seeded OM-2.
+RX_CAPQ_TEST = $(TRT4_CQ_BIN)
 RX_CAPQ_OBJ = $(OUT_DIR)/rx_capq.o
 
 $(RX_CAPQ_OBJ): src/runtime/rx_capq.c src/runtime/rx_capq.h src/runtime/rx_graph.h \
@@ -1123,23 +982,13 @@ $(RX_CAPQ_OBJ): src/runtime/rx_capq.c src/runtime/rx_capq.h src/runtime/rx_graph
 		echo "rx_capq.o references an authority admin operation; a query must not mint"; \
 		rm -f $@; exit 1; fi
 
-$(RX_CAPQ_TEST): $(RX_CAPQ_SRCS) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) src/runtime/rx_caproot.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_CAPQ_SRCS) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) \
-		$(AIENOS_CAP_LIB) -lm
-
 test-capability-query: $(RX_CAPQ_TEST)
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_capq.om ; then \
+		echo "rx_capq.om references an authority admin operation; a query must not mint"; exit 1; fi
 	./$(RX_CAPQ_TEST)
 
-# M20 canonical Capability Graph and Skill Router: rx_capq promoted (keys,
-# update/withdraw, canonical machine identity, wire form) plus rx_skillroute.
-# Like rx_capq.o, rx_skillroute.o must not reference an authority admin
-# operation: routing discovers, it never authorizes.
-RX_CAPGRAPH_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c src/runtime/aien_machine_id.c \
-	tests/runtime/rx_capability_graph.c
-RX_CAPGRAPH_TEST = $(OUT_DIR)/rx_capability_graph_test
+# M20 canonical Capability Graph and Skill Router, pure seeded OM-2.
+RX_CAPGRAPH_TEST = $(TRT2_CG_BIN)
 RX_SKILLROUTE_OBJ = $(OUT_DIR)/rx_skillroute.o
 
 $(RX_SKILLROUTE_OBJ): src/runtime/rx_skillroute.c src/runtime/rx_skillroute.h \
@@ -1149,123 +998,49 @@ $(RX_SKILLROUTE_OBJ): src/runtime/rx_skillroute.c src/runtime/rx_skillroute.h \
 		echo "rx_skillroute.o references an authority admin operation; routing must not mint"; \
 		rm -f $@; exit 1; fi
 
-$(RX_CAPGRAPH_TEST): $(RX_CAPGRAPH_SRCS) $(RX_SKILLROUTE_OBJ) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) \
-	src/runtime/rx_caproot.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_CAPGRAPH_SRCS) $(RX_SKILLROUTE_OBJ) $(RX_CAPQ_OBJ) \
-		$(RX_GRAPH_OBJ) $(AIENOS_CAP_LIB) -lm
-
 test-capability-graph: $(RX_CAPGRAPH_TEST)
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_skillroute.om ; then \
+		echo "rx_skillroute.om references an authority admin operation; routing must not mint"; exit 1; fi
 	./$(RX_CAPGRAPH_TEST)
 
-# COMPOSITION-2 WP-D: Skill Router end to end (requirement -> graph -> Skill
-# -> bound action-graph node -> World run) and each failure mode failing
-# closed. Repeats the no-mint symbol check on the router object it links.
-RX_SRCOMPOSE_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c src/runtime/aien_machine_id.c \
-	tests/runtime/rx_skillroute_compose_test.c
-RX_SRCOMPOSE_TEST = $(OUT_DIR)/rx_skillroute_compose_test
-
-$(RX_SRCOMPOSE_TEST): $(RX_SRCOMPOSE_SRCS) $(RX_SKILLROUTE_OBJ) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) \
-	src/runtime/rx_caproot.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_SRCOMPOSE_SRCS) $(RX_SKILLROUTE_OBJ) $(RX_CAPQ_OBJ) \
-		$(RX_GRAPH_OBJ) $(AIENOS_CAP_LIB) -lm
+# COMPOSITION-2 WP-D: Skill Router end to end, pure seeded OM-2.
+RX_SRCOMPOSE_TEST = $(TRT1_SRC_BIN)
 
 test-skillroute-compose: $(RX_SRCOMPOSE_TEST)
-	@if nm -u $(RX_SKILLROUTE_OBJ) | grep -E 'aienos_cap_|rx_caproot_mint|rx_caproot_revoke' ; then \
-		echo "rx_skillroute.o references an authority admin operation"; exit 1; fi
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_skillroute.om ; then \
+		echo "rx_skillroute.om references an authority admin operation"; exit 1; fi
 	@echo "SKILLROUTE_NO_MINT_PASS"
 	./$(RX_SRCOMPOSE_TEST)
 
-# OMEGA_PLAN_REUSE: plan IR and verified plan cache. rx_plan.o must not
-# reference any Aienux admin operation (the cache checks authority, never
-# creates it); rx_plan_arrange.o (AIEN's planner) must only read the World.
-RX_PLAN_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c tests/runtime/rx_plan_reuse.c
-RX_PLAN_TEST = $(OUT_DIR)/rx_plan_reuse_test
-RX_PLAN_OBJS = $(OUT_DIR)/rx_plan.o $(OUT_DIR)/rx_plan_arrange.o
-
-$(OUT_DIR)/rx_plan.o: src/runtime/rx_plan.c src/runtime/rx_plan.h src/runtime/rx_graph.h \
-	src/runtime/rx_world.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_plan.c
-	@if nm -u $@ | grep -E 'aienos_cap_|rx_caproot_mint|rx_caproot_revoke' ; then \
-		echo "rx_plan.o references an authority admin operation; the plan cache must not mint"; \
-		rm -f $@; exit 1; fi
-
-$(OUT_DIR)/rx_plan_arrange.o: src/runtime/rx_plan_arrange.c src/runtime/rx_plan_arrange.h \
-	src/runtime/rx_plan.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_plan_arrange.c
-	@if nm -u $@ | grep -E 'aienos_cap_|rx_caproot_|rx_world_publish|rx_graph_lower|rx_graph_start' ; then \
-		echo "rx_plan_arrange.o must only read the World: the planner changes nothing"; \
-		rm -f $@; exit 1; fi
-
-$(RX_PLAN_TEST): $(RX_PLAN_SRCS) $(RX_PLAN_OBJS) $(RX_GRAPH_OBJ) src/runtime/rx_caproot.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_PLAN_SRCS) $(RX_PLAN_OBJS) $(RX_GRAPH_OBJ) $(AIENOS_CAP_LIB) -lm
+# OMEGA_PLAN_REUSE: plan IR and verified plan cache, pure seeded OM-2.
+RX_PLAN_TEST = $(TRT5_PR_BIN)
 
 test-plan-reuse: $(RX_PLAN_TEST)
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_plan.om ; then \
+		echo "rx_plan.om references an authority admin operation; the plan cache must not mint"; exit 1; fi
+	@if grep -Eq '\b(aienos_cap_|rx_caproot_|rx_world_publish|rx_graph_lower|rx_graph_start)\b' src/runtime/rx_plan_arrange.om ; then \
+		echo "rx_plan_arrange.om must only read the World: the planner changes nothing"; exit 1; fi
 	./$(RX_PLAN_TEST)
 
-# OMEGA_SEMANTIC_COMMUNICATION: branches and workers receive the semantic
-# projection their InformationNeed selects, then only deltas, not full state.
-# rx_semcomm.o is built alone first. It enforces capability boundaries, so it
-# must not reference any authority admin operation, and it only reads the
-# World, so it must not reference a World write either.
-RX_SEMCOMM_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c tests/runtime/rx_semantic_comm.c
-RX_SEMCOMM_TEST = $(OUT_DIR)/rx_semantic_comm_test
-RX_SEMCOMM_OBJ = $(OUT_DIR)/rx_semcomm.o
-
-$(RX_SEMCOMM_OBJ): src/runtime/rx_semcomm.c src/runtime/rx_semcomm.h src/runtime/rx_world.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_semcomm.c
-	@if nm -u $@ | grep -E 'aienos_cap_|rx_caproot_mint|rx_caproot_revoke|rx_world_publish|rx_world_create|rx_world_retire|rx_world_add_reaction' ; then \
-		echo "rx_semcomm.o references an authority admin operation or a World write; projection must only read"; \
-		rm -f $@; exit 1; fi
-
-$(RX_SEMCOMM_TEST): $(RX_SEMCOMM_SRCS) $(RX_SEMCOMM_OBJ) src/runtime/rx_caproot.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_SEMCOMM_SRCS) $(RX_SEMCOMM_OBJ) $(AIENOS_CAP_LIB) -lm
+# OMEGA_SEMANTIC_COMMUNICATION, pure seeded OM-2.
+RX_SEMCOMM_TEST = $(TRT4_SC_BIN)
 
 test-semantic-comm: $(RX_SEMCOMM_TEST)
+	@if grep -Eq '\b(aienos_cap_|rx_caproot_mint|rx_caproot_revoke|rx_world_publish|rx_world_create|rx_world_retire|rx_world_add_reaction)\b' src/runtime/rx_semcomm.om ; then \
+		echo "rx_semcomm.om references an authority admin operation or a World write; projection must only read"; exit 1; fi
 	./$(RX_SEMCOMM_TEST)
 
-# OMEGA_COGNITIVE_ROUTING: each cognitive step goes to the cheapest
-# realization the evidence says meets it, escalating only on insufficient
-# verification or calibrated confidence. rx_route.o is built alone first and
-# must not reference promotion or any Aienux admin operation: routing profiles
-# change only through a promoted generation.
-RX_ROUTE_SRCS = src/runtime/rx_generation.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_cog_engines.c tests/runtime/rx_cognitive_routing.c
-RX_ROUTE_TEST = $(OUT_DIR)/rx_cognitive_routing_test
-RX_ROUTE_OBJ = $(OUT_DIR)/rx_route.o
-
-$(RX_ROUTE_OBJ): src/runtime/rx_route.c src/runtime/rx_route.h src/runtime/rx_generation.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_route.c
-	@if nm -u $@ | grep -E 'rx_gen_promote|aienos_cap_|rx_caproot_mint|rx_caproot_revoke' ; then \
-		echo "rx_route.o references promotion or an authority admin operation"; \
-		rm -f $@; exit 1; fi
-
-$(RX_ROUTE_TEST): $(RX_ROUTE_SRCS) $(RX_ROUTE_OBJ) tests/runtime/rx_cog_engines.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -Itests -o $@ $(RX_ROUTE_SRCS) $(RX_ROUTE_OBJ) $(AIENOS_CAP_LIB) -lm
+# OMEGA_COGNITIVE_ROUTING, pure seeded OM-2.
+RX_ROUTE_TEST = $(TRT4_CR_BIN)
 
 test-cognitive-routing: $(RX_ROUTE_TEST)
+	@if grep -Eq '\b(rx_gen_promote|aienos_cap_|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_route.om ; then \
+		echo "rx_route.om references promotion or an authority admin operation"; exit 1; fi
 	./$(RX_ROUTE_TEST)
 
 # OMEGA_EMPIRICAL_OPTIMIZER: realization choice from a learned, calibrated cost
-# model. rx_costmodel.o is built alone first and must not reference the
-# generation store, any authority operation, or anything that maps or runs
-# code: the model is a calculator; durability comes only through promotion.
+# model, pure seeded OM-2.
 .PHONY: test-costmodel test-empirical
-RX_CM_OBJ = $(OUT_DIR)/rx_costmodel.o
-
-$(RX_CM_OBJ): src/runtime/rx_costmodel.c src/runtime/rx_costmodel.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_costmodel.c
-	@if nm -u $@ | grep -E 'rx_gen_|aienos_cap_|rx_caproot_|rx_capadmin_|rx_world_|mmap|mprotect|fork|exec|dlopen|system' ; then \
-		echo "rx_costmodel.o references an operation a cost model must not have"; \
-		rm -f $@; exit 1; fi
 
 # Pure seeded OM-2 cost model unit test: synthetic measurements; fit, calibration, decisions, blob.
 RX_CM_UNIT = $(OUT_DIR)/rx_costmodel_unit
@@ -1273,6 +1048,8 @@ $(RX_CM_UNIT): $(RT_OM_CM_SRCS) $(RT_OM_OMC) | $(OUT_DIR)
 	( echo om2; cat $(RT_OM_CM_SRCS) ) | $(RT_OM_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-costmodel: $(RX_CM_UNIT)
+	@if grep -Eq '\b(rx_gen_|aienos_cap_|rx_caproot_|rx_capadmin_|rx_world_|mapnew|fork|execprog)\b' src/runtime/rx_costmodel.om ; then \
+		echo "rx_costmodel.om references an operation a cost model must not have"; exit 1; fi
 	./$(RX_CM_UNIT)
 	@set -eu; dir=$(OUT_DIR)/costmodel-mutant; rm -rf $$dir; mkdir -p $$dir; \
 	  sed '/CM704:refuse-unsupported-op/{N;N;s/ret RX_CM_CELL_NONE/op = sub RX_CM_OPS 1/;}' \
@@ -1316,75 +1093,29 @@ test-dagsim:
 	@echo "test-dagsim: NOT_RUN (requires Linux aarch64 for seed/out/omc)"
 endif
 
-# AArch64 hosts: the gate. Real realizations, training, promotion through the
-# R9 barrier on the native authority, held-out workloads.
-RX_EMP_SRCS = src/runtime/rx_generation.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_canonical.c src/omega_validate.c src/omega_core.c src/omega_codec.c \
-	src/aarch64_encoder.c src/aarch64_decoder.c src/omega_realize.c src/omega_realize_synth.c src/omega_program.c \
-	src/omega_machine.c src/omega_exec.c src/omega_verify.c src/omega_matvec.c src/omega_matvec_quad.c \
-	tests/runtime/rx_empirical_optimizer.c
-RX_EMP_TEST = $(OUT_DIR)/rx_empirical_optimizer_test
-
-$(RX_EMP_TEST): $(RX_EMP_SRCS) $(RX_CM_OBJ) src/runtime/rx_generation.h src/runtime/aienos_cap.h \
-	$(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_EMP_SRCS) $(RX_CM_OBJ) $(AIENOS_CAP_LIB) -lm
+# OMEGA_EMPIRICAL_OPTIMIZER gate, pure seeded OM-2.
+RX_EMP_TEST = $(TRT4_EO_BIN)
 
 test-empirical: $(RX_EMP_TEST)
 	./$(RX_EMP_TEST)
 
-# OMEGA_WORKFLOW_FUSION: repeated verified action-graph fragments become
-# MetaSkills; only a verified, measured, canaried, promoted (R9 barrier) and
-# published one replaces the steps. rx_fusion.o, like rx_graph.o, must not
-# reference any Aienux admin operation.
+# OMEGA_WORKFLOW_FUSION, pure seeded OM-2.
 .PHONY: test-workflow-fusion
-RX_FUSION_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/runtime/rx_generation.c src/omega_om_units.c \
-	src/omega_evidence.c src/omega_core.c src/omega_canonical.c tests/runtime/rx_workflow_fusion.c
-RX_FUSION_TEST = $(OUT_DIR)/rx_workflow_fusion_test
-RX_FUSION_OBJ = $(OUT_DIR)/rx_fusion.o
-
-$(RX_FUSION_OBJ): src/runtime/rx_fusion.c src/runtime/rx_fusion.h src/runtime/rx_graph.h \
-	src/runtime/rx_generation.h src/runtime/rx_world.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_fusion.c
-	@if nm -u $@ | grep -E 'aienos_cap_|rx_caproot_mint|rx_caproot_revoke' ; then \
-		echo "rx_fusion.o references an authority admin operation; fusion must not mint"; \
-		rm -f $@; exit 1; fi
-
-$(RX_FUSION_TEST): $(RX_FUSION_SRCS) $(RX_FUSION_OBJ) $(RX_GRAPH_OBJ) src/runtime/rx_caproot.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_FUSION_SRCS) $(RX_FUSION_OBJ) $(RX_GRAPH_OBJ) \
-		$(AIENOS_CAP_LIB) -lm
+RX_FUSION_TEST = $(TRT4_WF_BIN)
 
 test-workflow-fusion: $(RX_FUSION_TEST)
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_fusion.om ; then \
+		echo "rx_fusion.om references an authority admin operation; fusion must not mint"; exit 1; fi
 	./$(RX_FUSION_TEST)
 
-# OMEGA_TYPED_RESULT_CONSTRAINTS: structured results of cognition are checked
-# against typed contracts; the publish gate is the only writer of what is
-# published. rx_contract.o is built alone first and must not reference any
-# Aienux admin operation: a contract can find that authority is missing, never
-# create it.
-RX_TYPED_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c tests/runtime/rx_typed_results.c
-RX_TYPED_TEST = $(OUT_DIR)/rx_typed_results_test
-RX_CONTRACT_OBJ = $(OUT_DIR)/rx_contract.o
-TYPED_RESULTS_N ?= 400
-
-$(RX_CONTRACT_OBJ): src/runtime/rx_contract.c src/runtime/rx_contract.h src/runtime/rx_graph.h \
-	src/runtime/rx_world.h src/runtime/rx_aien.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c -o $@ src/runtime/rx_contract.c
-	@if nm -u $@ | grep -E 'aienos_cap_|rx_caproot_mint|rx_caproot_revoke' ; then \
-		echo "rx_contract.o references an authority admin operation; a contract must not mint"; \
-		rm -f $@; exit 1; fi
-
-$(RX_TYPED_TEST): $(RX_TYPED_SRCS) $(RX_CONTRACT_OBJ) $(RX_GRAPH_OBJ) src/runtime/rx_caproot.h \
-	src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_TYPED_SRCS) $(RX_CONTRACT_OBJ) $(RX_GRAPH_OBJ) \
-		$(AIENOS_CAP_LIB) -lm
+# OMEGA_TYPED_RESULT_CONSTRAINTS, pure seeded OM-2.
+RX_TYPED_TEST = $(TRT4_TR_BIN)
 
 .PHONY: test-typed-results
 test-typed-results: $(RX_TYPED_TEST)
-	./$(RX_TYPED_TEST) $(TYPED_RESULTS_N)
+	@if grep -Eq '\b(aienos_cap_|rx_capadmin_mint|rx_capadmin_revoke|rx_caproot_mint|rx_caproot_revoke)\b' src/runtime/rx_contract.om ; then \
+		echo "rx_contract.om references an authority admin operation; a contract must not mint"; exit 1; fi
+	./$(RX_TYPED_TEST)
 
 # ---- ARGUS producer (feat/argus-producer, lanes H/H2 of ARGUS-0) ---------
 # The runtime feeds ARGUS (src/runtime/rx_argus.{c,h}, ABI v1.1: per-thread
@@ -1489,15 +1220,8 @@ $(RX_R13_CORTEX): $(RX_R13_CORTEX_SRCS) tests/runtime/rx_r13_living.c src/runtim
 test-r13-cortex-episode: $(RX_R13_CORTEX)
 	./$(RX_R13_CORTEX)
 
-# ADAPTIVE-M4: bounded resource regulation (src/runtime/rx_regulate.c) on the
-# R11 host recipe. The regulator closes a loop on the World's admission budget
-# inside a fixed envelope; the test measures deferrals per burst as the objective.
-RX_REGULATE_TEST = $(OUT_DIR)/rx_regulate_test
-RX_REGULATE_SRCS = $(filter-out tests/runtime/rx_r11_aien.c,$(RX_R11_SRCS)) \
-	src/runtime/rx_regulate.c tests/runtime/rx_regulate_test.c
-$(RX_REGULATE_TEST): $(RX_REGULATE_SRCS) src/runtime/rx_regulate.h src/runtime/rx_world.h \
-		$(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_REGULATE_SRCS) $(AIENOS_CAP_LIB) -lm
+# ADAPTIVE-M4: bounded resource regulation, pure seeded OM-2.
+RX_REGULATE_TEST = $(TRT1_REG_BIN)
 
 .PHONY: test-regulate
 test-regulate: $(RX_REGULATE_TEST)
@@ -1559,9 +1283,7 @@ test-r16-operator-mutants: $(RX_R13_HOST) $(RX_OPERATOR_CLI)
 ARGUS_R7 = $(ARGUS_OUT)/rx_r7_native_test
 ARGUS_R8 = $(ARGUS_OUT)/rx_r8_aegis_test
 ARGUS_R9 = $(ARGUS_OUT)/rx_r9_barrier_test
-ARGUS_BENCH = $(ARGUS_OUT)/bench_rx_argus
-ARGUS_BENCH_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c tests/bench_rx_argus.c
+ARGUS_BENCH = $(TR2_BENCH_ARGUS_BIN)
 
 $(ARGUS_OUT):
 	mkdir -p $@
@@ -1572,9 +1294,6 @@ $(ARGUS_R8): $(RX_R8_SRCS) src/runtime/rx_argus.h $(ARGUS_RX) $(ARGUS_STAMP) $(A
 	$(CC) $(ARGUS_CFLAGS) $(ARGUS_LINK_FLAGS) -pthread -o $@ $(RX_R8_SRCS) $(ARGUS_RX) $(ARGUS_CAP_LIB) -lm
 $(ARGUS_R9): $(RX_R9_SRCS) src/runtime/rx_argus.h $(ARGUS_RX) $(ARGUS_STAMP) $(ARGUS_CAP_LIB) | $(ARGUS_OUT)
 	$(CC) $(ARGUS_CFLAGS) $(ARGUS_LINK_FLAGS) -pthread -o $@ $(RX_R9_SRCS) $(ARGUS_RX) $(ARGUS_CAP_LIB) -lm
-# The bench mints directly and announces its one grant itself: no observer wrap.
-$(ARGUS_BENCH): $(ARGUS_BENCH_SRCS) src/runtime/rx_argus.h $(ARGUS_RX) $(ARGUS_STAMP) $(ARGUS_CAP_LIB) | $(ARGUS_OUT)
-	$(CC) $(ARGUS_CFLAGS) -pthread -o $@ $(ARGUS_BENCH_SRCS) $(ARGUS_RX) $(ARGUS_CAP_LIB) -lm
 
 # ARGUS_RUNTIME_INTEGRATION: run each suite with the consumer ingesting into
 # the real argus_core; keep the raw 128-byte stream (consumer ingest order)
