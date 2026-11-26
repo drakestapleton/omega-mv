@@ -32,8 +32,14 @@
  * survives recording; a loser is never promoted.
  */
 #include "rx_compose_fixture.h"
+#include "omega_fs.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -699,6 +705,171 @@ static void t_symlink_confinement(void) {
     rmtree(real);
 }
 
+typedef struct {
+    Fx fx;
+    RxCompose c;
+    const char *dir;
+    atomic_int *ready;
+    int rc;
+} OpenRaceWorker;
+
+static OpenRaceWorker g_race[2];
+
+static void *open_race_thread(void *arg) {
+    OpenRaceWorker *w = arg;
+    atomic_fetch_add(w->ready, 1);
+    while (atomic_load(w->ready) < 2) {
+        /* spin briefly so both threads race on open_home */
+    }
+    w->rc = rx_compose_open(&w->c, w->dir, &w->fx.self, FX_SESSION, &w->fx.router,
+                            fx_contract, w->fx.admin, w->fx.view, 1);
+    return NULL;
+}
+
+static int has_stray_identity_tmp(const char *dir) {
+    DIR *dp = opendir(dir);
+    if (!dp) return 1;
+    int stray = 0;
+    struct dirent *e;
+    while ((e = readdir(dp))) {
+        if (strncmp(e->d_name, "machine.id.tmp.", 15) == 0) {
+            stray = 1;
+            break;
+        }
+    }
+    closedir(dp);
+    return stray;
+}
+
+static void t_concurrent_first_open_identity(void) {
+    printf("[*] concurrent first-open: atomic non-replacing identity install\n");
+    char d[240];
+    dir_for(d, sizeof d, "create_atomic");
+    int dfd = omega_fs_root_open(d, 1, 0700);
+    CHECK(dfd >= 0, "open create_atomic dir");
+    if (dfd >= 0) {
+        AienMachineId m1 = fx_mid(21), m2 = fx_mid(22), got;
+        CHECK(aien_mid_create_at(dfd, "machine.id", &m1) == AIEN_MID_OK,
+              "first create succeeds");
+        CHECK(aien_mid_create_at(dfd, "machine.id", &m2) == AIEN_MID_E_EXISTS,
+              "second non-replacing create returns AIEN_MID_E_EXISTS");
+        CHECK(aien_mid_load_at(dfd, "machine.id", &got) == AIEN_MID_OK &&
+                  aien_mid_equal(&got, &m1),
+              "winning identity preserved on EEXIST");
+
+        char sym[280], target[280];
+        snprintf(sym, sizeof sym, "%s/sym.id", d);
+        snprintf(target, sizeof target, "%s/absent_target", d);
+        CHECK(symlink(target, sym) == 0, "create dangling sym.id");
+        CHECK(aien_mid_create_at(dfd, "sym.id", &m1) == AIEN_MID_E_EXISTS,
+              "dangling symlink refused with AIEN_MID_E_EXISTS");
+        CHECK(access(target, F_OK) != 0, "dangling symlink target untouched");
+        CHECK(!has_stray_identity_tmp(d), "no stray temp files after create_at checks");
+        close(dfd);
+    }
+    rmtree(d);
+
+    /* Case A: two threads race to initialize the same fresh home with distinct identities. */
+    for (int round = 0; round < 16; round++) {
+        char rd[240], name[64];
+        snprintf(name, sizeof name, "race_diff_%d", round);
+        dir_for(rd, sizeof rd, name);
+        CHECK(mkdir(rd, 0700) == 0, "race diff %d mkdir", round);
+
+        memset(g_race, 0, sizeof g_race);
+        AienMachineId m1 = fx_mid((uint8_t)(30 + round * 2));
+        AienMachineId m2 = fx_mid((uint8_t)(31 + round * 2));
+        atomic_int ready = 0;
+        CHECK(fx_init_for(&g_race[0].fx, &m1) == 0 && fx_init_for(&g_race[1].fx, &m2) == 0,
+              "race diff %d fx_init_for", round);
+        CHECK(aienos_cap_start(&g_race[0].fx.admin, &g_race[0].fx.view) == 0 &&
+                  aienos_cap_start(&g_race[1].fx.admin, &g_race[1].fx.view) == 0,
+              "race diff %d aienos_cap_start", round);
+        g_race[0].dir = rd;
+        g_race[1].dir = rd;
+        g_race[0].ready = &ready;
+        g_race[1].ready = &ready;
+
+        pthread_t th[2];
+        CHECK(pthread_create(&th[0], NULL, open_race_thread, &g_race[0]) == 0, "pthread 0");
+        CHECK(pthread_create(&th[1], NULL, open_race_thread, &g_race[1]) == 0, "pthread 1");
+        pthread_join(th[0], NULL);
+        pthread_join(th[1], NULL);
+
+        int one_ok_one_id = (g_race[0].rc == RX_OK && g_race[1].rc == RX_ERR_IDENTITY) ||
+                            (g_race[1].rc == RX_OK && g_race[0].rc == RX_ERR_IDENTITY);
+        CHECK(one_ok_one_id, "race diff %d: rc0=%d rc1=%d", round, g_race[0].rc, g_race[1].rc);
+
+        int win = g_race[0].rc == RX_OK ? 0 : 1;
+        int lose = 1 - win;
+        for (int i = 0; i < 2; i++) {
+            if (g_race[i].rc == RX_OK) rx_compose_close(&g_race[i].c);
+            aienos_cap_stop(g_race[i].fx.admin, g_race[i].fx.view);
+            fx_free(&g_race[i].fx);
+        }
+
+        int vfd = omega_fs_root_open(rd, 0, 0);
+        AienMachineId stored;
+        CHECK(vfd >= 0 && aien_mid_load_at(vfd, "machine.id", &stored) == AIEN_MID_OK &&
+                  aien_mid_equal(&stored, win == 0 ? &m1 : &m2),
+              "race diff %d: persisted machine.id matches winner", round);
+        if (vfd >= 0) close(vfd);
+
+        Fx vf;
+        static RxCompose vc;
+        CHECK(fx_init_for(&vf, win == 0 ? &m1 : &m2) == 0, "winner fx_init");
+        CHECK(fx_open(&vf, &vc, rd, 1) == RX_OK, "race diff %d: winner reopens", round);
+        fx_close(&vf, &vc);
+        fx_free(&vf);
+
+        CHECK(fx_init_for(&vf, lose == 0 ? &m1 : &m2) == 0, "loser fx_init");
+        CHECK(fx_open(&vf, &vc, rd, 1) == RX_ERR_IDENTITY, "race diff %d: loser still refused",
+              round);
+        fx_free(&vf);
+
+        CHECK(!has_stray_identity_tmp(rd), "race diff %d: no stray temp files", round);
+        rmtree(rd);
+    }
+
+    /* Case B: same identity racing on fresh home never fails with RX_ERR_IDENTITY. */
+    for (int round = 0; round < 8; round++) {
+        char rd[240], name[64];
+        snprintf(name, sizeof name, "race_same_%d", round);
+        dir_for(rd, sizeof rd, name);
+        CHECK(mkdir(rd, 0700) == 0, "race same %d mkdir", round);
+
+        memset(g_race, 0, sizeof g_race);
+        AienMachineId m1 = fx_mid((uint8_t)(80 + round));
+        atomic_int ready = 0;
+        CHECK(fx_init_for(&g_race[0].fx, &m1) == 0 && fx_init_for(&g_race[1].fx, &m1) == 0,
+              "race same %d fx_init_for", round);
+        CHECK(aienos_cap_start(&g_race[0].fx.admin, &g_race[0].fx.view) == 0 &&
+                  aienos_cap_start(&g_race[1].fx.admin, &g_race[1].fx.view) == 0,
+              "race same %d aienos_cap_start", round);
+        g_race[0].dir = rd;
+        g_race[1].dir = rd;
+        g_race[0].ready = &ready;
+        g_race[1].ready = &ready;
+
+        pthread_t th[2];
+        CHECK(pthread_create(&th[0], NULL, open_race_thread, &g_race[0]) == 0, "pthread 0");
+        CHECK(pthread_create(&th[1], NULL, open_race_thread, &g_race[1]) == 0, "pthread 1");
+        pthread_join(th[0], NULL);
+        pthread_join(th[1], NULL);
+
+        int ok_and_lock = (g_race[0].rc == RX_OK && g_race[1].rc == RX_ERR_REPLAY) ||
+                          (g_race[1].rc == RX_OK && g_race[0].rc == RX_ERR_REPLAY);
+        CHECK(ok_and_lock, "race same %d: rc0=%d rc1=%d", round, g_race[0].rc, g_race[1].rc);
+        for (int i = 0; i < 2; i++) {
+            if (g_race[i].rc == RX_OK) rx_compose_close(&g_race[i].c);
+            aienos_cap_stop(g_race[i].fx.admin, g_race[i].fx.view);
+            fx_free(&g_race[i].fx);
+        }
+        CHECK(!has_stray_identity_tmp(rd), "race same %d: no stray temp files", round);
+        rmtree(rd);
+    }
+}
+
 int main(void) {
     snprintf(g_base, sizeof g_base, "/tmp/rx_compose_test.XXXXXX");
     if (!mkdtemp(g_base)) { perror("mkdtemp"); return 1; }
@@ -711,6 +882,7 @@ int main(void) {
     t_pending();
     t_refused_dir();
     t_symlink_confinement();
+    t_concurrent_first_open_identity();
     fx_free(&g_fx);
     rmtree(g_base);
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);

@@ -1668,14 +1668,18 @@ static int commit_u(JsSpace *s) {
     int fd = omega_fs_temp_name(tmp, sizeof tmp, "jspace.meta.tmp") == 0
                  ? omega_fs_open_regular_at(s->dir_fd, tmp, O_WRONLY | O_CREAT | O_EXCL, 0600)
                  : -1;
-    rc = fd < 0 ? JS_ERR_IO : JS_OK;
+    int tmp_created = fd >= 0;
+    rc = tmp_created ? JS_OK : JS_ERR_IO;
     if (rc == JS_OK) rc = write_all(fd, h, sizeof h);
     if (rc == JS_OK && body.n) rc = write_all(fd, body.p, body.n);
     if (rc == JS_OK && fsync(fd)) rc = JS_ERR_IO;
-    if (fd >= 0) close(fd);
-    if (rc == JS_OK && omega_fs_rename_at(s->dir_fd, tmp, "jspace.meta")) rc = JS_ERR_IO;
+    if (fd >= 0 && close(fd) != 0 && rc == JS_OK) rc = JS_ERR_IO;
+    if (rc == JS_OK) {
+        if (omega_fs_rename_at(s->dir_fd, tmp, "jspace.meta") != 0) rc = JS_ERR_IO;
+        else tmp_created = 0;
+    }
     if (rc == JS_OK && fsync(s->dir_fd)) rc = JS_ERR_IO;
-    if (rc != JS_OK && tmp[0]) omega_fs_unlink_at(s->dir_fd, tmp, 0);
+    if (rc != JS_OK && tmp_created) omega_fs_unlink_at(s->dir_fd, tmp, 0);
     free(body.p);
     if (rc != JS_OK) return rc;
 

@@ -1184,6 +1184,10 @@ Non-byte arrays and mismatched scalar types are error 7.
 | `renames A off n flags` | Rename the two paths in a packed list using `renameat2`; flag 1 refuses replacement. |
 | `link A off n` | Create a hard link from a packed two-path list (old, new). |
 | `symlnk A off n` | Create a symbolic link from a packed two-path list (target text, link path). |
+| `openat dirfd A off n flags mode` | Descriptor-relative `openat` using Linux flags/mode; returns fd or negative errno (program mode on Linux). |
+| `unlinkat dirfd A off n flags` | Descriptor-relative `unlinkat` on a checked component/relative path; returns 0 or negative errno (program mode on Linux). |
+| `renameat oldfd newfd A off n flags` | Descriptor-relative `renameat2` over a packed two-path list; returns 0 or negative errno (program mode on Linux). |
+| `fstatat dirfd A off n B off capacity flags` | Descriptor-relative `newfstatat`; writes the 128-byte ARM64 stat structure (program mode on Linux). |
 | `monons` | Monotonic nanoseconds, suitable for elapsed-time measurement. |
 | `realns` | Realtime nanoseconds since the Unix epoch, suitable for timestamps. |
 | `sleepns interval` | Sleep for nonnegative nanoseconds. Negative intervals trap 3. Interruptions return the kernel error. |

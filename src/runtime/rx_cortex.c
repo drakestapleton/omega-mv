@@ -312,8 +312,11 @@ static int replay(CxStore *s, const uint8_t *b, size_t len, size_t *good_end) {
 }
 
 /* The single integrity seam: see the guarantee in rx_cortex.h. */
-int cx_open_with(CxStore *s, const CxJournalOps *ops, void *ctx, const char *name,
-                 uint64_t n_subjects, uint32_t flags) {
+static int cx_open_with_info(CxStore *s, const CxJournalOps *ops, void *ctx, const char *name,
+                             uint64_t n_subjects, uint32_t flags,
+                             int *out_tail_repaired, size_t *out_final_size) {
+    if (out_tail_repaired) *out_tail_repaired = 0;
+    if (out_final_size) *out_final_size = 0;
     if (!s || !ops || !name || !ops->open || !ops->size || !ops->read || !ops->append ||
         !ops->truncate || !ops->close)
         return CX_ERR_ARG;
@@ -355,9 +358,11 @@ int cx_open_with(CxStore *s, const CxJournalOps *ops, void *ctx, const char *nam
             /* Only an incomplete trailing record is dropped. A complete record
              * whose digest differs is never repaired. */
             rc = ops->truncate(ctx, jh, good);
+            if (rc == CX_OK && out_tail_repaired) *out_tail_repaired = 1;
         }
     }
     CX_FREE(b);
+    if (rc == CX_OK && out_final_size) rc = ops->size(ctx, jh, out_final_size);
     if (rc != CX_OK) {
         ops->close(ctx, jh);
         cx_free(s);
@@ -368,6 +373,11 @@ int cx_open_with(CxStore *s, const CxJournalOps *ops, void *ctx, const char *nam
     s->jh = jh;
     s->open_flags = flags;
     return CX_OK;
+}
+
+int cx_open_with(CxStore *s, const CxJournalOps *ops, void *ctx, const char *name,
+                 uint64_t n_subjects, uint32_t flags) {
+    return cx_open_with_info(s, ops, ctx, name, n_subjects, flags, NULL, NULL);
 }
 
 #ifndef CX_NO_POSIX
@@ -447,6 +457,21 @@ static void jp_close(void *ctx, void *h) {
 
 const CxJournalOps cx_journal_posix = { jp_open, jp_size, jp_read, jp_append, jp_truncate, jp_close };
 
+static int jp_fd_open(void *ctx, const char *name, int ro, void **h) {
+    (void)name;
+    int fd = (int)(intptr_t)ctx - 1;
+    if (fd < 0 || ro) {
+        if (fd >= 0) close(fd);
+        return CX_ERR_ARG;
+    }
+    *h = (void *)(intptr_t)fd;
+    return CX_OK;
+}
+
+static const CxJournalOps cx_journal_posix_fd = {
+    jp_fd_open, jp_size, jp_read, jp_append, jp_truncate, jp_close
+};
+
 int cx_open(CxStore *s, const char *path, uint64_t n_subjects, uint32_t flags) {
     return cx_open_with(s, &cx_journal_posix, NULL, path, n_subjects, flags);
 }
@@ -455,6 +480,21 @@ int cx_open_at(CxStore *s, int dir_fd, const char *name, uint64_t n_subjects, ui
     if (dir_fd < 0 || !name || strchr(name, '/')) return CX_ERR_ARG;
     return cx_open_with(s, &cx_journal_posix, (void *)(intptr_t)(dir_fd + 1), name,
                         n_subjects, flags);
+}
+
+int cx_open_locked_fd(CxStore *s, int fd, uint64_t n_subjects, uint32_t flags,
+                      int *out_tail_repaired, uint64_t *out_size) {
+    if (out_tail_repaired) *out_tail_repaired = 0;
+    if (out_size) *out_size = 0;
+    if (!s || fd < 0 || (flags & CX_OPEN_READONLY)) {
+        if (fd >= 0) close(fd);
+        return CX_ERR_ARG;
+    }
+    size_t final_len = 0;
+    int rc = cx_open_with_info(s, &cx_journal_posix_fd, (void *)(intptr_t)(fd + 1), "",
+                               n_subjects, flags, out_tail_repaired, &final_len);
+    if (rc == CX_OK && out_size) *out_size = (uint64_t)final_len;
+    return rc;
 }
 #endif /* !CX_NO_POSIX */
 

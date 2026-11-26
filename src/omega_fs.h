@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -229,6 +232,42 @@ static inline int omega_fs_rename_at(int root_fd, const char *old_path, const ch
         return -1;
     }
     int rc = renameat(old_fd, old_leaf, new_fd, new_leaf);
+    int saved = errno;
+    close(new_fd);
+    close(old_fd);
+    errno = saved;
+    return rc;
+}
+
+/* Atomically install old_path at new_path only if new_path does not exist.
+ * Fails with errno = EEXIST on any collision (including a dangling symlink). */
+static inline int omega_fs_rename_noreplace_at(int root_fd, const char *old_path,
+                                               const char *new_path) {
+    char old_leaf[OMEGA_FS_NAME_MAX + 1], new_leaf[OMEGA_FS_NAME_MAX + 1];
+    int old_fd = omega_fs_parent_open_at(root_fd, old_path, old_leaf, sizeof old_leaf);
+    if (old_fd < 0) return -1;
+    int new_fd = omega_fs_parent_open_at(root_fd, new_path, new_leaf, sizeof new_leaf);
+    if (new_fd < 0) {
+        close(old_fd);
+        return -1;
+    }
+#ifdef __linux__
+    int rc = (int)syscall(SYS_renameat2, old_fd, old_leaf, new_fd, new_leaf, 1u);
+#elif defined(__APPLE__)
+    int rc = renameatx_np(old_fd, old_leaf, new_fd, new_leaf, RENAME_EXCL);
+#else
+    int rc = -1;
+    errno = ENOSYS;
+#endif
+    if (rc != 0 && (errno == ENOSYS || errno == EINVAL || errno == ENOTSUP)) {
+        rc = linkat(old_fd, old_leaf, new_fd, new_leaf, 0);
+        if (rc == 0 && unlinkat(old_fd, old_leaf, 0) != 0) {
+            int uerr = errno;
+            (void)unlinkat(new_fd, new_leaf, 0);
+            errno = uerr;
+            rc = -1;
+        }
+    }
     int saved = errno;
     close(new_fd);
     close(old_fd);

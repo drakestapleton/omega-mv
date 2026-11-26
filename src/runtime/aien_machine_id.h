@@ -110,7 +110,8 @@ enum {
     AIEN_MID_E_FORMAT = -3,   /* bad magic, version, reserved or hex */
     AIEN_MID_E_CHECK = -4,    /* check bytes do not match */
     AIEN_MID_E_IO = -5,
-    AIEN_MID_E_FULL = -6      /* index table full */
+    AIEN_MID_E_FULL = -6,     /* index table full */
+    AIEN_MID_E_EXISTS = -7    /* destination already exists (atomic create) */
 };
 
 typedef struct {
@@ -252,6 +253,9 @@ static inline int aien_mid_from_text(const char *s, AienMachineId *out) {
  * is touched. The _at forms use one checked component in a held directory. */
 int aien_mid_store(const char *path, const AienMachineId *m);
 int aien_mid_store_at(int dir_fd, const char *name, const AienMachineId *m);
+/* Like aien_mid_store_at, but never replaces an existing entry (returns
+ * AIEN_MID_E_EXISTS if the destination already exists, even as a symlink). */
+int aien_mid_create_at(int dir_fd, const char *name, const AienMachineId *m);
 /* Load; any file that is not exactly one valid record is rejected. */
 int aien_mid_load(const char *path, AienMachineId *out);
 int aien_mid_load_at(int dir_fd, const char *name, AienMachineId *out);

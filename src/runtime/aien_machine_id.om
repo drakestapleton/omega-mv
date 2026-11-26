@@ -27,8 +27,10 @@ const AIEN_MID_E_CHECK  int -4
 const AIEN_MID_E_IO     int -5
 const AIEN_MID_E_FULL   int -6
 
-text t_mid_dom "AIENOS-MACHINE-ID-V1"
-text t_mid_hex "0123456789abcdef"
+text t_mid_dom   "AIENOS-MACHINE-ID-V1"
+text t_mid_hex   "0123456789abcdef"
+text t_mid_dot   "."
+text t_mid_slash "/"
 
 global g_mid_tmp_p    uchar 4096
 global g_mid_tmp_t    uchar 4096
@@ -37,6 +39,7 @@ global g_mid_io_buf   uchar 48
 global g_mid_rec_tmp  uchar 44
 global g_mid_st       uchar 128
 global g_mid_seq      ulong 1
+global g_mid_leaf_meta ulong 4
 
 note Local index table (capacity up to 64 entries)
 global g_mid_idx_slots uchar 2112
@@ -384,21 +387,21 @@ fn mid_put_u16_ren off ulong v ulong to void
   put g_mid_ren_pkt add off 1 uchar and shr v 8 255
 end
 
-fn mid_store_rename tlen ulong plen ulong to int
+fn mid_store_rename_at dir_fd int tlen ulong leaf_off ulong leaf_len ulong to int
   mid_put_u16_ren 0 2
   mid_put_u16_ren 2 tlen
-  for i ulong tlen
+  for i ulong tlen bound 256
     put g_mid_ren_pkt add 4 i get g_mid_tmp_t i
   end
   off2 = add 4 tlen
-  mid_put_u16_ren off2 plen
-  for i ulong plen
-    put g_mid_ren_pkt add add off2 2 i get g_mid_tmp_p i
+  mid_put_u16_ren off2 leaf_len
+  for i ulong leaf_len bound 256
+    put g_mid_ren_pkt add add off2 2 i get g_mid_tmp_p add leaf_off i
   end
-  pkt_len = add add off2 2 plen
-  rr = renames g_mid_ren_pkt 0 pkt_len 0
+  pkt_len = add add off2 2 leaf_len
+  rr = renameat dir_fd dir_fd g_mid_ren_pkt 0 pkt_len 0
   if ne rr 0
-    ign = unlink g_mid_tmp_t 0 tlen
+    ign = unlinkat dir_fd g_mid_tmp_t 0 tlen 0
     ret sub int 0 5
   end
   ret 0
@@ -429,42 +432,101 @@ fn mid_stat_reg_ok to int
   ret 0
 end
 
-fn mid_no_symlink_ancestors plen ulong to int
+fn mid_parse_leaf plen ulong to int
   if eq plen 0
     ret sub int 0 1
   end
   if eq get g_mid_tmp_p sub plen 1 47
     ret sub int 0 1
   end
-  i = ulong 1
-  while lt i plen bound 4096
+  last_slash = ulong 0
+  has_slash = ulong 0
+  for i ulong plen bound 4096
     if eq get g_mid_tmp_p i 47
-      r = lstat g_mid_tmp_p 0 i g_mid_st 0 128
-      if ne r 0
-        ret sub int 0 1
-      end
-      mode = mid_st_u32 16
-      if ne and mode ulong 61440 ulong 16384
-        ret sub int 0 1
-      end
+      last_slash = i
+      has_slash = ulong 1
     end
-    i = add i 1
   end
+  leaf_off = ulong 0
+  if ne has_slash 0
+    leaf_off = add last_slash 1
+  end
+  leaf_len = sub plen leaf_off
+  if or eq leaf_len 0 gt leaf_len 255
+    ret sub int 0 1
+  end
+  if eq leaf_len 1
+    if eq get g_mid_tmp_p leaf_off 46
+      ret sub int 0 1
+    end
+  end
+  put g_mid_leaf_meta 0 leaf_off
+  put g_mid_leaf_meta 1 leaf_len
+  put g_mid_leaf_meta 2 last_slash
+  put g_mid_leaf_meta 3 has_slash
   ret 0
 end
 
-fn mid_replace_ok plen ulong to int
-  if ne mid_no_symlink_ancestors plen 0
+fn mid_open_parent plen ulong to int
+  if ne mid_parse_leaf plen 0
     ret sub int 0 1
   end
-  r = lstat g_mid_tmp_p 0 plen g_mid_st 0 128
-  if eq r sub long 0 2
-    ret 0
+  note O_RDONLY | O_DIRECTORY | O_CLOEXEC = 16384 + 524288 = 540672
+  pos = ulong 0
+  dfd = long 0
+  if eq get g_mid_leaf_meta 3 0
+    dfd = fopen t_mid_dot 0 1 540672 0
+  else
+    if eq get g_mid_tmp_p 0 47
+      dfd = fopen t_mid_slash 0 1 540672 0
+      pos = ulong 1
+    else
+      dfd = fopen t_mid_dot 0 1 540672 0
+    end
   end
-  if ne r 0
+  if lt dfd 0
     ret sub int 0 1
   end
-  ret mid_stat_reg_ok
+  dfdi = int dfd
+  if ne get g_mid_leaf_meta 3 0
+    while lt pos get g_mid_leaf_meta 2 bound 4096
+      if eq get g_mid_tmp_p pos 47
+        pos = add pos 1
+      else
+        endp = pos
+        while lt endp get g_mid_leaf_meta 2 bound 4096
+          if eq get g_mid_tmp_p endp 47
+            break
+          end
+          endp = add endp 1
+        end
+        clen = sub endp pos
+        if gt clen 255
+          ign = fclose dfdi
+          ret sub int 0 1
+        end
+        if or ne clen 1 ne get g_mid_tmp_p pos 46
+          note O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC = 16384 + 32768 + 524288 = 573440
+          nxt = openat dfdi g_mid_tmp_p pos clen 573440 0
+          ign = fclose dfdi
+          if lt nxt 0
+            ret sub int 0 1
+          end
+          dfdi = int nxt
+        end
+        pos = endp
+      end
+    end
+  end
+  if ne fstat dfdi g_mid_st 0 128 0
+    ign = fclose dfdi
+    ret sub int 0 1
+  end
+  if ne and mid_st_u32 16 ulong 61440 ulong 16384
+    ign = fclose dfdi
+    ret sub int 0 1
+  end
+  ret dfdi
 end
 
 fn mid_append_dec off ulong val ulong to ulong
@@ -481,7 +543,7 @@ fn mid_append_dec off ulong val ulong to ulong
       n = add n 1
     end
   end
-  if gt add off n 4095
+  if gt add off n 255
     ret 0
   end
   for i ulong n bound 24
@@ -490,19 +552,19 @@ fn mid_append_dec off ulong val ulong to ulong
   ret add off n
 end
 
-fn mid_build_tmp plen ulong to ulong
-  if gt add plen 36 4095
+fn mid_build_tmp_leaf leaf_off ulong leaf_len ulong to ulong
+  if gt add leaf_len 36 255
     ret 0
   end
-  for i ulong plen bound 4096
-    put g_mid_tmp_t i get g_mid_tmp_p i
+  for i ulong leaf_len bound 256
+    put g_mid_tmp_t i get g_mid_tmp_p add leaf_off i
   end
-  put g_mid_tmp_t plen uchar 46
-  put g_mid_tmp_t add plen 1 uchar 116
-  put g_mid_tmp_t add plen 2 uchar 109
-  put g_mid_tmp_t add plen 3 uchar 112
-  put g_mid_tmp_t add plen 4 uchar 46
-  pos = mid_append_dec add plen 5 ulong getpid
+  put g_mid_tmp_t leaf_len uchar 46
+  put g_mid_tmp_t add leaf_len 1 uchar 116
+  put g_mid_tmp_t add leaf_len 2 uchar 109
+  put g_mid_tmp_t add leaf_len 3 uchar 112
+  put g_mid_tmp_t add leaf_len 4 uchar 46
+  pos = mid_append_dec add leaf_len 5 ulong getpid
   if eq pos 0
     ret 0
   end
@@ -512,28 +574,42 @@ fn mid_build_tmp plen ulong to ulong
   ret mid_append_dec add pos 1 seq
 end
 
-fn mid_fsync_parent plen ulong to void
-  last = ulong 0
-  found = int 0
-  for i ulong plen bound 4096
-    if eq get g_mid_tmp_p i 47
-      last = i
-      found = int 1
-    end
+fn mid_fsync_dir_fd dir_fd int to int
+  if lt dir_fd 0
+    ret sub int 0 5
   end
-  if eq found 0
-    ret
+  fs = fsync dir_fd
+  if ne fs 0
+    ret sub int 0 5
   end
-  dlen = last
-  if eq dlen 0
-    dlen = ulong 1
+  ret 0
+end
+
+fn mid_write_tmp_at dir_fd int tlen ulong to int
+  note O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC = 1+64+128+32768+2048+524288 = 559297
+  fd = openat dir_fd g_mid_tmp_t 0 tlen 559297 420
+  if lt fd 0
+    ret sub int 0 5
   end
-  note O_RDONLY | O_DIRECTORY | O_NOFOLLOW = 16384 + 32768 = 49152
-  dfd = fopen g_mid_tmp_p 0 dlen 49152 0
-  if ge dfd 0
-    ign_s = fsync int dfd
-    ign_c = fclose int dfd
+  fdi = int fd
+  if or ne fstat fdi g_mid_st 0 128 0 ne mid_stat_reg_ok 0
+    ign = fclose fdi
+    ign = unlinkat dir_fd g_mid_tmp_t 0 tlen 0
+    ret sub int 0 5
   end
+  w = write fdi g_mid_rec_tmp 0 44
+  if ne w 44
+    ign = fclose fdi
+    ign = unlinkat dir_fd g_mid_tmp_t 0 tlen 0
+    ret sub int 0 5
+  end
+  fs = fsync fdi
+  cl = fclose fdi
+  if or ne fs 0 ne cl 0
+    ign = unlinkat dir_fd g_mid_tmp_t 0 tlen 0
+    ret sub int 0 5
+  end
+  ret 0
 end
 
 fn aien_mid_store path view uchar 4096 plen ulong m view uchar 33 to int
@@ -548,52 +624,48 @@ fn aien_mid_store path view uchar 4096 plen ulong m view uchar 33 to int
   if ne mid_path_check_g view path plen 4060 0
     ret sub int 0 1
   end
-  if ne mid_replace_ok plen 0
+  dir_fd = mid_open_parent plen
+  if lt dir_fd 0
     ret sub int 0 5
   end
-  tlen = mid_build_tmp plen
+  note AT_SYMLINK_NOFOLLOW = 256; check destination under held parent dirfd.
+  fr = fstatat dir_fd g_mid_tmp_p get g_mid_leaf_meta 0 get g_mid_leaf_meta 1 g_mid_st 0 128 256
+  if ne fr sub long 0 2
+    if or ne fr 0 ne mid_stat_reg_ok 0
+      fr = fclose dir_fd
+      ret sub int 0 5
+    end
+  end
+  tlen = mid_build_tmp_leaf get g_mid_leaf_meta 0 get g_mid_leaf_meta 1
   if eq tlen 0
+    fr = fclose dir_fd
     ret sub int 0 1
   end
-  note O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK = 1+64+128+32768+2048 = 35009
-  fd = fopen g_mid_tmp_t 0 tlen 35009 420
-  if lt fd 0
+  rc = mid_write_tmp_at dir_fd tlen
+  if eq rc 0
+    rc = mid_store_rename_at dir_fd tlen get g_mid_leaf_meta 0 get g_mid_leaf_meta 1
+  end
+  if eq rc 0
+    rc = mid_fsync_dir_fd dir_fd
+  end
+  fr = fclose dir_fd
+  if or ne rc 0 ne fr 0
     ret sub int 0 5
   end
-  fdi = int fd
-  if or ne fstat fdi g_mid_st 0 128 0 ne mid_stat_reg_ok 0
-    ign = fclose fdi
-    ign = unlink g_mid_tmp_t 0 tlen
-    ret sub int 0 5
-  end
-  w = write fdi g_mid_rec_tmp 0 44
-  if ne w 44
-    ign = fclose fdi
-    ign = unlink g_mid_tmp_t 0 tlen
-    ret sub int 0 5
-  end
-  fs = fsync fdi
-  cl = fclose fdi
-  if or ne fs 0 ne cl 0
-    ign = unlink g_mid_tmp_t 0 tlen
-    ret sub int 0 5
-  end
-  rrc = mid_store_rename tlen plen
-  if eq rrc 0
-    mid_fsync_parent plen
-  end
-  ret rrc
+  ret 0
 end
 
 fn aien_mid_load path view uchar 4096 plen ulong dst edit uchar 33 to int
   if ne mid_path_check_g view path plen 4096 0
     ret sub int 0 1
   end
-  if ne mid_no_symlink_ancestors plen 0
+  dir_fd = mid_open_parent plen
+  if lt dir_fd 0
     ret sub int 0 5
   end
-  note O_RDONLY|O_NOFOLLOW|O_NONBLOCK = 32768+2048 = 34816
-  fd = fopen g_mid_tmp_p 0 plen 34816 0
+  note O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC = 32768+2048+524288 = 559104
+  fd = openat dir_fd g_mid_tmp_p get g_mid_leaf_meta 0 get g_mid_leaf_meta 1 559104 0
+  ign_d = fclose dir_fd
   if lt fd 0
     ret sub int 0 5
   end

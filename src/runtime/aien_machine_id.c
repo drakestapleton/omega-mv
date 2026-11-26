@@ -35,12 +35,18 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
     return 0;
 }
 
-int aien_mid_store_at(int dir_fd, const char *name, const AienMachineId *m) {
+static int mid_write_at(int dir_fd, const char *name, const AienMachineId *m, int noreplace) {
     if (dir_fd < 0 || !name || !m || strchr(name, '/')) return AIEN_MID_E_ARG;
     uint8_t rec[AIEN_MID_RECORD_BYTES];
     int rc = aien_mid_encode(m, rec);
     if (rc != AIEN_MID_OK) return rc;
-    if (omega_fs_replace_ok_at(dir_fd, name) != 0) return AIEN_MID_E_IO;
+    if (noreplace) {
+        struct stat st;
+        if (omega_fs_lstat_at(dir_fd, name, &st) == 0) return AIEN_MID_E_EXISTS;
+        if (errno != ENOENT) return AIEN_MID_E_IO;
+    } else {
+        if (omega_fs_replace_ok_at(dir_fd, name) != 0) return AIEN_MID_E_IO;
+    }
 
     char stem[OMEGA_FS_NAME_MAX + 1], tmp[OMEGA_FS_NAME_MAX + 1];
     if ((size_t)snprintf(stem, sizeof stem, "%s.tmp", name) >= sizeof stem ||
@@ -51,11 +57,32 @@ int aien_mid_store_at(int dir_fd, const char *name, const AienMachineId *m) {
     if (write_all(fd, rec, sizeof rec) != 0 || fsync(fd) != 0) {
         close(fd); omega_fs_unlink_at(dir_fd, tmp, 0); return AIEN_MID_E_IO;
     }
-    if (close(fd) != 0 || omega_fs_rename_at(dir_fd, tmp, name) != 0 || fsync(dir_fd) != 0) {
+    if (close(fd) != 0) {
         omega_fs_unlink_at(dir_fd, tmp, 0);
         return AIEN_MID_E_IO;
     }
+    if (noreplace) {
+        if (omega_fs_rename_noreplace_at(dir_fd, tmp, name) != 0) {
+            int e = errno;
+            omega_fs_unlink_at(dir_fd, tmp, 0);
+            return e == EEXIST ? AIEN_MID_E_EXISTS : AIEN_MID_E_IO;
+        }
+    } else {
+        if (omega_fs_rename_at(dir_fd, tmp, name) != 0) {
+            omega_fs_unlink_at(dir_fd, tmp, 0);
+            return AIEN_MID_E_IO;
+        }
+    }
+    if (fsync(dir_fd) != 0) return AIEN_MID_E_IO;
     return AIEN_MID_OK;
+}
+
+int aien_mid_store_at(int dir_fd, const char *name, const AienMachineId *m) {
+    return mid_write_at(dir_fd, name, m, 0);
+}
+
+int aien_mid_create_at(int dir_fd, const char *name, const AienMachineId *m) {
+    return mid_write_at(dir_fd, name, m, 1);
 }
 
 int aien_mid_load_at(int dir_fd, const char *name, AienMachineId *out) {

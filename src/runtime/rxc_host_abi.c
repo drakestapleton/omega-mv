@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -588,59 +589,59 @@ int rxc_host_recover(const char *dir, uint32_t root_kind, const uint8_t *root, s
         return RXC_HOST_E_OPEN;
     }
 
-    int fd = omega_fs_open_regular_at(dir_fd, "cortex.cx", O_RDONLY, 0);
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        if (fd >= 0) close(fd);
+    int jfd = omega_fs_open_regular_at(dir_fd, "cortex.cx", O_RDWR, 0);
+    if (jfd < 0 || flock(jfd, LOCK_EX | LOCK_NB) != 0 || fstat(jfd, &st) != 0) {
+        if (jfd >= 0) close(jfd);
+        close(dir_fd);
+        return RXC_HOST_E_OPEN;
+    }
+    if (st.st_size <= 0) {
+        close(jfd);
         close(dir_fd);
         return RXC_HOST_E_OPEN;
     }
     const uint64_t old_size = (uint64_t)st.st_size;
 
     /* Keep the tail bytes before anything is cut (the cut goes into the
-     * repair record, so nothing leaves the journal unrecorded). */
+     * repair record, so nothing leaves the journal unrecorded). Held under the
+     * single exclusive writer lock through truncation and post-repair fstat. */
     uint64_t keep_n = old_size < RXC_HOST_REPAIR_KEEP_MAX ? old_size : RXC_HOST_REPAIR_KEEP_MAX;
     uint8_t *tail = malloc(keep_n ? keep_n : 1);
     if (!tail) {
-        close(fd);
+        close(jfd);
         close(dir_fd);
         return RXC_HOST_E_NOMEM;
     }
-    if (pread(fd, tail, keep_n, (off_t)(old_size - keep_n)) != (ssize_t)keep_n) {
-        close(fd);
-        free(tail);
-        close(dir_fd);
-        return RXC_HOST_E_OPEN;
+    {
+        uint64_t got = 0;
+        while (got < keep_n) {
+            ssize_t r = pread(jfd, tail + got, (size_t)(keep_n - got),
+                              (off_t)(old_size - keep_n + got));
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) {
+                close(jfd);
+                free(tail);
+                close(dir_fd);
+                return RXC_HOST_E_OPEN;
+            }
+            got += (uint64_t)r;
+        }
     }
-    close(fd);
 
-    CxStore probe;
-    memset(&probe, 0, sizeof probe);
-    int prc = cx_open_at(&probe, dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS, CX_OPEN_READONLY);
-    if (prc == CX_OK) cx_close(&probe);
-    else if (prc == CX_ERR_TORN) out->tail_torn = 1;
-    else { free(tail); close(dir_fd); return RXC_HOST_E_OPEN; }
-
-    /* The writer open: takes the journal lock (a live handle on this home
-     * makes it fail: RXC_HOST_E_OPEN) and, if torn, truncates the one
-     * incomplete trailing record. */
     CxStore cx;
     memset(&cx, 0, sizeof cx);
-    if (cx_open_at(&cx, dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS,
-                   CX_OPEN_SYNC | CX_OPEN_REPAIR_TAIL) != CX_OK) {
-        free(tail);
-        close(dir_fd);
-        return RXC_HOST_E_OPEN;
-    }
-    fd = omega_fs_open_regular_at(dir_fd, "cortex.cx", O_RDONLY, 0);
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        if (fd >= 0) close(fd);
+    int tail_repaired = 0;
+    uint64_t new_size = 0;
+    if (cx_open_locked_fd(&cx, jfd, RX_CORTEX_SUBJECTS,
+                          CX_OPEN_SYNC | CX_OPEN_REPAIR_TAIL,
+                          &tail_repaired, &new_size) != CX_OK ||
+        new_size > old_size) {
         cx_close(&cx);
         free(tail);
         close(dir_fd);
         return RXC_HOST_E_OPEN;
     }
-    close(fd);
-    const uint64_t new_size = (uint64_t)st.st_size;
+    out->tail_torn = tail_repaired ? 1u : 0u;
     const uint64_t kept = cx.n;
     out->cut_lo = new_size;
     out->cut_hi = old_size;

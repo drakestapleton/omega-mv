@@ -550,6 +550,13 @@ static void test_durable(void) {
     CHECK(unit_of(&s, sv.a.id, 7)->spill_off != named, "named extent reused before commit");
     CHECK(js_space_commit(&s) == JS_OK && s.commit_seq == seq + 1, "second commit");
     CHECK(s.n_ext_pending == 0, "quarantine not released by commit");
+    if (geteuid() != 0) {
+        /* Failed temp creation before O_CREAT leaves jspace intact and does not unlink. */
+        CHECK(js_branch_derive(&s, sv.a.id, 19) == JS_OK, "derive before EACCES commit");
+        CHECK(chmod(g_dir, 0500) == 0, "chmod dir 0500");
+        CHECK(js_space_commit(&s) == JS_ERR_IO, "commit in read-only dir refuses with JS_ERR_IO");
+        CHECK(chmod(g_dir, 0700) == 0, "restore dir 0700");
+    }
     js_space_destroy(&s);
     verify_reopen(&sv, "after second commit");
 

@@ -281,6 +281,10 @@ int  cx_open_with(CxStore *s, const CxJournalOps *ops, void *ctx, const char *na
 int  cx_open(CxStore *s, const char *path, uint64_t n_subjects, uint32_t flags);
 /* Descriptor-relative form for a single journal name in a retained directory. */
 int  cx_open_at(CxStore *s, int dir_fd, const char *name, uint64_t n_subjects, uint32_t flags);
+/* Open from an already open, caller-exclusively-locked regular file descriptor;
+ * transfers ownership of `fd` unconditionally (closing on error or cx_close). */
+int  cx_open_locked_fd(CxStore *s, int fd, uint64_t n_subjects, uint32_t flags,
+                       int *out_tail_repaired, uint64_t *out_size);
 #endif
 void cx_close(CxStore *s);   /* = cx_free */
 

@@ -876,19 +876,21 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
     c->dir_fd = omega_fs_root_open(checked, 1, 0700);
     if (c->dir_fd < 0) return RX_ERR_ARG;
 
-    struct stat st;
-    if (omega_fs_lstat_at(c->dir_fd, "machine.id", &st) == 0) {
-        AienMachineId stored;
-        if (aien_mid_load_at(c->dir_fd, "machine.id", &stored) != AIEN_MID_OK ||
-            !aien_mid_equal(&stored, self)) {
+    {
+        int mid_rc = aien_mid_create_at(c->dir_fd, "machine.id", self);
+        if (mid_rc == AIEN_MID_E_EXISTS) {
+            AienMachineId stored;
+            if (aien_mid_load_at(c->dir_fd, "machine.id", &stored) != AIEN_MID_OK ||
+                !aien_mid_equal(&stored, self)) {
+                close(c->dir_fd);
+                c->dir_fd = -1;
+                return RX_ERR_IDENTITY;
+            }
+        } else if (mid_rc != AIEN_MID_OK) {
             close(c->dir_fd);
             c->dir_fd = -1;
             return RX_ERR_IDENTITY;
         }
-    } else if (errno != ENOENT || aien_mid_store_at(c->dir_fd, "machine.id", self) != AIEN_MID_OK) {
-        close(c->dir_fd);
-        c->dir_fd = -1;
-        return RX_ERR_IDENTITY;
     }
 
     if (cx_open_at(&c->cx, c->dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS,

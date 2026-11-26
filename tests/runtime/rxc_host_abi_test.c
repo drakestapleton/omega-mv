@@ -36,12 +36,15 @@
  *      composition writer, recalled with the same ids after restart
  */
 #include "runtime/rxc_host_abi.h"
+#include "sha256.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -533,6 +536,73 @@ int main(void) {
     printf("T7 host records: constraint %llu authorization %llu effect %llu; host subject %u\n",
            (unsigned long long)c7, (unsigned long long)a7, (unsigned long long)e7, nha);
     rxc_host_close(h);
+
+    /* ---- T8 recover holds ONE exclusive writer lock from snapshot through evidence ---- */
+    {
+        char home8[320], cx8[400];
+        snprintf(home8, sizeof home8, "%s/home8_lock", dir);
+        snprintf(cx8, sizeof cx8, "%s/cortex.cx", home8);
+        h = open_home(home8, 0, NULL, &rc);
+        CHECK(h != NULL && rc == RXC_HOST_OK, "T8 open -> %d", rc);
+        if (!h) return 1;
+        RxcHostResult r8;
+        CHECK(rxc_host_run(h, 0x4E50310000000010ull, 9500000, &r8) == RXC_HOST_OK && r8.committed,
+              "T8 run");
+        rxc_host_close(h);
+
+        struct stat s8;
+        CHECK(stat(cx8, &s8) == 0 && s8.st_size > 0, "T8 clean stat");
+        uint64_t clean_sz = (uint64_t)s8.st_size;
+
+        uint8_t torn40[40];
+        for (size_t k = 0; k < sizeof torn40; k++) torn40[k] = (uint8_t)(0xA0u + k);
+        uint8_t want_sha[32];
+        sha256_hash(torn40, sizeof torn40, want_sha);
+
+        int lfd = open(cx8, O_RDWR);
+        CHECK(lfd >= 0 && flock(lfd, LOCK_EX | LOCK_NB) == 0, "T8 hold exclusive writer lock");
+        CHECK(lseek(lfd, 0, SEEK_END) == (off_t)clean_sz && write(lfd, torn40, 27) == 27 &&
+                  fdatasync(lfd) == 0,
+              "T8 write partial 27 torn bytes while locked");
+
+        /* Under contention, recover must fail BEFORE touching or probing the torn journal. */
+        memset(&rp, 0, sizeof rp);
+        rc = rxc_host_recover(home8, RXC_HOST_ROOT_PROVISIONED, ROOT, sizeof ROOT - 1, &rp);
+        CHECK(rc == RXC_HOST_E_OPEN && rp.tail_torn == 0 && rp.repaired == 0 &&
+                  rp.cut_lo == 0 && rp.cut_hi == 0,
+              "T8 recover refused cleanly before probing locked torn journal (rc=%d torn=%u rep=%u)",
+              rc, rp.tail_torn, rp.repaired);
+
+        /* Append remaining 13 torn bytes before unlocking so we prove consistent snapshot+cut+digest. */
+        CHECK(write(lfd, torn40 + 27, 13) == 13 && fdatasync(lfd) == 0, "T8 append 13 more torn bytes");
+        close(lfd);
+
+        memset(&rp, 0, sizeof rp);
+        rc = rxc_host_recover(home8, RXC_HOST_ROOT_PROVISIONED, ROOT, sizeof ROOT - 1, &rp);
+        CHECK(rc == RXC_HOST_OK && rp.tail_torn == 1 && rp.repaired == 1 &&
+                  rp.cut_lo == clean_sz && rp.cut_hi == clean_sz + 40 &&
+                  rp.cut_bytes_kept == 40 && memcmp(rp.cut_sha256, want_sha, 32) == 0 &&
+                  rp.opens == 1 && rp.open_rc == 0,
+              "T8 recover under single locked fd recorded exact 40-byte cut and digest (rc=%d lo=%llu hi=%llu kept=%llu)",
+              rc, (unsigned long long)rp.cut_lo, (unsigned long long)rp.cut_hi,
+              (unsigned long long)rp.cut_bytes_kept);
+
+        h = open_home(home8, 0, NULL, &rc);
+        CHECK(h != NULL && rc == RXC_HOST_OK, "T8 reopen after recovery -> %d", rc);
+        if (h) {
+            RxcHostRecord rec8;
+            uint64_t pay8[32];
+            int pn8 = rxc_host_record(h, rp.event_id, &rec8) == RXC_HOST_OK
+                          ? rxc_host_payload(h, rp.event_id, pay8, 32)
+                          : -1;
+            CHECK(pn8 >= (int)RXC_HOST_RP_BYTES + 5 &&
+                      pay8[RXC_HOST_RP_CUT_LO] == clean_sz &&
+                      pay8[RXC_HOST_RP_CUT_HI] == clean_sz + 40 &&
+                      pay8[RXC_HOST_RP_KEPT_BYTES] == 40,
+                  "T8 repair evidence persisted in Cortex (%d words)", pn8);
+            rxc_host_close(h);
+        }
+    }
 
     char m[17];
     hex8(mid, m);
