@@ -852,7 +852,8 @@ int  rx_world_operator_authorize(RxWorld *w, uint32_t subject, const RxCallerCre
 
 /* A stimulus from outside the organism (sensor, human input). Requires a
  * capability for (external_subject, object resource, WRITE). Returns the
- * causal id of the EXTERNAL crumb, or a negative error. */
+ * causal id of the EXTERNAL crumb, or a negative error (including RX_ERR_FULL
+ * without changing an object when the causal log has no room). */
 int64_t rx_world_publish_external(RxWorld *w, RxCapRef cap,
                                   const RxMutation *muts, uint32_t n);
 
