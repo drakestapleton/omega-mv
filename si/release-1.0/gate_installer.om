@@ -1,0 +1,1202 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note si/release-1.0/gate_installer.om: Pure seeded-OM-2 Gate for SI 1.0 Installer & Front-Door Pack.
+note
+note Build:
+note   seed/out/omc < si/release-1.0/gate_installer.om > gate_installer && chmod +x gate_installer
+note Run:
+note   gate_installer OMC_BIN REPO_ROOT SCRATCH_DIR
+note
+note Verifies fail-closed:
+note   1. Compiler SHA-256 pin matches REPO_ROOT/seed/out/omc.sha256 (exit 69 if mismatched).
+note   2. Deterministic 2x compilation of gate_installer.om (zero stderr, identical SHA-256).
+note   3. install-si-1.0.sh across all 5 simulated topologies:
+note      linux-aarch64-gb10, linux-aarch64, linux-x86_64, macos-arm64, wsl2-x86_64.
+note   4. Live Spark --dry-run (no --sim-* flags).
+note   5. Valid release bundle --verify-bundle PASS + --install into scratch prefix PASS.
+note   6. Negative controls (all MUST fail closed):
+note      a. 1-bit tampered bundle file -> refused
+note      b. Missing SHA256SUMS.txt -> refused
+note      c. Extra unverified file in bundle -> refused
+note      d. Unknown --profile -> refused
+note      e. Unsupported topology -> refused
+note      f. Policy scan of install-si-1.0.sh: zero retired GPU toolkit promotion, zero hardcoded
+note         host paths, zero UEFI/SPI commands, zero curl-pipe-sh
+note      g. Content integrity of UMBRELLA-README.md and PHYSICAL-BOOT-RUNBOOK.md
+note      h. 1-byte tampered omc pin check -> refused
+
+note ---- Embedded FIPS 180-4 SHA-256
+global s2_ok ulong 1
+global s2_k uint 64
+global s2_h uint 8
+global s2_v uint 8
+global s2_w uint 64
+global s2_buf uchar 64
+global s2_n ulong 1
+global s2_tot ulong 1
+global s2_out uchar 32
+
+note ---- Buffers
+global g_omc uchar 4096
+global g_root uchar 4096
+global g_scr uchar 4096
+global g_pa uchar 4096
+global g_pin uchar 64
+global g_d1 uchar 32
+global g_d2 uchar 32
+global g_av uchar 16384
+global g_stb uchar 4
+global g_fbuf uchar 65536
+global g_wbuf uchar 65536
+global g_cap uchar 131072
+global g_std uchar 32768
+global g_dg uchar 24
+global g_n ulong 32
+note g_n:
+note   0=omc_len, 1=root_len, 2=scr_len, 3=pa_len, 5=av_bytes, 6=av_argc,
+note   7=wbuf_len, 8=cap_len, 10=std_len, 11=checks_pass, 12=controls_tot,
+note   13=controls_caught, 14=fails
+
+text t_usage "usage: gate_installer OMC_BIN REPO_ROOT SCRATCH_DIR\n"
+text t_badpin "SI_INSTALLER_GATE INVALID: cannot read 64-hex digest from seed/out/omc.sha256\n"
+text t_refpin "SI_INSTALLER_GATE REFUSED: compiler digest differs from seed/out/omc.sha256 (exit 69)\n"
+text t_badscr "SI_INSTALLER_GATE INVALID: cannot create SCRATCH_DIR\n"
+
+text p_pin "/seed/out/omc.sha256"
+text p_self "/si/release-1.0/gate_installer.om"
+text p_inst "/si/release-1.0/install-si-1.0.sh"
+text p_umb "/si/release-1.0/UMBRELLA-README.md"
+text p_boot "/si/release-1.0/PHYSICAL-BOOT-RUNBOOK.md"
+
+text bin_sh "/bin/sh"
+text s_null "/dev/null"
+text s_out "/last.out"
+text s_err "/last.err"
+text s_b1 "/gate_installer.1"
+text s_b2 "/gate_installer.2"
+text s_e1 "/gate_installer.1.err"
+text s_e2 "/gate_installer.2.err"
+text s_pfx "/dry_prefix"
+text s_ipfx "/inst_prefix"
+text s_ipfx_f "/inst_prefix/share/si-1.0/hello.txt"
+
+text s_bok "/bnd_ok"
+text s_bok_h "/bnd_ok/hello.txt"
+text s_bok_s "/bnd_ok/SHA256SUMS.txt"
+text s_btmp "/bnd_tamper"
+text s_btmp_h "/bnd_tamper/hello.txt"
+text s_btmp_s "/bnd_tamper/SHA256SUMS.txt"
+text s_bnos "/bnd_nosums"
+text s_bnos_h "/bnd_nosums/hello.txt"
+text s_bext "/bnd_extra"
+text s_bext_h "/bnd_extra/hello.txt"
+text s_bext_r "/bnd_extra/rogue.bin"
+text s_bext_s "/bnd_extra/SHA256SUMS.txt"
+text s_omcp "/omc_tampered"
+
+text f_abc "abc"
+text f_abb "abb"
+text f_rogue "unlisted\n"
+text f_sums_abc "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  hello.txt\n"
+
+text a_sim_os "--sim-os"
+text a_sim_ar "--sim-arch"
+text a_sim_gp "--sim-gpu"
+text a_prof "--profile"
+text a_pfx "--prefix"
+text a_dry "--dry-run"
+text a_vfy "--verify-bundle"
+text a_ins "--install"
+
+text v_lin "linux"
+text v_dar "darwin"
+text v_wsl "wsl2"
+text v_fbs "freebsd"
+text v_a64 "aarch64"
+text v_arm "arm64"
+text v_x64 "x86_64"
+text v_rv64 "riscv64"
+text v_gb10 "gb10"
+text v_none "none"
+text v_core "core"
+text v_stud "studio"
+text v_full "full"
+text v_bogus "bogus-profile"
+
+text k_top_gb10 "TOPOLOGY=linux-aarch64-gb10"
+text k_top_a64 "TOPOLOGY=linux-aarch64"
+text k_top_x64 "TOPOLOGY=linux-x86_64"
+text k_top_mac "TOPOLOGY=macos-arm64"
+text k_top_wsl "TOPOLOGY=wsl2-x86_64"
+text k_tel "TELEMETRY=disabled"
+text k_dry "MODE=dry-run"
+text k_brew "brew tap"
+text k_quar "com.apple.quarantine"
+text k_csig "codesign -s - -f"
+text k_wsl2 "WSL 2"
+text k_noexe "no native Windows .exe"
+text k_vok "VERIFY=PASS files=1"
+text k_iok "INSTALL=PASS files=1"
+
+note Forbidden tokens scanned in install-si-1.0.sh (split/exact checks)
+text fb_c1 "CUDA++"
+text fb_c2 "cuda++"
+text fb_c3 "CUDApp"
+text fb_c4 "cudapp"
+text fb_h1 "drakestapleton"
+text fb_h2 "/Users/"
+text fb_h3 "/home/"
+text fb_u1 "efibootmgr"
+text fb_u2 "efivars"
+text fb_u3 "/boot/efi"
+text fb_u4 "flashrom"
+text fb_u5 "fwupdmgr"
+text fb_u6 "/dev/mtd"
+text fb_u7 "/dev/spidev"
+text fb_p1 "| sh"
+text fb_p2 "| bash"
+
+note Required markers in UMBRELLA-README.md & PHYSICAL-BOOT-RUNBOOK.md
+text ku_sov "Sovereign, not super"
+text ku_ng "Omega NG"
+text ku_ind "individual consciousness"
+text ku_hlx "Omega Helix"
+text ku_aut "individual autonomy"
+text ku_rm1 "RM1"
+text ku_rm11 "RM11"
+text ku_hv "HOST_VERIFIED"
+text ku_ps "PHYSICAL_SILICON"
+text ku_drv "omega-gpu-driver"
+text ku_rtl "rtl8127-omega"
+text ku_tf "tensorfold-omega"
+text kb_dra "DRA-938"
+text kb_efi "SPARK.EFI"
+text kb_smp "SMP_ONLINE"
+text kb_smmu "SMMUv3"
+text kb_ollm "OLLM DONE"
+text kb_b1 "Boot0001"
+
+text l_ok "PASS "
+text l_fl "FAIL "
+text l_ct "CTRL_CAUGHT "
+text l_ce "CTRL_ESCAPED "
+text l_sum "SI_INSTALLER_GATE "
+text l_ps "PASS"
+text l_fa "FAIL"
+text l_pin " omc_pin="
+text l_ck " checks="
+text l_co " controls="
+text l_ca " caught="
+text l_hw " hardware=HOST_VERIFIED\n"
+
+text n_c2x "compile_2x_gate_installer"
+text n_t_gb10 "topo_linux_aarch64_gb10"
+text n_t_a64 "topo_linux_aarch64"
+text n_t_x64 "topo_linux_x86_64"
+text n_t_mac "topo_macos_arm64"
+text n_t_wsl "topo_wsl2_x86_64"
+text n_t_live "live_spark_dry_run"
+text n_t_vfy "bundle_verify_and_install"
+text n_t_docs "umbrella_and_boot_runbook_integrity"
+text n_k_tmp "ctrl_tampered_bundle_1bit"
+text n_k_nos "ctrl_missing_sha256sums"
+text n_k_ext "ctrl_extra_unverified_file"
+text n_k_prf "ctrl_unknown_profile"
+text n_k_top "ctrl_unsupported_topology"
+text n_k_pol "ctrl_installer_policy_clean"
+text n_k_pin "ctrl_tampered_omc_pin"
+
+note ---- SHA-256 (FIPS 180-4)
+fn s2_setup to void
+if eq get s2_ok 0 1
+ret
+end
+put s2_k 0 1116352408
+put s2_k 1 1899447441
+put s2_k 2 3049323471
+put s2_k 3 3921009573
+put s2_k 4 961987163
+put s2_k 5 1508970993
+put s2_k 6 2453635748
+put s2_k 7 2870763221
+put s2_k 8 3624381080
+put s2_k 9 310598401
+put s2_k 10 607225278
+put s2_k 11 1426881987
+put s2_k 12 1925078388
+put s2_k 13 2162078206
+put s2_k 14 2614888103
+put s2_k 15 3248222580
+put s2_k 16 3835390401
+put s2_k 17 4022224774
+put s2_k 18 264347078
+put s2_k 19 604807628
+put s2_k 20 770255983
+put s2_k 21 1249150122
+put s2_k 22 1555081692
+put s2_k 23 1996064986
+put s2_k 24 2554220882
+put s2_k 25 2821834349
+put s2_k 26 2952996808
+put s2_k 27 3210313671
+put s2_k 28 3336571891
+put s2_k 29 3584528711
+put s2_k 30 113926993
+put s2_k 31 338241895
+put s2_k 32 666307205
+put s2_k 33 773529912
+put s2_k 34 1294757372
+put s2_k 35 1396182291
+put s2_k 36 1695183700
+put s2_k 37 1986661051
+put s2_k 38 2177026350
+put s2_k 39 2456956037
+put s2_k 40 2730485921
+put s2_k 41 2820302411
+put s2_k 42 3259730800
+put s2_k 43 3345764771
+put s2_k 44 3516065817
+put s2_k 45 3600352804
+put s2_k 46 4094571909
+put s2_k 47 275423344
+put s2_k 48 430227734
+put s2_k 49 506948616
+put s2_k 50 659060556
+put s2_k 51 883997877
+put s2_k 52 958139571
+put s2_k 53 1322822218
+put s2_k 54 1537002063
+put s2_k 55 1747873779
+put s2_k 56 1955562222
+put s2_k 57 2024104815
+put s2_k 58 2227730452
+put s2_k 59 2361852424
+put s2_k 60 2428436474
+put s2_k 61 2756734187
+put s2_k 62 3204031479
+put s2_k 63 3329325298
+put s2_ok 0 1
+end
+
+fn u32add a uint b uint to uint
+ret uint and add ulong a ulong b 4294967295
+end
+
+fn s2_init to void
+s2_setup
+put s2_h 0 1779033703
+put s2_h 1 3144134277
+put s2_h 2 1013904242
+put s2_h 3 2773480762
+put s2_h 4 1359893119
+put s2_h 5 2600822924
+put s2_h 6 528734635
+put s2_h 7 1541459225
+put s2_n 0 0
+put s2_tot 0 0
+end
+
+fn s2_sched to void
+for i ulong 16
+p = mul i 4
+w = shl uint get s2_buf p 24
+w = or w shl uint get s2_buf add p 1 16
+w = or w shl uint get s2_buf add p 2 8
+w = or w uint get s2_buf add p 3
+put s2_w i w
+end
+for i ulong 48
+idx = add i 16
+x = get s2_w sub idx 15
+s0 = xor xor rotr x 7 rotr x 18 shr x 3
+y = get s2_w sub idx 2
+s1 = xor xor rotr y 17 rotr y 19 shr y 10
+t = u32add get s2_w sub idx 16 s0
+t = u32add t get s2_w sub idx 7
+put s2_w idx u32add t s1
+end
+end
+
+fn s2_rnd i ulong to void
+e = get s2_v 4
+s1 = xor xor rotr e 6 rotr e 11 rotr e 25
+ch = xor and e get s2_v 5 and not e get s2_v 6
+t1 = u32add u32add get s2_v 7 s1 ch
+t1 = u32add u32add t1 get s2_k i get s2_w i
+a = get s2_v 0
+s0 = xor xor rotr a 2 rotr a 13 rotr a 22
+mj = xor xor and a get s2_v 1 and a get s2_v 2 and get s2_v 1 get s2_v 2
+t2 = u32add s0 mj
+for j ulong 7
+k = sub 7 j
+put s2_v k get s2_v sub k 1
+end
+put s2_v 4 u32add get s2_v 4 t1
+put s2_v 0 u32add t1 t2
+end
+
+fn s2_blk to void
+s2_sched
+for i ulong 8
+put s2_v i get s2_h i
+end
+for i ulong 64
+s2_rnd i
+end
+for i ulong 8
+put s2_h i u32add get s2_h i get s2_v i
+end
+end
+
+fn s2_byte b uchar to void
+n = get s2_n 0
+put s2_buf n b
+n = add n 1
+put s2_tot 0 add get s2_tot 0 1
+if eq n 64
+s2_blk
+n = 0
+end
+put s2_n 0 n
+end
+
+fn s2_fin to void
+bits = mul get s2_tot 0 8
+s2_byte 128
+while ne get s2_n 0 56 bound 128
+s2_byte 0
+end
+for i ulong 8
+sh = mul sub 7 i 8
+s2_byte uchar and shr bits sh 255
+end
+for i ulong 8
+w = get s2_h i
+o = mul i 4
+put s2_out o uchar and shr w 24 255
+put s2_out add o 1 uchar and shr w 16 255
+put s2_out add o 2 uchar and shr w 8 255
+put s2_out add o 3 uchar and w 255
+end
+end
+
+fn hexd v ulong to uchar
+if lt v 10
+ret uchar add 48 v
+end
+ret uchar add 87 v
+end
+
+note ---- Stdout / stderr helpers
+fn sflush to void
+n = get g_n 10
+if gt n 0
+r = write 1 g_std 0 n
+put g_n 10 0
+end
+end
+
+fn sb c uchar to void
+n = get g_n 10
+if ge n 32768
+sflush
+n = 0
+end
+put g_std n c
+put g_n 10 add n 1
+end
+
+fn st t view uchar * to void
+for i ulong len t bound 4096
+sb get t i
+end
+end
+
+fn sdec v ulong to void
+x = v
+n = ulong 0
+if eq x 0
+sb 48
+ret
+end
+while gt x 0 bound 24
+put g_dg n uchar add 48 rem x 10
+x = div x 10
+n = add n 1
+end
+while gt n 0 bound 24
+n = sub n 1
+sb get g_dg n
+end
+end
+
+fn werr t view uchar * to void
+r = write 2 t 0 len t
+end
+
+note ---- Path helpers
+fn pclr to void
+put g_n 3 0
+end
+
+fn pc c uchar to void
+n = get g_n 3
+put g_pa n c
+put g_n 3 add n 1
+end
+
+fn pt t view uchar * to void
+for i ulong len t bound 4096
+pc get t i
+end
+end
+
+fn proot to void
+for i ulong get g_n 1 bound 4096
+pc get g_root i
+end
+end
+
+fn pscr to void
+for i ulong get g_n 2 bound 4096
+pc get g_scr i
+end
+end
+
+fn pomc to void
+for i ulong get g_n 0 bound 4096
+pc get g_omc i
+end
+end
+
+fn pset_r suf view uchar * to void
+pclr
+proot
+pt suf
+end
+
+fn pset_s suf view uchar * to void
+pclr
+pscr
+pt suf
+end
+
+note ---- File helpers
+fn fclo fd int to void
+if ge fd 0
+z = fclose fd
+end
+end
+
+fn frd to int
+r = fopen g_pa 0 get g_n 3 524288 0
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn fwr to int
+r = fopen g_pa 0 get g_n 3 524865 420
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn fexe to int
+z = unlink g_pa 0 get g_n 3
+r = fopen g_pa 0 get g_n 3 524865 448
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn mkd_s suf view uchar * to bool
+pset_s suf
+r = makedir g_pa 0 get g_n 3 493
+ret or eq r 0 eq r -17
+end
+
+fn hash_pa to bool
+fd = frd
+if lt fd 0
+ret false
+end
+s2_init
+while true bound 1048576
+k = read fd g_fbuf 0 65536
+if lt k 0
+fclo fd
+ret false
+end
+if eq k 0
+break
+end
+for i ulong ulong k bound 65536
+s2_byte get g_fbuf i
+end
+end
+fclo fd
+s2_fin
+ret true
+end
+
+fn file_size_pa to ulong
+fd = frd
+if lt fd 0
+ret shl ulong 1 63
+end
+tot = ulong 0
+while true bound 1048576
+k = read fd g_fbuf 0 65536
+if lt k 0
+fclo fd
+ret shl ulong 1 63
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+fclo fd
+ret tot
+end
+
+fn save_d1 to void
+for j ulong 32
+put g_d1 j get s2_out j
+end
+end
+
+fn save_d2 to void
+for j ulong 32
+put g_d2 j get s2_out j
+end
+end
+
+fn d1_eq_d2 to bool
+for j ulong 32
+if ne get g_d1 j get g_d2 j
+ret false
+end
+end
+ret true
+end
+
+fn s2_eq_pin to bool
+for j ulong 32
+b = ulong get s2_out j
+if ne get g_pin mul j 2 hexd shr b 4
+ret false
+end
+if ne get g_pin add mul j 2 1 hexd and b 15
+ret false
+end
+end
+ret true
+end
+
+fn read_cap_pa to bool
+fd = frd
+if lt fd 0
+put g_n 8 0
+ret false
+end
+tot = ulong 0
+while lt tot 131072 bound 16384
+k = read fd g_cap tot sub 131072 tot
+if lt k 0
+fclo fd
+put g_n 8 0
+ret false
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+fclo fd
+put g_n 8 tot
+ret true
+end
+
+fn cap_has pat view uchar * to bool
+pn = len pat
+cn = get g_n 8
+if or eq pn 0 gt pn cn
+ret false
+end
+lim = add sub cn pn 1
+for i ulong lim bound 131072
+ok = true
+for j ulong pn bound 512
+if ne get g_cap add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn write_txt_s suf view uchar * data view uchar * to bool
+pset_s suf
+fd = fwr
+if lt fd 0
+ret false
+end
+n = len data
+p = ulong 0
+while lt p n bound 65536
+k = write fd data p sub n p
+if le k 0
+fclo fd
+ret false
+end
+p = add p ulong k
+end
+fclo fd
+ret true
+end
+
+note ---- Process runner
+fn aclr to void
+put g_n 5 2
+put g_n 6 0
+put g_av 0 0
+put g_av 1 0
+end
+
+fn apa to void
+p = get g_n 5
+n = get g_n 3
+for j ulong n bound 4096
+put g_av add add p 2 j get g_pa j
+end
+put g_av p uchar and n 255
+put g_av add p 1 uchar shr n 8
+put g_n 5 add p add n 2
+c = add get g_n 6 1
+put g_n 6 c
+put g_av 0 uchar and c 255
+put g_av 1 uchar shr c 8
+end
+
+fn atx t view uchar * to void
+pclr
+pt t
+apa
+end
+
+fn ascr suf view uchar * to void
+pset_s suf
+apa
+end
+
+fn aroot suf view uchar * to void
+pset_r suf
+apa
+end
+
+fn redir s int d int to void
+if ne dupfd s d 0 long d
+exit 127
+end
+end
+
+fn spawn fi int fo int fe int to ulong
+if or lt fi 0 or lt fo 0 lt fe 0
+fclo fi
+fclo fo
+fclo fe
+ret 512
+end
+pid = fork
+if lt pid 0
+exit 2
+end
+if eq pid 0
+redir fi 0
+redir fo 1
+redir fe 2
+z = execprog g_av 0 get g_n 5
+exit 127
+end
+fclo fi
+fclo fo
+fclo fe
+t0 = monons
+while true bound 1000000000
+r = waitpid int pid g_stb 0 len g_stb 1
+if eq r pid
+x = ulong get g_stb 0
+if ne x 0
+ret add 256 x
+end
+ret ulong get g_stb 1
+end
+if lt r 0
+exit 2
+end
+if gt sub monons t0 60000000000
+z = killpid int pid 9
+z = waitpid int pid g_stb 0 len g_stb 0
+ret 1000
+end
+z = sleepns 200000
+end
+exit 2
+end
+
+fn run_cap to ulong
+pclr
+pt s_null
+fi = frd
+pset_s s_out
+fo = fwr
+pset_s s_err
+fe = fwr
+rc = spawn fi fo fe
+pset_s s_out
+ok = read_cap_pa
+ret rc
+end
+
+fn compile_one src view uchar * out_s view uchar * err_s view uchar * to ulong
+pset_r src
+fi = frd
+aclr
+pclr
+pomc
+apa
+pset_s out_s
+fo = fexe
+pset_s err_s
+fe = fwr
+ret spawn fi fo fe
+end
+
+note ---- Reporting
+fn rec_chk name view uchar * ok bool to void
+if ok
+put g_n 11 add get g_n 11 1
+st l_ok
+else
+put g_n 14 add get g_n 14 1
+st l_fl
+end
+st name
+sb 10
+sflush
+end
+
+fn rec_ctrl name view uchar * caught bool to void
+put g_n 12 add get g_n 12 1
+if caught
+put g_n 13 add get g_n 13 1
+st l_ct
+else
+put g_n 14 add get g_n 14 1
+st l_ce
+end
+st name
+sb 10
+sflush
+end
+
+note ---- Load pin from seed/out/omc.sha256
+fn is_lhex c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 97 le c 102
+ret true
+end
+ret false
+end
+
+fn load_pin to bool
+pset_r p_pin
+fd = frd
+if lt fd 0
+ret false
+end
+k = read fd g_fbuf 0 256
+fclo fd
+if lt k 64
+ret false
+end
+for i ulong 64
+c = get g_fbuf i
+if not is_lhex c
+ret false
+end
+put g_pin i c
+end
+ret true
+end
+
+note ---- Build synthetic bundles in scratch
+fn setup_bundles to bool
+ok = mkd_s s_bok
+if not ok
+ret false
+end
+if not write_txt_s s_bok_h f_abc
+ret false
+end
+if not write_txt_s s_bok_s f_sums_abc
+ret false
+end
+ok = mkd_s s_btmp
+if not ok
+ret false
+end
+if not write_txt_s s_btmp_h f_abb
+ret false
+end
+if not write_txt_s s_btmp_s f_sums_abc
+ret false
+end
+ok = mkd_s s_bnos
+if not ok
+ret false
+end
+if not write_txt_s s_bnos_h f_abc
+ret false
+end
+ok = mkd_s s_bext
+if not ok
+ret false
+end
+if not write_txt_s s_bext_h f_abc
+ret false
+end
+if not write_txt_s s_bext_r f_rogue
+ret false
+end
+if not write_txt_s s_bext_s f_sums_abc
+ret false
+end
+ret true
+end
+
+fn start_inst_cmd to void
+aclr
+atx bin_sh
+aroot p_inst
+end
+
+fn test_sim_topo os_v view uchar * arch_v view uchar * prof_v view uchar * to ulong
+start_inst_cmd
+atx a_sim_os
+atx os_v
+atx a_sim_ar
+atx arch_v
+atx a_prof
+atx prof_v
+atx a_pfx
+ascr s_pfx
+atx a_dry
+ret run_cap
+end
+
+fn test_sim_lin_a64 gpu_v view uchar * prof_v view uchar * to ulong
+start_inst_cmd
+atx a_sim_os
+atx v_lin
+atx a_sim_ar
+atx v_a64
+atx a_sim_gp
+atx gpu_v
+atx a_prof
+atx prof_v
+atx a_pfx
+ascr s_pfx
+atx a_dry
+ret run_cap
+end
+
+fn check_2x_compile to bool
+r1 = compile_one p_self s_b1 s_e1
+r2 = compile_one p_self s_b2 s_e2
+if or ne r1 0 ne r2 0
+ret false
+end
+pset_s s_e1
+if ne file_size_pa 0
+ret false
+end
+pset_s s_e2
+if ne file_size_pa 0
+ret false
+end
+pset_s s_b1
+if not hash_pa
+ret false
+end
+save_d1
+pset_s s_b2
+if not hash_pa
+ret false
+end
+save_d2
+ret d1_eq_d2
+end
+
+fn check_installer_policy to bool
+pset_r p_inst
+if not read_cap_pa
+ret false
+end
+if or cap_has fb_c1 cap_has fb_c2
+ret false
+end
+if or cap_has fb_c3 cap_has fb_c4
+ret false
+end
+if or cap_has fb_h1 or cap_has fb_h2 cap_has fb_h3
+ret false
+end
+if or cap_has fb_u1 or cap_has fb_u2 cap_has fb_u3
+ret false
+end
+if or cap_has fb_u4 or cap_has fb_u5 or cap_has fb_u6 cap_has fb_u7
+ret false
+end
+if or cap_has fb_p1 cap_has fb_p2
+ret false
+end
+ret true
+end
+
+fn check_docs_integrity to bool
+pset_r p_umb
+if not read_cap_pa
+ret false
+end
+if not and cap_has ku_sov and cap_has ku_rm1 cap_has ku_rm11
+ret false
+end
+if not and cap_has ku_ng and cap_has ku_ind and cap_has ku_hlx cap_has ku_aut
+ret false
+end
+if not and cap_has ku_hv cap_has ku_ps
+ret false
+end
+if not and cap_has ku_drv and cap_has ku_rtl cap_has ku_tf
+ret false
+end
+pset_r p_boot
+if not read_cap_pa
+ret false
+end
+if not and cap_has kb_dra and cap_has kb_efi cap_has kb_smp
+ret false
+end
+if not and cap_has kb_smmu and cap_has kb_ollm cap_has kb_b1
+ret false
+end
+if or cap_has fb_p1 cap_has fb_p2
+ret false
+end
+ret true
+end
+
+fn check_tampered_omc to bool
+pclr
+pomc
+fd1 = frd
+if lt fd1 0
+ret false
+end
+pset_s s_omcp
+fd2 = fexe
+if lt fd2 0
+fclo fd1
+ret false
+end
+while true bound 1048576
+k = read fd1 g_fbuf 0 65536
+if lt k 0
+fclo fd1
+fclo fd2
+ret false
+end
+if eq k 0
+break
+end
+w = write fd2 g_fbuf 0 ulong k
+if ne w k
+fclo fd1
+fclo fd2
+ret false
+end
+end
+fclo fd1
+put g_fbuf 0 88
+w = write fd2 g_fbuf 0 1
+fclo fd2
+if ne w 1
+ret false
+end
+pset_s s_omcp
+if not hash_pa
+ret false
+end
+ret not s2_eq_pin
+end
+
+fn run_all_checks to void
+rec_chk n_c2x check_2x_compile
+
+rc = test_sim_lin_a64 v_gb10 v_full
+ok = and eq rc 0 and cap_has k_top_gb10 and cap_has k_tel cap_has k_dry
+rec_chk n_t_gb10 ok
+
+rc = test_sim_lin_a64 v_none v_core
+ok = and eq rc 0 and cap_has k_top_a64 and cap_has k_tel cap_has k_dry
+rec_chk n_t_a64 ok
+
+rc = test_sim_topo v_lin v_x64 v_stud
+ok = and eq rc 0 and cap_has k_top_x64 and cap_has k_tel cap_has k_dry
+rec_chk n_t_x64 ok
+
+rc = test_sim_topo v_dar v_arm v_core
+ok = and eq rc 0 and cap_has k_top_mac and cap_has k_brew and cap_has k_quar cap_has k_csig
+rec_chk n_t_mac ok
+
+rc = test_sim_topo v_wsl v_x64 v_core
+ok = and eq rc 0 and cap_has k_top_wsl and cap_has k_wsl2 cap_has k_noexe
+rec_chk n_t_wsl ok
+
+start_inst_cmd
+atx a_dry
+atx a_pfx
+ascr s_pfx
+rc = run_cap
+ok = and eq rc 0 and cap_has k_top_a64 and cap_has k_tel cap_has k_dry
+rec_chk n_t_live ok
+
+start_inst_cmd
+atx a_vfy
+ascr s_bok
+rc1 = run_cap
+ok1 = and eq rc1 0 cap_has k_vok
+start_inst_cmd
+atx a_vfy
+ascr s_bok
+atx a_ins
+atx a_pfx
+ascr s_ipfx
+rc2 = run_cap
+ok2 = and eq rc2 0 cap_has k_iok
+pset_s s_ipfx_f
+ok3 = eq file_size_pa 3
+rec_chk n_t_vfy and ok1 and ok2 ok3
+
+rec_chk n_t_docs check_docs_integrity
+
+note Negative controls (all must be caught / refused)
+start_inst_cmd
+atx a_vfy
+ascr s_btmp
+rec_ctrl n_k_tmp ne run_cap 0
+
+start_inst_cmd
+atx a_vfy
+ascr s_bnos
+rec_ctrl n_k_nos ne run_cap 0
+
+start_inst_cmd
+atx a_vfy
+ascr s_bext
+rec_ctrl n_k_ext ne run_cap 0
+
+start_inst_cmd
+atx a_prof
+atx v_bogus
+atx a_dry
+rec_ctrl n_k_prf ne run_cap 0
+
+rc = test_sim_topo v_fbs v_rv64 v_core
+rec_ctrl n_k_top ne rc 0
+
+rec_ctrl n_k_pol check_installer_policy
+rec_ctrl n_k_pin check_tampered_omc
+end
+
+fn emit_summary to int
+st l_sum
+if eq get g_n 14 0
+st l_ps
+else
+st l_fa
+end
+st l_pin
+for i ulong 16
+sb get g_pin i
+end
+st l_ck
+sdec get g_n 11
+st l_co
+sdec get g_n 12
+st l_ca
+sdec get g_n 13
+st l_hw
+sflush
+if eq get g_n 14 0
+ret 0
+end
+ret 1
+end
+
+fn main to int
+ac = ulong argcnt
+if ne ac 4
+werr t_usage
+ret 2
+end
+n0 = argread 1 g_omc 0 4095
+n1 = argread 2 g_root 0 4095
+n2 = argread 3 g_scr 0 4095
+if or le n0 0 or le n1 0 le n2 0
+werr t_usage
+ret 2
+end
+put g_n 0 ulong n0
+put g_n 1 ulong n1
+put g_n 2 ulong n2
+if not load_pin
+werr t_badpin
+ret 2
+end
+pclr
+pomc
+if not hash_pa
+werr t_refpin
+ret 69
+end
+if not s2_eq_pin
+werr t_refpin
+ret 69
+end
+pclr
+pscr
+r = makedir g_pa 0 get g_n 3 493
+if and ne r 0 ne r -17
+werr t_badscr
+ret 2
+end
+if not setup_bundles
+werr t_badscr
+ret 2
+end
+run_all_checks
+ret emit_summary
+end
