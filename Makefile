@@ -488,25 +488,13 @@ $(AIENOS_CAP_LIB): src/runtime/aienos_cap_om2.c src/runtime/aienos_cap.h src/run
 	rm -f $@ && $(AR) rcs $@ $(dir $@)/aienos_cap_om2.o
 
 # OMEGA_EFFECT_CAP64 (spec/effect-cap64-migration.md): effect objects carry the
-# full 64-bit Aienux capability generation. Physics-free: the Omega core, the
-# Visor effect-request adapter, and the pinned Aienux header + library
-# (aienos.lock) used directly. Prints OMEGA_EFFECT_CAP64_{ROUNDTRIP,IDENTITY,
+# full 64-bit Aienux capability generation. Pure seeded OM-2, physics-free
+# (mk/effect-cap64-om.mk). Prints OMEGA_EFFECT_CAP64_{ROUNDTRIP,IDENTITY,
 # STALE_REJECT,AUTHORITY}_PASS gate lines.
-EFFECT_CAP64_CAP_LIB ?= $(AIENOS_CAP_LIB)
 EFFECT_CAP64_CAP_INC ?= $(AIENOS_R7_DIR)/native/capability
-EFFECT_CAP64_TEST = $(OUT_DIR)/tests-effect/test_effect_cap64
-EFFECT_CAP64_OBJS = $(addprefix $(OUT_DIR)/,omega_om_units.o omega_canonical.o omega_validate.o omega_core.o omega_codec.o)
-
-$(EFFECT_CAP64_TEST): tests/effect/test_effect_cap64.c $(EFFECT_CAP64_OBJS) \
-		$(OUT_DIR)/visor/visor_effect_request.o src/visor/visor_effect_request.h \
-		src/omega_core.h src/omega_canonical.h src/omega_types.h $(EFFECT_CAP64_CAP_LIB) | aienos-authority-capability
-	mkdir -p $(dir $@)
-	$(CC) $(VISOR_CFLAGS) -I$(EFFECT_CAP64_CAP_INC) -pthread -o $@ tests/effect/test_effect_cap64.c \
-		$(OUT_DIR)/visor/visor_effect_request.o $(EFFECT_CAP64_OBJS) $(EFFECT_CAP64_CAP_LIB) -lm
 
 .PHONY: test-effect-cap64
-test-effect-cap64: $(EFFECT_CAP64_TEST)
-	./$(EFFECT_CAP64_TEST)
+test-effect-cap64: test-effect-cap64-om
 
 # OMEGA_AIENOS_CAP_ABI: src/runtime/aienos_cap.h, the copy the runtime compiles
 # against, must match the pinned header $(EFFECT_CAP64_CAP_INC)/aienos_capability.h
@@ -2754,15 +2742,13 @@ test-gpu-prefill-modelshapes: $(GPU_TCGEMM_TEST) $(GPU_QGEMM_TEST) $(GPU_PATTN_T
 	./$(GPU_PFHOST_TEST) --host-only
 	./$(GPU_PFHOST_TEST) --sim
 	@echo "test-gpu-prefill-modelshapes: PASS (5 model-shape prefill tests, host model + warp simulator, no device)"
-# omega#456: tools/own30b_decode_profile.c is a link-only recorder built by hand on the Spark; compile it with the
-# project's -Werror flags so a warning cannot land unseen, and also build & run the pure OM-2 port.
+# omega#456: pure seeded OM-2 OWN-30B decode stage profiler (tools/own30b_decode_profile.om).
 .PHONY: check-own30b-decode-profile
-check-own30b-decode-profile: tools/own30b_decode_profile.c tools/own30b_decode_profile.om seed/out/omc
+check-own30b-decode-profile: tools/own30b_decode_profile.om seed/out/omc
 	@mkdir -p $(OUT_DIR)
 	seed/out/omc < tools/own30b_decode_profile.om > $(OUT_DIR)/own30b_decode_profile.tmp.$$$$ && chmod +x $(OUT_DIR)/own30b_decode_profile.tmp.$$$$ && mv -f $(OUT_DIR)/own30b_decode_profile.tmp.$$$$ $(OUT_DIR)/own30b_decode_profile
 	./$(OUT_DIR)/own30b_decode_profile --test
-	$(CC) $(CFLAGS) -c -o $(OUT_DIR)/own30b_decode_profile.o tools/own30b_decode_profile.c
-	@echo "check-own30b-decode-profile: PASS (compiles with -Werror)"
+	@echo "check-own30b-decode-profile: PASS (pure OM-2)"
 # OWN-30B W-L2 (2026-10-13): command list (many launches, one submission) + decode glue kernels. test-gpu-cmdlist is
 # host-only + warp simulator; the chip gate is tools/run_gpu_cmdlist_chip.sh under the GB10 lock.
 .PHONY: test-gpu-cmdlist

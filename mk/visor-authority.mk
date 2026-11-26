@@ -2,8 +2,9 @@
 #
 # test-visor-authority   pure seeded OM-2 hostile test: Visor effect requests vs capability root
 #                        (rx_caproot.om) and AEGIS policy (rx_aegis.om). Host-only, physics-free.
-# visor-authority-check  isolation check: no Visor object references/defines an authority-mutating
-#                        symbol, and no OM-2 source of omega names one (with bite controls).
+# visor-authority-check  isolation check: zero Visor C files remain, and no OM-2 source of
+#                        omega names an authority-mutating symbol or unallowlisted host word
+#                        (with 22 bite controls).
 VISOR_AUTH_OMC ?= seed/out/omc
 VISOR_AUTH_OM_SRCS := src/visor/visor.om src/visor/visor_machine.om \
 	om/aarch64/aarch64_om2.om om/visor/verify_om2.om om/visor/validate_om2.om \
@@ -27,5 +28,5 @@ test-visor-authority: $(VISOR_AUTH_TEST)
 # om/visor, src/visor and src/language unit) for forbidden authority names, runtime prefixes
 # and authorization state, with planted-name bite controls that must be caught. The binary
 # stays a prerequisite so a source that does not compile fails the check.
-visor-authority-check: $(OUT_DIR)/visor/visor_effect_request.o $(OMEGA_BIN)
+visor-authority-check: $(OMEGA_BIN)
 	OMEGA_OM_SRCS='$(OMEGA_OM_SRCS)' sh tests/visor/check_authority_link.sh $(OUT_DIR)

@@ -14,20 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Omega Visor V1, lane 7: authority isolation check (objects and OM-2 sources).
+# Omega Visor V1, lane 7: authority isolation check (pure seeded OM-2 sources).
 # "The Visor can ask. The Visor cannot grant."
 #
-# Two halves:
-#  1. Objects (nm): fails when a Visor C object in $BUILD/visor (the test-only
-#     runtime-linked adapters) references an authority-mutating symbol from
-#     forbidden_symbols.txt, references any runtime / Aienux / publish-gate
-#     symbol at all (^rx_ ^aienos_cap_ ^rc_), or DEFINES a forbidden name, and
-#     checks that visor_effect_request.o exports only its four public functions.
+# Checks:
+#  1. Zero C/H files remain under src/visor (Visor is 100% pure seeded OM-2).
 #  2. OM-2 sources: the omega binary is pure seeded OM-2 with no symbol table,
 #     so `nm` sees nothing in it. Its isolation is checked on the sources it is
-#     built from (every tools/omega*.om, om/visor/*.om, src/visor/*.om,
-#     src/language/*.om, om/aarch64/aarch64_om2.om, plus any file named in
-#     $OMEGA_OM_SRCS, which the mk rule passes). On every code line (note lines
+#     built from (every tools/omega.om, tools/omega_*.om, om/visor/*.om,
+#     src/visor/*.om, src/language/*.om, om/aarch64/aarch64_om2.om, plus any
+#     file named in $OMEGA_OM_SRCS, which the mk rule passes). On every code line (note lines
 #     skipped, string literals blanked) no identifier may be a forbidden name or
 #     start with rx_, aienos_cap_ or rc_ (a call to, or a local definition of,
 #     an authority operation), and no identifier may contain `authorized` (the
@@ -64,70 +60,18 @@ BUILD=${1:-build}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 LIST="$HERE/forbidden_symbols.txt"
-NM=${NM:-nm}
 fail=0
-checked=0
 
 [ -f "$LIST" ] || { echo "FAIL: missing $LIST"; exit 1; }
 forbidden=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST" | grep -v '^$')
 [ -n "$forbidden" ] || { echo "FAIL: forbidden list is empty"; exit 1; }
 
-set -- "$BUILD"/visor/*.o
-if [ ! -e "$1" ]; then
-    echo "FAIL: no objects in $BUILD/visor (build the omega target first)"
-    echo "OMEGA_VISOR_AUTHORITY_ISOLATION_FAIL"
-    exit 1
-fi
-
-check_file() {
-    f=$1
-    if [ ! -e "$f" ]; then
-        echo "skip: $f (not built)"
-        return 0
-    fi
-    checked=$((checked + 1))
-    undef=$($NM -u "$f" 2>/dev/null | awk '{print $NF}' | sed 's/@.*//')
-    defs=$($NM --defined-only "$f" 2>/dev/null | awk '{print $NF}')
-    for s in $forbidden; do
-        if printf '%s\n' "$undef" | grep -qx "$s"; then
-            echo "FAIL: $f references forbidden symbol $s"; fail=1
-        fi
-        if printf '%s\n' "$defs" | grep -qx "$s"; then
-            echo "FAIL: $f defines forbidden symbol $s"; fail=1
-        fi
-    done
-    bad=$(printf '%s\n' "$undef" | grep -E '^(rx_|aienos_cap_|rc_)' || true)
-    if [ -n "$bad" ]; then
-        for s in $bad; do echo "FAIL: $f references runtime/authority symbol $s"; done
-        fail=1
-    fi
-}
-
-for f in "$BUILD"/visor/*.o; do
-    check_file "$f"
-done
-nobj=$checked
-
-# The adapter exports exactly its four public functions: no setter, no submit.
-ER="$BUILD/visor/visor_effect_request.o"
-if [ -e "$ER" ]; then
-    exports=$($NM --defined-only -g "$ER" | awk '$2 ~ /^[TDBR]$/ {print $3}' | sort | tr '\n' ' ')
-    want="visor_effect_request_build visor_effect_request_classify visor_effect_request_format_json visor_effect_request_format_text "
-    if [ "$exports" != "$want" ]; then
-        echo "FAIL: $ER exports [$exports], expected [$want]"; fail=1
-    fi
-else
-    echo "FAIL: $ER missing (lane 7 adapter not built)"; fail=1
-fi
-
-# No Visor C source (the test-only adapters left in src/visor) assigns `authorized`
-# anything but false.
+# Pure seeded OM-2 Visor: no C or header files remain under src/visor.
 [ -d "$ROOT/src/visor" ] || { echo "FAIL: $ROOT/src/visor missing"; fail=1; }
-hits=$(grep -rnE --include='*.c' --include='*.h' '(\.|->)authorized[[:space:]]*=[^=]' "$ROOT/src/visor" \
-        | grep -vE 'authorized[[:space:]]*=[[:space:]]*false[[:space:]]*;' || true)
-if [ -n "$hits" ]; then
-    printf '%s\n' "$hits"
-    echo "FAIL: a Visor C source assigns 'authorized' other than false"; fail=1
+c_left=$(find "$ROOT/src/visor" -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null || true)
+if [ -n "$c_left" ]; then
+    printf '%s\n' "$c_left"
+    echo "FAIL: unexpected C/H source remains under $ROOT/src/visor"; fail=1
 fi
 
 # ---- OM-2 sources of the omega binary ------------------------------------------
@@ -192,7 +136,7 @@ om_scan() {
 }
 
 om_files=""
-for f in "$ROOT"/tools/omega*.om "$ROOT"/om/visor/*.om "$ROOT"/src/visor/*.om \
+for f in "$ROOT"/tools/omega.om "$ROOT"/tools/omega_*.om "$ROOT"/om/visor/*.om "$ROOT"/src/visor/*.om \
          "$ROOT"/src/language/*.om "$ROOT"/om/aarch64/aarch64_om2.om; do
     [ -e "$f" ] && om_files="$om_files $f"
 done
@@ -263,6 +207,6 @@ if [ "$fail" -ne 0 ]; then
     echo "OMEGA_VISOR_AUTHORITY_ISOLATION_FAIL"
     exit 1
 fi
-echo "checked $nobj object(s) and $nom OM-2 source(s) against $(printf '%s\n' $forbidden | wc -l) forbidden symbols and $nhost host words (allowlist: $ALLOW); $bites/$nbite bite controls caught"
+echo "checked $nom OM-2 source(s) (0 Visor C/H files) against $(printf '%s\n' $forbidden | wc -l) forbidden symbols and $nhost host words (allowlist: $ALLOW); $bites/$nbite bite controls caught"
 echo "OMEGA_VISOR_AUTHORITY_ISOLATION_PASS"
 exit 0
