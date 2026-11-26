@@ -13,33 +13,40 @@
     2. Total Package Watt Conservation (`cbf_total_budget`, `cbf_nonneg_and_fan_bounds`):
        `pGpu + pCpu + pUnc <= min pBudget 140000`, all rails non-negative, and fan duty
        strictly inside `[20%, 100%]`.
-    3. Fail-Closed Non-Amplification & Invalid-Input Guards (`cbf_never_amplifies`,
-       `cbf_fail_closed_overtemp`, `cbf_fail_closed_bad_budget`, `cbf_fail_closed_bad_ceil`,
-       `cbf_fail_closed_bad_tau`):
+    3. Fail-Closed Non-Amplification & Invalid-Input/Fault Guards (`cbf_never_amplifies`,
+       `cbf_fail_closed_overtemp`, `cbf_fail_closed_sink_overtemp`,
+       `cbf_fail_closed_infeasible_barrier`, `cbf_fail_closed_bad_budget`,
+       `cbf_fail_closed_bad_ceil`, `cbf_fail_closed_bad_tau`):
        The shield never increases any requested power rail, and forces `(0, 0, 0, fan=100%)`
-       on over-temperature (`tDie >= tCeil`) or invalid policy (`pBudget <= 0`, `tau < 0`,
-       `tCeil > 90,000 mC`).
+       on over-temperature (`tDie >= tCeil` or `tSink >= tCeil`), infeasible reverse-conduction
+       barrier (`rawHeatBudget < 0`, where even 0 W violates `h >= 0`), or invalid policy
+       (`pBudget <= 0`, `pGpuBudget < 0`, `tau < 0`, `tCeil <= 0`, `tCeil > 90,000 mC`).
     4. Discrete 2-Node Thermal CBF Barrier Preservation & Inductive Invariance
        (`cbf_thermal_barrier_preserved`, `cbf_thermal_barrier_normal_regime`,
-       `cbf_step_box_safe`, `cbf_multistep_temp_safe`):
-       With `h(T_ceil, T_die, tau, dT) = T_ceil - T_die - tau * dT`, every filtered command
-       satisfies `h >= 0`, `T_die' <= T_ceil`, and next-step `h' >= 0`; by induction over
-       arbitrary N-step sequences of arbitrary adversarial proposals, both Node 1 (`T_die`)
-       and Node 2 (`T_sink`) remain inside `[T_amb, T_ceil]` forever.
-    5. Clamping Monotonicity, Anticipatory Pre-Cooling & Idempotence
+       `cbf_admitted_barrier_safe`, `cbf_step_box_safe`, `cbf_multistep_temp_safe`):
+       With `h(T_ceil, T_die, tau, dT) = T_ceil - T_die - tau * dT`, EVERY admitted command
+       (`failClosed = false`) unconditionally satisfies `h >= 0`, `T_die' <= T_ceil`, and
+       next-step `h' >= 0`; by induction over arbitrary N-step sequences of arbitrary
+       adversarial proposals, both Node 1 (`T_die`) and Node 2 (`T_sink`) remain inside
+       `[T_amb, T_ceil]` forever.
+    5. Unconditional Clamping Monotonicity, Anticipatory Pre-Cooling & Full Idempotence
        (`powerClamp_mono_pBudget`, `cbf_mono_pBudget_rails`, `cbf_mono_pGpuBudget`,
        `cbf_mono_gpu_req`, `cbf_mono_tCeil`, `cbf_mono_tSink`, `cbf_mono_tau`,
-       `cbf_mono_tDie_whole_unit`, `precool_fan_mono_sink`, `cbf_idempotent_power`):
-       Tighter budgets, lower ceilings, hotter heatsink, longer lookahead `tau`, or whole-unit
-       temperature rise monotonically reduce (or preserve) allowed power; higher fan duty
-       monotonically cools Node 2 (`T_sink`), which monotonically increases sustainable heat
-       headroom at burst onset.
+       `cbf_mono_tDie_whole_unit`, `precool_fan_mono_sink`, `cbf_idempotent`):
+       Tighter budgets (unconditionally for ALL proposals), lower ceilings, hotter heatsink,
+       longer lookahead `tau`, or whole-unit temperature rise monotonically reduce (or
+       preserve) allowed power; higher fan duty monotonically cools Node 2 (`T_sink`),
+       which monotonically increases sustainable heat headroom at burst onset; filtering an
+       already-filtered command is fully idempotent across power rails, fan duty, and
+       `failClosed`.
     6. Non-Vacuity Negative Controls (`neg_control_trap14_90w`, `neg_control_over_budget`,
-       `neg_control_hot_die_spike`, `neg_control_invalid_budget_fail_closed`):
+       `neg_control_hot_die_spike`, `neg_control_invalid_budget_fail_closed`,
+       `neg_control_hot_sink_infeasible`):
        Concrete counterexamples proving an unclamped 90 W GPU spike violates both Trap 14
        (`90000 > 80000`) and the thermal CBF barrier (`h = -700 < 0`), whereas `cbfFilter`
        clamps it into the safe invariant set (`pGpu = 62640 <= 80000`, `h = +668 >= 0`,
-       `fanPct = 100`).
+       `fanPct = 100`), and proving reverse-conduction / overheated-sink states violate
+       `h >= 0` even at 0 W while `cbfFilter` fails closed with `fanPct = 100`.
 
   Model-to-system link:
     Constants, `ceilDiv`, `barrierH`, `stepThermal`, and `cbfFilter` mirror 1:1 the exact
@@ -205,11 +212,24 @@ def policyValid (pol : WattPolicy) : Bool :=
   decide (pol.pBudget > 0 ∧ pol.pGpuBudget ≥ 0 ∧ pol.tCeil > 0 ∧
           pol.tCeil ≤ T_CEIL_ABS_MAX_MC ∧ pol.tau ≥ 0)
 
+/-- Raw signed thermal heat budget before clamping to 0: negative means even 0 W
+    cannot satisfy `barrierH >= 0` due to reverse conduction from a hotter sink. -/
+def rawHeatBudget (st : ThermalState) (pol : WattPolicy) : Int :=
+  if pol.tau < 0 then 0
+  else THERMAL_SCALE * ((pol.tCeil - st.tDie) / (pol.tau + 1)) + dieCoolDs st
+
 /-- Maximum thermally-safe scaled die heat for `(st, pol)`. -/
 def maxHeatSafe (st : ThermalState) (pol : WattPolicy) : Int :=
-  if st.tDie ≥ pol.tCeil then 0
-  else
-    max 0 (THERMAL_SCALE * ((pol.tCeil - st.tDie) / (pol.tau + 1)) + dieCoolDs st)
+  if st.tDie ≥ pol.tCeil ∨ st.tSink ≥ pol.tCeil ∨ pol.tau < 0 then 0
+  else max 0 (rawHeatBudget st pol)
+
+/-- Fail-closed predicate: invalid policy, Node 1 or Node 2 at/above ceiling,
+    or infeasible zero-power thermal barrier (`rawHeatBudget < 0`). -/
+def mustFailClosed (st : ThermalState) (pol : WattPolicy) : Bool :=
+  !policyValid pol ||
+  decide (st.tDie ≥ pol.tCeil) ||
+  decide (st.tSink ≥ pol.tCeil) ||
+  decide (rawHeatBudget st pol < 0)
 
 /-- Monotonic safety fan floor from thermal headroom and clamp engagement. -/
 def safeFanFloor (headroom : Int) (thermalClamped : Bool) : Int :=
@@ -253,7 +273,7 @@ def thermalClamp (r : RailTriple) (maxHeat : Int) : RailTriple :=
 
 /-- Fail-closed Discrete Thermal & Power CBF Safety Filter (exact mirror of `watt_cbf.om`). -/
 def cbfFilter (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal) : SafeCommand :=
-  if !policyValid pol || decide (st.tDie ≥ pol.tCeil) then
+  if mustFailClosed st pol then
     { pGpu       := 0
       pCpu       := 0
       pUnc       := 0
@@ -471,20 +491,56 @@ private theorem thermalClamp_mono_gpu (r1 r2 : RailTriple) (m1 m2 : Int)
          Int.ediv_le_ediv (by decide : (0 : Int) < K_CPU_HEAT) hhc,
          Int.ediv_le_ediv (by decide : (0 : Int) < K_GPU_HEAT) hhg⟩
 
+private theorem safeFanFloor_mono_tc (headroom : Int) (tc : Bool) :
+    safeFanFloor headroom false ≤ safeFanFloor headroom tc := by
+  cases tc
+  · exact Int.le_refl _
+  · unfold safeFanFloor FAN_MIN_PCT FAN_MAX_PCT
+    by_cases h1 : headroom ≤ 5000
+    · simp [h1]
+    · by_cases h2 : headroom ≤ 10000
+      · simp [h1, h2]
+      · by_cases h3 : headroom ≤ 18000
+        · simp [h1, h2, h3]
+        · by_cases h4 : headroom ≤ 28000
+          · simp [h1, h2, h3, h4]
+          · simp [h1, h2, h3, h4]
+
 private theorem policyValid_of_not_guard (st : ThermalState) (pol : WattPolicy)
-    (h : ¬ ((!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true)) :
+    (h : ¬ (mustFailClosed st pol = true)) :
     pol.pBudget > 0 ∧ pol.pGpuBudget ≥ 0 ∧ pol.tCeil > 0 ∧
-    pol.tCeil ≤ T_CEIL_ABS_MAX_MC ∧ pol.tau ≥ 0 ∧ st.tDie < pol.tCeil := by
+    pol.tCeil ≤ T_CEIL_ABS_MAX_MC ∧ pol.tau ≥ 0 ∧
+    st.tDie < pol.tCeil ∧ st.tSink < pol.tCeil ∧
+    0 ≤ rawHeatBudget st pol := by
+  unfold mustFailClosed at h
   have hv : policyValid pol = true := by
     cases hpv : policyValid pol <;> simp [hpv] at h ⊢
-  have hlt : ¬ (st.tDie ≥ pol.tCeil) := by
+  have hdie : ¬ (st.tDie ≥ pol.tCeil) := by
     intro hge; simp [hge] at h
+  have hsink : ¬ (st.tSink ≥ pol.tCeil) := by
+    intro hge; simp [hge] at h
+  have hraw : ¬ (rawHeatBudget st pol < 0) := by
+    intro hlt; simp [hlt] at h
   unfold policyValid at hv
   simp only [decide_eq_true_eq] at hv
   omega
 
+private theorem not_mustFailClosed_of_ok (st : ThermalState) (pol : WattPolicy)
+    (hbud : pol.pBudget > 0) (hgb : pol.pGpuBudget ≥ 0)
+    (hce0 : pol.tCeil > 0) (hceM : pol.tCeil ≤ T_CEIL_ABS_MAX_MC)
+    (htau : pol.tau ≥ 0) (hdie : st.tDie < pol.tCeil)
+    (hsink : st.tSink < pol.tCeil) (hraw : 0 ≤ rawHeatBudget st pol) :
+    ¬ (mustFailClosed st pol = true) := by
+  unfold mustFailClosed
+  have hv : policyValid pol = true := by
+    unfold policyValid; simp only [decide_eq_true_eq]; omega
+  have g1 : ¬ (st.tDie ≥ pol.tCeil) := by omega
+  have g2 : ¬ (st.tSink ≥ pol.tCeil) := by omega
+  have g3 : ¬ (rawHeatBudget st pol < 0) := by omega
+  simp [hv, g1, g2, g3]
+
 private theorem cbf_ok_rails (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
-    (h : ¬ ((!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true)) :
+    (h : ¬ (mustFailClosed st pol = true)) :
     (cbfFilter st pol prop).pGpu = (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pGpu ∧
     (cbfFilter st pol prop).pCpu = (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pCpu ∧
     (cbfFilter st pol prop).pUnc = (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pUnc := by
@@ -499,7 +555,7 @@ private theorem cbf_ok_rails (st : ThermalState) (pol : WattPolicy) (prop : Powe
 /-- Trap-14 Hardware Ceiling: filtered GPU power NEVER exceeds 80,000 mW (80 W). -/
 theorem cbf_gpu_hard_cap (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal) :
     (cbfFilter st pol prop).pGpu ≤ P_GPU_HARD_MAX_MW := by
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h, P_GPU_HARD_MAX_MW]
   · have hok := cbf_ok_rails st pol prop h
     have hp := policyValid_of_not_guard st pol h
@@ -511,7 +567,7 @@ theorem cbf_gpu_hard_cap (st : ThermalState) (pol : WattPolicy) (prop : PowerPro
 theorem cbf_gpu_budget_cap (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
     (hgb : 0 ≤ pol.pGpuBudget) :
     (cbfFilter st pol prop).pGpu ≤ min P_GPU_HARD_MAX_MW pol.pGpuBudget := by
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h, P_GPU_HARD_MAX_MW]; omega
   · have hok := cbf_ok_rails st pol prop h
     have hp := policyValid_of_not_guard st pol h
@@ -525,7 +581,7 @@ theorem cbf_total_budget (st : ThermalState) (pol : WattPolicy) (prop : PowerPro
     let out := cbfFilter st pol prop
     out.pGpu + out.pCpu + out.pUnc ≤ min pol.pBudget P_TOTAL_HARD_MAX_MW := by
   dsimp only
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h, P_TOTAL_HARD_MAX_MW]; omega
   · have hok := cbf_ok_rails st pol prop h
     have hp := policyValid_of_not_guard st pol h
@@ -539,7 +595,7 @@ theorem cbf_nonneg_and_fan_bounds (st : ThermalState) (pol : WattPolicy) (prop :
     0 ≤ out.pGpu ∧ 0 ≤ out.pCpu ∧ 0 ≤ out.pUnc ∧
     FAN_MIN_PCT ≤ out.fanPct ∧ out.fanPct ≤ FAN_MAX_PCT := by
   dsimp only
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h, FAN_MIN_PCT, FAN_MAX_PCT]
   · have hp := policyValid_of_not_guard st pol h
     have pb := powerClamp_bounds pol prop (by omega) (by omega)
@@ -561,7 +617,7 @@ theorem cbf_never_amplifies (st : ThermalState) (pol : WattPolicy) (prop : Power
     let out := cbfFilter st pol prop
     out.pGpu ≤ prop.pGpu ∧ out.pCpu ≤ prop.pCpu ∧ out.pUnc ≤ prop.pUnc := by
   dsimp only
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h]; omega
   · have hok := cbf_ok_rails st pol prop h
     have pl := powerClamp_le_prop pol prop hg hc hu
@@ -578,8 +634,34 @@ theorem cbf_fail_closed_overtemp (st : ThermalState) (pol : WattPolicy) (prop : 
     out.pGpu = 0 ∧ out.pCpu = 0 ∧ out.pUnc = 0 ∧
     out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
   dsimp only
-  unfold cbfFilter
-  have h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true := by simp [hot]
+  unfold cbfFilter mustFailClosed
+  have h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil) ||
+            decide (st.tSink ≥ pol.tCeil) || decide (rawHeatBudget st pol < 0)) = true := by
+    simp [hot]
+  simp [h]
+
+theorem cbf_fail_closed_sink_overtemp (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
+    (hot : st.tSink ≥ pol.tCeil) :
+    let out := cbfFilter st pol prop
+    out.pGpu = 0 ∧ out.pCpu = 0 ∧ out.pUnc = 0 ∧
+    out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
+  dsimp only
+  unfold cbfFilter mustFailClosed
+  have h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil) ||
+            decide (st.tSink ≥ pol.tCeil) || decide (rawHeatBudget st pol < 0)) = true := by
+    simp [hot]
+  simp [h]
+
+theorem cbf_fail_closed_infeasible_barrier (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
+    (hinfeas : rawHeatBudget st pol < 0) :
+    let out := cbfFilter st pol prop
+    out.pGpu = 0 ∧ out.pCpu = 0 ∧ out.pUnc = 0 ∧
+    out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
+  dsimp only
+  unfold cbfFilter mustFailClosed
+  have h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil) ||
+            decide (st.tSink ≥ pol.tCeil) || decide (rawHeatBudget st pol < 0)) = true := by
+    simp [hinfeas]
   simp [h]
 
 theorem cbf_fail_closed_bad_budget (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
@@ -588,7 +670,7 @@ theorem cbf_fail_closed_bad_budget (st : ThermalState) (pol : WattPolicy) (prop 
     out.pGpu = 0 ∧ out.pCpu = 0 ∧ out.pUnc = 0 ∧
     out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
   dsimp only
-  unfold cbfFilter
+  unfold cbfFilter mustFailClosed
   have hv : policyValid pol = false := by
     unfold policyValid; simp [decide_eq_false_iff_not]; omega
   simp [hv]
@@ -599,7 +681,7 @@ theorem cbf_fail_closed_bad_ceil (st : ThermalState) (pol : WattPolicy) (prop : 
     out.pGpu = 0 ∧ out.pCpu = 0 ∧ out.pUnc = 0 ∧
     out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
   dsimp only
-  unfold cbfFilter
+  unfold cbfFilter mustFailClosed
   have hv : policyValid pol = false := by
     unfold policyValid; simp [decide_eq_false_iff_not]; omega
   simp [hv]
@@ -610,7 +692,7 @@ theorem cbf_fail_closed_bad_tau (st : ThermalState) (pol : WattPolicy) (prop : P
     out.pGpu = 0 ∧ out.pCpu = 0 ∧ out.pUnc = 0 ∧
     out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
   dsimp only
-  unfold cbfFilter
+  unfold cbfFilter mustFailClosed
   have hv : policyValid pol = false := by
     unfold policyValid; simp [decide_eq_false_iff_not]; omega
   simp [hv]
@@ -624,7 +706,7 @@ theorem cbf_die_heat_le_maxHeat (st : ThermalState) (pol : WattPolicy) (prop : P
     let out := cbfFilter st pol prop
     dieHeat out.pGpu out.pCpu out.pUnc ≤ maxHeatSafe st pol := by
   dsimp only
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h, dieHeat]
     exact maxHeatSafe_nonneg st pol
   · have hok := cbf_ok_rails st pol prop h
@@ -656,12 +738,12 @@ theorem cbf_thermal_barrier_preserved
   dsimp only
   have hheat := cbf_die_heat_le_maxHeat st pol prop
   by_cases hlt : st.tDie < pol.tCeil
-  · have hmh : maxHeatSafe st pol =
+  · have hmh_le : maxHeatSafe st pol ≤
         THERMAL_SCALE * ((pol.tCeil - st.tDie) / (pol.tau + 1)) + dieCoolDs st := by
-      unfold maxHeatSafe
-      have hge : ¬ (st.tDie ≥ pol.tCeil) := by omega
-      simp only [hge, ↓reduceIte]
-      omega
+      unfold maxHeatSafe rawHeatBudget
+      have hntau : ¬ (pol.tau < 0) := by omega
+      simp only [hntau, ↓reduceIte]
+      split <;> omega
     have hdTle : nextDieDelta st (cbfFilter st pol prop).pGpu (cbfFilter st pol prop).pCpu
         (cbfFilter st pol prop).pUnc ≤ (pol.tCeil - st.tDie) / (pol.tau + 1) := by
       unfold nextDieDelta
@@ -723,6 +805,39 @@ theorem cbf_thermal_barrier_preserved
     dsimp only
     exact ⟨by omega, by omega, by omega⟩
 
+/-- Unconditional Admitted-Command Safety Theorem:
+    For ANY `(st, pol, prop)` whatsoever (zero extra assumptions on `tSink`, `tDie`, or `pol`),
+    whenever `cbfFilter` does NOT fail closed (`failClosed = false`), ALL safety invariants
+    hold simultaneously: Trap-14 GPU cap, total Watt budget, `barrierH >= 0`, `tDie' <= tCeil`,
+    and next-step `barrierH' >= 0`. -/
+theorem cbf_admitted_barrier_safe
+    (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
+    (hadmit : (cbfFilter st pol prop).failClosed = false) :
+    let out := cbfFilter st pol prop
+    let dT  := nextDieDelta st out.pGpu out.pCpu out.pUnc
+    let st' := stepThermal st out.pGpu out.pCpu out.pUnc out.fanPct
+    out.pGpu ≤ min P_GPU_HARD_MAX_MW pol.pGpuBudget ∧
+    out.pGpu + out.pCpu + out.pUnc ≤ min pol.pBudget P_TOTAL_HARD_MAX_MW ∧
+    barrierH pol.tCeil st.tDie pol.tau dT ≥ 0 ∧
+    st'.tDie ≤ pol.tCeil ∧
+    barrierH pol.tCeil st'.tDie pol.tau dT ≥ 0 := by
+  dsimp only
+  have hng : ¬ (mustFailClosed st pol = true) := by
+    intro hfc
+    unfold cbfFilter at hadmit
+    simp [hfc] at hadmit
+  have hp := policyValid_of_not_guard st pol hng
+  have hraw : 0 ≤ THERMAL_SCALE * ((pol.tCeil - st.tDie) / (pol.tau + 1)) + dieCoolDs st := by
+    have h1 := hp.2.2.2.2.2.2.2
+    unfold rawHeatBudget at h1
+    have hnt : ¬ (pol.tau < 0) := by omega
+    simp only [hnt, ↓reduceIte] at h1
+    exact h1
+  have hbar := cbf_thermal_barrier_preserved st pol prop (by omega) (by omega) hraw
+  have hg := cbf_gpu_budget_cap st pol prop (by omega)
+  have ht := cbf_total_budget st pol prop (by omega)
+  exact ⟨hg, ht, hbar.1, hbar.2.1, hbar.2.2⟩
+
 /-- Corollary: In the normal heated-die regime (`tSink <= tDie <= tCeil`), `h >= 0` holds
     without any extra passive-conduction hypothesis. -/
 theorem cbf_thermal_barrier_normal_regime
@@ -782,17 +897,16 @@ theorem cbf_step_box_safe
       unfold nextDieDelta
       rw [ceilDiv_le_iff _ THERMAL_SCALE _ (by decide)]
       by_cases hlt : st.tDie < pol.tCeil
-      · unfold maxHeatSafe at hheat_le
-        have hge : ¬ (st.tDie ≥ pol.tCeil) := by omega
-        simp only [hge, ↓reduceIte] at hheat_le
+      · unfold maxHeatSafe rawHeatBudget at hheat_le
+        have hntau : ¬ (pol.tau < 0) := by omega
+        simp only [hntau, ↓reduceIte] at hheat_le
         have hdiv := mul_ediv_bounds (pol.tCeil - st.tDie) (pol.tau + 1) (by omega) (by omega)
         have hqle : (pol.tCeil - st.tDie) / (pol.tau + 1) ≤ pol.tCeil - st.tDie := by
           have h1 : 1 * ((pol.tCeil - st.tDie) / (pol.tau + 1)) ≤
               (pol.tau + 1) * ((pol.tCeil - st.tDie) / (pol.tau + 1)) :=
             Int.mul_le_mul_of_nonneg_right (by omega) hdiv.1
           omega
-        unfold dieCoolDs K_DS_COND THERMAL_SCALE at *
-        omega
+        split at hheat_le <;> (unfold dieCoolDs K_DS_COND THERMAL_SCALE at *; omega)
       · have hfc := cbf_fail_closed_overtemp st pol prop (by omega)
         have hd0 : dieHeat (cbfFilter st pol prop).pGpu (cbfFilter st pol prop).pCpu
             (cbfFilter st pol prop).pUnc = 0 := by
@@ -895,50 +1009,94 @@ theorem powerClamp_mono_pBudget
     exact clampNonNeg_mono_hi prop.pGpu _ _ (by omega)
   exact ⟨hu, hc, hg⟩
 
-/-- Full CBF budget monotonicity (normal host-baseline regime where `pUnc + pCpu` fits
-    in `pol1.pBudget`): raising `pBudget` monotonically raises (or preserves) every rail
-    including `pGpu`. -/
+/-- Unconditional Full CBF Budget Monotonicity: for EVERY thermal state and EVERY
+    arbitrary proposal (even adversarial `pUnc + pCpu > pBudget`), raising `pBudget`
+    monotonically raises (or preserves) every admitted rail `(pUnc, pCpu, pGpu)`. -/
 theorem cbf_mono_pBudget_rails
     (st : ThermalState) (pol1 pol2 : WattPolicy) (prop : PowerProposal)
     (hbud : pol1.pBudget ≤ pol2.pBudget)
     (hgb  : pol1.pGpuBudget = pol2.pGpuBudget)
     (hce  : pol1.tCeil = pol2.tCeil)
-    (htau : pol1.tau = pol2.tau)
-    (hu0  : 0 ≤ prop.pUnc) (hc0 : 0 ≤ prop.pCpu)
-    (hhost : prop.pUnc ≤ P_UNC_HARD_MAX_MW ∧ prop.pUnc + prop.pCpu ≤ min pol1.pBudget P_TOTAL_HARD_MAX_MW) :
+    (htau : pol1.tau = pol2.tau) :
     let o1 := cbfFilter st pol1 prop
     let o2 := cbfFilter st pol2 prop
     o1.pUnc ≤ o2.pUnc ∧ o1.pCpu ≤ o2.pCpu ∧ o1.pGpu ≤ o2.pGpu := by
   dsimp only
-  by_cases h1 : (!policyValid pol1 || decide (st.tDie ≥ pol1.tCeil)) = true
+  by_cases h1 : mustFailClosed st pol1 = true
   · have hnn := cbf_nonneg_and_fan_bounds st pol2 prop
     unfold cbfFilter; simp only [h1, ↓reduceIte]
     exact ⟨hnn.2.2.1, hnn.2.1, hnn.1⟩
   · have hp1 := policyValid_of_not_guard st pol1 h1
-    have h2 : ¬ ((!policyValid pol2 || decide (st.tDie ≥ pol2.tCeil)) = true) := by
-      have hv2 : policyValid pol2 = true := by
-        unfold policyValid; simp only [decide_eq_true_eq]; omega
-      have hlt2 : ¬ (st.tDie ≥ pol2.tCeil) := by omega
-      simp [hv2, hlt2]
+    have hrawEq : rawHeatBudget st pol1 = rawHeatBudget st pol2 := by
+      unfold rawHeatBudget; rw [hce, htau]
+    have h2 : ¬ (mustFailClosed st pol2 = true) :=
+      not_mustFailClosed_of_ok st pol2 (by omega) (by omega) (by omega) (by omega)
+        (by omega) (by omega) (by omega) (by rw [← hrawEq]; exact hp1.2.2.2.2.2.2.2)
     have hok1 := cbf_ok_rails st pol1 prop h1
     have hok2 := cbf_ok_rails st pol2 prop h2
     rw [hok1.1, hok1.2.1, hok1.2.2, hok2.1, hok2.2.1, hok2.2.2]
     have hmEq : maxHeatSafe st pol1 = maxHeatSafe st pol2 := by
-      unfold maxHeatSafe; rw [hce, htau]
-    have hu1 : powerClampUnc pol1 prop = prop.pUnc := by
-      unfold powerClampUnc; exact clampNonNeg_eq_self _ _ hu0 (by omega)
-    have hu2 : powerClampUnc pol2 prop = prop.pUnc := by
-      unfold powerClampUnc; exact clampNonNeg_eq_self _ _ hu0 (by omega)
-    have hc1 : powerClampCpu pol1 prop = prop.pCpu := by
-      unfold powerClampCpu; rw [hu1]; exact clampNonNeg_eq_self _ _ hc0 (by omega)
-    have hc2 : powerClampCpu pol2 prop = prop.pCpu := by
-      unfold powerClampCpu; rw [hu2]; exact clampNonNeg_eq_self _ _ hc0 (by omega)
+      unfold maxHeatSafe rawHeatBudget; rw [hce, htau]
+    rw [hmEq]
     have hpm := powerClamp_mono_pBudget pol1 pol2 prop (by omega) hbud hgb
-    have huEq : (powerClamp pol1 prop).pUnc = (powerClamp pol2 prop).pUnc := by
-      dsimp only [powerClamp]; rw [hu1, hu2]
-    have hcEq : (powerClamp pol1 prop).pCpu = (powerClamp pol2 prop).pCpu := by
-      dsimp only [powerClamp]; rw [hc1, hc2]
-    exact thermalClamp_mono_gpu _ _ _ _ huEq hcEq hpm.2.2 (by rw [hmEq]; exact Int.le_refl _)
+    have hpb2 := powerClamp_bounds pol2 prop (by omega) (by omega)
+    have hth2 := thermalClamp_nonneg_and_heat (powerClamp pol2 prop) (maxHeatSafe st pol2)
+      hpb2.1 hpb2.2.1 hpb2.2.2.1 (maxHeatSafe_nonneg st pol2)
+    by_cases huEq : (powerClamp pol1 prop).pUnc = (powerClamp pol2 prop).pUnc
+    · by_cases hcEq : (powerClamp pol1 prop).pCpu = (powerClamp pol2 prop).pCpu
+      · exact thermalClamp_mono_gpu _ _ _ _ huEq hcEq hpm.2.2 (Int.le_refl _)
+      · have hcpu_sat : (powerClamp pol1 prop).pCpu =
+            min pol1.pBudget P_TOTAL_HARD_MAX_MW - (powerClamp pol1 prop).pUnc := by
+          dsimp only [powerClamp] at huEq hcEq hpm ⊢
+          have hru1_nn : 0 ≤ min pol1.pBudget 140000 - powerClampUnc pol1 prop := by
+            have hb1 := clampNonNeg_bounds prop.pUnc (min P_UNC_HARD_MAX_MW (min pol1.pBudget P_TOTAL_HARD_MAX_MW))
+            unfold powerClampUnc P_UNC_HARD_MAX_MW P_TOTAL_HARD_MAX_MW at *; omega
+          unfold powerClampCpu clampNonNeg P_TOTAL_HARD_MAX_MW at hcEq ⊢
+          rw [← huEq] at hcEq
+          by_cases a1 : min pol1.pBudget 140000 - powerClampUnc pol1 prop ≤ 0 <;>
+          by_cases a2 : min pol2.pBudget 140000 - powerClampUnc pol1 prop ≤ 0 <;>
+          by_cases bx : prop.pCpu ≤ 0 <;>
+          by_cases c1 : prop.pCpu ≥ min pol1.pBudget 140000 - powerClampUnc pol1 prop <;>
+          by_cases c2 : prop.pCpu ≥ min pol2.pBudget 140000 - powerClampUnc pol1 prop <;>
+          simp [a1, a2, bx, c1, c2] at hcEq ⊢ <;> omega
+        have hg1_zero : (powerClamp pol1 prop).pGpu = 0 := by
+          have hpb1 := powerClamp_bounds pol1 prop (by omega) (by omega)
+          omega
+        have hthu_eq : thermalHeatUnc (powerClamp pol1 prop) (maxHeatSafe st pol2) =
+            thermalHeatUnc (powerClamp pol2 prop) (maxHeatSafe st pol2) := by
+          unfold thermalHeatUnc; rw [huEq]
+        have hthc_le : thermalHeatCpu (powerClamp pol1 prop) (maxHeatSafe st pol2) ≤
+            thermalHeatCpu (powerClamp pol2 prop) (maxHeatSafe st pol2) := by
+          unfold thermalHeatCpu; rw [hthu_eq]; unfold K_CPU_HEAT; omega
+        have htg1_zero : (thermalClamp (powerClamp pol1 prop) (maxHeatSafe st pol2)).pGpu = 0 := by
+          have hpb1 := powerClamp_bounds pol1 prop (by omega) (by omega)
+          have hth1 := thermalClamp_nonneg_and_heat (powerClamp pol1 prop) (maxHeatSafe st pol2)
+            hpb1.1 hpb1.2.1 hpb1.2.2.1 (maxHeatSafe_nonneg st pol2)
+          have hle1 := thermalClamp_le_input (powerClamp pol1 prop) (maxHeatSafe st pol2)
+          omega
+        refine ⟨by unfold thermalClamp; rw [hthu_eq]; exact Int.le_refl _,
+                by unfold thermalClamp; exact Int.ediv_le_ediv (by decide : (0 : Int) < K_CPU_HEAT) hthc_le,
+                by omega⟩
+    · have hunc_sat : (powerClamp pol1 prop).pUnc = min pol1.pBudget P_TOTAL_HARD_MAX_MW := by
+        dsimp only [powerClamp] at huEq ⊢
+        unfold powerClampUnc clampNonNeg P_UNC_HARD_MAX_MW P_TOTAL_HARD_MAX_MW at huEq ⊢
+        by_cases a1 : min 25000 (min pol1.pBudget 140000) ≤ 0 <;>
+        by_cases a2 : min 25000 (min pol2.pBudget 140000) ≤ 0 <;>
+        by_cases bx : prop.pUnc ≤ 0 <;>
+        by_cases c1 : prop.pUnc ≥ min 25000 (min pol1.pBudget 140000) <;>
+        by_cases c2 : prop.pUnc ≥ min 25000 (min pol2.pBudget 140000) <;>
+        simp [a1, a2, bx, c1, c2] at huEq ⊢ <;> omega
+      have hpb1 := powerClamp_bounds pol1 prop (by omega) (by omega)
+      have hc1_zero : (powerClamp pol1 prop).pCpu = 0 := by omega
+      have hg1_zero : (powerClamp pol1 prop).pGpu = 0 := by omega
+      have hth1 := thermalClamp_nonneg_and_heat (powerClamp pol1 prop) (maxHeatSafe st pol2)
+        hpb1.1 hpb1.2.1 hpb1.2.2.1 (maxHeatSafe_nonneg st pol2)
+      have hle1 := thermalClamp_le_input (powerClamp pol1 prop) (maxHeatSafe st pol2)
+      have hthu_le : thermalHeatUnc (powerClamp pol1 prop) (maxHeatSafe st pol2) ≤
+          thermalHeatUnc (powerClamp pol2 prop) (maxHeatSafe st pol2) := by
+        unfold thermalHeatUnc K_CPU_HEAT; omega
+      refine ⟨by unfold thermalClamp; exact Int.ediv_le_ediv (by decide : (0 : Int) < K_CPU_HEAT) hthu_le,
+              by omega, by omega⟩
 
 /-- Policy GPU-budget monotonicity: raising `pGpuBudget` never decreases filtered `pGpu`. -/
 theorem cbf_mono_pGpuBudget
@@ -948,20 +1106,20 @@ theorem cbf_mono_pGpuBudget
     (hce  : pol1.tCeil = pol2.tCeil)
     (htau : pol1.tau = pol2.tau) :
     (cbfFilter st pol1 prop).pGpu ≤ (cbfFilter st pol2 prop).pGpu := by
-  by_cases h1 : (!policyValid pol1 || decide (st.tDie ≥ pol1.tCeil)) = true
+  by_cases h1 : mustFailClosed st pol1 = true
   · have hnn := cbf_nonneg_and_fan_bounds st pol2 prop
     unfold cbfFilter; simp only [h1, ↓reduceIte]; exact hnn.1
   · have hp1 := policyValid_of_not_guard st pol1 h1
-    have h2 : ¬ ((!policyValid pol2 || decide (st.tDie ≥ pol2.tCeil)) = true) := by
-      have hv2 : policyValid pol2 = true := by
-        unfold policyValid; simp only [decide_eq_true_eq]; omega
-      have hlt2 : ¬ (st.tDie ≥ pol2.tCeil) := by omega
-      simp [hv2, hlt2]
+    have hrawEq : rawHeatBudget st pol1 = rawHeatBudget st pol2 := by
+      unfold rawHeatBudget; rw [hce, htau]
+    have h2 : ¬ (mustFailClosed st pol2 = true) :=
+      not_mustFailClosed_of_ok st pol2 (by omega) (by omega) (by omega) (by omega)
+        (by omega) (by omega) (by omega) (by rw [← hrawEq]; exact hp1.2.2.2.2.2.2.2)
     have hok1 := cbf_ok_rails st pol1 prop h1
     have hok2 := cbf_ok_rails st pol2 prop h2
     rw [hok1.1, hok2.1]
     have hmEq : maxHeatSafe st pol1 = maxHeatSafe st pol2 := by
-      unfold maxHeatSafe; rw [hce, htau]
+      unfold maxHeatSafe rawHeatBudget; rw [hce, htau]
     have hu : (powerClamp pol1 prop).pUnc = (powerClamp pol2 prop).pUnc := by
       unfold powerClamp powerClampUnc; rw [hbud]
     have hc : (powerClamp pol1 prop).pCpu = (powerClamp pol2 prop).pCpu := by
@@ -976,7 +1134,7 @@ theorem cbf_mono_gpu_req
     (st : ThermalState) (pol : WattPolicy) (p1 p2 : PowerProposal)
     (hg : p1.pGpu ≤ p2.pGpu) (hc : p1.pCpu = p2.pCpu) (hu : p1.pUnc = p2.pUnc) :
     (cbfFilter st pol p1).pGpu ≤ (cbfFilter st pol p2).pGpu := by
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h]
   · have hok1 := cbf_ok_rails st pol p1 h
     have hok2 := cbf_ok_rails st pol p2 h
@@ -1001,16 +1159,22 @@ theorem cbf_mono_tCeil
     let o2 := cbfFilter st pol2 prop
     o1.pUnc ≤ o2.pUnc ∧ o1.pCpu ≤ o2.pCpu ∧ o1.pGpu ≤ o2.pGpu := by
   dsimp only
-  by_cases h1 : (!policyValid pol1 || decide (st.tDie ≥ pol1.tCeil)) = true
+  by_cases h1 : mustFailClosed st pol1 = true
   · have hnn := cbf_nonneg_and_fan_bounds st pol2 prop
     unfold cbfFilter; simp only [h1, ↓reduceIte]
     exact ⟨hnn.2.2.1, hnn.2.1, hnn.1⟩
   · have hp1 := policyValid_of_not_guard st pol1 h1
-    have h2 : ¬ ((!policyValid pol2 || decide (st.tDie ≥ pol2.tCeil)) = true) := by
-      have hv2 : policyValid pol2 = true := by
-        unfold policyValid; simp only [decide_eq_true_eq]; omega
-      have hlt2 : ¬ (st.tDie ≥ pol2.tCeil) := by omega
-      simp [hv2, hlt2]
+    have hraw_le : rawHeatBudget st pol1 ≤ rawHeatBudget st pol2 := by
+      unfold rawHeatBudget
+      have nt1 : ¬ (pol1.tau < 0) := by omega
+      have nt2 : ¬ (pol2.tau < 0) := by omega
+      simp only [nt1, nt2, ↓reduceIte]
+      rw [htau]
+      have hd := Int.ediv_le_ediv (by omega : 0 < pol2.tau + 1) (by omega : pol1.tCeil - st.tDie ≤ pol2.tCeil - st.tDie)
+      unfold THERMAL_SCALE; omega
+    have h2 : ¬ (mustFailClosed st pol2 = true) :=
+      not_mustFailClosed_of_ok st pol2 (by omega) (by omega) (by omega) (by omega)
+        (by omega) (by omega) (by omega) (by omega)
     have hok1 := cbf_ok_rails st pol1 prop h1
     have hok2 := cbf_ok_rails st pol2 prop h2
     rw [hok1.1, hok1.2.1, hok1.2.2, hok2.1, hok2.2.1, hok2.2.2]
@@ -1018,12 +1182,9 @@ theorem cbf_mono_tCeil
       unfold powerClamp powerClampGpu powerClampCpu powerClampUnc; rw [hbud, hgb]
     have hm : maxHeatSafe st pol1 ≤ maxHeatSafe st pol2 := by
       unfold maxHeatSafe
-      have g1 : ¬ (st.tDie ≥ pol1.tCeil) := by omega
-      have g2 : ¬ (st.tDie ≥ pol2.tCeil) := by omega
-      simp only [g1, g2, ↓reduceIte]
-      rw [htau]
-      have hd := Int.ediv_le_ediv (by omega : 0 < pol2.tau + 1) (by omega : pol1.tCeil - st.tDie ≤ pol2.tCeil - st.tDie)
-      unfold THERMAL_SCALE; omega
+      have g1 : ¬ (st.tDie ≥ pol1.tCeil ∨ st.tSink ≥ pol1.tCeil ∨ pol1.tau < 0) := by omega
+      have g2 : ¬ (st.tDie ≥ pol2.tCeil ∨ st.tSink ≥ pol2.tCeil ∨ pol2.tau < 0) := by omega
+      simp only [g1, g2, ↓reduceIte]; omega
     rw [hpcEq]
     exact thermalClamp_mono_heat _ _ _ hm
 
@@ -1036,17 +1197,26 @@ theorem cbf_mono_tSink
     let o2 := cbfFilter st2 pol prop
     o2.pUnc ≤ o1.pUnc ∧ o2.pCpu ≤ o1.pCpu ∧ o2.pGpu ≤ o1.pGpu := by
   dsimp only
-  by_cases h : (!policyValid pol || decide (st2.tDie ≥ pol.tCeil)) = true
-  · have h1 : (!policyValid pol || decide (st1.tDie ≥ pol.tCeil)) = true := by rw [hdie]; exact h
-    unfold cbfFilter; simp [h, h1]
-  · have h1 : ¬ ((!policyValid pol || decide (st1.tDie ≥ pol.tCeil)) = true) := by rw [hdie]; exact h
-    have hok1 := cbf_ok_rails st1 pol prop h1
-    have hok2 := cbf_ok_rails st2 pol prop h
-    rw [hok1.1, hok1.2.1, hok1.2.2, hok2.1, hok2.2.1, hok2.2.2]
-    have hm : maxHeatSafe st2 pol ≤ maxHeatSafe st1 pol := by
-      unfold maxHeatSafe dieCoolDs K_DS_COND
+  by_cases h2 : mustFailClosed st2 pol = true
+  · have hnn := cbf_nonneg_and_fan_bounds st1 pol prop
+    unfold cbfFilter; simp only [h2, ↓reduceIte]
+    exact ⟨hnn.2.2.1, hnn.2.1, hnn.1⟩
+  · have hp2 := policyValid_of_not_guard st2 pol h2
+    have hraw_le : rawHeatBudget st2 pol ≤ rawHeatBudget st1 pol := by
+      unfold rawHeatBudget dieCoolDs K_DS_COND
       rw [hdie]
       split <;> omega
+    have h1 : ¬ (mustFailClosed st1 pol = true) :=
+      not_mustFailClosed_of_ok st1 pol (by omega) (by omega) (by omega) (by omega)
+        (by omega) (by omega) (by omega) (by omega)
+    have hok1 := cbf_ok_rails st1 pol prop h1
+    have hok2 := cbf_ok_rails st2 pol prop h2
+    rw [hok1.1, hok1.2.1, hok1.2.2, hok2.1, hok2.2.1, hok2.2.2]
+    have hm : maxHeatSafe st2 pol ≤ maxHeatSafe st1 pol := by
+      unfold maxHeatSafe
+      have g1 : ¬ (st1.tDie ≥ pol.tCeil ∨ st1.tSink ≥ pol.tCeil ∨ pol.tau < 0) := by omega
+      have g2 : ¬ (st2.tDie ≥ pol.tCeil ∨ st2.tSink ≥ pol.tCeil ∨ pol.tau < 0) := by omega
+      simp only [g1, g2, ↓reduceIte]; omega
     exact thermalClamp_mono_heat _ _ _ hm
 
 /-- Monotonicity in lookahead `tau`: a larger safety horizon `tau` monotonically
@@ -1060,46 +1230,41 @@ theorem cbf_mono_tau
     let o2 := cbfFilter st pol2 prop
     o2.pUnc ≤ o1.pUnc ∧ o2.pCpu ≤ o1.pCpu ∧ o2.pGpu ≤ o1.pGpu := by
   dsimp only
-  have hvEq : policyValid pol1 = policyValid pol2 := by
-    unfold policyValid; rw [hbud, hgb, hce]
-    have h1 : decide (pol1.tau ≥ 0) = true := by simp [htau0]
-    have h2 : decide (pol2.tau ≥ 0) = true := by simp only [decide_eq_true_eq]; omega
-    by_cases h : pol2.pBudget > 0 ∧ pol2.pGpuBudget ≥ 0 ∧ pol2.tCeil > 0 ∧ pol2.tCeil ≤ T_CEIL_ABS_MAX_MC
-    · have ha : pol1.tau ≥ 0 := by omega
-      have hb : pol2.tau ≥ 0 := by omega
-      simp [h, ha, hb]
-    · have hf1 : ¬ (pol2.pBudget > 0 ∧ pol2.pGpuBudget ≥ 0 ∧ pol2.tCeil > 0 ∧ pol2.tCeil ≤ T_CEIL_ABS_MAX_MC ∧ pol1.tau ≥ 0) :=
-        fun hx => h ⟨hx.1, hx.2.1, hx.2.2.1, hx.2.2.2.1⟩
-      have hf2 : ¬ (pol2.pBudget > 0 ∧ pol2.pGpuBudget ≥ 0 ∧ pol2.tCeil > 0 ∧ pol2.tCeil ≤ T_CEIL_ABS_MAX_MC ∧ pol2.tau ≥ 0) :=
-        fun hx => h ⟨hx.1, hx.2.1, hx.2.2.1, hx.2.2.2.1⟩
-      rw [decide_eq_false hf1, decide_eq_false hf2]
-  by_cases h : (!policyValid pol2 || decide (st.tDie ≥ pol2.tCeil)) = true
-  · have h1 : (!policyValid pol1 || decide (st.tDie ≥ pol1.tCeil)) = true := by
-      rw [hvEq, hce]; exact h
-    unfold cbfFilter; simp [h, h1]
-  · have h1 : ¬ ((!policyValid pol1 || decide (st.tDie ≥ pol1.tCeil)) = true) := by
-      rw [hvEq, hce]; exact h
+  by_cases h2 : mustFailClosed st pol2 = true
+  · have hnn := cbf_nonneg_and_fan_bounds st pol1 prop
+    unfold cbfFilter; simp only [h2, ↓reduceIte]
+    exact ⟨hnn.2.2.1, hnn.2.1, hnn.1⟩
+  · have hp2 := policyValid_of_not_guard st pol2 h2
+    have hraw_le : rawHeatBudget st pol2 ≤ rawHeatBudget st pol1 := by
+      unfold rawHeatBudget
+      have nt1 : ¬ (pol1.tau < 0) := by omega
+      have nt2 : ¬ (pol2.tau < 0) := by omega
+      simp only [nt1, nt2, ↓reduceIte]
+      rw [hce]
+      have hpos : 0 ≤ pol2.tCeil - st.tDie := by omega
+      have hb2 := mul_ediv_bounds (pol2.tCeil - st.tDie) (pol2.tau + 1) (by omega) hpos
+      have hmul : (pol1.tau + 1) * ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) ≤
+          (pol2.tau + 1) * ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) :=
+        Int.mul_le_mul_of_nonneg_right (by omega) hb2.1
+      have hcomm : (pol1.tau + 1) * ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) =
+          ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) * (pol1.tau + 1) := Int.mul_comm _ _
+      have hd : (pol2.tCeil - st.tDie) / (pol2.tau + 1) ≤
+          (pol2.tCeil - st.tDie) / (pol1.tau + 1) :=
+        Int.le_ediv_of_mul_le (by omega) (by omega)
+      unfold THERMAL_SCALE; omega
+    have h1 : ¬ (mustFailClosed st pol1 = true) :=
+      not_mustFailClosed_of_ok st pol1 (by omega) (by omega) (by omega) (by omega)
+        (by omega) (by omega) (by omega) (by omega)
     have hok1 := cbf_ok_rails st pol1 prop h1
-    have hok2 := cbf_ok_rails st pol2 prop h
+    have hok2 := cbf_ok_rails st pol2 prop h2
     rw [hok1.1, hok1.2.1, hok1.2.2, hok2.1, hok2.2.1, hok2.2.2]
     have hpcEq : powerClamp pol1 prop = powerClamp pol2 prop := by
       unfold powerClamp powerClampGpu powerClampCpu powerClampUnc; rw [hbud, hgb]
     have hm : maxHeatSafe st pol2 ≤ maxHeatSafe st pol1 := by
       unfold maxHeatSafe
-      rw [hce]
-      split
-      · omega
-      · have hpos : 0 ≤ pol2.tCeil - st.tDie := by omega
-        have hb2 := mul_ediv_bounds (pol2.tCeil - st.tDie) (pol2.tau + 1) (by omega) hpos
-        have hmul : (pol1.tau + 1) * ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) ≤
-            (pol2.tau + 1) * ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) :=
-          Int.mul_le_mul_of_nonneg_right (by omega) hb2.1
-        have hcomm : (pol1.tau + 1) * ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) =
-            ((pol2.tCeil - st.tDie) / (pol2.tau + 1)) * (pol1.tau + 1) := Int.mul_comm _ _
-        have hd : (pol2.tCeil - st.tDie) / (pol2.tau + 1) ≤
-            (pol2.tCeil - st.tDie) / (pol1.tau + 1) :=
-          Int.le_ediv_of_mul_le (by omega) (by omega)
-        unfold THERMAL_SCALE; omega
+      have g1 : ¬ (st.tDie ≥ pol1.tCeil ∨ st.tSink ≥ pol1.tCeil ∨ pol1.tau < 0) := by omega
+      have g2 : ¬ (st.tDie ≥ pol2.tCeil ∨ st.tSink ≥ pol2.tCeil ∨ pol2.tau < 0) := by omega
+      simp only [g1, g2, ↓reduceIte]; omega
     rw [hpcEq]
     exact thermalClamp_mono_heat _ _ _ hm
 
@@ -1114,27 +1279,29 @@ theorem cbf_mono_tDie_whole_unit
     let o2 := cbfFilter st2 pol prop
     o2.pUnc ≤ o1.pUnc ∧ o2.pCpu ≤ o1.pCpu ∧ o2.pGpu ≤ o1.pGpu := by
   dsimp only
-  by_cases h2 : (!policyValid pol || decide (st2.tDie ≥ pol.tCeil)) = true
+  by_cases h2 : mustFailClosed st2 pol = true
   · have hnn := cbf_nonneg_and_fan_bounds st1 pol prop
     unfold cbfFilter; simp only [h2, ↓reduceIte]
     exact ⟨hnn.2.2.1, hnn.2.1, hnn.1⟩
   · have hp2 := policyValid_of_not_guard st2 pol h2
-    have h1 : ¬ ((!policyValid pol || decide (st1.tDie ≥ pol.tCeil)) = true) := by
-      have hv : policyValid pol = true := by
-        unfold policyValid; simp only [decide_eq_true_eq]; omega
-      have hlt1 : ¬ (st1.tDie ≥ pol.tCeil) := by omega
-      simp [hv, hlt1]
+    have hraw_le : rawHeatBudget st2 pol ≤ rawHeatBudget st1 pol := by
+      unfold rawHeatBudget dieCoolDs
+      have nt : ¬ (pol.tau < 0) := by omega
+      simp only [nt, ↓reduceIte]
+      have hd := Int.ediv_le_ediv (by omega : 0 < pol.tau + 1) (by omega : pol.tCeil - st2.tDie ≤ pol.tCeil - st1.tDie)
+      rw [hdelta]
+      unfold THERMAL_SCALE; omega
+    have h1 : ¬ (mustFailClosed st1 pol = true) :=
+      not_mustFailClosed_of_ok st1 pol (by omega) (by omega) (by omega) (by omega)
+        (by omega) (by omega) (by omega) (by omega)
     have hok1 := cbf_ok_rails st1 pol prop h1
     have hok2 := cbf_ok_rails st2 pol prop h2
     rw [hok1.1, hok1.2.1, hok1.2.2, hok2.1, hok2.2.1, hok2.2.2]
     have hm : maxHeatSafe st2 pol ≤ maxHeatSafe st1 pol := by
-      unfold maxHeatSafe dieCoolDs
-      have g1 : ¬ (st1.tDie ≥ pol.tCeil) := by omega
-      have g2 : ¬ (st2.tDie ≥ pol.tCeil) := by omega
-      simp only [g1, g2, ↓reduceIte]
-      have hd := Int.ediv_le_ediv (by omega : 0 < pol.tau + 1) (by omega : pol.tCeil - st2.tDie ≤ pol.tCeil - st1.tDie)
-      rw [hdelta]
-      unfold THERMAL_SCALE; omega
+      unfold maxHeatSafe
+      have g1 : ¬ (st1.tDie ≥ pol.tCeil ∨ st1.tSink ≥ pol.tCeil ∨ pol.tau < 0) := by omega
+      have g2 : ¬ (st2.tDie ≥ pol.tCeil ∨ st2.tSink ≥ pol.tCeil ∨ pol.tau < 0) := by omega
+      simp only [g1, g2, ↓reduceIte]; omega
     exact thermalClamp_mono_heat _ _ _ hm
 
 /-- Anticipatory Pre-Cooling Theorem: raising fan duty (`fan1 <= fan2`) monotonically
@@ -1196,15 +1363,38 @@ private theorem thermalClamp_of_safe_heat (r : RailTriple) (maxHeat : Int)
   unfold thermalClamp
   simp only [hmu, hmc, hmg, d1, d2, d3]
 
-/-- Idempotence of the CBF power rails: filtering an already-filtered command leaves
-    `(pGpu, pCpu, pUnc)` unchanged. -/
-theorem cbf_idempotent_power
+private theorem cbfFilter_admit_eq (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal)
+    (h : ¬ (mustFailClosed st pol = true)) :
+    cbfFilter st pol prop =
+      let r1         := powerClamp pol prop
+      let r2         := thermalClamp r1 (maxHeatSafe st pol)
+      let headroom   := pol.tCeil - st.tDie
+      let thermClamp := decide (r2.pUnc < r1.pUnc ∨ r2.pCpu < r1.pCpu ∨ r2.pGpu < r1.pGpu)
+      let fanFloor   := safeFanFloor headroom thermClamp
+      let fanOut     := min FAN_MAX_PCT (max fanFloor (max FAN_MIN_PCT prop.fanPct))
+      let clamped    := decide (r2.pGpu ≠ prop.pGpu ∨ r2.pCpu ≠ prop.pCpu ∨
+                                r2.pUnc ≠ prop.pUnc ∨ fanOut ≠ prop.fanPct)
+      { pGpu       := r2.pGpu
+        pCpu       := r2.pCpu
+        pUnc       := r2.pUnc
+        fanPct     := fanOut
+        failClosed := false
+        clamped    := clamped } := by
+  unfold cbfFilter
+  rw [ite_eq_right h]
+
+/-- Full idempotence of the CBF shield: filtering an already-filtered command leaves
+    `(pGpu, pCpu, pUnc, fanPct, failClosed)` unchanged, and clears `clamped` whenever
+    the command was admitted (`failClosed = false`). -/
+theorem cbf_idempotent
     (st : ThermalState) (pol : WattPolicy) (prop : PowerProposal) :
     let o1 := cbfFilter st pol prop
     let o2 := cbfFilter st pol { pGpu := o1.pGpu, pCpu := o1.pCpu, pUnc := o1.pUnc, fanPct := o1.fanPct }
-    o2.pGpu = o1.pGpu ∧ o2.pCpu = o1.pCpu ∧ o2.pUnc = o1.pUnc := by
+    o2.pGpu = o1.pGpu ∧ o2.pCpu = o1.pCpu ∧ o2.pUnc = o1.pUnc ∧
+    o2.fanPct = o1.fanPct ∧ o2.failClosed = o1.failClosed ∧
+    (o1.failClosed = false → o2.clamped = false) := by
   dsimp only
-  by_cases h : (!policyValid pol || decide (st.tDie ≥ pol.tCeil)) = true
+  by_cases h : mustFailClosed st pol = true
   · unfold cbfFilter; simp [h]
   · have hp := policyValid_of_not_guard st pol h
     have pb := powerClamp_bounds pol prop (by omega) (by omega)
@@ -1212,11 +1402,6 @@ theorem cbf_idempotent_power
     have th := thermalClamp_nonneg_and_heat (powerClamp pol prop) (maxHeatSafe st pol)
       pb.1 pb.2.1 pb.2.2.1 (maxHeatSafe_nonneg st pol)
     have hok1 := cbf_ok_rails st pol prop h
-    have hok2 := cbf_ok_rails st pol
-      { pGpu := (cbfFilter st pol prop).pGpu
-        pCpu := (cbfFilter st pol prop).pCpu
-        pUnc := (cbfFilter st pol prop).pUnc
-        fanPct := (cbfFilter st pol prop).fanPct } h
     have hpc : powerClamp pol
         { pGpu := (cbfFilter st pol prop).pGpu
           pCpu := (cbfFilter st pol prop).pCpu
@@ -1230,8 +1415,54 @@ theorem cbf_idempotent_power
     have htc : thermalClamp (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)) (maxHeatSafe st pol) =
         thermalClamp (powerClamp pol prop) (maxHeatSafe st pol) :=
       thermalClamp_of_safe_heat _ _ th.1 th.2.1 th.2.2.1 th.2.2.2
-    rw [hok2.1, hok2.2.1, hok2.2.2, hpc, htc, hok1.1, hok1.2.1, hok1.2.2]
-    exact ⟨rfl, rfl, rfl⟩
+    have hfan_mono : safeFanFloor (pol.tCeil - st.tDie) false ≤
+        safeFanFloor (pol.tCeil - st.tDie)
+          (decide ((thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pUnc < (powerClamp pol prop).pUnc ∨
+                   (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pCpu < (powerClamp pol prop).pCpu ∨
+                   (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pGpu < (powerClamp pol prop).pGpu)) :=
+      safeFanFloor_mono_tc _ _
+    have hfan_b := safeFanFloor_bounds (pol.tCeil - st.tDie)
+      (decide ((thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pUnc < (powerClamp pol prop).pUnc ∨
+               (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pCpu < (powerClamp pol prop).pCpu ∨
+               (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pGpu < (powerClamp pol prop).pGpu))
+    have ho1_fc : (cbfFilter st pol prop).failClosed = false := by
+      rw [cbfFilter_admit_eq st pol prop h]
+    have ho1_fan : (cbfFilter st pol prop).fanPct =
+        min FAN_MAX_PCT (max (safeFanFloor (pol.tCeil - st.tDie)
+          (decide ((thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pUnc < (powerClamp pol prop).pUnc ∨
+                   (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pCpu < (powerClamp pol prop).pCpu ∨
+                   (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pGpu < (powerClamp pol prop).pGpu)))
+          (max FAN_MIN_PCT prop.fanPct)) := by
+      rw [cbfFilter_admit_eq st pol prop h]
+    have ho2_def := cbfFilter_admit_eq st pol
+      { pGpu := (cbfFilter st pol prop).pGpu
+        pCpu := (cbfFilter st pol prop).pCpu
+        pUnc := (cbfFilter st pol prop).pUnc
+        fanPct := (cbfFilter st pol prop).fanPct } h
+    dsimp only at ho2_def
+    rw [hpc, htc] at ho2_def
+    have hlt_false :
+        decide ((thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pUnc <
+                  (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pUnc ∨
+                (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pCpu <
+                  (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pCpu ∨
+                (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pGpu <
+                  (thermalClamp (powerClamp pol prop) (maxHeatSafe st pol)).pGpu) = false := by
+      simp
+    rw [hlt_false] at ho2_def
+    have hfan_eq :
+        min FAN_MAX_PCT (max (safeFanFloor (pol.tCeil - st.tDie) false)
+          (max FAN_MIN_PCT (cbfFilter st pol prop).fanPct)) =
+        (cbfFilter st pol prop).fanPct := by
+      rw [ho1_fan]
+      unfold FAN_MIN_PCT FAN_MAX_PCT at *
+      omega
+    rw [ho2_def]
+    dsimp only
+    refine ⟨hok1.1.symm, hok1.2.1.symm, hok1.2.2.symm, hfan_eq, ho1_fc.symm, ?_⟩
+    intro _
+    rw [hok1.1, hok1.2.1, hok1.2.2, hfan_eq]
+    simp
 
 -- =========================================================================
 -- Section 5: Non-Vacuity Negative Controls (Concrete Witness Theorems)
@@ -1305,18 +1536,43 @@ theorem neg_control_invalid_budget_fail_closed :
     out.fanPct = FAN_MAX_PCT ∧ out.failClosed = true := by
   decide
 
+/-- Negative Control 5 (Reverse-Conduction & Overheated-Heatsink Fail-Closed):
+    (a) Even inside `[tAmb, tCeil]` (`T_die = 77.0 C`, `T_sink = 77.9 C < 78.0 C`, `tau = 20 s`),
+        reverse conduction at 0 W yields `dT = +90 mC/s` and `h = -800 < 0` (infeasible barrier);
+        `cbfFilter` MUST fail closed (`0 W`, `fanPct = 100%`, `failClosed = true`).
+    (b) On an overheated heatsink (`T_die = 48.7 C`, `T_sink = 150.0 C >= 85.0 C`), `cbfFilter`
+        MUST fail closed rather than admitting power into a breached vapor chamber. -/
+theorem neg_control_hot_sink_infeasible :
+    let st1  : ThermalState  := { tDie := 77000, tSink := 77900, tAmb := 25000 }
+    let pol1 : WattPolicy    := { pBudget := 100000, pGpuBudget := 80000, tCeil := 78000, tau := 20 }
+    let pr1  : PowerProposal := { pGpu := 0, pCpu := 0, pUnc := 0, fanPct := 30 }
+    let dT1  := nextDieDelta st1 0 0 0
+    let o1   := cbfFilter st1 pol1 pr1
+    let st2  : ThermalState  := { tDie := 48700, tSink := 150000, tAmb := 25000 }
+    let pol2 : WattPolicy    := { pBudget := 100000, pGpuBudget := 80000, tCeil := 85000, tau := 2 }
+    let pr2  : PowerProposal := { pGpu := 75000, pCpu := 17000, pUnc := 8000, fanPct := 60 }
+    let o2   := cbfFilter st2 pol2 pr2
+    barrierH pol1.tCeil st1.tDie pol1.tau dT1 < 0 ∧
+    o1.pGpu = 0 ∧ o1.pCpu = 0 ∧ o1.pUnc = 0 ∧ o1.fanPct = FAN_MAX_PCT ∧ o1.failClosed = true ∧
+    st2.tSink ≥ pol2.tCeil ∧
+    o2.pGpu = 0 ∧ o2.pCpu = 0 ∧ o2.pUnc = 0 ∧ o2.fanPct = FAN_MAX_PCT ∧ o2.failClosed = true := by
+  decide
+
 #print axioms cbf_gpu_hard_cap
 #print axioms cbf_gpu_budget_cap
 #print axioms cbf_total_budget
 #print axioms cbf_nonneg_and_fan_bounds
 #print axioms cbf_never_amplifies
 #print axioms cbf_fail_closed_overtemp
+#print axioms cbf_fail_closed_sink_overtemp
+#print axioms cbf_fail_closed_infeasible_barrier
 #print axioms cbf_fail_closed_bad_budget
 #print axioms cbf_fail_closed_bad_ceil
 #print axioms cbf_fail_closed_bad_tau
 #print axioms cbf_die_heat_le_maxHeat
 #print axioms cbf_thermal_barrier_preserved
 #print axioms cbf_thermal_barrier_normal_regime
+#print axioms cbf_admitted_barrier_safe
 #print axioms cbf_step_box_safe
 #print axioms cbf_multistep_temp_safe
 #print axioms powerClamp_mono_pBudget
@@ -1328,10 +1584,11 @@ theorem neg_control_invalid_budget_fail_closed :
 #print axioms cbf_mono_tau
 #print axioms cbf_mono_tDie_whole_unit
 #print axioms precool_fan_mono_sink
-#print axioms cbf_idempotent_power
+#print axioms cbf_idempotent
 #print axioms neg_control_trap14_90w
 #print axioms neg_control_over_budget
 #print axioms neg_control_hot_die_spike
 #print axioms neg_control_invalid_budget_fail_closed
+#print axioms neg_control_hot_sink_infeasible
 
 end WattCBF
