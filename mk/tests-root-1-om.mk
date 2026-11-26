@@ -30,6 +30,7 @@ TR1_MUFU_FTZ_SRCS := \
 TR1_MUFU_FTZ_BIN = $(OUT_DIR)/test_bw_mufu_ftz_om
 
 TR1_GENESIS_SRCS := \
+	src/omega_genesis.om \
 	tests/test_omega_genesis.om
 TR1_GENESIS_BIN = $(OUT_DIR)/test_omega_genesis_om
 
