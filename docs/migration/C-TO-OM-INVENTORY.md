@@ -28,6 +28,8 @@ Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-3): completed 100% pure seede
 
 Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-4): cut over `tools/autodiff_mutations.sh` (12/12 pure OM-2 mutants), `tools/tensor_mutations.sh` CPU + store sweeps (33 pure OM-2 mutants), and `mk/tensor.mk` (`test-tensor-no-hooks`) to pure seeded OM-2; retired `tests/test_omega_autodiff.c`, `src/tensor/omega_tensor_store.{c,h}`, `tests/test_omega_tensor.c`, `tests/test_omega_tensor_store.c`, and `tests/tensor_reduce_multi_tests.inc` (`PARITY.tsv` ref `2ed9f8735`; Stage 2 GB10 C files `omega_autodiff.c`/`test_omega_ad_fixture.c`/`omega_tensor{,_cpu,_reduce_seam,_gb10}.c` remain until Stage 2 retires chip arms).
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-5): cut over `test-library`, `test-exec-native-cache`, `test-vcstore`, `test-vcstore-genesis`, `test-genesis`, `test-genesis-real`, `test-program-ir`, `test-vc-bridge`, `test-unwritten-trap-host`, and `mk/compiler.mk` (`test-compiler`, `test-compiler-quick`) to pure seeded OM-2; retired 38 C/H files (12 `src/` CPU modules + 16 headers + 9 CPU tests + `tests/vc_fixture.h`; `PARITY.tsv` ref `8726d4eff`). `src/omega_blake3.{c,h}` stay on disk as declared `om-units` C parity oracle (`om/blake3/parity/run.sh`).
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage

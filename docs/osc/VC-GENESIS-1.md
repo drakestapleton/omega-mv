@@ -1,8 +1,8 @@
 # VC-GENESIS-1: the Genesis Set
 
 Authority: ADR 0029 Decision 8 (BOOTSTRAP admission) and Decision 11 (no direct library insert).
-Code: `src/omega_genesis.h` (the pinned table, nothing else), enforced in `src/omega_vcstore.c` and
-`src/omega_resolve.c`. Tests: `make test-genesis-real test-genesis test-vcstore test-resolve test-vc-bridge`.
+Code: `src/omega_genesis.om` (the pinned table, nothing else), enforced in `src/omega_vcstore.om` and
+`src/omega_resolve.om`. Tests: `make test-genesis-real test-genesis test-vcstore test-resolve test-vc-bridge`.
 
 Members: 0
 
@@ -27,12 +27,12 @@ How it is enforced, and the only ways:
   in the store.
 - The resolver has no genesis permission field. Membership of this list is the only input. There is no
   flag, no environment variable, no file and no store content that adds a member. The list is a
-  compile time constant in `src/omega_genesis.h`.
+  compile time constant in `src/omega_genesis.om`.
 - No wildcard and no prefix match: an id is a member only if all 32 bytes equal a row. The all-zero id is
   never a member.
 
 Changing the set (adding or removing a member, or renaming it) is an ADR level change. Two tests pin it:
-`tests/test_omega_genesis.c` fails until the table and this file name exactly the same members, and until
+`tests/test_omega_genesis.om` fails until the table and this file name exactly the same members, and until
 the count matches the number in the "Members:" line above.
 
 ## Members
@@ -90,7 +90,7 @@ record is trusted without being listed, and a BOOTSTRAP record in any store is r
 
 What an empty set costs: the BOOTSTRAP admission path exists and is tested (with a one member variant
 build, `make test-genesis`) but nothing uses it. The day a real member is needed it is added by an ADR
-level change that edits `src/omega_genesis.h` and adds a row and an audit entry to this file; the test
+level change that edits `src/omega_genesis.om` and adds a row and an audit entry to this file; the test
 refuses any other order of events.
 
 Audit record: this section, dated 2026-10-02, stage 6 of VC1. The audit hash a future member would carry
