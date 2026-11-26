@@ -288,15 +288,15 @@ done
 note "golden: 15 stdout files byte-identical to tests/orig4/expected"
 note "refusals: damaged image-5, truncated image-1, forged records-7, wrong-profile records-9, revoked allow-12, absent allow-13, budget 10/770, config 68, mode 64"
 
-# 8. Default-off proof, static: the tap's environment variable has exactly one reader in the
-# code (the test harness), and the serving/runtime sources never reference the advisor.
+# 8. Default-off proof, static: no reader of OMEGA_EMPIRICAL_RECORDS exists in runtime/tests/src,
+# and the serving/runtime sources never reference the advisor.
 readers=$(cd "$ROOT" && grep -rl 'OMEGA_EMPIRICAL_RECORDS' src tests/runtime tests/gates mk tools Makefile 2> /dev/null | sort)
 echo "$readers" > "$OUT/tap-readers.txt"
-[ "$readers" = "tests/runtime/rx_empirical_optimizer.c" ] || fail "OMEGA_EMPIRICAL_RECORDS readers: $readers"
+[ -z "$readers" ] || fail "OMEGA_EMPIRICAL_RECORDS readers: $readers"
 srcrefs=$(cd "$ROOT" && grep -rlE 'omexp|orig4|shadow\.om|hvscore|shadow-advice' src | sort)
 echo "$srcrefs" > "$OUT/src-advisor-refs.txt"
 [ -z "$srcrefs" ] || fail "src/ references the advisor: $srcrefs"
-note "default_off: tap readers = tests/runtime/rx_empirical_optimizer.c only; src/ references to omexp|orig4|shadow.om|hvscore|shadow-advice = none"
+note "default_off: tap readers = none; src/ references to omexp|orig4|shadow.om|hvscore|shadow-advice = none"
 
 (cd "$OUT" && sha256sum -- *.stdout *.rc *.compile.stderr *.wall_ms candidates-check.txt tap-readers.txt src-advisor-refs.txt) > "$OUT/raw.sha256"
 (cd "$BUILD" && sha256sum -- *.elf *.om *.rb *.img *.txt) > "$OUT/build.sha256"
