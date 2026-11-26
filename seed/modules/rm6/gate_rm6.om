@@ -1,0 +1,1092 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/modules/rm6/gate_rm6.om:
+note Pure seeded OM-2 verification gate for RM6 Digest-Addressed Modules & Separate Compilation.
+note
+note Usage:
+note   gate_rm6 <modlink-bin> <omc-bin> <omc-sha256-file> <work-dir>
+note
+note Verifies on DGX Spark Linux AArch64:
+note   Positive tests (bit-for-bit parity vs concatenated single-unit omc builds):
+note     1. 2-module DAG (`base` -> `app2`) in program mode: byte-identical ELF & identical exit 36
+note     2. 2-module DAG (`base` -> `lib2`) in function mode: byte-identical machine-code image
+note     3. 3-module diamond DAG (`base` -> `mid` -> `top` + `top` -> `base`) with interleaved calls
+note        in program mode: byte-identical ELF & identical exit 91
+note     4. 3-module diamond DAG with interleaved calls in function mode: byte-identical machine-code image
+note     5. MOD_STORE_DIR environment variable resolution via `execenv` (without `--store` CLI flag)
+note   All RM6 required negative controls (fail-closed, output artifact MUST remain absent!):
+note     6. Wrong digest (1-byte tamper of stored `<hash>.om`) -> exit 40 (ML_ERR_DIGEST)
+note     7. Wrong compiler pin (bad `pin:` in import & bad `--pin` flag) -> exit 41 (ML_ERR_PIN)
+note     8. Wrong profile (invalid `om99` & mixed `om2 release` dep) -> exit 42 (ML_ERR_PROFILE)
+note     9. Duplicate export across two separate modules -> exit 43 (ML_ERR_DUP_EXPORT)
+note    10. Cyclic import (`A -> B -> A` with real body SHA-256 digests) -> exit 44 (ML_ERR_CYCLE)
+note    11. Missing module digest in store -> exit 45 (ML_ERR_MISSING)
+note    12. Private visibility violation (`base.priv_bias`) -> exit 47 (ML_ERR_VISIBILITY)
+om2
+
+global g_ml uchar 512
+global g_mll ulong 1
+global g_omc uchar 512
+global g_omcl ulong 1
+global g_pin uchar 64
+global g_wd uchar 512
+global g_wdl ulong 1
+global g_stdir uchar 512
+global g_stdirl ulong 1
+
+global g_p1 uchar 640
+global g_p1l ulong 1
+global g_p2 uchar 640
+global g_p2l ulong 1
+global g_pk uchar 4096
+global g_pkl ulong 1
+global g_pkr ulong 1
+global g_epk uchar 1024
+global g_epkl ulong 1
+global g_epkr ulong 1
+global g_cap uchar 8192
+global g_capl ulong 1
+global g_src uchar 8192
+global g_srcl ulong 1
+global g_ba uchar 524288
+global g_bb uchar 524288
+global g_dig uchar 24
+global g_cnt ulong 4
+
+note Stored module body hashes (64 hex chars each)
+global h_base uchar 64
+global h_mid uchar 64
+global h_dup1 uchar 64
+global h_dup2 uchar 64
+global h_rel uchar 64
+global h_ca uchar 64
+global h_cb uchar 64
+
+text t_use "usage: gate_rm6 <modlink-bin> <omc-bin> <omc-sha256-file> <work-dir>\n"
+text t_hdr "=== OMEGA RM6 DIGEST-ADDRESSED MODULES & SEPARATE COMPILATION GATE ===\n"
+text t_pass "RM6-GATE PASS tests="
+text t_ctrl " controls="
+text t_fail "RM6-GATE FAIL at test="
+text t_got " got="
+text t_nl "\n"
+
+text t_ok1 "PASS 2-module program mode: bit-identical ELF vs single-unit baseline (exit=36)\n"
+text t_ok2 "PASS 2-module function mode: bit-identical machine code vs single-unit baseline\n"
+text t_ok3 "PASS 3-module diamond DAG program mode: bit-identical ELF vs baseline (exit=91)\n"
+text t_ok4 "PASS 3-module diamond DAG function mode: bit-identical machine code vs baseline\n"
+text t_ok5 "PASS MOD_STORE_DIR env resolution via execenv (exit=91)\n"
+text t_okneg "PASS all 7 RM6 fail-closed negative controls (digest/pin/profile/dup-export/cycle/missing/visibility)\n"
+
+text t_put "put"
+text t_link "link"
+text t_f_omc "--omc"
+text t_f_pin "--pin"
+text t_f_mode "--mode"
+text t_f_out "--out"
+text t_f_store "--store"
+text t_m_prog "program"
+text t_m_func "function"
+text t_env_pfx "MOD_STORE_DIR="
+text t_store_sub "/store"
+text t_sl "/"
+text t_ext_om ".om"
+text t_bad_hash "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+note Module source fragments
+text s_base "om1.0\nfn priv_bias x ulong to ulong\nret add x 3\nend\nexport fn base_mix a ulong b ulong to ulong\nret add mul a 7 priv_bias b\nend\n"
+text s_mid_body "fn mid_double v ulong to ulong\nret mul v 2\nend\nexport fn mid_step x ulong y ulong to ulong\nt = base.base_mix x y\nret add mid_double t 1\nend\n"
+text s_app2_body "fn main to int\nret int base.base_mix 4 5\nend\n"
+text s_lib2_body "export fn app2_eval x ulong y ulong to ulong\nret add base.base_mix x y 10\nend\n"
+text s_top_prog_body "fn main to int\na = mid.mid_step 4 5\nb = base.base_mix 2 1\nret int rem add a b 200\nend\n"
+text s_top_lib_body "export fn top_eval x ulong y ulong to ulong\na = mid.mid_step x y\nb = base.base_mix y x\nret add a b\nend\n"
+
+note Concatenated single-unit baselines (exact oracles for bit-for-bit comparison!)
+text b_prog2 "om2\nfn priv_bias x ulong to ulong\nret add x 3\nend\nfn base_mix a ulong b ulong to ulong\nret add mul a 7 priv_bias b\nend\nfn main to int\nret int base_mix 4 5\nend\n"
+text b_func2 "om2\nfn priv_bias x ulong to ulong\nret add x 3\nend\nexport fn base_mix a ulong b ulong to ulong\nret add mul a 7 priv_bias b\nend\nexport fn app2_eval x ulong y ulong to ulong\nret add base_mix x y 10\nend\n"
+text b_prog3 "om2\nfn priv_bias x ulong to ulong\nret add x 3\nend\nfn base_mix a ulong b ulong to ulong\nret add mul a 7 priv_bias b\nend\nfn mid_double v ulong to ulong\nret mul v 2\nend\nfn mid_step x ulong y ulong to ulong\nt = base_mix x y\nret add mid_double t 1\nend\nfn main to int\na = mid_step 4 5\nb = base_mix 2 1\nret int rem add a b 200\nend\n"
+text b_func3 "om2\nfn priv_bias x ulong to ulong\nret add x 3\nend\nexport fn base_mix a ulong b ulong to ulong\nret add mul a 7 priv_bias b\nend\nfn mid_double v ulong to ulong\nret mul v 2\nend\nexport fn mid_step x ulong y ulong to ulong\nt = base_mix x y\nret add mid_double t 1\nend\nexport fn top_eval x ulong y ulong to ulong\na = mid_step x y\nb = base_mix y x\nret add a b\nend\n"
+
+note Negative-control module bodies
+text s_bad_prof "om99\nfn main to int\nret 0\nend\n"
+text s_rel_dep "om2 release\nexport fn rel_fn x ulong to ulong\nret add x 1\nend\n"
+text s_dup1 "om1.0\nexport fn collide x ulong to ulong\nret add x 1\nend\n"
+text s_dup2 "om1.0\nexport fn collide x ulong to ulong\nret add x 2\nend\n"
+text s_dup_root "fn main to int\nret int a.collide 5\nend\n"
+text s_ca_body "export fn cyc_a x ulong to ulong\nret add x 1\nend\n"
+text s_cb_body "export fn cyc_b x ulong to ulong\nret add x 2\nend\n"
+text s_vis_body "fn main to int\nret int base.priv_bias 5\nend\n"
+
+text t_om10_nl "om1.0\n"
+text t_imp_base "import base sha256:"
+text t_imp_mid "import mid sha256:"
+text t_imp_a "import a sha256:"
+text t_imp_b "import b sha256:"
+text t_imp_rel "import r sha256:"
+text t_imp_pin " pin:"
+
+text fn_base "base.om"
+text fn_mid "mid.om"
+text fn_app2 "app2.om"
+text fn_lib2 "lib2.om"
+text fn_topp "top_prog.om"
+text fn_topl "top_lib.om"
+text fn_badp "bad_prof.om"
+text fn_reld "rel_dep.om"
+text fn_relr "rel_root.om"
+text fn_dup1 "dup1.om"
+text fn_dup2 "dup2.om"
+text fn_dupr "dup_root.om"
+text fn_ca "cyc_a.om"
+text fn_cb "cyc_b.om"
+text fn_miss "miss_root.om"
+text fn_vis "vis_root.om"
+text fn_badpin "badpin_root.om"
+
+text out_p2 "out_p2.elf"
+text out_p2b "base_p2.elf"
+text out_f2 "out_f2.bin"
+text out_f2b "base_f2.bin"
+text out_p3 "out_p3.elf"
+text out_p3b "base_p3.elf"
+text out_f3 "out_f3.bin"
+text out_f3b "base_f3.bin"
+text out_env "out_env.elf"
+text out_neg "out_neg.elf"
+
+fn w_u64 v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put g_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      w = write 1 g_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn fail_t id ulong got ulong to int
+  w = write 1 t_fail 0 len t_fail
+  w_u64 id
+  w = write 1 t_got 0 len t_got
+  w_u64 got
+  w = write 1 t_nl 0 1
+  ret int id
+end
+
+note ---- Path & source builders ----
+fn mk_path1 name view uchar * to void
+  p = ulong 0
+  for i ulong get g_wdl 0 bound 512
+    put g_p1 p get g_wd i
+    p = add p 1
+  end
+  put g_p1 p 47
+  p = add p 1
+  for i ulong len name bound 64
+    put g_p1 p get name i
+    p = add p 1
+  end
+  put g_p1l 0 p
+end
+
+fn mk_path2 name view uchar * to void
+  p = ulong 0
+  for i ulong get g_wdl 0 bound 512
+    put g_p2 p get g_wd i
+    p = add p 1
+  end
+  put g_p2 p 47
+  p = add p 1
+  for i ulong len name bound 64
+    put g_p2 p get name i
+    p = add p 1
+  end
+  put g_p2l 0 p
+end
+
+fn sb_reset to void
+  put g_srcl 0 0
+end
+
+fn sb_txt t view uchar * to void
+  n = get g_srcl 0
+  for i ulong len t bound 4096
+    put g_src add n i get t i
+  end
+  put g_srcl 0 add n len t
+end
+
+fn sb_h64 which ulong to void
+  n = get g_srcl 0
+  for i ulong 64
+    c = uchar 0
+    if eq which 0
+      c = get h_base i
+    end
+    if eq which 1
+      c = get h_mid i
+    end
+    if eq which 2
+      c = get h_dup1 i
+    end
+    if eq which 3
+      c = get h_dup2 i
+    end
+    if eq which 4
+      c = get h_rel i
+    end
+    if eq which 5
+      c = get h_ca i
+    end
+    if eq which 6
+      c = get h_cb i
+    end
+    if eq which 7
+      c = get g_pin i
+    end
+    put g_src add n i c
+  end
+  put g_srcl 0 add n 64
+end
+
+fn sb_badpin to void
+  n = get g_srcl 0
+  for i ulong 64
+    c = get g_pin i
+    if eq i 0
+      if eq c 48
+        c = uchar 49
+      else
+        c = uchar 48
+      end
+    end
+    put g_src add n i c
+  end
+  put g_srcl 0 add n 64
+end
+
+fn write_src_p1 to bool
+  fd = fopen g_p1 0 get g_p1l 0 577 420
+  if lt fd 0
+    ret false
+  end
+  n = get g_srcl 0
+  w = write int fd g_src 0 n
+  x = fclose int fd
+  ret eq w long n
+end
+
+fn write_txt_p1 src view uchar * to bool
+  sb_reset
+  sb_txt src
+  ret write_src_p1
+end
+
+note ---- Packed argv/envp & process runner ----
+fn pk_reset to void
+  put g_pk 0 0
+  put g_pk 1 0
+  put g_pkl 0 2
+end
+
+fn pk_open to void
+  n = get g_pkl 0
+  put g_pkr 0 n
+  put g_pk n 0
+  put g_pk add n 1 0
+  put g_pkl 0 add n 2
+  c = add or ulong get g_pk 0 shl ulong get g_pk 1 8 1
+  put g_pk 0 uchar and c 255
+  put g_pk 1 uchar shr c 8
+end
+
+fn pk_byte c uchar to void
+  n = get g_pkl 0
+  if lt n 4094
+    put g_pk n c
+    put g_pkl 0 add n 1
+    r = get g_pkr 0
+    k = add or ulong get g_pk r shl ulong get g_pk add r 1 8 1
+    put g_pk r uchar and k 255
+    put g_pk add r 1 uchar shr k 8
+  end
+end
+
+fn pk_txt t view uchar * to void
+  pk_open
+  for i ulong len t bound 256
+    pk_byte get t i
+  end
+end
+
+fn pk_ml to void
+  pk_reset
+  pk_open
+  for i ulong get g_mll 0 bound 512
+    pk_byte get g_ml i
+  end
+end
+
+fn pk_omc_arg to void
+  pk_open
+  for i ulong get g_omcl 0 bound 512
+    pk_byte get g_omc i
+  end
+end
+
+fn pk_pin_arg flip bool to void
+  pk_open
+  for i ulong 64
+    c = get g_pin i
+    if and flip eq i 0
+      if eq c 48
+        c = uchar 49
+      else
+        c = uchar 48
+      end
+    end
+    pk_byte c
+  end
+end
+
+fn pk_p1 to void
+  pk_open
+  for i ulong get g_p1l 0 bound 640
+    pk_byte get g_p1 i
+  end
+end
+
+fn pk_p2 to void
+  pk_open
+  for i ulong get g_p2l 0 bound 640
+    pk_byte get g_p2 i
+  end
+end
+
+fn pk_store to void
+  pk_open
+  for i ulong get g_stdirl 0 bound 512
+    pk_byte get g_stdir i
+  end
+end
+
+fn build_env_store to void
+  put g_epk 0 1
+  put g_epk 1 0
+  el = add len t_env_pfx get g_stdirl 0
+  put g_epk 2 uchar and el 255
+  put g_epk 3 uchar and shr el 8 255
+  p = ulong 4
+  for i ulong len t_env_pfx bound 32
+    put g_epk p get t_env_pfx i
+    p = add p 1
+  end
+  for i ulong get g_stdirl 0 bound 512
+    put g_epk p get g_stdir i
+    p = add p 1
+  end
+  put g_epkl 0 p
+end
+
+fn rd32 a view uchar * o ulong to int
+  v = or ulong get a o shl ulong get a add o 1 8
+  v = or v shl ulong get a add o 2 16
+  v = or v shl ulong get a add o 3 24
+  ret int v
+end
+
+fn run_pk useEnv bool to ulong
+  put g_capl 0 0
+  pp = new uchar 8 0
+  if lt pipefds pp 0 8 524288 0
+    ret 997
+  end
+  rfd = rd32 pp 0
+  wfd = rd32 pp 4
+  pid = fork
+  if lt pid 0
+    x = fclose rfd
+    x = fclose wfd
+    ret 996
+  end
+  if eq pid 0
+    x = dupfd wfd 1 0
+    x = dupfd wfd 2 0
+    if useEnv
+      x = execenv g_pk 0 get g_pkl 0 g_epk 0 get g_epkl 0
+    else
+      x = execprog g_pk 0 get g_pkl 0
+    end
+    exit 127
+  end
+  x = fclose wfd
+  while true bound 8192
+    n = get g_capl 0
+    if ge n 8191
+      break
+    end
+    k = read rfd g_cap n sub 8191 n
+    if le k 0
+      break
+    end
+    put g_capl 0 add n ulong k
+  end
+  x = fclose rfd
+  st = new uchar 4 0
+  w = waitpid int pid st 0 4 0
+  s = or ulong get st 0 shl ulong get st 1 8
+  if eq and s 127 0
+    ret and shr s 8 255
+  end
+  ret add 128 and s 127
+end
+
+fn run_elf_p2 to ulong
+  pk_reset
+  pk_p2
+  ret run_pk false
+end
+
+note Compile concatenated baseline source directly with pinned `omc` into g_p2
+fn compile_baseline src view uchar * isProg bool to ulong
+  fi = memfd t_put 0 3 0
+  perm = int 420
+  if isProg
+    perm = int 493
+  end
+  fo = fopen g_p2 0 get g_p2l 0 577 perm
+  if or lt fi 0 lt fo 0
+    ret 995
+  end
+  w = write int fi src 0 len src
+  x = fseek int fi 0 0
+  pk_reset
+  pk_omc_arg
+  pid = fork
+  if eq pid 0
+    x = dupfd int fi 0 0
+    x = dupfd int fo 1 0
+    x = execprog g_pk 0 get g_pkl 0
+    exit 127
+  end
+  st = new uchar 4 0
+  w2 = waitpid int pid st 0 4 0
+  x = fclose int fi
+  x = fclose int fo
+  s = or ulong get st 0 shl ulong get st 1 8
+  ret and shr s 8 255
+end
+
+fn cmp_p1_p2 to bool
+  f1 = fopen g_p1 0 get g_p1l 0 0 0
+  f2 = fopen g_p2 0 get g_p2l 0 0 0
+  if or lt f1 0 lt f2 0
+    if ge f1 0
+      x = fclose int f1
+    end
+    if ge f2 0
+      x = fclose int f2
+    end
+    ret false
+  end
+  n1 = ulong 0
+  while true bound 8192
+    k = read int f1 g_ba n1 sub 524288 n1
+    if le k 0
+      break
+    end
+    n1 = add n1 ulong k
+  end
+  n2 = ulong 0
+  while true bound 8192
+    k = read int f2 g_bb n2 sub 524288 n2
+    if le k 0
+      break
+    end
+    n2 = add n2 ulong k
+  end
+  x = fclose int f1
+  x = fclose int f2
+  if or eq n1 0 ne n1 n2
+    ret false
+  end
+  for i ulong n1 bound 524288
+    if ne get g_ba i get g_bb i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn do_put name view uchar * slot ulong to ulong
+  mk_path1 name
+  pk_ml
+  pk_txt t_put
+  pk_p1
+  pk_txt t_f_omc
+  pk_omc_arg
+  pk_txt t_f_pin
+  pk_pin_arg false
+  pk_txt t_f_store
+  pk_store
+  rc = run_pk false
+  if ne rc 0
+    ret rc
+  end
+  if lt get g_capl 0 64
+    ret 994
+  end
+  for i ulong 64
+    c = get g_cap i
+    if eq slot 0
+      put h_base i c
+    end
+    if eq slot 1
+      put h_mid i c
+    end
+    if eq slot 2
+      put h_dup1 i c
+    end
+    if eq slot 3
+      put h_dup2 i c
+    end
+    if eq slot 4
+      put h_rel i c
+    end
+    if eq slot 5
+      put h_ca i c
+    end
+    if eq slot 6
+      put h_cb i c
+    end
+  end
+  ret 0
+end
+
+fn do_link inName view uchar * outName view uchar * flags ulong to ulong
+  isFunc = ne and flags 1 0
+  flipPin = ne and flags 2 0
+  useEnv = ne and flags 4 0
+  mk_path1 inName
+  mk_path2 outName
+  x = unlink g_p2 0 get g_p2l 0
+  pk_ml
+  pk_txt t_link
+  pk_p1
+  pk_txt t_f_omc
+  pk_omc_arg
+  pk_txt t_f_pin
+  pk_pin_arg flipPin
+  pk_txt t_f_mode
+  if isFunc
+    pk_txt t_m_func
+  else
+    pk_txt t_m_prog
+  end
+  pk_txt t_f_out
+  pk_p2
+  if not useEnv
+    pk_txt t_f_store
+    pk_store
+  end
+  ret run_pk useEnv
+end
+
+fn p2_absent to bool
+  ret lt faccess g_p2 0 get g_p2l 0 0 0
+end
+
+note ---- Positive test suite (5 tests: 2-mod & 3-mod prog/func bit-exact parity + MOD_STORE_DIR env) ----
+fn run_positives to int
+  note Put base.om into store
+  mk_path1 fn_base
+  if not write_txt_p1 s_base
+    ret fail_t 1 901
+  end
+  rc = do_put fn_base 0
+  if ne rc 0
+    ret fail_t 1 rc
+  end
+
+  note Put mid.om (imports base) into store
+  mk_path1 fn_mid
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_mid_body
+  if not write_src_p1
+    ret fail_t 1 902
+  end
+  rc = do_put fn_mid 1
+  if ne rc 0
+    ret fail_t 1 rc
+  end
+
+  note Test 1: 2-module program mode (base -> app2) bit-identical ELF & exit 36
+  mk_path1 fn_app2
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_app2_body
+  if not write_src_p1
+    ret fail_t 1 903
+  end
+  rc = do_link fn_app2 out_p2 0
+  if ne rc 0
+    ret fail_t 1 rc
+  end
+  mk_path2 out_p2b
+  rc = compile_baseline b_prog2 true
+  if ne rc 0
+    ret fail_t 1 rc
+  end
+  mk_path1 out_p2
+  if not cmp_p1_p2
+    ret fail_t 1 904
+  end
+  mk_path2 out_p2
+  if ne run_elf_p2 36
+    ret fail_t 1 905
+  end
+  mk_path2 out_p2b
+  if ne run_elf_p2 36
+    ret fail_t 1 906
+  end
+  w = write 1 t_ok1 0 len t_ok1
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 2: 2-module function mode (base -> lib2) bit-identical machine code
+  mk_path1 fn_lib2
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_lib2_body
+  if not write_src_p1
+    ret fail_t 2 907
+  end
+  rc = do_link fn_lib2 out_f2 1
+  if ne rc 0
+    ret fail_t 2 rc
+  end
+  mk_path2 out_f2b
+  rc = compile_baseline b_func2 false
+  if ne rc 0
+    ret fail_t 2 rc
+  end
+  mk_path1 out_f2
+  if not cmp_p1_p2
+    ret fail_t 2 908
+  end
+  w = write 1 t_ok2 0 len t_ok2
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 3: 3-module diamond DAG program mode (base -> mid -> top + top -> base) bit-identical & exit 91
+  mk_path1 fn_topp
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt t_imp_mid
+  sb_h64 1
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_top_prog_body
+  if not write_src_p1
+    ret fail_t 3 909
+  end
+  rc = do_link fn_topp out_p3 0
+  if ne rc 0
+    ret fail_t 3 rc
+  end
+  mk_path2 out_p3b
+  rc = compile_baseline b_prog3 true
+  if ne rc 0
+    ret fail_t 3 rc
+  end
+  mk_path1 out_p3
+  if not cmp_p1_p2
+    ret fail_t 3 910
+  end
+  mk_path2 out_p3
+  if ne run_elf_p2 91
+    ret fail_t 3 911
+  end
+  w = write 1 t_ok3 0 len t_ok3
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 4: 3-module diamond DAG function mode bit-identical machine code
+  mk_path1 fn_topl
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt t_imp_mid
+  sb_h64 1
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_top_lib_body
+  if not write_src_p1
+    ret fail_t 4 912
+  end
+  rc = do_link fn_topl out_f3 1
+  if ne rc 0
+    ret fail_t 4 rc
+  end
+  mk_path2 out_f3b
+  rc = compile_baseline b_func3 false
+  if ne rc 0
+    ret fail_t 4 rc
+  end
+  mk_path1 out_f3
+  if not cmp_p1_p2
+    ret fail_t 4 913
+  end
+  w = write 1 t_ok4 0 len t_ok4
+  put g_cnt 0 add get g_cnt 0 1
+
+  note Test 5: MOD_STORE_DIR environment variable resolution via execenv (no --store flag!)
+  build_env_store
+  rc = do_link fn_topp out_env 4
+  if ne rc 0
+    ret fail_t 5 rc
+  end
+  mk_path2 out_env
+  if ne run_elf_p2 91
+    ret fail_t 5 914
+  end
+  w = write 1 t_ok5 0 len t_ok5
+  put g_cnt 0 add get g_cnt 0 1
+  ret 0
+end
+
+note ---- Negative controls 6..12 (all 7 MUST refuse fail-closed with absent output!) ----
+fn tamper_store_base restore bool to bool
+  p = ulong 0
+  for i ulong get g_stdirl 0 bound 512
+    put g_p1 p get g_stdir i
+    p = add p 1
+  end
+  put g_p1 p 47
+  p = add p 1
+  for i ulong 64
+    put g_p1 p get h_base i
+    p = add p 1
+  end
+  for i ulong len t_ext_om bound 8
+    put g_p1 p get t_ext_om i
+    p = add p 1
+  end
+  put g_p1l 0 p
+  sb_reset
+  sb_txt s_base
+  if not restore
+    put g_src sub get g_srcl 0 2 uchar 88
+  end
+  ret write_src_p1
+end
+
+fn run_negatives to int
+  note Control 1 (Test 6): Wrong digest (tampered stored base.om -> exit 40)
+  if not tamper_store_base false
+    ret fail_t 6 920
+  end
+  rc = do_link fn_app2 out_neg 0
+  ok_r = tamper_store_base true
+  if or ne rc 40 not p2_absent
+    ret fail_t 6 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 2 (Test 7): Wrong compiler pin (a: bad --pin flag, b: bad pin: in import -> exit 41)
+  rc = do_link fn_app2 out_neg 2
+  if or ne rc 41 not p2_absent
+    ret fail_t 7 rc
+  end
+  mk_path1 fn_badpin
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_badpin
+  sb_txt t_nl
+  sb_txt s_app2_body
+  if not write_src_p1
+    ret fail_t 7 921
+  end
+  rc = do_link fn_badpin out_neg 0
+  if or ne rc 41 not p2_absent
+    ret fail_t 7 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 3 (Test 8): Wrong profile (a: invalid om99, b: om1.0 importing om2 release -> exit 42)
+  mk_path1 fn_badp
+  if not write_txt_p1 s_bad_prof
+    ret fail_t 8 922
+  end
+  rc = do_link fn_badp out_neg 0
+  if or ne rc 42 not p2_absent
+    ret fail_t 8 rc
+  end
+  mk_path1 fn_reld
+  if not write_txt_p1 s_rel_dep
+    ret fail_t 8 923
+  end
+  rc = do_put fn_reld 4
+  if ne rc 0
+    ret fail_t 8 rc
+  end
+  mk_path1 fn_relr
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_rel
+  sb_h64 4
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_app2_body
+  if not write_src_p1
+    ret fail_t 8 924
+  end
+  rc = do_link fn_relr out_neg 0
+  if or ne rc 42 not p2_absent
+    ret fail_t 8 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 4 (Test 9): Duplicate export (`collide` exported by two distinct modules -> exit 43)
+  mk_path1 fn_dup1
+  if not write_txt_p1 s_dup1
+    ret fail_t 9 925
+  end
+  rc = do_put fn_dup1 2
+  if ne rc 0
+    ret fail_t 9 rc
+  end
+  mk_path1 fn_dup2
+  if not write_txt_p1 s_dup2
+    ret fail_t 9 926
+  end
+  rc = do_put fn_dup2 3
+  if ne rc 0
+    ret fail_t 9 rc
+  end
+  mk_path1 fn_dupr
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_a
+  sb_h64 2
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt t_imp_b
+  sb_h64 3
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_dup_root
+  if not write_src_p1
+    ret fail_t 9 927
+  end
+  rc = do_link fn_dupr out_neg 0
+  if or ne rc 43 not p2_absent
+    ret fail_t 9 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 5 (Test 10): Cyclic import A -> B -> A (genuine body SHA-256 digests -> exit 44)
+  note First register A & B bodies to obtain exact body SHA-256 digests h_ca and h_cb
+  mk_path1 fn_ca
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt s_ca_body
+  if not write_src_p1
+    ret fail_t 10 928
+  end
+  rc = do_put fn_ca 5
+  if ne rc 0
+    ret fail_t 10 rc
+  end
+  mk_path1 fn_cb
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt s_cb_body
+  if not write_src_p1
+    ret fail_t 10 929
+  end
+  rc = do_put fn_cb 6
+  if ne rc 0
+    ret fail_t 10 rc
+  end
+  note Now add cross-imports A -> B and B -> A (same verified bodies!) and re-put into store
+  mk_path1 fn_ca
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_b
+  sb_h64 6
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_ca_body
+  if not write_src_p1
+    ret fail_t 10 930
+  end
+  rc = do_put fn_ca 5
+  if ne rc 0
+    ret fail_t 10 rc
+  end
+  mk_path1 fn_cb
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_a
+  sb_h64 5
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_cb_body
+  if not write_src_p1
+    ret fail_t 10 931
+  end
+  rc = do_put fn_cb 6
+  if ne rc 0
+    ret fail_t 10 rc
+  end
+  rc = do_link fn_ca out_neg 1
+  if or ne rc 44 not p2_absent
+    ret fail_t 10 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 6 (Test 11): Missing module digest in store -> exit 45
+  mk_path1 fn_miss
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_txt t_bad_hash
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_app2_body
+  if not write_src_p1
+    ret fail_t 11 932
+  end
+  rc = do_link fn_miss out_neg 0
+  if or ne rc 45 not p2_absent
+    ret fail_t 11 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  note Control 7 (Test 12): Private visibility violation (`base.priv_bias` -> exit 47)
+  mk_path1 fn_vis
+  sb_reset
+  sb_txt t_om10_nl
+  sb_txt t_imp_base
+  sb_h64 0
+  sb_txt t_imp_pin
+  sb_h64 7
+  sb_txt t_nl
+  sb_txt s_vis_body
+  if not write_src_p1
+    ret fail_t 12 933
+  end
+  rc = do_link fn_vis out_neg 0
+  if or ne rc 47 not p2_absent
+    ret fail_t 12 rc
+  end
+  put g_cnt 0 add get g_cnt 0 1
+  put g_cnt 1 add get g_cnt 1 1
+
+  w = write 1 t_okneg 0 len t_okneg
+  ret 0
+end
+
+fn main to int
+  if lt argcnt 5
+    w = write 2 t_use 0 len t_use
+    ret 2
+  end
+  l1 = argread 1 g_ml 0 511
+  l2 = argread 2 g_omc 0 511
+  l3 = argread 3 g_p1 0 511
+  l4 = argread 4 g_wd 0 511
+  if or le l1 0 or le l2 0 or le l3 0 le l4 0
+    w = write 2 t_use 0 len t_use
+    ret 2
+  end
+  put g_mll 0 ulong l1
+  put g_omcl 0 ulong l2
+  put g_wdl 0 ulong l4
+
+  note Read 64-hex pin from pin file
+  pfd = fopen g_p1 0 ulong l3 0 0
+  if lt pfd 0
+    ret 90
+  end
+  pr = read int pfd g_pin 0 64
+  x = fclose int pfd
+  if ne pr 64
+    ret 91
+  end
+
+  note Prepare <work-dir>/store directory
+  p = ulong 0
+  for i ulong get g_wdl 0 bound 512
+    put g_stdir p get g_wd i
+    p = add p 1
+  end
+  for i ulong len t_store_sub bound 16
+    put g_stdir p get t_store_sub i
+    p = add p 1
+  end
+  put g_stdirl 0 p
+  mk = makedir g_stdir 0 p 493
+
+  w = write 1 t_hdr 0 len t_hdr
+  put g_cnt 0 0
+  put g_cnt 1 0
+
+  r = run_positives
+  if ne r 0
+    ret r
+  end
+  r = run_negatives
+  if ne r 0
+    ret r
+  end
+
+  w = write 1 t_pass 0 len t_pass
+  w_u64 get g_cnt 0
+  w = write 1 t_ctrl 0 len t_ctrl
+  w_u64 get g_cnt 1
+  w = write 1 t_nl 0 1
+  ret 0
+end
