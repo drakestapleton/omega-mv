@@ -78,8 +78,8 @@ compile "$out/compute-lock" "$out/signer-profile.om" gpu/nvidia/native/arboris/c
 compile "$out/capq" om/runtime/rx_capq_core.om seed/authority/capq.om tests/arboris/capq.om
 "$out/capq"
 compile "$out/caproot-check" seed/authority/caproot.om tests/arboris/caproot-check.om
-cc -O1 -c src/omega_om_units.c -o "$out/units.o"
-cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/caproot_issuer.c src/runtime/rx_caproot.c "$out/units.o" -o "$out/caproot-issuer"
+(printf 'om2\n'; sed -e '/^om2$/d' -e 's/^export fn /fn /' seed/authority/cap_table_om2.om src/runtime/rx_caproot.om seed/authority/caproot.om tests/arboris/caproot_issuer.om) | "$OMC" > "$out/caproot-issuer"
+chmod +x "$out/caproot-issuer"
 "$out/caproot-issuer" "$out/caproot-check"
 compile "$out/wave-qmd" om/gpu/bw_qmd.om om/blackwell_arboris_qmd.om tests/arboris/wave-qmd.om
 "$out/wave-qmd"
