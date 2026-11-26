@@ -2,24 +2,33 @@ om2
 note SPDX-License-Identifier: Apache-2.0
 note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 note
-note src/allen/allen_bind.om -- Pure seeded OM-2 port of src/allen/allen_bind.c.
+note src/allen/allen_bind.om -- Pure seeded OM-2 port of src/allen/allen_bind.c
+note and the Aienux continuity_subject v0 codec (AIENSUBJ / AIENOS-STORE-OBJECT-V1).
 note Composes with seed/ng/sha256.om and src/allen/allen_core.om.
-note Implements the three ALLEN bindings (identity, memory, intent) and subject codec/loader.
+note Pure functions over the subject object, Cortex lineage, and goal mutations.
+note No threads, no timers, no signals, no authority, no unbounded loops.
 
-const AL_MAX_INTENTS ulong 16
-const AL_MAX_KNOWLEDGE ulong 16
-const AL_MAX_OBJ_BYTES ulong 4096
+const AL_MAX_INTENTS ulong 64
+const AL_MAX_KNOWLEDGE ulong 64
+const AL_MAX_OBJ_BYTES ulong 16384
+const AL_HDR_BYTES ulong 16
+const AL_FIXED_BODY ulong 184
+const AL_INTENT_BYTES ulong 96
+const AL_KNOW_BYTES ulong 48
 
-const CS_ACTIVE ulong 1
-const CS_SUPERSEDED ulong 2
-const CS_INTENT_GOAL_LATENCY ulong 1
+const CS_KIND_SUBJECT ulong 24
+const CS_STORE_VER ulong 1
+const CS_FORMAT_VER ulong 0
 const CS_ORIGIN_OPERATOR ulong 1
+const CS_ORIGIN_PROMOTED ulong 2
+const CS_INTENT_GOAL_LATENCY ulong 1
+const CS_ACTIVE ulong 1
+const CS_INACTIVE ulong 2
+const CS_SUPERSEDED ulong 3
 
-note Canonical subject binary format magic: "ALN0" (0x304e4c41 LE), version 0
-const AL_MAGIC ulong 810437697
-const AL_VERSION ulong 0
-const AL_HDR_BYTES ulong 156
-const AL_INTENT_BYTES ulong 64
+text t_al_magic "AIENSUBJ"
+text t_al_idom  "AIENOS_INTENT_v0:"
+text t_al_odom  "AIENOS-STORE-OBJECT-V1"
 
 note Subject state (struct cs_subject)
 global g_al_agent uchar 32
@@ -31,13 +40,18 @@ global g_al_seq ulong 1
 global g_al_origin ulong 1
 global g_al_n_intents ulong 1
 global g_al_n_knowledge ulong 1
-global g_al_in_id uchar 512
-global g_al_in_kind ulong 16
-global g_al_in_state ulong 16
-global g_al_in_since ulong 16
-global g_al_in_p0 ulong 16
-global g_al_in_p1 ulong 16
+global g_al_in_id uchar 2048
+global g_al_in_sup uchar 2048
+global g_al_in_kind ulong 64
+global g_al_in_state ulong 64
+global g_al_in_since ulong 64
+global g_al_in_p0 ulong 64
+global g_al_in_p1 ulong 64
+global g_al_kn_dig uchar 2048
+global g_al_kn_rec ulong 64
+global g_al_kn_since ulong 64
 global g_al_subj_id uchar 32
+global g_al_err ulong 1
 
 note Identity binding record (AllenBinding)
 global g_al_bind_ext_subj ulong 1
@@ -45,7 +59,7 @@ global g_al_bind_agent uchar 32
 global g_al_bind_subj_id uchar 32
 global g_al_bind_seq ulong 1
 
-note Cortex journal header (in-memory view of record 1 digest + record count)
+note Cortex journal summary (record count + record 1 digest)
 global g_al_cx_n ulong 1
 global g_al_cx_gen_dig uchar 32
 
@@ -54,9 +68,14 @@ global g_al_mut_obj ulong 4
 global g_al_mut_fld ulong 4
 global g_al_mut_val ulong 4
 
-note Scratch I/O buffer for subject encode/decode
-global g_al_buf uchar 4096
+note Scratch I/O buffer (16384 + 1 bytes to detect oversize files)
+global g_al_buf uchar 16385
 global g_al_buf_len ulong 1
+
+fn al_put_u16le off ulong v ulong to void
+  put g_al_buf off uchar and v 255
+  put g_al_buf add off 1 uchar and shr v 8 255
+end
 
 fn al_put_u32le off ulong v ulong to void
   put g_al_buf off uchar and v 255
@@ -68,6 +87,12 @@ end
 fn al_put_u64le off ulong v ulong to void
   al_put_u32le off and v 4294967295
   al_put_u32le add off 4 shr v 32
+end
+
+fn al_get_u16le off ulong to ulong
+  b0 = ulong get g_al_buf off
+  b1 = ulong get g_al_buf add off 1
+  ret or b0 shl b1 8
 end
 
 fn al_get_u32le off ulong to ulong
@@ -86,6 +111,134 @@ fn al_get_u64le off ulong to ulong
   ret or lo shl hi 32
 end
 
+fn al_buf_zeros off ulong n ulong to bool
+  for i ulong n bound 16
+    if ne get g_al_buf add off i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_zero_root to bool
+  for i ulong 32
+    if ne get g_al_root i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_zero_agent to bool
+  for i ulong 32
+    if ne get g_al_agent i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_zero_prev to bool
+  for i ulong 32
+    if ne get g_al_prev i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_zero_prov to bool
+  for i ulong 32
+    if ne get g_al_prov i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_zero_sup ib ulong to bool
+  for i ulong 32
+    if ne get g_al_in_sup add ib i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_zero_kn kb ulong to bool
+  for i ulong 32
+    if ne get g_al_kn_dig add kb i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_in_eq_sh ib ulong to bool
+  for i ulong 32
+    if ne get sh_dig i get g_al_in_id add ib i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_sup_eq_in sup_off ulong id_off ulong to bool
+  for i ulong 32
+    if ne get g_al_in_sup add sup_off i get g_al_in_id add id_off i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn al_in_cmp_new aoff ulong b view uchar 32 to long
+  for i ulong 32
+    av = get g_al_in_id add aoff i
+    bv = get b i
+    if lt av bv
+      ret -1
+    end
+    if gt av bv
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn al_in_cmp_idx aoff ulong boff ulong to long
+  for i ulong 32
+    av = get g_al_in_id add aoff i
+    bv = get g_al_in_id add boff i
+    if lt av bv
+      ret -1
+    end
+    if gt av bv
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn al_kn_cmp_idx aoff ulong boff ulong to long
+  for i ulong 32
+    av = get g_al_kn_dig add aoff i
+    bv = get g_al_kn_dig add boff i
+    if lt av bv
+      ret -1
+    end
+    if gt av bv
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn al_set_err code ulong to long
+  put g_al_err 0 code
+  ret -1
+end
+
 fn al_subject_reset to void
   for i ulong 32
     put g_al_agent i 0
@@ -99,166 +252,461 @@ fn al_subject_reset to void
   put g_al_origin 0 CS_ORIGIN_OPERATOR
   put g_al_n_intents 0 0
   put g_al_n_knowledge 0 0
+  put g_al_err 0 0
 end
 
-fn al_subject_add_intent kind ulong p0 ulong p1 ulong to long
-  n = get g_al_n_intents 0
-  if ge n AL_MAX_INTENTS
-    ret -1
+note Compute exact Aienux cs_intent_id into sh_dig[0..32).
+fn al_compute_intent_id kind ulong since ulong p0 ulong p1 ulong to void
+  for i ulong 17
+    put sh_dat i get t_al_idom i
   end
-  note Supersede any prior ACTIVE intent of the same kind and regime (p0)
-  for i ulong n bound 16
-    if and eq get g_al_in_state i CS_ACTIVE eq get g_al_in_kind i kind
-      if eq get g_al_in_p0 i p0
-        put g_al_in_state i CS_SUPERSEDED
+  for i ulong 32
+    put sh_dat add 17 i get g_al_agent i
+  end
+  for i ulong 4
+    put sh_dat add 49 i uchar and shr kind mul i 8 255
+  end
+  for i ulong 8
+    put sh_dat add 53 i uchar and shr since mul i 8 255
+    put sh_dat add 61 i uchar and shr p0 mul i 8 255
+    put sh_dat add 69 i uchar and shr p1 mul i 8 255
+  end
+  sh_all 77
+end
+
+note Compute exact AIENOS-STORE-OBJECT-V1 ObjectId (kind 24, version 1) into g_al_subj_id[0..32).
+fn al_compute_subject_id total ulong to void
+  for i ulong 22
+    put sh_dat i get t_al_odom i
+  end
+  put sh_dat 22 0
+  put sh_dat 23 uchar and CS_KIND_SUBJECT 255
+  put sh_dat 24 uchar and shr CS_KIND_SUBJECT 8 255
+  put sh_dat 25 uchar and CS_STORE_VER 255
+  put sh_dat 26 uchar and shr CS_STORE_VER 8 255
+  for i ulong 8
+    put sh_dat add 27 i uchar and shr total mul i 8 255
+  end
+  for i ulong total bound 16384
+    put sh_dat add 35 i get g_al_buf i
+  end
+  sh_all add 35 total
+  for i ulong 32
+    put g_al_subj_id i get sh_dig i
+  end
+end
+
+fn al_shift_intent_right pos ulong n ulong to void
+  cnt = sub n pos
+  for step ulong cnt bound 64
+    dst = sub n step
+    src = sub dst 1
+    db = mul dst 32
+    sb = mul src 32
+    for k ulong 32
+      put g_al_in_id add db k get g_al_in_id add sb k
+      put g_al_in_sup add db k get g_al_in_sup add sb k
+    end
+    put g_al_in_kind dst get g_al_in_kind src
+    put g_al_in_state dst get g_al_in_state src
+    put g_al_in_since dst get g_al_in_since src
+    put g_al_in_p0 dst get g_al_in_p0 src
+    put g_al_in_p1 dst get g_al_in_p1 src
+  end
+end
+
+fn al_find_intent_ins n ulong new_id view uchar 32 to long
+  ins = n
+  for i ulong n bound 64
+    c = al_in_cmp_new mul i 32 new_id
+    if eq c 0
+      ret -1
+    end
+    if and eq ins n gt c 0
+      ins = i
+    end
+  end
+  ret long ins
+end
+
+fn al_supersede_slot n ulong kind ulong p0 ulong sup_id edit uchar 32 to void
+  for i ulong n bound 64
+    if eq get g_al_in_state i CS_ACTIVE
+      if eq get g_al_in_kind i kind
+        if eq get g_al_in_p0 i p0
+          put g_al_in_state i CS_SUPERSEDED
+          sb = mul i 32
+          for k ulong 32
+            put sup_id k get g_al_in_id add sb k
+          end
+        end
       end
     end
   end
-  note Compute deterministic intent id = SHA256(agent || kind || p0 || p1 || n)
+end
+
+fn al_subject_add_intent kind ulong p0 ulong p1 ulong to long
+  new_id = new uchar 32 0
+  sup_id = new uchar 32 0
+  n = get g_al_n_intents 0
+  if ge n AL_MAX_INTENTS
+    ret al_set_err 7
+  end
+  seq = get g_al_seq 0
+  al_compute_intent_id kind seq p0 p1
   for i ulong 32
-    put sh_dat i get g_al_agent i
+    put new_id i get sh_dig i
   end
-  for i ulong 8
-    put sh_dat add 32 i uchar and shr kind mul i 8 255
-    put sh_dat add 40 i uchar and shr p0 mul i 8 255
-    put sh_dat add 48 i uchar and shr p1 mul i 8 255
-    put sh_dat add 56 i uchar and shr n mul i 8 255
+  ins_r = al_find_intent_ins n new_id
+  if lt ins_r 0
+    ret al_set_err 17
   end
-  sh_all 64
-  base = mul n 32
-  for i ulong 32
-    put g_al_in_id add base i get sh_dig i
+  ins = ulong ins_r
+  al_supersede_slot n kind p0 sup_id
+  if lt ins n
+    al_shift_intent_right ins n
   end
-  put g_al_in_kind n kind
-  put g_al_in_state n CS_ACTIVE
-  put g_al_in_since n get g_al_seq 0
-  put g_al_in_p0 n p0
-  put g_al_in_p1 n p1
+  ib = mul ins 32
+  for k ulong 32
+    put g_al_in_id add ib k get new_id k
+    put g_al_in_sup add ib k get sup_id k
+  end
+  put g_al_in_kind ins kind
+  put g_al_in_state ins CS_ACTIVE
+  put g_al_in_since ins seq
+  put g_al_in_p0 ins p0
+  put g_al_in_p1 ins p1
   put g_al_n_intents 0 add n 1
   ret 0
 end
 
-fn al_subject_encode to long
+fn al_validate_sup ib ulong ni ulong sn ulong to long
+  if al_zero_sup ib
+    ret 0
+  end
+  if al_sup_eq_in ib ib
+    ret al_set_err 22
+  end
+  found = ni
+  for j ulong ni bound 64
+    if al_sup_eq_in ib mul j 32
+      found = j
+    end
+  end
+  if eq found ni
+    ret al_set_err 23
+  end
+  if ne get g_al_in_state found CS_SUPERSEDED
+    ret al_set_err 24
+  end
+  if gt get g_al_in_since found sn
+    ret al_set_err 25
+  end
+  ret 0
+end
+
+fn al_validate_intent idx ulong ni ulong seq ulong to long
+  ib = mul idx 32
+  if gt idx 0
+    if ge al_in_cmp_idx mul sub idx 1 32 ib 0
+      ret al_set_err 17
+    end
+  end
+  st = get g_al_in_state idx
+  if ne st CS_ACTIVE
+    if ne st CS_INACTIVE
+      if ne st CS_SUPERSEDED
+        ret al_set_err 18
+      end
+    end
+  end
+  kd = get g_al_in_kind idx
+  if ne kd CS_INTENT_GOAL_LATENCY
+    ret al_set_err 19
+  end
+  sn = get g_al_in_since idx
+  if or eq sn 0 gt sn seq
+    ret al_set_err 20
+  end
+  al_compute_intent_id kd sn get g_al_in_p0 idx get g_al_in_p1 idx
+  if not al_in_eq_sh ib
+    ret al_set_err 21
+  end
+  if ne al_validate_sup ib ni sn 0
+    ret -1
+  end
+  if eq st CS_ACTIVE
+    p0i = get g_al_in_p0 idx
+    for j ulong idx bound 64
+      if eq get g_al_in_state j CS_ACTIVE
+        if eq get g_al_in_kind j kd
+          if eq get g_al_in_p0 j p0i
+            ret al_set_err 26
+          end
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn al_subject_validate to long
+  if al_zero_root
+    ret al_set_err 10
+  end
+  if al_zero_agent
+    ret al_set_err 11
+  end
+  seq = get g_al_seq 0
+  if eq seq 0
+    ret al_set_err 12
+  end
+  prev_z = al_zero_prev
+  if and eq seq 1 not prev_z
+    ret al_set_err 13
+  end
+  if and gt seq 1 prev_z
+    ret al_set_err 14
+  end
+  if al_zero_prov
+    ret al_set_err 15
+  end
+  orig = get g_al_origin 0
+  if and ne orig CS_ORIGIN_OPERATOR ne orig CS_ORIGIN_PROMOTED
+    ret al_set_err 16
+  end
   ni = get g_al_n_intents 0
   if gt ni AL_MAX_INTENTS
+    ret al_set_err 7
+  end
+  nk = get g_al_n_knowledge 0
+  if gt nk AL_MAX_KNOWLEDGE
+    ret al_set_err 8
+  end
+  for i ulong ni bound 64
+    if ne al_validate_intent i ni seq 0
+      ret -1
+    end
+  end
+  for i ulong ni bound 64
+    if eq get g_al_in_state i CS_SUPERSEDED
+      named = ulong 0
+      ib = mul i 32
+      for j ulong ni bound 64
+        if al_sup_eq_in mul j 32 ib
+          named = add named 1
+        end
+      end
+      if ne named 1
+        ret al_set_err 27
+      end
+    end
+  end
+  for i ulong nk bound 64
+    kb = mul i 32
+    if al_zero_kn kb
+      ret al_set_err 28
+    end
+    if gt i 0
+      if ge al_kn_cmp_idx mul sub i 1 32 kb 0
+        ret al_set_err 29
+      end
+    end
+    ks = get g_al_kn_since i
+    if or eq ks 0 gt ks seq
+      ret al_set_err 30
+    end
+  end
+  put g_al_err 0 0
+  ret 0
+end
+
+fn al_subject_encode to long
+  if ne al_subject_validate 0
     ret -1
   end
-  total = add AL_HDR_BYTES mul ni AL_INTENT_BYTES
+  ni = get g_al_n_intents 0
+  nk = get g_al_n_knowledge 0
+  body = add AL_FIXED_BODY add mul ni AL_INTENT_BYTES mul nk AL_KNOW_BYTES
+  total = add AL_HDR_BYTES body
   if gt total AL_MAX_OBJ_BYTES
-    ret -1
+    ret al_set_err 32
   end
-  al_put_u32le 0 AL_MAGIC
-  al_put_u32le 4 AL_VERSION
-  al_put_u32le 8 get g_al_origin 0
-  al_put_u32le 12 ni
-  al_put_u64le 16 get g_al_seq 0
-  al_put_u32le 24 get g_al_n_knowledge 0
+  for i ulong 8
+    put g_al_buf i get t_al_magic i
+  end
+  al_put_u16le 8 CS_FORMAT_VER
+  al_put_u16le 10 0
+  al_put_u32le 12 body
   for i ulong 32
-    put g_al_buf add 28 i get g_al_agent i
-    put g_al_buf add 60 i get g_al_root i
-    put g_al_buf add 92 i get g_al_prev i
-    put g_al_buf add 124 i get g_al_cortex i
+    put g_al_buf add 16 i get g_al_root i
+    put g_al_buf add 48 i get g_al_agent i
+    put g_al_buf add 80 i get g_al_prev i
+    put g_al_buf add 120 i get g_al_cortex i
+    put g_al_buf add 152 i get g_al_prov i
   end
-  off = ulong AL_HDR_BYTES
-  for i ulong ni bound 16
+  al_put_u64le 112 get g_al_seq 0
+  put g_al_buf 184 uchar and get g_al_origin 0 255
+  for i ulong 7
+    put g_al_buf add 185 i 0
+  end
+  al_put_u16le 192 ni
+  al_put_u16le 194 nk
+  al_put_u32le 196 0
+  off = ulong 200
+  for i ulong ni bound 64
     base = mul i 32
     for k ulong 32
       put g_al_buf add off k get g_al_in_id add base k
+      put g_al_buf add add off 32 k get g_al_in_sup add base k
     end
-    al_put_u32le add off 32 get g_al_in_kind i
-    al_put_u32le add off 36 get g_al_in_state i
-    al_put_u64le add off 40 get g_al_in_since i
-    al_put_u64le add off 48 get g_al_in_p0 i
-    al_put_u64le add off 56 get g_al_in_p1 i
+    al_put_u32le add off 64 get g_al_in_kind i
+    put g_al_buf add off 68 uchar and get g_al_in_state i 255
+    put g_al_buf add off 69 0
+    put g_al_buf add off 70 0
+    put g_al_buf add off 71 0
+    al_put_u64le add off 72 get g_al_in_since i
+    al_put_u64le add off 80 get g_al_in_p0 i
+    al_put_u64le add off 88 get g_al_in_p1 i
     off = add off AL_INTENT_BYTES
   end
-  put g_al_buf_len 0 total
-  for i ulong total bound 4096
-    put sh_dat i get g_al_buf i
+  for i ulong nk bound 64
+    base = mul i 32
+    for k ulong 32
+      put g_al_buf add off k get g_al_kn_dig add base k
+    end
+    al_put_u64le add off 32 get g_al_kn_rec i
+    al_put_u64le add off 40 get g_al_kn_since i
+    off = add off AL_KNOW_BYTES
   end
-  sh_all total
-  for i ulong 32
-    put g_al_subj_id i get sh_dig i
+  put g_al_buf_len 0 total
+  al_compute_subject_id total
+  ret 0
+end
+
+fn al_decode_entries ni ulong nk ulong to long
+  off = ulong 200
+  for i ulong ni bound 64
+    base = mul i 32
+    off32 = add off 32
+    for k ulong 32
+      put g_al_in_id add base k get g_al_buf add off k
+      put g_al_in_sup add base k get g_al_buf add off32 k
+    end
+    put g_al_in_kind i al_get_u32le add off 64
+    put g_al_in_state i ulong get g_al_buf add off 68
+    if not al_buf_zeros add off 69 3
+      ret al_set_err 6
+    end
+    put g_al_in_since i al_get_u64le add off 72
+    put g_al_in_p0 i al_get_u64le add off 80
+    put g_al_in_p1 i al_get_u64le add off 88
+    off = add off AL_INTENT_BYTES
+  end
+  for i ulong nk bound 64
+    base = mul i 32
+    for k ulong 32
+      put g_al_kn_dig add base k get g_al_buf add off k
+    end
+    put g_al_kn_rec i al_get_u64le add off 32
+    put g_al_kn_since i al_get_u64le add off 40
+    off = add off AL_KNOW_BYTES
   end
   ret 0
 end
 
 fn al_subject_decode n ulong to long
+  al_subject_reset
+  if gt n AL_MAX_OBJ_BYTES
+    ret al_set_err 32
+  end
   if lt n AL_HDR_BYTES
-    ret -1
+    ret al_set_err 1
   end
-  if ne al_get_u32le 0 AL_MAGIC
-    ret -1
-  end
-  if ne al_get_u32le 4 AL_VERSION
-    ret -1
-  end
-  orig = al_get_u32le 8
-  if or eq orig 0 gt orig 4
-    ret -1
-  end
-  ni = al_get_u32le 12
-  if gt ni AL_MAX_INTENTS
-    ret -1
-  end
-  expect = add AL_HDR_BYTES mul ni AL_INTENT_BYTES
-  if ne n expect
-    ret -1
-  end
-  put g_al_origin 0 orig
-  put g_al_n_intents 0 ni
-  put g_al_seq 0 al_get_u64le 16
-  put g_al_n_knowledge 0 al_get_u32le 24
-  for i ulong 32
-    put g_al_agent i get g_al_buf add 28 i
-    put g_al_root i get g_al_buf add 60 i
-    put g_al_prev i get g_al_buf add 92 i
-    put g_al_cortex i get g_al_buf add 124 i
-  end
-  off = ulong AL_HDR_BYTES
-  for i ulong ni bound 16
-    base = mul i 32
-    for k ulong 32
-      put g_al_in_id add base k get g_al_buf add off k
+  for i ulong 8
+    if ne get g_al_buf i get t_al_magic i
+      ret al_set_err 2
     end
-    put g_al_in_kind i al_get_u32le add off 32
-    put g_al_in_state i al_get_u32le add off 36
-    put g_al_in_since i al_get_u64le add off 40
-    put g_al_in_p0 i al_get_u64le add off 48
-    put g_al_in_p1 i al_get_u64le add off 56
-    off = add off AL_INTENT_BYTES
   end
-  for i ulong n bound 4096
-    put sh_dat i get g_al_buf i
+  if ne al_get_u16le 8 CS_FORMAT_VER
+    ret al_set_err 3
   end
-  sh_all n
+  if not al_buf_zeros 10 2
+    ret al_set_err 4
+  end
+  body_len = al_get_u32le 12
+  if ne body_len sub n AL_HDR_BYTES
+    ret al_set_err 5
+  end
+  if lt n 200
+    ret al_set_err 1
+  end
   for i ulong 32
-    put g_al_subj_id i get sh_dig i
+    put g_al_root i get g_al_buf add 16 i
+    put g_al_agent i get g_al_buf add 48 i
+    put g_al_prev i get g_al_buf add 80 i
+    put g_al_cortex i get g_al_buf add 120 i
+    put g_al_prov i get g_al_buf add 152 i
   end
+  put g_al_seq 0 al_get_u64le 112
+  put g_al_origin 0 ulong get g_al_buf 184
+  if not al_buf_zeros 185 7
+    ret al_set_err 6
+  end
+  ni = al_get_u16le 192
+  if gt ni AL_MAX_INTENTS
+    ret al_set_err 7
+  end
+  nk = al_get_u16le 194
+  if gt nk AL_MAX_KNOWLEDGE
+    ret al_set_err 8
+  end
+  if not al_buf_zeros 196 4
+    ret al_set_err 6
+  end
+  expect = add 200 add mul ni AL_INTENT_BYTES mul nk AL_KNOW_BYTES
+  if lt n expect
+    ret al_set_err 1
+  end
+  if gt n expect
+    ret al_set_err 9
+  end
+  put g_al_n_intents 0 ni
+  put g_al_n_knowledge 0 nk
+  if ne al_decode_entries ni nk 0
+    ret -1
+  end
+  if ne al_subject_validate 0
+    ret -1
+  end
+  al_compute_subject_id n
   ret 0
 end
 
 note allen_load: read subject object file at path[0..plen), decode, compute id. Returns 0 or -1.
 fn allen_load path view uchar * plen ulong to long
-  rbuf = new uchar 4096 0
   if or eq plen 0 gt plen 511
-    ret -1
+    ret al_set_err 31
   end
   fd = fopen path 0 plen 0 0
   if lt fd 0
-    ret -1
+    ret al_set_err 31
   end
-  got = read int fd rbuf 0 4096
+  total = ulong 0
+  for chunk ulong 64
+    rem_cap = sub 16385 total
+    if eq rem_cap 0
+      break
+    end
+    got = read int fd g_al_buf total rem_cap
+    if le got 0
+      break
+    end
+    total = add total ulong got
+  end
   ign = fclose int fd
-  if le got 0
-    ret -1
-  end
-  n = ulong got
-  for i ulong n bound 4096
-    put g_al_buf i get rbuf i
-  end
-  put g_al_buf_len 0 n
-  ret al_subject_decode n
+  put g_al_buf_len 0 total
+  ret al_subject_decode total
 end
 
 note allen_lineage: extract genesis record digest into dst[32]. Returns 0 if present, -1 if empty.

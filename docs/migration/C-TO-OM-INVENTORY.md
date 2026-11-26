@@ -32,6 +32,8 @@ Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-5): cut over `test-library`, 
 
 Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-6a): completed 100% pure seeded OM-2 retirement of `tests/model/` (5 C/H files: `world_model.{c,h}`, `world_explore.{c,h}`, `world_diff.c`; `PARITY.tsv` ref `ffb96c32f`); cut over `mk/proof.mk` (`test-model`, `test-model-diff`, `test-model-tsan`, `test-proof`) and `tests/model/receipt.sh` to pure seeded OM-2, and added live `real.I1.{settled,quiescent}_leak_violations` + `real.I3.duplicate_commit_runs` receipt counters to `tests/model/world_diff.om`.
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-6b): completed 100% pure seeded OM-2 retirement of ALLEN (`src/allen/allen_bind.{c,h}`, `tools/allen.c`; `PARITY.tsv` ref `7130bd1e9`); upgraded `src/allen/allen_bind.om` to the byte-exact Aienux `AIENSUBJ` v0 / `AIENOS-STORE-OBJECT-V1` / `AIENOS_INTENT_v0:` codec with full validation & refusal codes, composed `tools/allen.om` directly with `src/runtime/rx_cortex.om` + `src/runtime/rx_aien.om`, and cut over `mk/allen.mk`, `mk/allen_tool-om.mk`, and `tests/allen/run.sh` (all 10 gates G1..G6 + FORMAT + REPLAY + SUPERSEDE + MISMATCH PASS).
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage
