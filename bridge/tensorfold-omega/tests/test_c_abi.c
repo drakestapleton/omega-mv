@@ -119,21 +119,46 @@ int main(int argc, char **argv) {
     st = omega2_tf_sm121_check_stall(&res, bad_bb, 8, 2, 6);
     if (st != OMEGA_OK || res != 2) fail("sm121 BB escape must return 2", res, 2);
 
-    /* 4. EGP3 single-cert check from disk + 1-bit tamper negative control */
+    /* 4. EGP3 single-cert check from disk + fail-closed negative controls */
     FILE *fp = fopen(argv[1], "rb");
     if (!fp) fail("open egp3 cert", 0, 1);
-    uint8_t cert[512];
-    size_t n = fread(cert, 1, sizeof(cert), fp);
+    uint8_t orig_cert[512];
+    size_t n = fread(orig_cert, 1, sizeof(orig_cert), fp);
     fclose(fp);
     if (n != 240) fail("egp3 cert size", n, 240);
 
+    uint8_t cert[512];
+    memcpy(cert, orig_cert, n);
     st = omega2_tf_egp3_check_cert(&res, cert, (uint64_t)n);
     if (st != OMEGA_OK || res != 0) fail("valid EGP3 cert", res, 0);
 
-    /* Corrupt Rule 1 RHS operand -> must refuse with code 8 */
+    /* Negative control 4a: corrupt Rule 1 RHS operand -> must refuse with code 8 */
     cert[36 + 5 * 32 + 3 * 4] ^= 1;
     st = omega2_tf_egp3_check_cert(&res, cert, (uint64_t)n);
     if (st != OMEGA_OK || res != 8) fail("tampered EGP3 cert must return 8", res, 8);
+
+    /* Negative control 4b: corrupt RHS + switch rule_id=3 (verifier #35 attack) -> must refuse with code 8 */
+    cert[228] = 3;
+    st = omega2_tf_egp3_check_cert(&res, cert, (uint64_t)n);
+    if (st != OMEGA_OK || res != 8) fail("bogus rule_id=3 must return 8", res, 8);
+
+    /* Negative control 4c: rule_id=19 out of range -> must refuse with code 7 */
+    cert[228] = 19;
+    st = omega2_tf_egp3_check_cert(&res, cert, (uint64_t)n);
+    if (st != OMEGA_OK || res != 7) fail("invalid rule_id=19 must return 7", res, 7);
+
+    /* Negative control 4d: disconnected root_before=0, root_after=1 with valid step 4->5 -> must refuse with code 11 */
+    memcpy(cert, orig_cert, n);
+    cert[24] = 0; cert[25] = 0; cert[26] = 0; cert[27] = 0;
+    cert[28] = 1; cert[29] = 0; cert[30] = 0; cert[31] = 0;
+    st = omega2_tf_egp3_check_cert(&res, cert, (uint64_t)n);
+    if (st != OMEGA_OK || res != 11) fail("disconnected roots must return 11", res, 11);
+
+    /* Negative control 4e: tc=0 with root_before=4 != root_after=5 (228-byte cert) -> must refuse with code 11 */
+    memcpy(cert, orig_cert, 228);
+    cert[32] = 0; cert[33] = 0; cert[34] = 0; cert[35] = 0;
+    st = omega2_tf_egp3_check_cert(&res, cert, 228);
+    if (st != OMEGA_OK || res != 11) fail("zero-trace distinct roots must return 11", res, 11);
 
     /* 5. ABI v2 null pointer & aliased buffer -> status 32 (OMEGA_BAD_ARG) */
     st = omega2_tf_egp3_check_cert(&res, NULL, 36);
@@ -145,6 +170,6 @@ int main(int argc, char **argv) {
     st = omega2_tf_arboris_observe(&res, table, 1024, cfg, 3 /* wrong fixed len */, 3, cur_a, 2);
     if (st != OMEGA_BAD_ARG) fail("wrong fixed cfg len must return 32", st, OMEGA_BAD_ARG);
 
-    printf("C_ABI_V2_PASS ident=%s arboris=OK sm121_floor=6 egp3=OK neg_controls=7\n", ident);
+    printf("C_ABI_V2_PASS ident=%s arboris=OK sm121_floor=6 egp3=OK neg_controls=11\n", ident);
     return 0;
 }
