@@ -29,7 +29,7 @@ global g_cppc_ok long 20
 note Summary metadata slots:
 note 0=zones_ok 1=cpus_ok 2=cppc_ok 3=a725_avg_khz 4=x925_avg_khz
 note 5=t_gpu_mc 6=t_soc_mc 7=t_unc_mc 8=t_die_max_mc 9=ts_mono_ns
-note 10=a725_del_ratio_pm 11=x925_del_ratio_pm 12=hw_writes
+note 10=a725_del_ratio_pm 11=x925_del_ratio_pm 12=hw_writes 13=live_thermal_ok
 global g_wmeta long 16
 
 note Sysfs path fragments (strictly read-only thermal + cpufreq + acpi_cppc)
@@ -140,22 +140,30 @@ wd_put_u64 ulong v
 end
 
 fn wd_put_fixed3 v long to void
-note Format milli-units (mC or mW) as signed D.DDD
-av = v
-if lt av 0
+note Format milli-units (mC or mW) as signed D.DDD without INT64_MIN overflow
+whole = ulong 0
+frac = ulong 0
+if lt v 0
 wd_putb 45
-av = neg av
+q = div v -1000
+r = rem v 1000
+if lt r 0
+r = neg r
 end
-whole = div av 1000
-frac = rem av 1000
-wd_put_u64 ulong whole
+whole = ulong q
+frac = ulong r
+else
+whole = ulong div v 1000
+frac = ulong rem v 1000
+end
+wd_put_u64 whole
 wd_putb 46
 d1 = div frac 100
 d2 = rem div frac 10 10
 d3 = rem frac 10
-wd_putb uchar add 48 ulong d1
-wd_putb uchar add 48 ulong d2
-wd_putb uchar add 48 ulong d3
+wd_putb uchar add 48 d1
+wd_putb uchar add 48 d2
+wd_putb uchar add 48 d3
 end
 
 fn wd_eq_view a view uchar * b view uchar * to bool
@@ -335,7 +343,18 @@ digits = ulong 0
 while lt i n bound 256
 c = get g_wread i
 if and ge c 48 le c 57
-acc = add mul acc 10 ulong sub c 48
+d = ulong sub c 48
+if gt acc 1844674407370955161
+put g_wmeta 14 long i
+put g_wmeta 15 0
+ret 0
+end
+if and eq acc 1844674407370955161 gt d 5
+put g_wmeta 14 long i
+put g_wmeta 15 0
+ret 0
+end
+acc = add mul acc 10 d
 digits = add digits 1
 i = add i 1
 else
@@ -451,13 +470,19 @@ end
 fn ws_sense_zones to void
 zok = long 0
 tmax = long 0
+has_max = false
 for z ulong 7
 ws_read_one_zone z
 if eq get g_tz_ok z 1
 zok = add zok 1
 tv = get g_tz_mc z
+if not has_max
+tmax = tv
+has_max = true
+else
 if gt tv tmax
 tmax = tv
+end
 end
 end
 end
@@ -466,6 +491,11 @@ put g_wmeta 5 get g_tz_mc 5
 put g_wmeta 6 get g_tz_mc 0
 put g_wmeta 7 get g_tz_mc 6
 put g_wmeta 8 tmax
+live_ok = long 0
+if and eq get g_tz_ok 0 1 eq get g_tz_ok 5 1
+live_ok = 1
+end
+put g_wmeta 13 live_ok
 end
 
 fn ws_sense_cpus to void
@@ -514,6 +544,27 @@ ws_sense_cpus
 ws_compute_cppc_ratios
 end
 
+note Overflow-safe CPPC delivered/reference permille helper (handles both tiny and 64-bit counters)
+fn ws_ratio_permille dv ulong rv ulong to long
+if eq rv 0
+ret 0
+end
+ds = dv
+rs = rv
+while or gt ds 10000000000000 gt rs 10000000000000 bound 32
+ds = shr ds 2
+rs = shr rs 2
+end
+if eq rs 0
+ret 1000000
+end
+q = div mul ds 1000 rs
+if gt q 1000000
+ret 1000000
+end
+ret long q
+end
+
 fn ws_compute_cppc_ratios to void
 a_pm = long 0
 a_n = long 0
@@ -524,22 +575,13 @@ if eq get g_cppc_ok c 1
 rv = get g_cppc_ref c
 dv = get g_cppc_del c
 if gt rv 0
-note Scale safely before multiplying by 1000 to prevent ulong wrap even after decades of uptime
-rs = shr rv 10
-ds = shr dv 10
-if or gt rs 10000000000000 gt ds 10000000000000
-rs = shr rv 20
-ds = shr dv 20
-end
-if gt rs 0
-pm = long div mul ds 1000 rs
+pm = ws_ratio_permille dv rv
 if ws_is_a725 c
 a_pm = add a_pm pm
 a_n = add a_n 1
 else
 x_pm = add x_pm pm
 x_n = add x_n 1
-end
 end
 end
 end
@@ -556,28 +598,52 @@ put g_wmeta 11 0
 end
 end
 
-note Derive conservative 2-node thermal state from live sensors (or safe fallback if offline)
-fn ws_fill_thermal_state st edit WattThermal to void
-tgpu = get g_wmeta 5
-tunc = get g_wmeta 7
-zok = get g_wmeta 0
-if lt zok 6
-put st t_die 45000
-put st t_sink 40000
+note Derive conservative whole-unit 2-node thermal state from live sensors.
+note Returns true iff critical live sensors (zone0 [TSOC] and zone5 [TGPU]) are valid;
+note otherwise populates fail-closed critical sentinel (104.8 C) and returns false.
+fn ws_fill_thermal_state st edit WattThermal to bool
+if or ne get g_tz_ok 0 1 ne get g_tz_ok 5 1
+put st t_die 104800
+put st t_sink 104800
 put st t_amb 25000
-ret
+ret false
 end
-note Node 1 = live Blackwell TGPU (zone5); Node 2 = conservative vapor-chamber proxy from TUNC/TGPU
-tsink = sub tunc 4000
-if gt tsink tgpu
-tsink = sub tgpu 2000
+note Whole-unit Node 1 = max across all live GB10 silicon zones (covers BOTH TGPU and Grace TSOC)
+tdie = get g_wmeta 8
+tgpu = get g_tz_mc 5
+if gt tgpu tdie
+tdie = tgpu
 end
+tsoc = get g_tz_mc 0
+if gt tsoc tdie
+tdie = tsoc
+end
+note Node 2 = conservative vapor-chamber proxy (never fabricate cold 25C sink when zone6 TUNC missing)
+tsink = sub tdie 2000
+if eq get g_tz_ok 6 1
+tunc_p = sub get g_tz_mc 6 4000
+if lt tunc_p tsink
+tsink = tunc_p
+end
+end
+tamb = long 25000
 if lt tsink 25000
-tsink = long 25000
+if ge tdie 25000
+tsink = 25000
+if gt tsink tdie
+tsink = tdie
 end
-put st t_die tgpu
+else
+tamb = tsink
+end
+end
+if lt tdie tamb
+tamb = tdie
+end
+put st t_die tdie
 put st t_sink tsink
-put st t_amb 25000
+put st t_amb tamb
+ret true
 end
 
 fn ws_print_zone_lbl z ulong to void
