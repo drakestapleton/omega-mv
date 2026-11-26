@@ -22,6 +22,8 @@ Updated 2026-11-25 (Phase 1A CPU tools port): added `tools/turing_cal_eval.om` (
 
 Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-1): cut over root `Makefile` `all` / `$(TARGET)` (`build/omegatool`), `test`, `test-m5`..`test-m15`, `test-r16-surface`, and `mk/omegatool-path.mk` (`test-omegatool-path`) to pure seeded OM-2 (`tools/omegatool.om`, physics-free, zero C); retired `tools/omegatool.c` and `tests/omegatool_path/physics_dir_test.c` (`PARITY.tsv` ref `f9bf35bde`).
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-2): cut over `oscv`, `test-resolve`, and `test-resolve-genesis` to pure seeded OM-2 (`src/oscv_main.om`, `src/omega_resolve.om`, `src/omega_resolve_osc.om`, `src/omega_receipt.om`, `src/omega_blake3.om`); retired 13 uncompilable legacy-OSC C files + `src/omega_resolve_osc.h` (`PARITY.tsv` ref `a72beec32`).
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage
