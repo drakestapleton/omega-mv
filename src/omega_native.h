@@ -263,7 +263,7 @@ uint32_t omega2_cg_matmul_frag_block(uint64_t *result, const uint64_t *o_sp, uin
 uint32_t omega2_cg_matmul_frag_shape(uint64_t *result, uint64_t o_mt, uint64_t o_nt, uint64_t o_kp, uint64_t *o_res, uint64_t o_res_len);
 /* export fn cg_matmul_i32 sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_matmul_i32(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
-#define OMEGA2_IDENT_cg_gpu_gemm "omega-ident 1 unit=cg_gpu_gemm abi=2 profile=OM-2 src=6c14d88ea1618f6695af0da19cef03734db36fc991c9e6fbe11d46860c77f170 omc=180323d7dc549360c351621f4969dec1e7778cff5a30b01298bc21911b0842e2"
+#define OMEGA2_IDENT_cg_gpu_gemm "omega-ident 1 unit=cg_gpu_gemm abi=2 profile=OM-2 src=b1dba10f56a1a1769a75d4ba275b1a7f1b9debf7d1f592de7eaf7b8ffc5b022c omc=180323d7dc549360c351621f4969dec1e7778cff5a30b01298bc21911b0842e2"
 const char *omega2_ident_cg_gpu_gemm(void);
 /* export fn cg_gpu_gemm_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_gpu_gemm_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
