@@ -103,6 +103,21 @@ static void host_only(void) {
     check(omega_gpu_gemm(OMEGA_GPU_GEMM_E4M3, 0, 1, 1, 1, NULL, b, c, NULL) == OMEGA_GPU_GEMM_BAD_ARGS, "NULL A refused");
     OmegaGemmCfg bad; omega_gpu_gemm_default_cfg(OMEGA_GPU_GEMM_BF16, &bad); bad.rt = 3;
     check(!omega_gpu_gemm_cfg_ok(&bad), "a tile of 3 row tiles refused");
+    {
+        const int bad_muts[2] = { 5, -1 };
+        BlackwellIRProgram *p = calloc(1, sizeof *p);
+        for (size_t i = 0; i < 2; i++) {
+            OmegaGemmCfg bm; omega_gpu_gemm_default_cfg(OMEGA_GPU_GEMM_BF16, &bm); bm.mutant = bad_muts[i];
+            OmegaGemmPlan bp;
+            snprintf(w, sizeof w, "mutant %d refused by cfg_ok", bad_muts[i]);
+            check(!omega_gpu_gemm_cfg_ok(&bm), w);
+            snprintf(w, sizeof w, "mutant %d refused by plan", bad_muts[i]);
+            check(omega_gpu_gemm_plan(&bm, 65, 63, 100, &bp) == OMEGA_GPU_GEMM_BAD_ARGS, w);
+            snprintf(w, sizeof w, "mutant %d refused by codegen", bad_muts[i]);
+            check(p && omega_gpu_gemm_codegen(&bm, OMEGA_GEMM_K_PACK_A, p) != 0, w);
+        }
+        free(p);
+    }
 
     /* the model itself is a multiply: within 2^-20 of the exact sum, relative to the sum of the magnitudes */
     for (int t = 0; t < 2; t++) for (unsigned lay = 0; lay < 4; lay++) {
@@ -239,9 +254,13 @@ static void sim_tier(void) {
             const uint32_t M = 65, N = 63, K = 100;
             fill(cfg.type, A, M * K, 77); fill(cfg.type, B, K * N, 78);
             int built = sim_build(&c, &cfg) == 0, rc = built ? sim_gemm(&c, &cfg, lay, M, N, K, A, B, C) : -1;
-            uint64_t checked = 0, bad = rc == 0 ? compare(cfg.type, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
-            snprintf(w, sizeof w, "simulator red check: %s mutant %d (%s) is caught (%" PRIu64 " wrong)", tname(cfg.type), mut, lname(lay), bad);
-            check(built && bad > 0, w);
+            uint64_t checked = 0, bad = (built && rc == 0) ? compare(cfg.type, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 0;
+            if (!built || rc != 0)
+                snprintf(w, sizeof w, "simulator red check: %s mutant %d (%s) failed to run (built=%d, rc=%d%s%s)",
+                         tname(cfg.type), mut, lname(lay), built, rc, c.err[0] ? ": " : "", c.err);
+            else
+                snprintf(w, sizeof w, "simulator red check: %s mutant %d (%s) is caught (%" PRIu64 " wrong)", tname(cfg.type), mut, lname(lay), bad);
+            check(built && rc == 0 && bad > 0, w);
             printf("%s\n", w);
             sim_free(&c);
         }
@@ -304,13 +323,13 @@ static void chip_tier(int quick) {
         for (int mut = 1; mut <= 4; mut++)
             for (unsigned lay = 0; lay < (mut == 4 ? 2u : 1u); lay++) { /* the wrong transpose both ways: A row- and column-major */
             OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
-            omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, &cfg);
+            int set_rc = omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, &cfg);
             const uint32_t M = 65, N = 63, K = 100;
             fill((OmegaGpuGemmType)t, A, M * K, 77); fill((OmegaGpuGemmType)t, B, K * N, 78);
-            int rc = omega_gpu_gemm((OmegaGpuGemmType)t, lay, M, N, K, A, B, C, NULL);
-            char first[200]; uint64_t checked = 0, bad = rc == 0 ? compare((OmegaGpuGemmType)t, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
-            snprintf(w, sizeof w, "chip red check: %s mutant %d (%s) is caught (%s, %" PRIu64 " wrong)", tname((OmegaGpuGemmType)t), mut, lname(lay), omega_gpu_gemm_rc_name(rc), bad);
-            check(bad > 0, w);
+            int rc = set_rc == OMEGA_GPU_GEMM_OK ? omega_gpu_gemm((OmegaGpuGemmType)t, lay, M, N, K, A, B, C, NULL) : set_rc;
+            char first[200]; uint64_t checked = 0, bad = (set_rc == OMEGA_GPU_GEMM_OK && rc == OMEGA_GPU_GEMM_OK) ? compare((OmegaGpuGemmType)t, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 0;
+            snprintf(w, sizeof w, "chip red check: %s mutant %d (%s) is caught (set=%s, rc=%s, %" PRIu64 " wrong)", tname((OmegaGpuGemmType)t), mut, lname(lay), omega_gpu_gemm_rc_name(set_rc), omega_gpu_gemm_rc_name(rc), bad);
+            check(set_rc == OMEGA_GPU_GEMM_OK && rc == OMEGA_GPU_GEMM_OK && bad > 0, w);
             printf("%s\n", w);
             omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, NULL);
         }
