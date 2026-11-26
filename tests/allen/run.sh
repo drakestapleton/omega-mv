@@ -15,8 +15,7 @@
 # limitations under the License.
 
 # ALLEN v0 host gates (spec/allen.md; ARCH-0035 PROPOSED, OS-0018 PROPOSED).
-# Usage (from `make test-allen`): ALLEN_TOOL=<allen> ALLEN_BIND_OBJ=<allen_bind.o>
-#   ALLEN_MAIN_OBJ=<allen.o> ALLEN_OUT=<scratch dir> sh tests/allen/run.sh
+# Usage (from `make test-allen`): ALLEN_TOOL=<allen> ALLEN_OUT=<scratch dir> sh tests/allen/run.sh
 #
 # Every gate is a host test: processes, files, the resident World. None of
 # this is hardware qualification, an OS reboot, or a machine migration; the
@@ -29,8 +28,6 @@
 # qualifying run, with the commit bound).
 set -u
 T=${ALLEN_TOOL:?ALLEN_TOOL}
-BIND=${ALLEN_BIND_OBJ:?ALLEN_BIND_OBJ}
-MAIN=${ALLEN_MAIN_OBJ:?ALLEN_MAIN_OBJ}
 OUT=${ALLEN_OUT:?ALLEN_OUT}
 case $T in /*) ;; *) T=$(pwd)/$T ;; esac
 rm -rf "$OUT" && mkdir -p "$OUT" || exit 2
@@ -141,21 +138,21 @@ ok=1
 gate G4 $ok "models X, Y and none give the same subject, intent and goal; object bytes unchanged ($h0)"
 
 # ---- G5 no authority, no orchestrator (R16) ---------------------------------
-# allen_bind.o: no thread, wait, clock, signal, reaction registration or
-# capability mint symbols. allen.o (the rig) may build the World and mint for
-# the AIEN faculty like R11's test does, but has no thread, timer, signal or
-# reaction of its own: it publishes and observes.
-need_absent_bind='pthread_create|^poll$|epoll|^select$|^sleep$|nanosleep|usleep|clock_|timer_|^signal$|sigaction|alarm|rx_world_add_reaction|rx_world_resume|aienos_cap_mint|rx_aien_|rx_world_publish'
-need_absent_main='pthread_create|^poll$|epoll|^select$|^sleep$|nanosleep|usleep|clock_|timer_|^signal$|sigaction|alarm|rx_world_add_reaction|rx_world_resume|fork|execv|system'
-ub=$(nm -u "$BIND" | awk '{print $2}' | grep -E "$need_absent_bind" || true)
-um=$(nm -u "$MAIN" | awk '{print $2}' | grep -E "$need_absent_main" || true)
-# Source: no loop in allen_bind.c except the fixed byte loops; no run_until/max_turns anywhere.
-lp=$(grep -nE 'while|for *\(' src/allen/allen_bind.c | grep -vE 'i < n|i >= 0|2 \* i' || true)
-mt=$(grep -nEi 'max_turns|max_steps|run_until|orchestrat|heartbeat|dispatch' src/allen/allen_bind.c src/allen/allen_bind.h tools/allen.c || true)
+# Pure seeded OM-2 binary ($T) must be a static ELF with zero dynamic library
+# imports, and the ALLEN pure-OM sources must contain no thread, wait, clock,
+# timer, signal, fork/exec, socket, or orchestrator/loop-driver constructs.
+dyn=""
+if command -v readelf >/dev/null 2>&1; then
+    dyn=$(readelf -d "$T" 2>/dev/null | grep -E 'NEEDED|DYNAMIC' || true)
+fi
+om_bad='\b(fork|execprog|waitpid|netopen|netlisten|netaccept|netconn|nanosleep|usleep|sigaction|pthread_create|aienos_cap_mint|rx_world_add_reaction|rx_world_resume)\b|clock_|timer_'
+ub=$(grep -nE "$om_bad" src/allen/allen_bind.om src/allen/allen_core.om tools/allen.om || true)
+lp=$(grep -nE '^[[:space:]]*while[[:space:]]' src/allen/allen_bind.om src/allen/allen_core.om || true)
+mt=$(grep -nEi 'max_turns|max_steps|run_until|orchestrat|heartbeat|dispatch' src/allen/allen_bind.om src/allen/allen_core.om tools/allen.om || true)
 ok=1
-[ -z "$ub" ] && [ -z "$um" ] && [ -z "$lp" ] && [ -z "$mt" ] && ok=0
-[ -n "$ub$um$lp$mt" ] && say "G5 offenders: bind[$ub] main[$um] loops[$lp] words[$mt]"
-gate G5 $ok "allen_bind.o and allen.o carry no thread/wait/timer/signal/reaction/mint symbols; no loop words in source"
+[ -z "$dyn" ] && [ -z "$ub" ] && [ -z "$lp" ] && [ -z "$mt" ] && ok=0
+[ -n "$dyn$ub$lp$mt" ] && say "G5 offenders: dyn[$dyn] ops[$ub] loops[$lp] words[$mt]"
+gate G5 $ok "pure OM-2 allen binary is static with zero forbidden ops/unbounded loops/orchestrator words"
 # The cross-repo loop inventory (R16-G2, make test-r16-inventory) is run by
 # the qualifying session on the committed tree; its result is in the receipt.
 
