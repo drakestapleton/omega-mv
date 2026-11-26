@@ -1,0 +1,2057 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/gpu_om/gate_gpu_stage2_host.om:
+note   Stage 2 Host GPU Verification Gate (pure seeded OM-2, zero C/Python/CUDA,
+note   zero /dev/nvidia* access). Covers all Class (A) HOST GPU C test suites
+note   audited in tests/gpu_om/STAGE2-GPU-AUDIT.tsv plus optional live TSV
+note   integrity verification (--audit <STAGE2-GPU-AUDIT.tsv>).
+note
+note Usage:
+note   gate_gpu_stage2_host
+note   gate_gpu_stage2_host --audit tests/gpu_om/STAGE2-GPU-AUDIT.tsv
+om2
+
+const OK ulong 0
+
+note Output and global test counters
+global g_out uchar 512
+global g_out_n ulong 1
+global g_checks ulong 1
+global g_controls ulong 1
+global g_failed ulong 1
+global g_first_err ulong 1
+global g_suite_mark ulong 1
+
+note CLI and TSV file buffers
+global g_arg uchar 4096
+global g_tsv_buf uchar 65536
+global g_tsv_counts ulong 4
+note g_tsv_counts: [0]=total, [1]=HOST, [2]=SILICON_LEGACY_NV, [3]=SILICON_AIEN_GPU
+
+text t_s1 "[S1] bw_hazard: "
+text t_s2 "[S2] gpu_cmdlist+streams: "
+text t_s3 "[S3] gpu_moe_plan: "
+text t_s4 "[S4] gpu_reconv+elementwise: "
+text t_s5 "[S5] gpu_gpr_boundary: "
+text t_s6 "[S6] gpu_fp8_slots: "
+text t_s7 "[S7] gpu_serving_alloc+pf: "
+text t_s8 "[S8] gpu_q36_q38_graph_qmd+matmul: "
+text t_s9 "[S9] gpu_imadhi+window+num_tc: "
+text t_s10_live "[S10] stage2_audit_tsv (synthetic+live): "
+text t_s10_syn "[S10] stage2_audit_tsv (synthetic-only): "
+text t_pass_nl "PASS\n"
+text t_fail_nl "FAIL\n"
+text t_pass_a "GATE_GPU_STAGE2_HOST PASS suites=10 checks="
+text t_pass_b " controls="
+text t_pass_c " audit_rows="
+text t_pass_d " host="
+text t_pass_e " silicon_legacy_nv="
+text t_pass_f " silicon_aien_gpu="
+text t_pass_g " evidence=HOST_VERIFIED PHYSICAL_SILICON=NOT_RUN\n"
+text t_fail_a "GATE_GPU_STAGE2_HOST FAIL first_code="
+text t_fail_b " failed="
+text t_fail_c " checks="
+text t_fail_d " controls="
+text t_nl "\n"
+text t_usage "usage: gate_gpu_stage2_host [--audit <STAGE2-GPU-AUDIT.tsv>]\n"
+text t_f_audit "--audit"
+text t_bad_open "GATE_GPU_STAGE2_HOST FAIL audit_open_error\n"
+text t_bad_read "GATE_GPU_STAGE2_HOST FAIL audit_read_error\n"
+text t_bad_tsv "GATE_GPU_STAGE2_HOST FAIL audit_tsv_code="
+
+text t_cls_host "HOST"
+text t_cls_leg "SILICON_LEGACY_NV"
+text t_cls_aien "SILICON_AIEN_GPU"
+text t_none "none"
+text t_pfx_tests "tests/"
+text t_hdr_pfx "c_test_file"
+
+text t_syn_good "tests/x.c\tHOST\thost_only\tom/a.om\tnone\tS1_X\tnone\tcmd"
+text t_syn_7col "tests/x.c\tHOST\thost_only\tom/a.om\tnone\tS1_X\tnone"
+text t_syn_9col "tests/x.c\tHOST\thost_only\tom/a.om\tnone\tS1_X\tnone\tcmd\textra"
+text t_syn_badcls "tests/x.c\tFAKE_CLASS\thost_only\tom/a.om\tnone\tS1_X\tnone\tcmd"
+text t_syn_empty "tests/x.c\tHOST\t\tom/a.om\tnone\tS1_X\tnone\tcmd"
+text t_syn_baddrv "tests/x.c\tHOST\thost_only\tom/a.om\tnone\tS1_X\t/dev/nvidia*\tcmd"
+text t_syn_badc "src/x.c\tHOST\thost_only\tom/a.om\tnone\tS1_X\tnone\tcmd"
+
+fn out_flush to void
+  n = get g_out_n 0
+  if gt n 0
+    ign = write 1 g_out 0 n
+    put g_out_n 0 0
+  end
+end
+
+fn out_ch c uchar to void
+  n = get g_out_n 0
+  if ge n 500
+    out_flush
+    n = 0
+  end
+  put g_out n c
+  put g_out_n 0 add n 1
+end
+
+fn out_u64 v ulong to void
+  if eq v 0
+    out_ch 48
+    ret
+  end
+  digs = new uchar 24 0
+  k = ulong 0
+  x = v
+  while gt x 0 bound 24
+    d = rem x 10
+    put digs k uchar add 48 d
+    x = div x 10
+    k = add k 1
+  end
+  for i ulong k bound 24
+    idx = sub sub k 1 i
+    out_ch get digs idx
+  end
+end
+
+fn wr_str s view uchar * to void
+  out_flush
+  ign = write 1 s 0 len s
+end
+
+fn fail_rec code ulong to void
+  put g_failed 0 add get g_failed 0 1
+  if eq get g_first_err 0 0
+    put g_first_err 0 code
+  end
+end
+
+fn chk cond bool code ulong to void
+  put g_checks 0 add get g_checks 0 1
+  if not cond
+    fail_rec code
+  end
+end
+
+fn chk_neg cond bool code ulong to void
+  put g_controls 0 add get g_controls 0 1
+  if not cond
+    fail_rec code
+  end
+end
+
+fn suite_done label view uchar * to void
+  wr_str label
+  cur = get g_failed 0
+  if eq cur get g_suite_mark 0
+    wr_str t_pass_nl
+  else
+    wr_str t_fail_nl
+    put g_suite_mark 0 cur
+  end
+end
+
+note =========================================================================
+note [S1] bw_hazard: SM121 Scoreboard, Wait-Barrier & Antibody #17a/#17d
+note =========================================================================
+const HZ_OP_NOP ulong 0
+const HZ_OP_LDG ulong 1
+const HZ_OP_STG ulong 2
+const HZ_OP_ALU ulong 3
+const HZ_OP_DEPBAR ulong 4
+const HZ_OP_ISETP ulong 5
+const HZ_OP_EXIT ulong 6
+const HZ_BAR_NONE ulong 7
+const HZ_REG_RZ ulong 255
+const HZ_PRED_PT ulong 7
+
+const ERR_HZ_RAW ulong 101
+const ERR_HZ_WAW ulong 102
+const ERR_HZ_WAR ulong 103
+const ERR_HZ_PRED ulong 104
+const ERR_HZ_STALL ulong 105
+const ERR_HZ_BAR ulong 106
+const ERR_HZ_EXIT ulong 107
+
+global g_hz_op ulong 32
+global g_hz_dst ulong 32
+global g_hz_s1 ulong 32
+global g_hz_s2 ulong 32
+global g_hz_pred ulong 32
+global g_hz_wbar ulong 32
+global g_hz_rbar ulong 32
+global g_hz_wait ulong 32
+global g_hz_stall ulong 32
+global g_hz_n ulong 1
+
+global g_hz_wmask ulong 256
+global g_hz_rmask ulong 256
+global g_hz_pmask ulong 8
+
+fn hz_reset to void
+  put g_hz_n 0 0
+  for r ulong 256
+    put g_hz_wmask r 0
+    put g_hz_rmask r 0
+  end
+  for p ulong 8
+    put g_hz_pmask p 0
+  end
+end
+
+fn hz_push_regs op ulong dst ulong s1 ulong s2 ulong pred ulong to ulong
+  idx = get g_hz_n 0
+  put g_hz_op idx op
+  put g_hz_dst idx dst
+  put g_hz_s1 idx s1
+  put g_hz_s2 idx s2
+  put g_hz_pred idx pred
+  put g_hz_wbar idx HZ_BAR_NONE
+  put g_hz_rbar idx HZ_BAR_NONE
+  put g_hz_wait idx 0
+  put g_hz_stall idx 1
+  put g_hz_n 0 add idx 1
+  ret idx
+end
+
+fn hz_set_bar idx ulong wbar ulong rbar ulong wmask ulong stall ulong to void
+  put g_hz_wbar idx wbar
+  put g_hz_rbar idx rbar
+  put g_hz_wait idx wmask
+  put g_hz_stall idx stall
+end
+
+fn hz_clear_wait wmask ulong to void
+  if eq wmask 0
+    ret
+  end
+  keep = xor wmask ulong 0x3f
+  for r ulong 256
+    put g_hz_wmask r and get g_hz_wmask r keep
+    put g_hz_rmask r and get g_hz_rmask r keep
+  end
+  for p ulong 8
+    put g_hz_pmask p and get g_hz_pmask p keep
+  end
+end
+
+fn hz_any_pending to bool
+  for r ulong 256
+    if ne get g_hz_wmask r 0
+      ret true
+    end
+    if ne get g_hz_rmask r 0
+      ret true
+    end
+  end
+  for p ulong 8
+    if ne get g_hz_pmask p 0
+      ret true
+    end
+  end
+  ret false
+end
+
+fn hz_check_src reg ulong to ulong
+  if eq reg HZ_REG_RZ
+    ret OK
+  end
+  if ne get g_hz_wmask reg 0
+    ret ERR_HZ_RAW
+  end
+  ret OK
+end
+
+fn hz_check_dst reg ulong to ulong
+  if eq reg HZ_REG_RZ
+    ret OK
+  end
+  if ne get g_hz_wmask reg 0
+    ret ERR_HZ_WAW
+  end
+  if ne get g_hz_rmask reg 0
+    ret ERR_HZ_WAR
+  end
+  ret OK
+end
+
+fn hz_mark_bars i ulong to void
+  wbar = get g_hz_wbar i
+  dst = get g_hz_dst i
+  if ne dst HZ_REG_RZ
+    if ne wbar HZ_BAR_NONE
+      wbit = shl ulong 1 wbar
+      put g_hz_wmask dst or get g_hz_wmask dst wbit
+    end
+  end
+  rbar = get g_hz_rbar i
+  if ne rbar HZ_BAR_NONE
+    rbit = shl ulong 1 rbar
+    s1 = get g_hz_s1 i
+    if ne s1 HZ_REG_RZ
+      put g_hz_rmask s1 or get g_hz_rmask s1 rbit
+    end
+    s2 = get g_hz_s2 i
+    if ne s2 HZ_REG_RZ
+      put g_hz_rmask s2 or get g_hz_rmask s2 rbit
+    end
+  end
+end
+
+fn hz_check_ctrl i ulong to ulong
+  if gt get g_hz_stall i 15
+    ret ERR_HZ_STALL
+  end
+  wb = get g_hz_wbar i
+  if ne wb HZ_BAR_NONE
+    if gt wb 5
+      ret ERR_HZ_BAR
+    end
+  end
+  rb = get g_hz_rbar i
+  if ne rb HZ_BAR_NONE
+    if gt rb 5
+      ret ERR_HZ_BAR
+    end
+  end
+  hz_clear_wait get g_hz_wait i
+  pr = get g_hz_pred i
+  if lt pr HZ_PRED_PT
+    if ne get g_hz_pmask pr 0
+      ret ERR_HZ_PRED
+    end
+  end
+  ret OK
+end
+
+fn hz_verify_one i ulong to ulong
+  ec = hz_check_ctrl i
+  if ne ec OK
+    ret ec
+  end
+  op = get g_hz_op i
+  if eq op HZ_OP_EXIT
+    if hz_any_pending
+      ret ERR_HZ_EXIT
+    end
+    ret OK
+  end
+  if eq op HZ_OP_DEPBAR
+    ret OK
+  end
+  ec = hz_check_src get g_hz_s1 i
+  if ne ec OK
+    ret ec
+  end
+  ec = hz_check_src get g_hz_s2 i
+  if ne ec OK
+    ret ec
+  end
+  dst = get g_hz_dst i
+  if eq op HZ_OP_ISETP
+    pr = get g_hz_pred i
+    if lt pr HZ_PRED_PT
+      if eq dst pr
+        ret ERR_HZ_PRED
+      end
+    end
+    wb = get g_hz_wbar i
+    if lt dst HZ_PRED_PT
+      if ne wb HZ_BAR_NONE
+        put g_hz_pmask dst or get g_hz_pmask dst shl ulong 1 wb
+      end
+    end
+    ret OK
+  end
+  ec = hz_check_dst dst
+  if ne ec OK
+    ret ec
+  end
+  hz_mark_bars i
+  ret OK
+end
+
+fn hz_verify to ulong
+  for r ulong 256
+    put g_hz_wmask r 0
+    put g_hz_rmask r 0
+  end
+  for p ulong 8
+    put g_hz_pmask p 0
+  end
+  n = get g_hz_n 0
+  for i ulong n bound 32
+    rc = hz_verify_one i
+    if ne rc OK
+      ret rc
+    end
+  end
+  ret OK
+end
+
+fn suite_s1_bw_hazard to void
+  note Positive 1: clean LDG(B0) -> wait(B0) -> ALU -> STG(rbar=B1) -> wait(B1) -> EXIT
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 0 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_DEPBAR HZ_REG_RZ HZ_REG_RZ HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 1 1
+  idx = hz_push_regs HZ_OP_ALU 8 4 6 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 4
+  idx = hz_push_regs HZ_OP_STG HZ_REG_RZ 0 8 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE 1 0 1
+  idx = hz_push_regs HZ_OP_DEPBAR HZ_REG_RZ HZ_REG_RZ HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 2 1
+  idx = hz_push_regs HZ_OP_EXIT HZ_REG_RZ HZ_REG_RZ HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 1
+  chk eq hz_verify OK 1001
+
+  note Positive 2: double-buffered B0/B1 async loads with distinct waits
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 0 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_LDG 5 3 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 1 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_ALU 10 4 6 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 1 4
+  idx = hz_push_regs HZ_OP_ALU 11 5 6 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 2 4
+  idx = hz_push_regs HZ_OP_EXIT HZ_REG_RZ HZ_REG_RZ HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 1
+  chk eq hz_verify OK 1002
+
+  note NC1: missing wait before RAW read of R4 -> ERR_HZ_RAW
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 0 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_ALU 8 4 6 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 4
+  chk_neg eq hz_verify ERR_HZ_RAW 1101
+
+  note NC2: WAW on R4 under unwaited B0 -> ERR_HZ_WAW
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 0 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_ALU 4 6 7 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 1
+  chk_neg eq hz_verify ERR_HZ_WAW 1102
+
+  note NC3: WAR overwriting STG source R8 before rbar=B1 wait -> ERR_HZ_WAR
+  hz_reset
+  idx = hz_push_regs HZ_OP_STG HZ_REG_RZ 0 8 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE 1 0 1
+  idx = hz_push_regs HZ_OP_ALU 8 6 7 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 1
+  chk_neg eq hz_verify ERR_HZ_WAR 1103
+
+  note NC4: Antibody #17d multi-barrier ownership (R4 on B0, only wait B1) -> ERR_HZ_RAW
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 0 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_LDG 5 3 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 1 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_ALU 9 4 5 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 2 4
+  chk_neg eq hz_verify ERR_HZ_RAW 1104
+
+  note NC5: SM121 barrier ID 6 out-of-range -> ERR_HZ_BAR
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 6 HZ_BAR_NONE 0 1
+  chk_neg eq hz_verify ERR_HZ_BAR 1105
+
+  note NC6: EXIT with unwaited B0 -> ERR_HZ_EXIT
+  hz_reset
+  idx = hz_push_regs HZ_OP_LDG 4 2 HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx 0 HZ_BAR_NONE 0 1
+  idx = hz_push_regs HZ_OP_EXIT HZ_REG_RZ HZ_REG_RZ HZ_REG_RZ HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 1
+  chk_neg eq hz_verify ERR_HZ_EXIT 1106
+
+  note NC7: Antibody #17a guarded ISETP self-clobbering guard P0 -> ERR_HZ_PRED
+  hz_reset
+  idx = hz_push_regs HZ_OP_ISETP 0 4 5 0
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 1
+  chk_neg eq hz_verify ERR_HZ_PRED 1107
+
+  note NC8: stall cycles > 15 -> ERR_HZ_STALL
+  hz_reset
+  idx = hz_push_regs HZ_OP_ALU 8 4 6 HZ_PRED_PT
+  hz_set_bar idx HZ_BAR_NONE HZ_BAR_NONE 0 16
+  chk_neg eq hz_verify ERR_HZ_STALL 1108
+
+  suite_done t_s1
+end
+
+note =========================================================================
+note [S2] gpu_cmdlist + gpu_streams: Decode glue specs, ARGMAX tiebreak, semaphores
+note =========================================================================
+const GLUE_AXPY ulong 1
+const GLUE_RES ulong 2
+const GLUE_SWIGLU ulong 3
+const GLUE_ARGMAX ulong 4
+
+fn glue_spec_ok kind ulong width ulong mode ulong stride ulong to bool
+  if or eq width 0 gt width 8192
+    ret false
+  end
+  if ne rem width 1024 0
+    ret false
+  end
+  if eq kind GLUE_AXPY
+    if or eq stride 0 ne rem stride 256 0
+      ret false
+    end
+    ret true
+  end
+  if eq kind GLUE_RES
+    note Valid single modes: ADD=1, COMBINE=2, NORM=4; also ADD|NORM=5, COMBINE|NORM=6
+    if eq mode 0
+      ret false
+    end
+    if gt mode 7
+      ret false
+    end
+    if eq and mode 3 3
+      ret false
+    end
+    ret true
+  end
+  if eq kind GLUE_SWIGLU
+    ret eq mode 0
+  end
+  if eq kind GLUE_ARGMAX
+    ret le mode 1
+  end
+  ret false
+end
+
+fn argmax_tiebreak_idx idx_a ulong val_a long idx_b ulong val_b long to ulong
+  if gt val_b val_a
+    ret idx_b
+  end
+  if gt val_a val_b
+    ret idx_a
+  end
+  if lt idx_a idx_b
+    ret idx_a
+  end
+  ret idx_b
+end
+
+global g_cmd_stream ulong 16
+global g_cmd_wait ulong 16
+global g_cmd_sig ulong 16
+global g_cmd_skip ulong 16
+
+fn cmdlist_verify n ulong to ulong
+  last_sig = ulong 0
+  for i ulong n bound 16
+    st = get g_cmd_stream i
+    if ge st 8
+      ret 201
+    end
+    wt = get g_cmd_wait i
+    sg = get g_cmd_sig i
+    sk = get g_cmd_skip i
+    if gt wt last_sig
+      ret 202
+    end
+    if and ne sk 0 eq sg 0
+      ret 203
+    end
+    if ne sg 0
+      if le sg last_sig
+        ret 204
+      end
+      last_sig = sg
+    end
+  end
+  ret OK
+end
+
+fn suite_s2_cmdlist_streams to void
+  note Positive decode glue specs
+  chk glue_spec_ok GLUE_AXPY 5120 0 2048 2001
+  chk glue_spec_ok GLUE_AXPY 8192 0 256 2002
+  chk glue_spec_ok GLUE_RES 5120 1 0 2003
+  chk glue_spec_ok GLUE_RES 5120 2 0 2004
+  chk glue_spec_ok GLUE_RES 5120 4 0 2005
+  chk glue_spec_ok GLUE_RES 5120 5 0 2006
+  chk glue_spec_ok GLUE_SWIGLU 8192 0 0 2007
+  chk glue_spec_ok GLUE_ARGMAX 5120 0 0 2008
+  chk glue_spec_ok GLUE_ARGMAX 5120 1 0 2009
+
+  note ARGMAX tie-break picks lowest index 1007 over 90007
+  chk eq argmax_tiebreak_idx 1007 4200 90007 4200 1007 2010
+  chk eq argmax_tiebreak_idx 90007 4200 1007 4200 1007 2011
+  chk eq argmax_tiebreak_idx 1007 4200 90007 4201 90007 2012
+
+  note Clean 3-entry multi-stream command list
+  put g_cmd_stream 0 0
+  put g_cmd_wait 0 0
+  put g_cmd_sig 0 1
+  put g_cmd_skip 0 0
+  put g_cmd_stream 1 3
+  put g_cmd_wait 1 1
+  put g_cmd_sig 1 2
+  put g_cmd_skip 1 0
+  put g_cmd_stream 2 7
+  put g_cmd_wait 2 2
+  put g_cmd_sig 2 3
+  put g_cmd_skip 2 1
+  chk eq cmdlist_verify 3 OK 2013
+
+  note Negative controls
+  chk_neg not glue_spec_ok GLUE_RES 5120 0 0 2101
+  chk_neg not glue_spec_ok GLUE_RES 5120 3 0 2102
+  chk_neg not glue_spec_ok GLUE_RES 5120 8 0 2103
+  chk_neg not glue_spec_ok GLUE_AXPY 512 0 2048 2104
+  chk_neg not glue_spec_ok GLUE_AXPY 9216 0 2048 2105
+  chk_neg not glue_spec_ok GLUE_AXPY 5120 0 100 2106
+  chk_neg not glue_spec_ok GLUE_ARGMAX 5120 2 0 2107
+
+  note skip_launch with missing semaphore (sig=0) -> 203
+  put g_cmd_sig 2 0
+  chk_neg eq cmdlist_verify 3 203 2108
+
+  note Non-monotonic semaphore release -> 204
+  put g_cmd_sig 2 2
+  chk_neg eq cmdlist_verify 3 204 2109
+
+  note Out-of-range stream ID 8 -> 201
+  put g_cmd_stream 2 8
+  put g_cmd_sig 2 3
+  chk_neg eq cmdlist_verify 3 201 2110
+
+  suite_done t_s2
+end
+
+note =========================================================================
+note [S3] gpu_moe_plan: Ring queue, wrap stress, unified planner, traffic
+note =========================================================================
+global g_mq_cap ulong 1
+global g_mq_head ulong 1
+global g_mq_tail ulong 1
+global g_mq_cnt ulong 1
+global g_mq_epoch ulong 1
+global g_mq_done ulong 1
+global g_mq_toks ulong 64
+
+fn mq_init cap ulong to ulong
+  if or eq cap 0 gt cap 64
+    ret 301
+  end
+  put g_mq_cap 0 cap
+  put g_mq_head 0 0
+  put g_mq_tail 0 0
+  put g_mq_cnt 0 0
+  put g_mq_epoch 0 0
+  put g_mq_done 0 0
+  ret OK
+end
+
+fn mq_enq tokens ulong to ulong
+  if or eq tokens 0 gt tokens 1024
+    ret 302
+  end
+  cap = get g_mq_cap 0
+  cnt = get g_mq_cnt 0
+  if ge cnt cap
+    ret 303
+  end
+  tail = get g_mq_tail 0
+  put g_mq_toks tail tokens
+  put g_mq_tail 0 rem add tail 1 cap
+  put g_mq_cnt 0 add cnt 1
+  ret OK
+end
+
+fn mq_claim max_tok ulong claimed_out edit ulong 2 to ulong
+  cap = get g_mq_cap 0
+  head = get g_mq_head 0
+  cnt = get g_mq_cnt 0
+  sum = ulong 0
+  active = ulong 0
+  while gt cnt 0 bound 64
+    tk = get g_mq_toks head
+    if and gt active 0 gt add sum tk max_tok
+      break
+    end
+    if and eq active 0 gt tk max_tok
+      break
+    end
+    sum = add sum tk
+    active = add active 1
+    head = rem add head 1 cap
+    cnt = sub cnt 1
+  end
+  put g_mq_head 0 head
+  put g_mq_cnt 0 cnt
+  if gt active 0
+    put g_mq_epoch 0 add get g_mq_epoch 0 1
+    put g_mq_done 0 add get g_mq_done 0 active
+  end
+  put claimed_out 0 sum
+  put claimed_out 1 active
+  ret OK
+end
+
+fn moe_plan_ops n_tok ulong n_exp ulong top_k ulong flags ulong to ulong
+  if or eq n_tok 0 eq n_exp 0
+    ret 0
+  end
+  if or eq top_k 0 gt top_k n_exp
+    ret 0
+  end
+  note flags bit0=QMMA, bit1=OVERLAP_RQ -> 5 ops (ACT_QUANT independent)
+  if eq and flags 3 3
+    ret 5
+  end
+  if eq n_tok 1
+    ret 3
+  end
+  ret 4
+end
+
+fn moe_plan_path n_tok ulong to ulong
+  note 1 = GEMV (T==1), 2 = GEMM (T>=2)
+  if eq n_tok 1
+    ret 1
+  end
+  ret 2
+end
+
+fn suite_s3_moe_plan to void
+  note Ring queue basic + claim(40) on 3x16 -> claims 2x16=32, epoch=1, active=2
+  chk eq mq_init 4 OK 3001
+  chk eq mq_enq 16 OK 3002
+  chk eq mq_enq 16 OK 3003
+  chk eq mq_enq 16 OK 3004
+  chk eq mq_enq 16 OK 3005
+  chk_neg eq mq_enq 16 303 3101
+
+  cl_res = new ulong 2 0
+  chk eq mq_claim 40 cl_res OK 3006
+  chk eq get cl_res 0 32 3007
+  chk eq get cl_res 1 2 3008
+  chk eq get g_mq_epoch 0 1 3009
+  chk eq get g_mq_cnt 0 2 3010
+
+  note Drain remaining 2 and run 100 wrap-around cycles
+  chk eq mq_claim 64 cl_res OK 3011
+  chk eq get g_mq_cnt 0 0 3012
+  chk eq mq_init 8 OK 3013
+  for c ulong 100
+    rc_e = mq_enq 16
+    rc_c = mq_claim 16 cl_res
+    if or ne rc_e OK ne rc_c OK
+      fail_rec 3014
+    end
+  end
+  chk eq get g_mq_cnt 0 0 3015
+  chk eq get g_mq_done 0 100 3016
+
+  note Unified planner + traffic estimator (>500 MB at 126 active experts)
+  chk eq moe_plan_path 1 1 3017
+  chk eq moe_plan_path 64 2 3018
+  chk eq moe_plan_ops 64 128 8 3 5 3019
+  chk eq moe_plan_ops 1 128 8 0 3 3020
+  bytes_per_exp = mul ulong 3 mul ulong 5120 1536
+  note 126 experts * 3 matrices * 5120 * 1536 * 1B (FP8) / 2 (W4) > 500 MB
+  w4_traffic = div mul ulong 126 bytes_per_exp 2
+  chk gt w4_traffic 500000000 3021
+
+  note Negative controls
+  chk_neg eq mq_init 0 301 3102
+  chk_neg eq mq_init 65 301 3103
+  chk_neg eq mq_enq 0 302 3104
+  chk_neg eq mq_enq 1025 302 3105
+  chk_neg eq moe_plan_ops 16 8 9 0 0 3106
+  chk_neg eq moe_plan_ops 16 0 1 0 0 3107
+
+  suite_done t_s3
+end
+
+note =========================================================================
+note [S4] gpu_reconv + gpu_elementwise: SM121 BSSY/BSYNC stack & vec4 admission
+note =========================================================================
+const OP_BSSY ulong 2373
+const OP_BSYNC ulong 2369
+const OP_RECONV_EXIT ulong 2381
+
+global g_rc_op ulong 40
+global g_rc_bar ulong 40
+global g_rc_delta ulong 40
+global g_rc_n ulong 1
+global g_rc_stk ulong 16
+
+fn rc_reset to void
+  put g_rc_n 0 0
+end
+
+fn rc_push op ulong bar ulong delta ulong to void
+  idx = get g_rc_n 0
+  put g_rc_op idx op
+  put g_rc_bar idx bar
+  put g_rc_delta idx delta
+  put g_rc_n 0 add idx 1
+end
+
+fn rc_verify to ulong
+  depth = ulong 0
+  armed = ulong 0
+  n = get g_rc_n 0
+  for i ulong n bound 40
+    op = get g_rc_op i
+    bar = get g_rc_bar i
+    dlt = get g_rc_delta i
+    if eq op OP_BSSY
+      if ge bar 16
+        ret 401
+      end
+      if lt dlt 2
+        ret 402
+      end
+      bit = shl ulong 1 bar
+      if ne and armed bit 0
+        ret 403
+      end
+      if ge depth 16
+        ret 404
+      end
+      put g_rc_stk depth bar
+      depth = add depth 1
+      armed = or armed bit
+    else
+      if eq op OP_BSYNC
+        if ge bar 16
+          ret 401
+        end
+        bit = shl ulong 1 bar
+        if eq and armed bit 0
+          ret 405
+        end
+        if eq depth 0
+          ret 405
+        end
+        top = get g_rc_stk sub depth 1
+        if ne top bar
+          ret 406
+        end
+        depth = sub depth 1
+        armed = xor armed bit
+      else
+        if eq op OP_RECONV_EXIT
+          if ne depth 0
+            ret 407
+          end
+        end
+      end
+    end
+  end
+  if ne depth 0
+    ret 407
+  end
+  ret OK
+end
+
+fn elem_vec_width n ulong to ulong
+  if eq n 0
+    ret 0
+  end
+  if eq rem n 4 0
+    ret 4
+  end
+  ret 1
+end
+
+fn suite_s4_reconv_elementwise to void
+  note R3 diamond: BSSY B0 (delta=4) ... BSYNC B0 ... EXIT
+  rc_reset
+  rc_push OP_BSSY 0 4
+  rc_push OP_BSYNC 0 0
+  rc_push OP_RECONV_EXIT 0 0
+  chk eq rc_verify OK 4001
+
+  note R5 nested: B0 outer, B1 inner
+  rc_reset
+  rc_push OP_BSSY 0 6
+  rc_push OP_BSSY 1 3
+  rc_push OP_BSYNC 1 0
+  rc_push OP_BSYNC 0 0
+  rc_push OP_RECONV_EXIT 0 0
+  chk eq rc_verify OK 4002
+
+  note Depth-16 full B0..B15 push & LIFO pop
+  rc_reset
+  for b ulong 16
+    rc_push OP_BSSY b 2
+  end
+  for b ulong 16
+    rc_push OP_BSYNC sub 15 b 0
+  end
+  rc_push OP_RECONV_EXIT 0 0
+  chk eq rc_verify OK 4003
+
+  note Elementwise admission (n=0 noop, n=1024 vec4, n=1025 scalar tail)
+  chk eq elem_vec_width 0 0 4004
+  chk eq elem_vec_width 1024 4 4005
+  chk eq elem_vec_width 1025 1 4006
+
+  note NC1: BSSY delta < 2 -> 402
+  rc_reset
+  rc_push OP_BSSY 0 1
+  rc_push OP_BSYNC 0 0
+  chk_neg eq rc_verify 402 4101
+
+  note NC2: barrier ID 16 out of range -> 401
+  rc_reset
+  rc_push OP_BSSY 16 2
+  chk_neg eq rc_verify 401 4102
+
+  note NC3: dropped BSYNC (leaked barrier at EXIT) -> 407
+  rc_reset
+  rc_push OP_BSSY 0 4
+  rc_push OP_RECONV_EXIT 0 0
+  chk_neg eq rc_verify 407 4103
+
+  note NC4: unarmed BSYNC -> 405
+  rc_reset
+  rc_push OP_BSYNC 3 0
+  chk_neg eq rc_verify 405 4104
+
+  note NC5: double-arm B0 -> 403
+  rc_reset
+  rc_push OP_BSSY 0 4
+  rc_push OP_BSSY 0 2
+  chk_neg eq rc_verify 403 4105
+
+  note NC6: out-of-order BSYNC (LIFO violation) -> 406
+  rc_reset
+  rc_push OP_BSSY 0 6
+  rc_push OP_BSSY 1 3
+  rc_push OP_BSYNC 0 0
+  rc_push OP_BSYNC 1 0
+  chk_neg eq rc_verify 406 4106
+
+  suite_done t_s4
+end
+
+note =========================================================================
+note [S5] gpu_gpr_boundary: SM121 OWN-30B Declared GPR Boundary Rule
+note =========================================================================
+fn gpr_declared peak ulong to ulong
+  if gt peak 246
+    ret 0
+  end
+  need = add peak 2
+  ret mul div add need 7 8 8
+end
+
+fn gpr_declared_ok decl ulong peak ulong to bool
+  if gt peak 246
+    ret false
+  end
+  if or eq decl 0 gt decl 255
+    ret false
+  end
+  if ne rem decl 8 0
+    ret false
+  end
+  ret ge decl add peak 2
+end
+
+fn suite_s5_gpr_boundary to void
+  note Spot checks including historic OWN-30B cases
+  chk eq gpr_declared 0 8 5001
+  chk eq gpr_declared 6 8 5002
+  chk eq gpr_declared 7 16 5003
+  chk eq gpr_declared 64 72 5004
+  chk eq gpr_declared 72 80 5005
+  chk eq gpr_declared 103 112 5006
+  chk gpr_declared_ok 112 103 5007
+
+  note Full sweep peak=0..240: every declared value valid & tightest mult-8
+  sweep_ok = true
+  for p ulong 241
+    d = gpr_declared p
+    if not gpr_declared_ok d p
+      sweep_ok = false
+    end
+    if ge sub d add p 2 8
+      sweep_ok = false
+    end
+  end
+  chk sweep_ok 5008
+
+  note Negative controls (including historic GB10 hang peak=103 decl=104!)
+  chk_neg not gpr_declared_ok 104 103 5101
+  chk_neg not gpr_declared_ok 64 64 5102
+  chk_neg not gpr_declared_ok 72 72 5103
+  chk_neg not gpr_declared_ok 14 10 5104
+  chk_neg not gpr_declared_ok 105 103 5105
+  chk_neg eq gpr_declared 255 0 5106
+
+  suite_done t_s5
+end
+
+note =========================================================================
+note [S6] gpu_fp8_slots: Expert Ribbon P1 Slot Table State Machine & ABA Safety
+note =========================================================================
+const SL_EMPTY ulong 0
+const SL_LOAD ulong 1
+const SL_READY ulong 2
+const SL_NSLOTS ulong 16
+
+const SL_ERR_ARGS ulong 601
+const SL_ERR_BUSY ulong 602
+const SL_ERR_STALE ulong 603
+
+global g_sl_state ulong 16
+global g_sl_ver ulong 16
+global g_sl_pins ulong 16
+global g_sl_key ulong 16
+global g_sl_seq ulong 1
+
+fn sl_reset to void
+  put g_sl_seq 0 0
+  for i ulong SL_NSLOTS
+    put g_sl_state i SL_EMPTY
+    put g_sl_ver i 0
+    put g_sl_pins i 0
+    put g_sl_key i 0
+  end
+end
+
+fn sl_begin_load idx ulong key ulong to ulong
+  if ge idx SL_NSLOTS
+    ret SL_ERR_ARGS
+  end
+  st = get g_sl_state idx
+  if ne st SL_EMPTY
+    ret SL_ERR_BUSY
+  end
+  if ne get g_sl_pins idx 0
+    ret SL_ERR_BUSY
+  end
+  put g_sl_state idx SL_LOAD
+  put g_sl_key idx key
+  ret OK
+end
+
+fn sl_finish_load idx ulong ok ulong ver_out edit ulong 1 to ulong
+  if ge idx SL_NSLOTS
+    ret SL_ERR_ARGS
+  end
+  if ne get g_sl_state idx SL_LOAD
+    ret SL_ERR_ARGS
+  end
+  if eq ok 0
+    put g_sl_state idx SL_EMPTY
+    put g_sl_key idx 0
+    put ver_out 0 0
+    ret OK
+  end
+  nv = add get g_sl_seq 0 1
+  put g_sl_seq 0 nv
+  put g_sl_ver idx nv
+  put g_sl_state idx SL_READY
+  put ver_out 0 nv
+  ret OK
+end
+
+fn sl_pin idx ulong expect_ver ulong to ulong
+  if ge idx SL_NSLOTS
+    ret SL_ERR_ARGS
+  end
+  if ne get g_sl_state idx SL_READY
+    ret SL_ERR_STALE
+  end
+  if ne get g_sl_ver idx expect_ver
+    ret SL_ERR_STALE
+  end
+  put g_sl_pins idx add get g_sl_pins idx 1
+  ret OK
+end
+
+fn sl_unpin idx ulong expect_ver ulong to ulong
+  if ge idx SL_NSLOTS
+    ret SL_ERR_ARGS
+  end
+  pins = get g_sl_pins idx
+  if eq pins 0
+    ret SL_ERR_ARGS
+  end
+  if ne get g_sl_ver idx expect_ver
+    ret SL_ERR_ARGS
+  end
+  put g_sl_pins idx sub pins 1
+  ret OK
+end
+
+fn sl_evict idx ulong to ulong
+  if ge idx SL_NSLOTS
+    ret SL_ERR_ARGS
+  end
+  if ne get g_sl_pins idx 0
+    ret SL_ERR_BUSY
+  end
+  if eq get g_sl_state idx SL_LOAD
+    ret SL_ERR_BUSY
+  end
+  put g_sl_state idx SL_EMPTY
+  put g_sl_key idx 0
+  ret OK
+end
+
+fn sl_idle to bool
+  for i ulong SL_NSLOTS
+    if ne get g_sl_pins i 0
+      ret false
+    end
+    if eq get g_sl_state i SL_LOAD
+      ret false
+    end
+  end
+  ret true
+end
+
+fn s6_stress_1000 prev_init ulong to bool
+  prev_v = prev_init
+  vtmp = new ulong 1 0
+  mono_ok = true
+  for c ulong 1000
+    sidx = rem c SL_NSLOTS
+    if ne sl_begin_load sidx add 1000 c OK
+      mono_ok = false
+    end
+    if ne sl_finish_load sidx 1 vtmp OK
+      mono_ok = false
+    end
+    cur_v = get vtmp 0
+    if ne sl_pin sidx cur_v OK
+      mono_ok = false
+    end
+    if ne sl_unpin sidx cur_v OK
+      mono_ok = false
+    end
+    if ne sl_evict sidx OK
+      mono_ok = false
+    end
+    if le cur_v prev_v
+      mono_ok = false
+    end
+    prev_v = cur_v
+  end
+  ret mono_ok
+end
+
+fn suite_s6_fp8_slots to void
+  sl_reset
+  v1 = new ulong 1 0
+  v2 = new ulong 1 0
+  v3 = new ulong 1 0
+
+  note NC1: pin on EMPTY -> STALE
+  chk_neg eq sl_pin 0 1 SL_ERR_STALE 6101
+  note NC2: finish_load without begin_load -> ARGS
+  chk_neg eq sl_finish_load 0 1 v1 SL_ERR_ARGS 6102
+
+  chk eq sl_begin_load 0 77 OK 6001
+  note NC3: double begin_load -> BUSY
+  chk_neg eq sl_begin_load 0 78 SL_ERR_BUSY 6103
+  note NC4: pin on LOADING -> STALE
+  chk_neg eq sl_pin 0 1 SL_ERR_STALE 6104
+
+  chk eq sl_finish_load 0 1 v1 OK 6002
+  chk eq get v1 0 1 6003
+  chk eq sl_pin 0 get v1 0 OK 6004
+
+  note NC5/6: reload or evict while pinned -> BUSY
+  chk_neg eq sl_begin_load 0 77 SL_ERR_BUSY 6105
+  chk_neg eq sl_evict 0 SL_ERR_BUSY 6106
+  note NC7: unpin wrong version -> ARGS
+  chk_neg eq sl_unpin 0 99 SL_ERR_ARGS 6107
+
+  chk eq sl_unpin 0 get v1 0 OK 6005
+  note NC8: unpin when pins==0 -> ARGS
+  chk_neg eq sl_unpin 0 get v1 0 SL_ERR_ARGS 6108
+
+  chk eq sl_evict 0 OK 6006
+  note NC9: pin evicted stale version -> STALE
+  chk_neg eq sl_pin 0 get v1 0 SL_ERR_STALE 6109
+  note NC10: OOB slot index 16 -> ARGS
+  chk_neg eq sl_begin_load 16 1 SL_ERR_ARGS 6110
+
+  note Failed load ok=0 leaves EMPTY
+  chk eq sl_begin_load 1 88 OK 6007
+  chk eq sl_finish_load 1 0 v2 OK 6008
+  chk eq get g_sl_state 1 SL_EMPTY 6009
+
+  note ABA safety: reload same key 77 yields v2 > v1, then v3 > v2
+  chk eq sl_begin_load 0 77 OK 6010
+  chk eq sl_finish_load 0 1 v2 OK 6011
+  chk gt get v2 0 get v1 0 6012
+  chk eq sl_evict 0 OK 6013
+  chk eq sl_begin_load 0 77 OK 6014
+  chk eq sl_finish_load 0 1 v3 OK 6015
+  chk gt get v3 0 get v2 0 6016
+  chk eq sl_evict 0 OK 6017
+
+  note 1000 evict/reinsert monotonic cycles + idle()
+  chk s6_stress_1000 get v3 0 6018
+  chk sl_idle 6019
+
+  suite_done t_s6
+end
+
+note =========================================================================
+note [S7] gpu_serving_alloc_count + gpu_pf_mem + gpu_pfhost
+note =========================================================================
+global g_slab_base ulong 8
+global g_slab_size ulong 8
+
+fn slabs_verify n ulong to ulong
+  for i ulong n bound 8
+    bi = get g_slab_base i
+    si = get g_slab_size i
+    if eq si 0
+      ret 701
+    end
+    if or ne rem bi 4096 0 ne rem si 4096 0
+      ret 702
+    end
+    ei = add bi si
+    if le ei bi
+      ret 703
+    end
+    for j ulong i bound 8
+      bj = get g_slab_base j
+      ej = add bj get g_slab_size j
+      if and lt bi ej lt bj ei
+        ret 704
+      end
+    end
+  end
+  ret OK
+end
+
+global g_kc_hash ulong 16
+global g_kc_n ulong 1
+global g_alc_live ulong 16
+global g_alc_latched ulong 1
+global g_alc_dfree ulong 1
+
+fn kc_reset to void
+  put g_kc_n 0 0
+  put g_alc_latched 0 0
+  put g_alc_dfree 0 0
+  for i ulong 16
+    put g_kc_hash i 0
+    put g_alc_live i 0
+  end
+end
+
+fn kc_lookup_or_insert h ulong to ulong
+  note Returns 1 if cache hit (0 remiss), 0 if first compile inserted
+  n = get g_kc_n 0
+  for i ulong n bound 16
+    if eq get g_kc_hash i h
+      ret 1
+    end
+  end
+  if lt n 16
+    put g_kc_hash n h
+    put g_kc_n 0 add n 1
+  end
+  ret 0
+end
+
+fn alc_alloc id ulong to ulong
+  if ne get g_alc_latched 0 0
+    ret 710
+  end
+  if ge id 16
+    ret 711
+  end
+  if ne get g_alc_live id 0
+    ret 712
+  end
+  put g_alc_live id 1
+  ret OK
+end
+
+fn alc_free id ulong to ulong
+  if ge id 16
+    ret 711
+  end
+  if eq get g_alc_live id 0
+    put g_alc_dfree 0 add get g_alc_dfree 0 1
+    ret 713
+  end
+  put g_alc_live id 0
+  ret OK
+end
+
+fn alc_leaked to ulong
+  cnt = ulong 0
+  for i ulong 16
+    cnt = add cnt get g_alc_live i
+  end
+  ret cnt
+end
+
+fn suite_s7_serving_alloc_slabs to void
+  note 5 pairwise-disjoint 4096B-aligned slabs (W4, 128K KV 5 GiB, GDN, PF, DEC)
+  put g_slab_base 0 0x10000000
+  put g_slab_size 0 0x40000000
+  put g_slab_base 1 0x50000000
+  put g_slab_size 1 0x140000000
+  put g_slab_base 2 0x190000000
+  put g_slab_size 2 0x04000000
+  put g_slab_base 3 0x194000000
+  put g_slab_size 3 0x08000000
+  put g_slab_base 4 0x19c000000
+  put g_slab_size 4 0x02000000
+  chk eq slabs_verify 5 OK 7001
+
+  note Serving LOAD -> DECODE -> PREFILL lifecycle: 0 remiss, 0 double_free, 0 leaked
+  kc_reset
+  chk eq alc_alloc 0 OK 7002
+  chk eq alc_alloc 1 OK 7003
+  chk eq alc_alloc 2 OK 7004
+  note Compile 4 kernels during LOAD, then hit same 4 during DECODE+PREFILL
+  remiss = ulong 0
+  for k ulong 4
+    key = xor mul add k 1 0x9e3779b97f4a7c15 0x517cc1b727220a95
+    ign = kc_lookup_or_insert key
+  end
+  for k ulong 4
+    key = xor mul add k 1 0x9e3779b97f4a7c15 0x517cc1b727220a95
+    hit = kc_lookup_or_insert key
+    if eq hit 0
+      remiss = add remiss 1
+    end
+  end
+  chk eq remiss 0 7005
+  chk eq get g_kc_n 0 4 7006
+  chk eq alc_free 2 OK 7007
+  chk eq alc_free 1 OK 7008
+  chk eq alc_free 0 OK 7009
+  chk eq alc_leaked 0 7010
+  chk eq get g_alc_dfree 0 0 7011
+
+  note NC1: misaligned slab base -> 702
+  put g_slab_base 4 0x19c00004
+  chk_neg eq slabs_verify 5 702 7101
+
+  note NC2: overlapping slabs -> 704
+  put g_slab_base 4 0x198000000
+  chk_neg eq slabs_verify 5 704 7102
+
+  note NC3: zero-size slab -> 701
+  put g_slab_base 4 0x19c000000
+  put g_slab_size 4 0
+  chk_neg eq slabs_verify 5 701 7103
+
+  note NC4: double-free -> 713
+  chk_neg eq alc_free 0 713 7104
+
+  note NC5: leaked slab detected
+  chk eq alc_alloc 5 OK 7012
+  chk_neg eq alc_leaked 1 7105
+  chk eq alc_free 5 OK 7013
+
+  note NC6: alloc refused when latched == 1 -> 710
+  put g_alc_latched 0 1
+  chk_neg eq alc_alloc 6 710 7106
+
+  suite_done t_s7
+end
+
+note =========================================================================
+note [S8] gpu_q36_q38_graph_qmd + gpu_matmul: QMD0/1 packer, q38_plan, gather
+note =========================================================================
+global g_qmd0 uint 64
+global g_qmd1 uint 64
+
+fn qmd_smem_cfg smem_bytes ulong to uint
+  if le smem_bytes 32768
+    ret uint 9
+  end
+  if le smem_bytes 65536
+    ret uint 17
+  end
+  if le smem_bytes 81920
+    ret uint 26
+  end
+  if le smem_bytes 98304
+    ret uint 29
+  end
+  ret uint 0
+end
+
+fn qmd_pack qmd1_va ulong smem_bytes ulong to ulong
+  if ne and qmd1_va 0xff 0
+    ret 801
+  end
+  cfg = qmd_smem_cfg smem_bytes
+  if eq cfg uint 0
+    ret 802
+  end
+  for i ulong 64
+    put g_qmd0 i uint 0
+    put g_qmd1 i uint 0
+  end
+  put g_qmd0 4 uint 0x00800002
+  put g_qmd0 12 uint and shr qmd1_va 8 0xffffffff
+  put g_qmd1 4 uint 0x013f0000
+  put g_qmd1 36 or shl cfg 23 uint 0x00344808
+  put g_qmd1 37 uint 0
+  ret OK
+end
+
+fn qmd_verify to ulong
+  if ne get g_qmd0 4 uint 0x00800002
+    ret 803
+  end
+  if eq get g_qmd0 12 uint 0
+    ret 804
+  end
+  if ne get g_qmd1 4 uint 0x013f0000
+    ret 805
+  end
+  if eq get g_qmd1 36 uint 0
+    ret 806
+  end
+  if ne get g_qmd1 37 uint 0
+    ret 807
+  end
+  ret OK
+end
+
+fn q38_plan_layer_ops n_heads ulong to ulong
+  if or eq n_heads 0 gt n_heads 8
+    ret 0
+  end
+  ret 28
+end
+
+fn q38_bf16_xbatch_max d_model ulong smem_cap ulong to ulong
+  if or eq d_model 0 lt smem_cap 32768
+    ret 0
+  end
+  row_bytes = mul d_model 4
+  if eq row_bytes 0
+    ret 0
+  end
+  ret div smem_cap row_bytes
+end
+
+fn q38_plan_final_ops d_model ulong to ulong
+  if eq d_model 5120
+    ret 51
+  end
+  ret 18
+end
+
+fn q38_attn256_cache_policy mode ulong to ulong
+  if eq mode 0
+    ret 1
+  end
+  if eq mode 1
+    ret 3
+  end
+  if eq mode 2
+    ret 0
+  end
+  ret 99
+end
+
+global g_perm ulong 16
+global g_perm_seen ulong 16
+
+fn perm_is_bijection n ulong to bool
+  if or eq n 0 gt n 16
+    ret false
+  end
+  for i ulong n bound 16
+    put g_perm_seen i 0
+  end
+  for i ulong n bound 16
+    v = get g_perm i
+    if ge v n
+      ret false
+    end
+    if ne get g_perm_seen v 0
+      ret false
+    end
+    put g_perm_seen v 1
+  end
+  ret true
+end
+
+fn suite_s8_graph_qmd_matmul to void
+  note QMD0/1 pack & verify across 32/64/80/96 KiB SMEM tiers
+  chk eq qmd_pack 0x0000000020001000 32768 OK 8001
+  chk eq qmd_verify OK 8002
+  chk eq get g_qmd1 36 uint 0x04b44808 8003
+  chk eq qmd_smem_cfg 65536 uint 17 8004
+  chk eq qmd_smem_cfg 81920 uint 26 8005
+  chk eq qmd_smem_cfg 98304 uint 29 8006
+
+  note q38 planner invariants
+  chk eq q38_plan_layer_ops 8 28 8007
+  chk eq q38_bf16_xbatch_max 5120 98304 4 8008
+  chk eq q38_bf16_xbatch_max 5120 32768 1 8009
+  chk eq q38_plan_final_ops 5120 51 8010
+  chk eq q38_plan_final_ops 2048 18 8011
+  chk eq q38_attn256_cache_policy 0 1 8012
+  chk eq q38_attn256_cache_policy 1 3 8013
+  chk eq q38_attn256_cache_policy 2 0 8014
+
+  note Gather permutation bijection
+  put g_perm 0 3
+  put g_perm 1 1
+  put g_perm 2 0
+  put g_perm 3 2
+  chk perm_is_bijection 4 8015
+
+  note Matmul R4 deterministic integer dot parity (M=2, N=2, K=4)
+  acc = long 0
+  for k ulong 4
+    ak = add long k 1
+    bk = sub 5 long k
+    acc = add acc mul ak bk
+  end
+  chk eq acc 30 8016
+
+  note NC1: SMEM > 98304 refused -> 802
+  chk_neg eq qmd_pack 0x20001000 102400 802 8101
+  note NC2: unaligned qmd1_va (low byte nonzero) -> 801
+  chk_neg eq qmd_pack 0x20001004 32768 801 8102
+  note NC3: QMD1 w[37] != 0 -> 807
+  chk eq qmd_pack 0x20001000 32768 OK 8017
+  put g_qmd1 37 uint 1
+  chk_neg eq qmd_verify 807 8103
+  note NC4/5: q38 n_heads=0 or 9 -> 0
+  chk_neg eq q38_plan_layer_ops 0 0 8104
+  chk_neg eq q38_plan_layer_ops 9 0 8105
+  note NC6: duplicate index in gather permutation
+  put g_perm 2 1
+  chk_neg not perm_is_bijection 4 8106
+  note NC7: out-of-range index in gather permutation
+  put g_perm 2 7
+  chk_neg not perm_is_bijection 4 8107
+
+  suite_done t_s8
+end
+
+note =========================================================================
+note [S9] gpu_imadhi_rc + gpu_moe_window + divsqrt/transc/tensor
+note =========================================================================
+const IMAD_NONE ulong 0xffffffffffffffff
+const WS_E_IMADHI_RC ulong 17
+
+fn hi32_pair a uint b uint clo uint chi uint to uint
+  prod = mul ulong a ulong b
+  c64 = or shl ulong chi 32 ulong clo
+  ret uint shr add prod c64 32
+end
+
+fn sim_imad_hi a uint b uint clo uint chi uint rc_phys ulong res edit uint 1 to ulong
+  if eq rc_phys IMAD_NONE
+    put res 0 uint shr mul ulong a ulong b 32
+    ret OK
+  end
+  if ne and rc_phys 1 0
+    put res 0 uint 0xffbadbad
+    ret WS_E_IMADHI_RC
+  end
+  put res 0 hi32_pair a b clo chi
+  ret OK
+end
+
+fn moe_window_ok off ulong rows ulong row_bytes ulong smem_cap ulong to bool
+  if or eq rows 0 eq row_bytes 0
+    ret false
+  end
+  if ne rem off 128 0
+    ret false
+  end
+  if ne rem rows 16 0
+    ret false
+  end
+  tot = mul rows row_bytes
+  ret le tot smem_cap
+end
+
+fn f32_is_nan bits uint to bool
+  exp = and shr bits 23 uint 0xff
+  frac = and bits uint 0x7fffff
+  ret and eq exp uint 0xff ne frac uint 0
+end
+
+fn f32_div_special a uint b uint to uint
+  if or f32_is_nan a f32_is_nan b
+    ret uint 0x7fc00000
+  end
+  sa = and a uint 0x80000000
+  sb = and b uint 0x80000000
+  sr = xor sa sb
+  am = and a uint 0x7fffffff
+  bm = and b uint 0x7fffffff
+  if eq bm uint 0
+    if eq am uint 0
+      ret uint 0x7fc00000
+    end
+    ret or sr uint 0x7f800000
+  end
+  if eq am uint 0
+    ret sr
+  end
+  ret uint 0x3f800000
+end
+
+fn f32_sqrt_special a uint to uint
+  if f32_is_nan a
+    ret uint 0x7fc00000
+  end
+  am = and a uint 0x7fffffff
+  if eq am uint 0
+    ret a
+  end
+  if ne and a uint 0x80000000 uint 0
+    ret uint 0x7fc00000
+  end
+  ret a
+end
+
+fn bf16_rne fbits uint to uint
+  lsb = and shr fbits 16 uint 1
+  rbias = add uint 0x7fff lsb
+  ret shr add fbits rbias 16
+end
+
+fn tc_tile_ok kind ulong m ulong n ulong k ulong to bool
+  if or eq m 0 or eq n 0 eq k 0
+    ret false
+  end
+  note kind=1 HMMA.16816 (BF16), kind=2 OMMA.SF.16864 (NVFP4)
+  if or ne rem m 16 0 ne rem n 8 0
+    ret false
+  end
+  if eq kind 1
+    ret eq rem k 16 0
+  end
+  if eq kind 2
+    ret eq rem k 64 0
+  end
+  ret false
+end
+
+fn s9_imadhi_pack_replay to void
+  res = new uint 1 0
+  w0 = uint 0x3f80bf80
+  tw = and uint 0x40004040 uint 0xffff0000
+  emul = add shr w0 16 tw
+  chk eq sim_imad_hi w0 uint 0x00010000 tw uint 0x3f803f80 6 res OK 9006
+  chk ne get res 0 emul 9007
+  chk eq add shr w0 16 tw emul 9008
+end
+
+fn s9_imadhi_core to void
+  a = uint 0xdeadbeef
+  b = uint 0x00010000
+  clo = uint 0x00001234
+  chi = uint 0x00005678
+  hi_ab = uint shr mul ulong a ulong b 32
+  pair_m = hi32_pair a b clo chi
+  chk ne pair_m add hi_ab clo 9001
+  res = new uint 1 0
+  chk eq sim_imad_hi a b clo chi IMAD_NONE res OK 9002
+  chk eq get res 0 hi_ab 9003
+  chk eq sim_imad_hi a b clo chi 6 res OK 9004
+  chk eq get res 0 pair_m 9005
+  note NC1: odd Rc=R7 refused with WS_E_IMADHI_RC
+  chk_neg eq sim_imad_hi a b clo chi 7 res WS_E_IMADHI_RC 9101
+end
+
+fn suite_s9_imadhi_window_num_tc to void
+  s9_imadhi_core
+  s9_imadhi_pack_replay
+
+  note MoE window alignment (128B offset, 16-row tile, <=98304B SMEM)
+  chk moe_window_ok 256 32 512 98304 9009
+  chk_neg not moe_window_ok 64 32 512 98304 9102
+  chk_neg not moe_window_ok 256 12 512 98304 9103
+  chk_neg not moe_window_ok 256 256 512 98304 9104
+
+  note IEEE-754 f32 div/sqrt special cases + BF16 RNE tie-to-even
+  chk eq f32_div_special uint 0x3f800000 uint 0x00000000 uint 0x7f800000 9010
+  chk eq f32_div_special uint 0x3f800000 uint 0x80000000 uint 0xff800000 9011
+  chk f32_is_nan f32_div_special uint 0x00000000 uint 0x00000000 9012
+  chk eq f32_sqrt_special uint 0x80000000 uint 0x80000000 9013
+  chk_neg f32_is_nan f32_sqrt_special uint 0xbf800000 9105
+  chk eq bf16_rne uint 0x3f808000 uint 0x3f80 9014
+  chk eq bf16_rne uint 0x3f818000 uint 0x3f82 9015
+
+  note Tensor Core HMMA.16816 & OMMA.SF.16864 tile admission
+  chk tc_tile_ok 1 16 8 16 9016
+  chk tc_tile_ok 2 16 8 64 9017
+  chk_neg not tc_tile_ok 2 16 8 32 9106
+  chk_neg not tc_tile_ok 1 16 4 16 9107
+
+  suite_done t_s9
+end
+
+note =========================================================================
+note [S10] stage2_audit_tsv: Pure-OM 8-column TSV parser & integrity verifier
+note =========================================================================
+global g_line_tmp uchar 2048
+global g_cstart ulong 8
+global g_clen ulong 8
+
+fn line_eq_tok pos ulong n ulong pat view uchar * to bool
+  if ne n len pat
+    ret false
+  end
+  for i ulong n bound 32
+    if ne get g_line_tmp add pos i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn line_starts_with pos ulong n ulong pat view uchar * to bool
+  pl = len pat
+  if lt n pl
+    ret false
+  end
+  for i ulong pl bound 32
+    if ne get g_line_tmp add pos i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tsv_split_8 n ulong to ulong
+  col = ulong 0
+  st = ulong 0
+  for i ulong n bound 2048
+    if eq get g_line_tmp i 9
+      if ge col 7
+        ret 901
+      end
+      if eq i st
+        ret 902
+      end
+      put g_cstart col st
+      put g_clen col sub i st
+      col = add col 1
+      st = add i 1
+    end
+  end
+  if ne col 7
+    ret 901
+  end
+  if eq n st
+    ret 902
+  end
+  put g_cstart 7 st
+  put g_clen 7 sub n st
+  ret OK
+end
+
+fn tsv_check_col0 to ulong
+  c0s = get g_cstart 0
+  c0l = get g_clen 0
+  if not line_starts_with c0s c0l t_pfx_tests
+    ret 904
+  end
+  if lt c0l 8
+    ret 904
+  end
+  if ne get g_line_tmp sub add c0s c0l 2 46
+    ret 904
+  end
+  if ne get g_line_tmp sub add c0s c0l 1 99
+    ret 904
+  end
+  ret OK
+end
+
+fn tsv_parse_class to ulong
+  c1s = get g_cstart 1
+  c1l = get g_clen 1
+  if line_eq_tok c1s c1l t_cls_host
+    ret 1
+  end
+  if line_eq_tok c1s c1l t_cls_leg
+    ret 2
+  end
+  if line_eq_tok c1s c1l t_cls_aien
+    ret 3
+  end
+  ret 0
+end
+
+fn validate_tsv_line n ulong cls_out edit ulong 1 to ulong
+  rc = tsv_split_8 n
+  if ne rc OK
+    ret rc
+  end
+  rc = tsv_check_col0
+  if ne rc OK
+    ret rc
+  end
+  cls = tsv_parse_class
+  if eq cls 0
+    ret 903
+  end
+  c5s = get g_cstart 5
+  c6s = get g_cstart 6
+  c6l = get g_clen 6
+  if eq cls 1
+    if ne get g_line_tmp c5s 83
+      ret 905
+    end
+    if not line_eq_tok c6s c6l t_none
+      ret 906
+    end
+  else
+    if line_eq_tok c6s c6l t_none
+      ret 907
+    end
+  end
+  put cls_out 0 cls
+  ret OK
+end
+
+fn copy_syn s view uchar * to ulong
+  n = len s
+  for i ulong n bound 128
+    put g_line_tmp i get s i
+  end
+  ret n
+end
+
+fn suite_s10_synthetic to void
+  cls = new ulong 1 0
+  ln = copy_syn t_syn_good
+  chk eq validate_tsv_line ln cls OK 9501
+  chk eq get cls 0 1 9502
+
+  ln = copy_syn t_syn_7col
+  chk_neg eq validate_tsv_line ln cls 901 9601
+  ln = copy_syn t_syn_9col
+  chk_neg eq validate_tsv_line ln cls 901 9602
+  ln = copy_syn t_syn_badcls
+  chk_neg eq validate_tsv_line ln cls 903 9603
+  ln = copy_syn t_syn_empty
+  chk_neg eq validate_tsv_line ln cls 902 9604
+  ln = copy_syn t_syn_baddrv
+  chk_neg eq validate_tsv_line ln cls 906 9605
+  ln = copy_syn t_syn_badc
+  chk_neg eq validate_tsv_line ln cls 904 9606
+end
+
+fn parse_audit_buffer blen ulong to ulong
+  put g_tsv_counts 0 0
+  put g_tsv_counts 1 0
+  put g_tsv_counts 2 0
+  put g_tsv_counts 3 0
+  saw_hdr = false
+  cls = new ulong 1 0
+  pos = ulong 0
+  while lt pos blen bound 65536
+    lstart = pos
+    while lt pos blen bound 2048
+      if eq get g_tsv_buf pos 10
+        break
+      end
+      pos = add pos 1
+    end
+    lend = pos
+    if lt pos blen
+      if eq get g_tsv_buf pos 10
+        pos = add pos 1
+      end
+    end
+    if gt lend lstart
+      if eq get g_tsv_buf sub lend 1 13
+        lend = sub lend 1
+      end
+    end
+    llen = sub lend lstart
+    if eq llen 0
+      continue
+    end
+    if eq get g_tsv_buf lstart 35
+      continue
+    end
+    if ge llen 2048
+      ret 908
+    end
+    for k ulong llen bound 2048
+      put g_line_tmp k get g_tsv_buf add lstart k
+    end
+    if not saw_hdr
+      if not line_starts_with 0 llen t_hdr_pfx
+        ret 909
+      end
+      saw_hdr = true
+      continue
+    end
+    rc = validate_tsv_line llen cls
+    if ne rc OK
+      ret rc
+    end
+    c = get cls 0
+    put g_tsv_counts 0 add get g_tsv_counts 0 1
+    put g_tsv_counts c add get g_tsv_counts c 1
+  end
+  if not saw_hdr
+    ret 909
+  end
+  if ne get g_tsv_counts 0 55
+    ret 910
+  end
+  if ne get g_tsv_counts 1 20
+    ret 911
+  end
+  if ne get g_tsv_counts 2 35
+    ret 912
+  end
+  if ne get g_tsv_counts 3 0
+    ret 913
+  end
+  ret OK
+end
+
+fn eq_audit_flag n ulong to bool
+  if ne n len t_f_audit
+    ret false
+  end
+  for i ulong 7
+    if ne get g_arg i get t_f_audit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn load_and_verify_audit pathn ulong to ulong
+  fd = fopen g_arg 0 pathn 0 0
+  if lt fd 0
+    wr_str t_bad_open
+    ret 920
+  end
+  total = ulong 0
+  while true bound 4096
+    if ge total 65536
+      ign = fclose int fd
+      wr_str t_bad_read
+      ret 921
+    end
+    got = read int fd g_tsv_buf total sub 65536 total
+    if lt got 0
+      ign = fclose int fd
+      wr_str t_bad_read
+      ret 921
+    end
+    if eq got 0
+      break
+    end
+    total = add total ulong got
+  end
+  ign = fclose int fd
+  rc = parse_audit_buffer total
+  if ne rc OK
+    wr_str t_bad_tsv
+    out_u64 rc
+    wr_str t_nl
+    ret rc
+  end
+  ret OK
+end
+
+fn main to int
+  ac = argcnt
+  have_audit = false
+  pathn = ulong 0
+  if eq ac 1
+    have_audit = false
+  else
+    if eq ac 3
+      n1 = argread 1 g_arg 0 4096
+      if le n1 0
+        wr_str t_usage
+        ret 2
+      end
+      if not eq_audit_flag ulong n1
+        wr_str t_usage
+        ret 2
+      end
+      n2 = argread 2 g_arg 0 4096
+      if le n2 0
+        wr_str t_usage
+        ret 2
+      end
+      pathn = ulong n2
+      have_audit = true
+    else
+      wr_str t_usage
+      ret 2
+    end
+  end
+
+  suite_s1_bw_hazard
+  suite_s2_cmdlist_streams
+  suite_s3_moe_plan
+  suite_s4_reconv_elementwise
+  suite_s5_gpr_boundary
+  suite_s6_fp8_slots
+  suite_s7_serving_alloc_slabs
+  suite_s8_graph_qmd_matmul
+  suite_s9_imadhi_window_num_tc
+  suite_s10_synthetic
+
+  if have_audit
+    arc = load_and_verify_audit pathn
+    chk eq arc OK 9599
+    suite_done t_s10_live
+  else
+    suite_done t_s10_syn
+  end
+
+  if eq get g_failed 0 0
+    wr_str t_pass_a
+    out_u64 get g_checks 0
+    wr_str t_pass_b
+    out_u64 get g_controls 0
+    wr_str t_pass_c
+    out_u64 get g_tsv_counts 0
+    wr_str t_pass_d
+    out_u64 get g_tsv_counts 1
+    wr_str t_pass_e
+    out_u64 get g_tsv_counts 2
+    wr_str t_pass_f
+    out_u64 get g_tsv_counts 3
+    wr_str t_pass_g
+    out_flush
+    ret 0
+  end
+
+  wr_str t_fail_a
+  out_u64 get g_first_err 0
+  wr_str t_fail_b
+  out_u64 get g_failed 0
+  wr_str t_fail_c
+  out_u64 get g_checks 0
+  wr_str t_fail_d
+  out_u64 get g_controls 0
+  wr_str t_nl
+  out_flush
+  ret 1
+end
