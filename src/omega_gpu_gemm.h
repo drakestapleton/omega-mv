@@ -50,7 +50,8 @@ typedef enum { OMEGA_GEMM_K_PACK_A = 0, OMEGA_GEMM_K_PACK_B, OMEGA_GEMM_K_MAIN, 
  * with 4 (4 rt + 2 ct + rt ct) <= 100 (the registers of two operand sets and the accumulators; rt 2 ct 4 is the largest),
  * stall: issue cycles after each tensor-core op (1 .. 15).
  * mutant (red checks): 1 MAIN drops the second step of every k pair, 2 the packs let element 0 in past the edges (instead of zero),
- * 3 MAIN stores each column pair swapped. */
+ * 3 MAIN stores each column pair swapped, 4 the driver packs A with the other layout's strides (a wrong transpose: row-major
+ * read as column-major and back; every element read stays inside A). */
 typedef struct { OmegaGpuGemmType type; uint32_t rt, ct, wm, wn, stall; int mutant; } OmegaGemmCfg;
 void omega_gpu_gemm_default_cfg(OmegaGpuGemmType type, OmegaGemmCfg *cfg);
 int omega_gpu_gemm_cfg_ok(const OmegaGemmCfg *cfg);

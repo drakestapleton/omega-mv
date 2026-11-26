@@ -21,7 +21,7 @@ void omega_gpu_gemm_default_cfg(OmegaGpuGemmType type, OmegaGemmCfg *cfg) {
 
 int omega_gpu_gemm_cfg_ok(const OmegaGemmCfg *c) {
     return c && (c->type == OMEGA_GPU_GEMM_BF16 || c->type == OMEGA_GPU_GEMM_E4M3) && pow124(c->rt) && pow124(c->ct) &&
-           pow124(c->wm) && pow124(c->wn) && c->stall >= 1u && c->stall <= 15u && c->mutant >= 0 && c->mutant <= 3 &&
+           pow124(c->wm) && pow124(c->wn) && c->stall >= 1u && c->stall <= 15u && c->mutant >= 0 && c->mutant <= 4 &&
            4u * (4u * c->rt + 2u * c->ct + c->rt * c->ct) <= 100u; /* registers: two operand sets + accumulators, R2..R127 in all */
 }
 
@@ -90,7 +90,8 @@ int omega_gpu_gemm_drive(const OmegaGemmCfg *c, unsigned layout, uint32_t M, uin
     /* A element (m, k): row-major m K + k, column-major k M + m */
     memset(a, 0, sizeof a);
     put64(a, 0, a_va); put64(a, 2, ap_va); a[4] = M; a[5] = K;
-    a[6] = layout & OMEGA_GPU_GEMM_A_COL ? 1u : K; a[7] = layout & OMEGA_GPU_GEMM_A_COL ? M : 1u; a[8] = p.KS2;
+    const unsigned acol = (layout & OMEGA_GPU_GEMM_A_COL) ^ (c->mutant == 4 ? OMEGA_GPU_GEMM_A_COL : 0u); /* 4: wrong transpose */
+    a[6] = acol ? 1u : K; a[7] = acol ? M : 1u; a[8] = p.KS2;
     if (launch(ctx, OMEGA_GEMM_K_PACK_A, a, p.grid[0][0], p.grid[0][1], p.threads[0]) != 0) return OMEGA_GPU_GEMM_CHIP_FAIL;
     /* B element (k, n) as packed row n: row-major k N + n, column-major n K + k */
     memset(a, 0, sizeof a);
