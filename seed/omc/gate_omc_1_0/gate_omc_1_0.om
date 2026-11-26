@@ -1,0 +1,601 @@
+om2
+note Pure seeded OM-2 gate driver for the omc 1.0 Pin-Bump Wave (seed/omc/gate_omc_1_0/).
+note Usage: gate_omc_1_0 NEW_OMC OLD_OMC WORK_DIR
+note Executes (100% pure OM-2, zero external deps):
+note   1. Live AArch64 SCM_RIGHTS sendfd/recvfd memfd transfer + no-fd (-1) + 3 runtime trap-3 controls
+note   2. Compile-time negative controls for sendfd/recvfd/execpure (fn-mode=9, ro-out=20, x86efi=25, contract=30)
+note   3. RM8 human-readable stderr (OMC_DIAGNOSTICS=1) & universal omc-diag 2 records (OMC_DIAG=1 + OMC_DIAGNOSTICS=2)
+note      on bare om1, om2, target x86linux, ir, check, object profiles (with stdout parity & 1-byte tamper control)
+note   4. C2 byte-identity check: OLD_OMC vs NEW_OMC emit bit-identical AArch64 ELF for non-sendfd/recvfd programs
+
+global omc_new uchar 512
+global omc_new_n ulong 1
+global omc_old uchar 512
+global omc_old_n ulong 1
+global wdir uchar 512
+global wdir_n ulong 1
+global pbuf uchar 1024
+global pkt uchar 4096
+global envpkt uchar 256
+global out1 uchar 65536
+global out2 uchar 65536
+global err1 uchar 8192
+global err2 uchar 8192
+global fbuf uchar 262144
+global fbuf2 uchar 262144
+global olen1 ulong 1
+global elen1 ulong 1
+global olen2 ulong 1
+global elen2 ulong 1
+global pfd uchar 24
+global pfds int 6
+global wstat uchar 8
+
+text s_usage "usage: gate_omc_1_0 NEW_OMC OLD_OMC WORK_DIR\n"
+text s_fail "OMC_1_0_GATE FAIL step="
+text s_pass "OMC_1_0_GATE PASS scm_rights=1 runtime_traps=3 compile_ctrls=5 rm8_diag=7 c2_identical=2\n"
+text e_diag1 "OMC_DIAG=1"
+text e_diagh "OMC_DIAGNOSTICS=1"
+text e_diag2 "OMC_DIAGNOSTICS=2"
+text e_empty ""
+text p_scm_src "/test_scm_rights.om"
+text p_scm_bin "/test_scm_rights"
+text a_t1 "trap-sendfd-zero"
+text a_t2 "trap-recvfd-short"
+text a_t3 "trap-sendfd-oob"
+
+note Negative compile-time inputs
+text c_fn_sendfd "om2\nfn f s int fd int a view uchar * to long\nret sendfd s fd a 0 1\nend\n"
+text c_ro_recvfd "om2\ntext ro \"abcd\"\nfn main to int\nb = new uchar 8 0\nz = recvfd 3 b 0 8 ro 0 4\nret 0\nend\n"
+text c_efi_sendfd "target x86efi\nfn main to int\nb = new uchar 8 0\nz = sendfd 3 4 b 0 1\nret 0\nend\n"
+text c_efi_execpure "target x86efi\nfn main to int\nb = new uchar 8 0\nz = execpure b 0 1\nret 0\nend\n"
+text c_con_sendfd "om2\nfn f s int fd int a view uchar * to int\nrequires eq sendfd s fd a 0 1 1\nret 0\nend\nfn main to int\nret 0\nend\n"
+
+note RM8 diagnostic inputs (bare om1, om2, target x86linux, ir, check, object)
+text d_om1 "fn main to int\nret missing\nend\n"
+text d_om1_mut "fn main to int\nret missinX\nend\n"
+text d_om2 "om2\nfn main to int\nret missing\nend\n"
+text d_x86 "target x86linux\nfn main to int\nret missing\nend\n"
+text d_ir "ir\nfn f to int\nret missing\nend\n"
+text d_chk "check\nfn main to int\nret missing\nend\n"
+text d_obj "object\nom2\nexport fn f to int\nret missing\nend\n"
+
+note C2 byte-identity programs (no sendfd/recvfd)
+text c2_p1 "fn add2 a ulong b ulong to ulong\nret add a b\nend\nfn main to int\nx = add2 19 23\nret int x\nend\n"
+text c2_p2 "om2\ntext hi \"hello\\n\"\nfn main to int\nw = write 1 hi 0 len hi\nret 0\nend\n"
+
+text k_pfx "omc: line "
+text k_rec "omc-diag 2 "
+text k_ish "input_sha256="
+text k_csh "compiler_source_sha256="
+text k_scm_ok "SCM_RIGHTS_PASS\n"
+
+fn die step ulong to void
+w1 = write 2 s_fail 0 len s_fail
+d = new uchar 20 0
+x = step
+k = ulong 0
+for i ulong 20 bound 20
+put d k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+rev = new uchar 21 0
+for j ulong k bound 20
+put rev j get d sub sub k j 1
+end
+put rev k 10
+w2 = write 2 rev 0 add k 1
+exit int step
+end
+
+fn gbyte bid ulong idx ulong to uchar
+if eq bid 0
+ret get out1 idx
+end
+if eq bid 1
+ret get err1 idx
+end
+ret get err2 idx
+end
+
+fn find_gbuf bid ulong hlen ulong nd view uchar * to ulong
+if lt hlen len nd
+ret hlen
+end
+lim = add sub hlen len nd 1
+for i ulong lim bound 65536
+ok = true
+for j ulong len nd bound 256
+if ne gbyte bid add i j get nd j
+ok = false
+break
+end
+end
+if ok
+ret i
+end
+end
+ret hlen
+end
+
+fn has_gbuf bid ulong hlen ulong nd view uchar * to bool
+ret lt find_gbuf bid hlen nd hlen
+end
+
+fn load_text t view uchar * to ulong
+for i ulong len t bound 65536
+put fbuf i get t i
+end
+ret len t
+end
+
+fn pack_omc which ulong to ulong
+n = ulong 0
+if eq which 0
+n = get omc_new_n 0
+put pkt 0 1
+put pkt 1 0
+put pkt 2 uchar and n 255
+put pkt 3 uchar and shr n 8 255
+for i ulong n bound 512
+put pkt add 4 i get omc_new i
+end
+else
+n = get omc_old_n 0
+put pkt 0 1
+put pkt 1 0
+put pkt 2 uchar and n 255
+put pkt 3 uchar and shr n 8 255
+for i ulong n bound 512
+put pkt add 4 i get omc_old i
+end
+end
+ret add 4 n
+end
+
+fn pack_env t view uchar * to ulong
+n = len t
+put envpkt 0 1
+put envpkt 1 0
+put envpkt 2 uchar and n 255
+put envpkt 3 uchar and shr n 8 255
+for i ulong n bound 256
+put envpkt add 4 i get t i
+end
+ret add 4 n
+end
+
+fn pack_pbuf blen ulong arg1 view uchar * a1len ulong to ulong
+if eq a1len 0
+put pkt 0 1
+else
+put pkt 0 2
+end
+put pkt 1 0
+put pkt 2 uchar and blen 255
+put pkt 3 uchar and shr blen 8 255
+for i ulong blen bound 1024
+put pkt add 4 i get pbuf i
+end
+if eq a1len 0
+ret add 4 blen
+end
+off = add 4 blen
+put pkt off uchar and a1len 255
+put pkt add off 1 uchar and shr a1len 8 255
+for i ulong a1len bound 1024
+put pkt add add off 2 i get arg1 i
+end
+ret add add off 2 a1len
+end
+
+fn read_gbuf fd int bid ulong cap ulong to ulong
+tot = ulong 0
+while lt tot cap bound 262144
+r = long 0
+if eq bid 0
+r = read fd out1 tot sub cap tot
+end
+if eq bid 1
+r = read fd out2 tot sub cap tot
+end
+if eq bid 2
+r = read fd err1 tot sub cap tot
+end
+if eq bid 3
+r = read fd err2 tot sub cap tot
+end
+if eq bid 4
+r = read fd fbuf tot sub cap tot
+end
+if eq bid 5
+r = read fd fbuf2 tot sub cap tot
+end
+if le r 0
+break
+end
+tot = add tot ulong r
+end
+ret tot
+end
+
+fn write_fbuf fd int which ulong n ulong to bool
+off = ulong 0
+while lt off n bound 262144
+w = long 0
+if eq which 0
+w = write fd fbuf off sub n off
+else
+w = write fd fbuf2 off sub n off
+end
+if le w 0
+ret false
+end
+off = add off ulong w
+end
+ret true
+end
+
+fn le32_pfd off ulong to int
+b0 = ulong get pfd off
+b1 = ulong get pfd add off 1
+b2 = ulong get pfd add off 2
+b3 = ulong get pfd add off 3
+u = or or b0 shl b1 8 or shl b2 16 shl b3 24
+ret int uint u
+end
+
+note run_omc: stdin is fbuf[0..inlen).
+note flags = which_omc (bit 0: 0=new, 1=old) | (ev_id << 4: 0=none, 1=OMC_DIAG=1, 2=OMC_DIAGNOSTICS=1, 3=OMC_DIAGNOSTICS=2) | (slot << 8: 0=out1/err1, 1=out2/err2, 2=fbuf2/err1)
+fn run_omc inlen ulong flags ulong to ulong
+r0 = pipefds pfd 0 8 0
+if lt r0 0
+ret 254
+end
+r0 = pipefds pfd 8 8 0
+if lt r0 0
+ret 254
+end
+r0 = pipefds pfd 16 8 0
+if lt r0 0
+ret 254
+end
+put pfds 0 le32_pfd 0
+put pfds 1 le32_pfd 4
+put pfds 2 le32_pfd 8
+put pfds 3 le32_pfd 12
+put pfds 4 le32_pfd 16
+put pfds 5 le32_pfd 20
+
+plen = pack_omc and flags 1
+elen = ulong 0
+if eq and shr flags 4 15 1
+elen = pack_env e_diag1
+end
+if eq and shr flags 4 15 2
+elen = pack_env e_diagh
+end
+if eq and shr flags 4 15 3
+elen = pack_env e_diag2
+end
+
+pid = fork
+if lt pid 0
+ret 253
+end
+if eq pid 0
+z = dupfd get pfds 0 0 0
+z = dupfd get pfds 3 1 0
+z = dupfd get pfds 5 2 0
+z = fclose get pfds 1
+z = fclose get pfds 2
+z = fclose get pfds 4
+if gt elen 0
+z = execenv pkt 0 plen envpkt 0 elen
+else
+z = execprog pkt 0 plen
+end
+exit 127
+end
+z = fclose get pfds 0
+z = fclose get pfds 3
+z = fclose get pfds 5
+okw = write_fbuf get pfds 1 0 inlen
+z = fclose get pfds 1
+
+slot = and shr flags 8 15
+if eq slot 0
+put olen1 0 read_gbuf get pfds 2 0 65536
+put elen1 0 read_gbuf get pfds 4 2 8192
+end
+if eq slot 1
+put olen2 0 read_gbuf get pfds 2 1 65536
+put elen2 0 read_gbuf get pfds 4 3 8192
+end
+if eq slot 2
+put olen1 0 read_gbuf get pfds 2 5 262144
+put elen1 0 read_gbuf get pfds 4 2 8192
+end
+z = fclose get pfds 2
+z = fclose get pfds 4
+z = waitpid int pid wstat 0 8 0
+if lt z 0
+ret 252
+end
+s0 = ulong get wstat 0
+s1 = ulong get wstat 1
+if ne and s0 127 0
+ret add 128 and s0 127
+end
+ret s1
+end
+
+fn run_bin blen ulong arg1 view uchar * a1len ulong to ulong
+r0 = pipefds pfd 0 8 0
+if lt r0 0
+ret 254
+end
+put pfds 0 le32_pfd 0
+put pfds 1 le32_pfd 4
+plen = pack_pbuf blen arg1 a1len
+pid = fork
+if lt pid 0
+ret 253
+end
+if eq pid 0
+z = dupfd get pfds 1 1 0
+z = fclose get pfds 0
+z = execprog pkt 0 plen
+exit 127
+end
+z = fclose get pfds 1
+put olen1 0 read_gbuf get pfds 0 0 65536
+z = fclose get pfds 0
+z = waitpid int pid wstat 0 8 0
+if lt z 0
+ret 252
+end
+s0 = ulong get wstat 0
+s1 = ulong get wstat 1
+if ne and s0 127 0
+ret add 128 and s0 127
+end
+ret s1
+end
+
+fn join_wdir suf view uchar * to ulong
+wn = get wdir_n 0
+for i ulong wn bound 512
+put pbuf i get wdir i
+end
+for i ulong len suf bound 512
+put pbuf add wn i get suf i
+end
+ret add wn len suf
+end
+
+fn eq_out12 n ulong to bool
+for i ulong n bound 65536
+a = get out1 i
+b = get out2 i
+if ne a b
+ret false
+end
+end
+ret true
+end
+
+fn eq_err12 p1 ulong p2 ulong to bool
+for i ulong 64 bound 64
+a = get err1 add p1 i
+b = get err2 add p2 i
+if ne a b
+ret false
+end
+end
+ret true
+end
+
+fn chk_rm8_profile src view uchar * evid ulong step ulong to void
+n = load_text src
+rc1 = run_omc n 0
+rc2 = run_omc n or shl evid 4 256
+if or eq rc1 0 ne rc1 rc2
+die step
+end
+if ne get olen1 0 get olen2 0
+die step
+end
+if not eq_out12 get olen1 0
+die step
+end
+e2n = get elen2 0
+if not has_gbuf 2 e2n k_pfx
+die step
+end
+if not has_gbuf 2 e2n k_rec
+die step
+end
+if not has_gbuf 2 e2n k_ish
+die step
+end
+if not has_gbuf 2 e2n k_csh
+die step
+end
+end
+
+fn main to int
+if ne argcnt 4
+z = write 2 s_usage 0 len s_usage
+ret 2
+end
+z = argread 1 omc_new 0 512
+if le z 0
+die 1
+end
+put omc_new_n 0 ulong z
+z = argread 2 omc_old 0 512
+if le z 0
+die 1
+end
+put omc_old_n 0 ulong z
+z = argread 3 wdir 0 512
+if le z 0
+die 1
+end
+put wdir_n 0 ulong z
+
+note === 1. Compile and execute test_scm_rights.om (live AArch64 SCM_RIGHTS + 3 runtime trap-3 controls) ===
+bp_len = join_wdir p_scm_src
+z = fopen pbuf 0 bp_len 0 0
+if lt z 0
+die 10
+end
+rc = read_gbuf int z 4 262144
+z = fclose int z
+if eq rc 0
+die 11
+end
+rc = run_omc rc 512
+if or ne rc 0 eq get olen1 0 0
+die 12
+end
+bp_len = join_wdir p_scm_bin
+z = fopen pbuf 0 bp_len 577 493
+if lt z 0
+die 13
+end
+if not write_fbuf int z 1 get olen1 0
+die 14
+end
+z = fclose int z
+z = chmod pbuf 0 bp_len 493
+
+note Run positive test (sendfd memfd + recvfd + pread + no-fd -1 control)
+rc = run_bin bp_len e_empty 0
+if ne rc 0
+die 15
+end
+if not has_gbuf 0 get olen1 0 k_scm_ok
+die 16
+end
+
+note Run 3 runtime trap-3 controls (exit code must be 103 = 100 + trap 3)
+rc = run_bin bp_len a_t1 len a_t1
+if ne rc 103
+die 17
+end
+rc = run_bin bp_len a_t2 len a_t2
+if ne rc 103
+die 18
+end
+rc = run_bin bp_len a_t3 len a_t3
+if ne rc 103
+die 19
+end
+
+note === 2. Compile-time negative controls (5) ===
+rc = run_omc load_text c_fn_sendfd 0
+if ne rc 9
+die 20
+end
+rc = run_omc load_text c_ro_recvfd 0
+if ne rc 20
+die 21
+end
+rc = run_omc load_text c_efi_sendfd 0
+if ne rc 25
+die 22
+end
+rc = run_omc load_text c_efi_execpure 0
+if ne rc 25
+die 23
+end
+rc = run_omc load_text c_con_sendfd 0
+if ne rc 30
+die 24
+end
+
+note === 3. RM8 Diagnostics (OMC_DIAGNOSTICS=1 single-line human + OMC_DIAG=1 across all 1.0 profiles + 1-byte tamper) ===
+rc = run_omc load_text d_om1 32
+if ne rc 3
+die 30
+end
+if not has_gbuf 1 get elen1 0 k_pfx
+die 31
+end
+if has_gbuf 1 get elen1 0 k_rec
+die 32
+end
+rc = ulong 0
+for i ulong get elen1 0 bound 8192
+if eq get err1 i 10
+rc = add rc 1
+end
+end
+if ne rc 1
+die 33
+end
+
+chk_rm8_profile d_om1 1 34
+chk_rm8_profile d_om2 1 35
+chk_rm8_profile d_x86 1 36
+chk_rm8_profile d_ir 1 37
+chk_rm8_profile d_chk 1 38
+chk_rm8_profile d_obj 1 39
+chk_rm8_profile d_om1 3 40
+
+note 1-byte input tamper must change input_sha256 in omc-diag 2 record
+rc = run_omc load_text d_om1 16
+rc2 = run_omc load_text d_om1_mut 272
+p1 = find_gbuf 1 get elen1 0 k_ish
+p2 = find_gbuf 2 get elen2 0 k_ish
+if ge add p1 add len k_ish 64 get elen1 0
+die 41
+end
+if ge add p2 add len k_ish 64 get elen2 0
+die 41
+end
+if eq_err12 add p1 len k_ish add p2 len k_ish
+die 42
+end
+
+note Valid om1 compile with OMC_DIAG=1 must keep stdout bit-identical and stderr empty
+rc = run_omc load_text c2_p1 0
+rc2 = run_omc load_text c2_p1 272
+if or ne rc 0 ne rc2 0
+die 43
+end
+if or ne get olen1 0 get olen2 0 ne get elen2 0 0
+die 43
+end
+if not eq_out12 get olen1 0
+die 44
+end
+
+note === 4. C2 Byte-Identity Check: OLD_OMC vs NEW_OMC on existing AArch64 programs ===
+rc = run_omc load_text c2_p1 1
+rc2 = run_omc load_text c2_p1 256
+if or ne rc 0 or ne rc2 0 ne get olen1 0 get olen2 0
+die 50
+end
+if not eq_out12 get olen1 0
+die 51
+end
+
+rc = run_omc load_text c2_p2 1
+rc2 = run_omc load_text c2_p2 256
+if or ne rc 0 or ne rc2 0 ne get olen1 0 get olen2 0
+die 52
+end
+if not eq_out12 get olen1 0
+die 53
+end
+
+z = write 1 s_pass 0 len s_pass
+ret 0
+end
