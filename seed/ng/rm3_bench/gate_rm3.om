@@ -11,12 +11,14 @@ note   1. Compiles real kernels (fib38, matmul) across all 4 arms (omc, ng @ng f
 note      gcc -O2 -static, gcc -O3 -static), measuring compile time via rm3_bench time_io.
 note   2. Runs rm3_bench run (interleaved paired timing + exact SHA-256 output parity check) across
 note      all 4 arms on both kernels -> exit 0, RM3_BENCH_PASS, exact output equality verified.
-note   3. 5 fail-closed negative controls:
+note   3. 7 fail-closed negative controls:
 note      - neg01_wrong_output: planted mutant outputting fib(38)+1 -> rm3_bench exits 1 + R MISMATCH
 note      - neg02_bad_want: corrupted 64-hex WANT_SHA -> rm3_bench exits 1 + R MISMATCH
 note      - neg03_trap_arm: arm trapping with trap 1 (exit 101) -> rm3_bench exits 1 + R MISMATCH
 note      - neg04_missing_bin: nonexistent arm binary -> rm3_bench exits 1 + R BIN_ERR
 note      - neg05_bad_usage: invalid CLI mode -> rm3_bench exits 2
+note      - neg06_opt_noop_break: bypassing @ng opt fails the >=10% IR reduction gate fail-closed
+note      - neg07_opt_sem_mutant: mis-optimized rotl mutant compiled by ng -> rm3_bench exits 1 + R MISMATCH
 
 global gr_omc uchar 512
 global gr_ng uchar 512
@@ -98,6 +100,17 @@ text gr_s_n2 "neg02_bad_want"
 text gr_s_n3 "neg03_trap_arm"
 text gr_s_n4 "neg04_missing_bin"
 text gr_s_n5 "neg05_bad_usage"
+text gr_s_n6 "neg06_opt_noop_break"
+text gr_s_n7 "neg07_opt_sem_mutant"
+text gr_s_opt_k "opt_probe"
+text gr_s_f_optom "/opt_probe.om"
+text gr_s_f_optbad "/opt_bad.om"
+text gr_s_b_optomc "/b_opt_omc"
+text gr_s_b_optng "/b_opt_ng"
+text gr_s_b_optbad "/b_opt_bad"
+text gr_s_f_optout "/opt_ref.out"
+text gr_s_opt_src "om2\nfn qr x edit uint 4 a ulong b ulong to void inline\nva = get x a\nvb = get x b\nva = add va vb\nvb = rotl xor vb va 7\nput x a va\nput x b vb\nend\nfn main to int\ns = new uint 4 0\nput s 0 0x12345678\nput s 1 0x9abcdef0\nput s 2 0x13579bdf\nput s 3 0x2468ace0\nfor i ulong 4 unroll\nqr s i and add i 1 3\nend\no = new uchar 16 0\nfor i ulong 4 unroll\nv = get s i\nput o mul i 4 uchar and v 0xff\nput o add mul i 4 1 uchar and shr v 8 0xff\nput o add mul i 4 2 uchar and shr v 16 0xff\nput o add mul i 4 3 uchar shr v 24\nend\nw = write 1 o 0 16\nret 0\nend\n"
+text gr_s_optbad_src "om2\nfn qr x edit uint 4 a ulong b ulong to void inline\nva = get x a\nvb = get x b\nva = add va vb\nvb = rotl xor vb va 8\nput x a va\nput x b vb\nend\nfn main to int\ns = new uint 4 0\nput s 0 0x12345678\nput s 1 0x9abcdef0\nput s 2 0x13579bdf\nput s 3 0x2468ace0\nfor i ulong 4 unroll\nqr s i and add i 1 3\nend\no = new uchar 16 0\nfor i ulong 4 unroll\nv = get s i\nput o mul i 4 uchar and v 0xff\nput o add mul i 4 1 uchar and shr v 8 0xff\nput o add mul i 4 2 uchar and shr v 16 0xff\nput o add mul i 4 3 uchar shr v 24\nend\nw = write 1 o 0 16\nret 0\nend\n"
 text gr_s_rc " rc="
 text gr_s_gp "GATE_RM3 PASS kernels="
 text gr_s_gf "GATE_RM3 FAIL kernels="
@@ -745,6 +758,216 @@ put gr_n 4 ulong l4
 ret true
 end
 
+fn gr_file_len suf view uchar * to ulong
+gr_ps_scr suf
+fd = gr_rdonly
+if lt fd 0
+ret 0
+end
+tot = ulong 0
+while true bound 262145
+k = read fd gr_buf 0 len gr_buf
+if le k 0
+break
+end
+tot = add tot ulong k
+end
+gr_fclo fd
+ret tot
+end
+
+fn gr_run_ref_hash bin_suf view uchar * to bool
+gr_aclr
+gr_apa_scr bin_suf
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_optout
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+if ne gr_spawn fi fo fe 0
+ret false
+end
+gr_ps_scr gr_s_f_optout
+fd = gr_rdonly
+if lt fd 0
+ret false
+end
+n = ulong 0
+while lt n len sh_dat bound 65537
+k = read fd sh_dat n sub len sh_dat n
+if le k 0
+break
+end
+n = add n ulong k
+end
+gr_fclo fd
+sh_all n
+for j ulong 32
+b = uint get sh_dig j
+put gr_want mul j 2 sh_hexd shr b 4
+put gr_want add mul j 2 1 sh_hexd and b 15
+end
+ret true
+end
+
+fn gr_compile_ng_scr src_suf view uchar * bin_suf view uchar * to bool
+gr_ps_scr src_suf
+if not gr_prepend_file gr_s_p_fir gr_s_f_in1
+ret false
+end
+if not gr_ng_step gr_s_f_in1 gr_s_f_ir
+ret false
+end
+gr_ps_scr gr_s_f_ir
+if not gr_prepend_file gr_s_p_opt gr_s_f_in2
+ret false
+end
+if not gr_ng_step gr_s_f_in2 gr_s_f_opt
+ret false
+end
+gr_ps_scr gr_s_f_opt
+if not gr_prepend_file gr_s_p_a64 gr_s_f_in3
+ret false
+end
+if not gr_ng_step gr_s_f_in3 bin_suf
+ret false
+end
+ret gr_chmod_scr bin_suf
+end
+
+fn gr_opt_reduces ir_sz ulong opt_sz ulong to bool
+if or eq ir_sz 0 eq opt_sz 0
+ret false
+end
+ret lt mul opt_sz 10 mul ir_sz 9
+end
+
+fn gr_run_opt_neg7 to void
+note neg07: mis-optimized rotl semantic mutant compiled by ng MUST fail closed in rm3_bench
+ig0 = gr_write_scr gr_s_f_optbad gr_s_optbad_src
+ig1 = gr_compile_ng_scr gr_s_f_optbad gr_s_b_optbad
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_run
+gr_apa_txt gr_s_1
+gr_apa_txt gr_s_2
+gr_ps_scr gr_s_sl
+gr_apa
+gr_apa_txt gr_s_opt_k
+gr_apa_want
+gr_apa_txt gr_s_arm_omc
+gr_apa_scr gr_s_b_optomc
+gr_apa_txt gr_s_arm_mut
+gr_apa_scr gr_s_b_optbad
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_out
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+rc2 = gr_spawn fi fo fe
+ig2 = gr_slurp_out
+if and eq rc2 1 gr_out_has gr_s_m_mis
+gr_w gr_s_nok
+gr_w gr_s_n7
+gr_w gr_s_rc
+gr_wn rc2
+gr_w gr_s_nl
+put gr_n 9 add get gr_n 9 1
+else
+gr_w gr_s_nfl
+gr_w gr_s_n7
+gr_w gr_s_rc
+gr_wn rc2
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+end
+end
+
+fn gr_run_opt_checks to void
+if not gr_write_scr gr_s_f_optom gr_s_opt_src
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_compile_omc false gr_s_f_optom gr_s_b_optomc
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_run_ref_hash gr_s_b_optomc
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_compile_ng_scr gr_s_f_optom gr_s_b_optng
+put gr_n 10 add get gr_n 10 1
+ret
+end
+ir_sz = gr_file_len gr_s_f_ir
+opt_sz = gr_file_len gr_s_f_opt
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_run
+gr_apa_txt gr_s_1
+gr_apa_txt gr_s_2
+gr_ps_scr gr_s_sl
+gr_apa
+gr_apa_txt gr_s_opt_k
+gr_apa_want
+gr_apa_txt gr_s_arm_omc
+gr_apa_scr gr_s_b_optomc
+gr_apa_txt gr_s_arm_ng
+gr_apa_scr gr_s_b_optng
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_out
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+rc = gr_spawn fi fo fe
+ig = gr_slurp_out
+ok = false
+if eq rc 0
+if gr_out_has gr_s_m_pass
+ok = gr_opt_reduces ir_sz opt_sz
+end
+end
+if ok
+gr_w gr_s_ok
+gr_w gr_s_opt_k
+gr_w gr_s_nl
+put gr_n 8 add get gr_n 8 1
+else
+gr_w gr_s_fl
+gr_w gr_s_opt_k
+gr_w gr_s_rc
+gr_wn rc
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+end
+note neg06: bypassing @ng opt (opt_sz == ir_sz) MUST fail the IR reduction check closed
+if not gr_opt_reduces ir_sz ir_sz
+gr_w gr_s_nok
+gr_w gr_s_n6
+gr_w gr_s_rc
+gr_wn 1
+gr_w gr_s_nl
+put gr_n 9 add get gr_n 9 1
+else
+gr_w gr_s_nfl
+gr_w gr_s_n6
+gr_w gr_s_rc
+gr_wn 0
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+end
+gr_run_opt_neg7
+end
+
 fn main to int
 if ne argcnt 6
 r = write 2 gr_s_usage 0 len gr_s_usage
@@ -757,6 +980,7 @@ end
 gr_test_kernel gr_s_fib
 gr_test_kernel gr_s_mm
 gr_run_neg_controls
+gr_run_opt_checks
 fails = get gr_n 10
 if eq fails 0
 gr_w gr_s_gp
