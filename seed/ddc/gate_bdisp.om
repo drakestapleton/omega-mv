@@ -1,0 +1,694 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/ddc/gate_bdisp.om: RM10 #669 Branch Displacement Extremes Gate in pure seeded OM-2.
+note Zero C, Python, or shell. Standalone OM-2 program:
+note   seed/out/omc < seed/ddc/gate_bdisp.om > gate_bdisp
+note Usage:
+note   gate_bdisp OMC SCRATCH [wrong]
+note
+note Generates, compiles, executes, and decodes AArch64 branch encodings across EVERY omc branch form:
+note   1. `if` B.cond (imm19): exact max +1,048,572 B (n=262142, taken & skipped) vs +1 insn (n=262143 -> error 24)
+note   2. `if` CBZ (bool var, imm19): exact max +1,048,572 B (n=262142, true & false) vs +1 insn (n=262143 -> error 24)
+note   3. `else` B (patch26 imm26): >1.2 MiB else body (n=300000, both if-taken jump & else-taken exec PASS)
+note   4. `while` (CBZ/B.cond + bound-trap B.HS imm19 + forward break B.AL imm19 + backward continue B.AL imm19 + latch B imm26):
+note      exact max n=262135 PASS, +1 insn n=262136 -> error 24, plus ~1 MiB break+continue multi-iteration PASS
+note   5. `for` (OM-2 lpback backward B.LO imm19 exact max n=262139 PASS vs n=262140 -> error 24; OM-1 n=262200 -> error 24)
+note   6. `fn` BL (imm26 forward & backward calls across >1.2 MiB spacer fns + trap `island` B patch26 inside >1.2 MiB fn)
+note   7. Independent AArch64 B.cond binary decoder check (verifies imm19 == 262143 in compiled ELF) + 2 negative controls
+note      (corrupted imm19 displacement caught fail-closed + wrong runtime exit caught) + `wrong` CLI control!
+
+global bd_omc uchar 2048
+global bd_ol ulong 1
+global bd_scr uchar 2048
+global bd_sl ulong 1
+global bd_pa uchar 4096
+global bd_pl ulong 1
+global bd_av uchar 8192
+global bd_an ulong 1
+global bd_st uchar 4
+global bd_dig uchar 24
+global bd_src uchar 12582912
+global bd_sn ulong 1
+global bd_bin uchar 4194304
+global bd_bn ulong 1
+global bd_err uchar 1024
+global bd_en ulong 1
+global bd_wrong ulong 1
+global bd_ok ulong 1
+global bd_ref ulong 1
+global bd_neg ulong 1
+
+text bd_s_src "/case.om"
+text bd_s_bin "/case.bin"
+text bd_s_err "/case.err"
+text bd_s_nul "/case.nul"
+text bd_s_c02 "/c02.bin"
+
+text bd_w_wrong "wrong"
+text bd_t_add "x = add x 1\n"
+text bd_t_err24 "error 24"
+text bd_t_usage "usage: gate_bdisp OMC SCRATCH [wrong]\n"
+text bd_t_fail "BDISP-GATE FAIL check="
+text bd_t_pass1 "BDISP-GATE PASS cases="
+text bd_t_pass2 " boundary_ok="
+text bd_t_pass3 " boundary_refused="
+text bd_t_pass4 " neg_controls="
+text bd_t_nl "\n"
+
+text bd_p_om2 "om2\n"
+text bd_p_main "fn main to int\n"
+text bd_p_x0 "x = ulong 0\n"
+text bd_p_x77 "x = ulong 77\n"
+text bd_p_x55 "x = ulong 55\n"
+text bd_p_x42 "x = ulong 42\n"
+text bd_p_ifeq0 "if eq x 0\n"
+text bd_p_ifeq42 "if eq x 42\n"
+text bd_p_flt "fl = true\nif fl\n"
+text bd_p_flf "fl = false\nif fl\n"
+text bd_p_else "else\n"
+text bd_p_wh1 "c = true\nwhile c bound 2\n"
+text bd_p_wh2 "c = false\nend\n"
+text bd_p_whbc1 "k = ulong 0\nwhile lt k 3 bound 4\nk = add k 1\nif eq k 3\nbreak\nend\n"
+text bd_p_whbc2 "if eq k 1\ncontinue\nend\nx = add x 7\nend\n"
+text bd_p_for2 "for i ulong 2\n"
+text bd_p_end "end\n"
+text bd_p_ret "ret int and x 255\nend\n"
+
+text bd_p_bl1 "fn f_pre to ulong\nret 17\nend\nfn f_pad1 v ulong to ulong\na = new ulong 4 3\nx = add v get a 1\n"
+text bd_p_bl2 "ret and x 255\nend\nfn main to int\np = f_pre\nm = f_pad1 0\nq = f_post\nret int and add add p m q 255\nend\nfn f_pad2 to ulong\nx = ulong 0\n"
+text bd_p_bl3 "ret x\nend\nfn f_post to ulong\nret 29\nend\n"
+
+fn bd_wrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn bd_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put bd_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 bd_dig p sub 24 p
+ret
+end
+end
+end
+
+fn bd_fail code ulong to int
+bd_wrt bd_t_fail
+bd_num code
+bd_wrt bd_t_nl
+ret int code
+end
+
+fn bd_spath suf view uchar * to void
+n = get bd_sl 0
+for i ulong n bound 2048
+put bd_pa i get bd_scr i
+end
+m = len suf
+for j ulong m bound 128
+put bd_pa add n j get suf j
+end
+put bd_pl 0 add n m
+end
+
+fn bd_sclr to void
+put bd_sn 0 0
+end
+
+fn bd_sapp s view uchar * to void
+p = get bd_sn 0
+m = len s
+for i ulong m bound 512
+put bd_src add p i get s i
+end
+put bd_sn 0 add p m
+end
+
+fn bd_sadds n ulong to void
+p = get bd_sn 0
+for i ulong n bound 400000
+for j ulong 12
+put bd_src add p j get bd_t_add j
+end
+p = add p 12
+end
+put bd_sn 0 p
+end
+
+fn bd_wsrc to bool
+bd_spath bd_s_src
+fd = fopen bd_pa 0 get bd_pl 0 577 420
+if lt fd 0
+ret false
+end
+n = get bd_sn 0
+o = ulong 0
+while lt o n bound 1024
+chunk = sub n o
+if gt chunk 65536
+chunk = ulong 65536
+end
+k = write int fd bd_src o chunk
+if le k 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k
+end
+r = fclose int fd
+ret true
+end
+
+note Compile SCRATCH/case.om -> SCRATCH/outSuf with OMC; returns omc exit code
+fn bd_compile outSuf view uchar * to ulong
+n = get bd_ol 0
+put bd_av 0 1
+put bd_av 1 0
+put bd_av 2 uchar and n 255
+put bd_av 3 uchar shr n 8
+for i ulong n bound 2048
+put bd_av add 4 i get bd_omc i
+end
+put bd_an 0 add 4 n
+bd_spath bd_s_src
+fi = fopen bd_pa 0 get bd_pl 0 0 0
+bd_spath outSuf
+fo = fopen bd_pa 0 get bd_pl 0 577 493
+bd_spath bd_s_err
+fe = fopen bd_pa 0 get bd_pl 0 577 420
+if or lt fi 0 or lt fo 0 lt fe 0
+ret 255
+end
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fe 2 0
+r = execprog bd_av 0 get bd_an 0
+exit 127
+end
+r = fclose int fi
+r = fclose int fo
+r = fclose int fe
+w = waitpid int pid bd_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get bd_st 0 0
+ret add 256 ulong get bd_st 0
+end
+ret ulong get bd_st 1
+end
+
+note Execute SCRATCH/binSuf directly; returns exit status
+fn bd_run binSuf view uchar * to ulong
+bd_spath binSuf
+n = get bd_pl 0
+put bd_av 0 1
+put bd_av 1 0
+put bd_av 2 uchar and n 255
+put bd_av 3 uchar shr n 8
+for i ulong n bound 4096
+put bd_av add 4 i get bd_pa i
+end
+put bd_an 0 add 4 n
+bd_spath bd_s_nul
+fi = fopen bd_pa 0 get bd_pl 0 0 0
+bd_spath bd_s_err
+fo = fopen bd_pa 0 get bd_pl 0 577 420
+if or lt fi 0 lt fo 0
+ret 255
+end
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fo 2 0
+r = execprog bd_av 0 get bd_an 0
+exit 127
+end
+r = fclose int fi
+r = fclose int fo
+w = waitpid int pid bd_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get bd_st 0 0
+ret add 256 ulong get bd_st 0
+end
+ret ulong get bd_st 1
+end
+
+fn bd_err_has_24 to bool
+bd_spath bd_s_err
+fd = fopen bd_pa 0 get bd_pl 0 0 0
+if lt fd 0
+ret false
+end
+k = read int fd bd_err 0 1024
+r = fclose int fd
+if lt k 8
+ret false
+end
+n = ulong k
+for i ulong sub n 7 bound 1024
+ok = true
+for j ulong 8
+if ne get bd_err add i j get bd_t_err24 j
+ok = false
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn bd_rbin binSuf view uchar * to ulong
+bd_spath binSuf
+fd = fopen bd_pa 0 get bd_pl 0 0 0
+if lt fd 0
+ret 0
+end
+n = ulong 0
+while lt n len bd_bin bound 1024
+chunk = sub len bd_bin n
+if gt chunk 65536
+chunk = ulong 65536
+end
+k = read int fd bd_bin n chunk
+if le k 0
+break
+end
+n = add n ulong k
+end
+r = fclose int fd
+put bd_bn 0 n
+ret n
+end
+
+fn bd_rd32 off ulong to ulong
+b0 = ulong get bd_bin off
+b1 = shl ulong get bd_bin add off 1 8
+b2 = shl ulong get bd_bin add off 2 16
+b3 = shl ulong get bd_bin add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn bd_wr32 off ulong w ulong to void
+put bd_bin off uchar and w 255
+put bd_bin add off 1 uchar and shr w 8 255
+put bd_bin add off 2 uchar and shr w 16 255
+put bd_bin add off 3 uchar and shr w 24 255
+end
+
+note Independent AArch64 B.cond imm19 bounds verifier over ELF code [176, bn).
+note Returns offset of first B.cond with imm19 == 262143, or 0 if any B.cond target is out of bounds!
+fn bd_audit_bcond to ulong
+n = get bd_bn 0
+if lt n 200
+ret 0
+end
+maxAt = ulong 0
+o = ulong 176
+while le add o 4 n bound 1048576
+w = bd_rd32 o
+if eq and w 4278190096 1409286144
+imm = and shr w 5 524287
+if lt imm 262144
+tgt = add o mul imm 4
+if ge tgt n
+ret 0
+end
+if eq imm 262143
+if eq maxAt 0
+maxAt = o
+end
+end
+else
+bk = mul sub 524288 imm 4
+if gt bk sub o 176
+ret 0
+end
+end
+end
+o = add o 4
+end
+ret maxAt
+end
+
+fn bd_expect_ok binSuf view uchar * wantExit ulong failId ulong to int
+if not bd_wsrc
+ret bd_fail failId
+end
+if ne bd_compile binSuf 0
+ret bd_fail failId
+end
+if ne bd_run binSuf wantExit
+ret bd_fail add failId 100
+end
+put bd_ok 0 add get bd_ok 0 1
+ret 0
+end
+
+fn bd_expect_ref24 failId ulong to int
+if not bd_wsrc
+ret bd_fail failId
+end
+ec = bd_compile bd_s_bin
+want = ulong 24
+if and ne get bd_wrong 0 0 eq failId 3
+want = ulong 0
+end
+if ne ec want
+ret bd_fail failId
+end
+if eq want 24
+if not bd_err_has_24
+ret bd_fail add failId 100
+end
+end
+put bd_ref 0 add get bd_ref 0 1
+ret 0
+end
+
+note ---- Case Group 1: `if` B.cond & `if` CBZ exact imm19 boundaries + `else` imm26 >1.2 MiB ----
+
+fn bd_run_if_else to int
+note c01: if B.cond exact max (n=262142, +1048572 B) taken -> 254
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_ifeq0
+bd_sadds 262142
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 254 1
+if ne r 0
+ret r
+end
+
+note c02: if B.cond exact max (n=262142, +1048572 B) skipped -> 77 (saved to /c02.bin for decoder audit!)
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x77
+bd_sapp bd_p_ifeq0
+bd_sadds 262142
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_c02 77 2
+if ne r 0
+ret r
+end
+
+note c03: if B.cond +1 insn over imm19 (n=262143, +1048576 B) -> refused error 24!
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_ifeq0
+bd_sadds 262143
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ref24 3
+if ne r 0
+ret r
+end
+
+note c04: if CBZ (bool var) exact max (n=262142) true -> 254
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_flt
+bd_sadds 262142
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 254 4
+if ne r 0
+ret r
+end
+
+note c05: if CBZ (bool var) exact max (n=262142) false -> 55
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x55
+bd_sapp bd_p_flf
+bd_sadds 262142
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 55 5
+if ne r 0
+ret r
+end
+
+note c06: if CBZ +1 insn over imm19 (n=262143) -> refused error 24!
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_flt
+bd_sadds 262143
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ref24 6
+if ne r 0
+ret r
+end
+
+note c07: else B (imm26 patch26) >1.2 MiB body (n=300000), if-taken jumps over 1.2 MiB -> 43
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x42
+bd_sapp bd_p_ifeq42
+bd_sapp bd_t_add
+bd_sapp bd_p_else
+bd_sadds 300000
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 43 7
+if ne r 0
+ret r
+end
+
+note c08: else B (imm26 patch26) >1.2 MiB body (n=300000), else-taken executes 300000 ops -> 224
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_ifeq42
+bd_sapp bd_t_add
+bd_sapp bd_p_else
+bd_sadds 300000
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 224 8
+if ne r 0
+ret r
+end
+ret 0
+end
+
+note ---- Case Group 2: `while` (head/bound/break/continue/latch), `for` (OM-2 & OM-1), `BL` + `island` ----
+
+fn bd_run_loops_and_bl to int
+note c09: while exact max (n=262135) -> 247
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_wh1
+bd_sadds 262135
+bd_sapp bd_p_wh2
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 247 9
+if ne r 0
+ret r
+end
+
+note c10: while +1 insn over bound-trap imm19 (n=262136) -> refused error 24!
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_wh1
+bd_sadds 262136
+bd_sapp bd_p_wh2
+bd_sapp bd_p_ret
+r = bd_expect_ref24 10
+if ne r 0
+ret r
+end
+
+note c11: while ~1 MiB body (n=250000) exercising backward continue (imm19), forward break (imm19), latch B (imm26) -> 39
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_whbc1
+bd_sadds 250000
+bd_sapp bd_p_whbc2
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 39 11
+if ne r 0
+ret r
+end
+
+note c12: OM-2 for lpback backward B.LO imm19 exact max (n=262139, 2 iters) -> 246
+bd_sclr
+bd_sapp bd_p_om2
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_for2
+bd_sadds 262139
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ok bd_s_bin 246 12
+if ne r 0
+ret r
+end
+
+note c13: OM-2 for +1 insn over imm19 (n=262140) -> refused error 24!
+bd_sclr
+bd_sapp bd_p_om2
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_for2
+bd_sadds 262140
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ref24 13
+if ne r 0
+ret r
+end
+
+note c14: OM-1 for over imm19 (n=262200) -> refused error 24!
+bd_sclr
+bd_sapp bd_p_main
+bd_sapp bd_p_x0
+bd_sapp bd_p_for2
+bd_sadds 262200
+bd_sapp bd_p_end
+bd_sapp bd_p_ret
+r = bd_expect_ref24 14
+if ne r 0
+ret r
+end
+
+note c15: fn BL (imm26 backward & forward across >1.2 MiB spacers) + trap `island` B patch26 inside >1.2 MiB fn -> 17
+bd_sclr
+bd_sapp bd_p_bl1
+bd_sadds 300000
+bd_sapp bd_p_bl2
+bd_sadds 300000
+bd_sapp bd_p_bl3
+r = bd_expect_ok bd_s_bin 17 15
+if ne r 0
+ret r
+end
+ret 0
+end
+
+note ---- Independent AArch64 imm19 Binary Audit + Negative Controls ----
+
+fn bd_run_negatives to int
+n = bd_rbin bd_s_c02
+if lt n 1048576
+ret bd_fail 20
+end
+maxAt = bd_audit_bcond
+if eq maxAt 0
+ret bd_fail 21
+end
+note NC1: Corrupt max B.cond word's imm19 to 0x40000 (-1,048,576 B underflow before ELF code start!) -> audit MUST reject!
+origW = bd_rd32 maxAt
+badW = or and origW 4278190111 shl ulong 262144 5
+bd_wr32 maxAt badW
+if ne bd_audit_bcond 0
+ret bd_fail 22
+end
+bd_wr32 maxAt origW
+if eq bd_audit_bcond 0
+ret bd_fail 23
+end
+put bd_neg 0 add get bd_neg 0 1
+
+note NC2: Runtime exit mismatch control — c02.bin exits 77; checking against wrong exit 78 MUST detect mismatch!
+got = bd_run bd_s_c02
+if or ne got 77 eq got 78
+ret bd_fail 24
+end
+put bd_neg 0 add get bd_neg 0 1
+ret 0
+end
+
+fn bd_check_wrong to void
+if lt argcnt 4
+ret
+end
+k = argread 3 bd_pa 0 64
+if ne k long len bd_w_wrong
+ret
+end
+for i ulong len bd_w_wrong
+if ne get bd_pa i get bd_w_wrong i
+ret
+end
+end
+put bd_wrong 0 1
+end
+
+fn main to int
+if or lt argcnt 3 gt argcnt 4
+bd_wrt bd_t_usage
+ret 2
+end
+ol = argread 1 bd_omc 0 2047
+sl = argread 2 bd_scr 0 2047
+if or lt ol 1 lt sl 1
+bd_wrt bd_t_usage
+ret 2
+end
+put bd_ol 0 ulong ol
+put bd_sl 0 ulong sl
+put bd_wrong 0 0
+put bd_ok 0 0
+put bd_ref 0 0
+put bd_neg 0 0
+bd_check_wrong
+r = makedir bd_scr 0 ulong sl 493
+bd_spath bd_s_nul
+fnul = fopen bd_pa 0 get bd_pl 0 577 420
+if lt fnul 0
+ret bd_fail 99
+end
+r = fclose int fnul
+
+rc = bd_run_if_else
+if ne rc 0
+ret rc
+end
+rc = bd_run_loops_and_bl
+if ne rc 0
+ret rc
+end
+rc = bd_run_negatives
+if ne rc 0
+ret rc
+end
+
+bd_wrt bd_t_pass1
+bd_num add get bd_ok 0 get bd_ref 0
+bd_wrt bd_t_pass2
+bd_num get bd_ok 0
+bd_wrt bd_t_pass3
+bd_num get bd_ref 0
+bd_wrt bd_t_pass4
+bd_num get bd_neg 0
+bd_wrt bd_t_nl
+ret 0
+end
