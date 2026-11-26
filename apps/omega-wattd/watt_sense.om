@@ -1,0 +1,654 @@
+note apps/omega-wattd/watt_sense.om
+note Pure seeded OM-2 live DGX Spark GB10 thermal, cpufreq, and ACPI CPPC sensor reader.
+note Strictly READ-ONLY: zero nvidia.ko, zero /dev/nvidia*, zero writes to sysfs/UEFI/SPI/PCIe.
+note Compose with si/directives/om2.om first, then watt_sense.om, watt_cbf.om, and wattd_main.om or gate_wattd.om.
+
+note Shared structs MUST precede the first fn in concatenated OM-2 units.
+struct WattThermal t_die long t_sink long t_amb long end
+struct WattPolicy p_budget long p_gpu_budget long t_ceil long tau long end
+struct WattProp p_gpu long p_cpu long p_unc long fan_pct long end
+struct WattCmd p_gpu long p_cpu long p_unc long fan_pct long fail_closed long clamped long end
+struct WattPlan p_gpu_req long p_cpu_req long p_unc_req long fan_req long precool_active long precool_fan long trough_mw long bpj long end
+
+note Output and sysfs scratch globals (never passed as arguments)
+global g_wout uchar 16384
+global g_wout_pos ulong 1
+global g_wpath uchar 256
+global g_wread uchar 256
+
+note Live sensor arrays (DGX Spark: 7 ACPI thermal zones, 20 Grace CPUs)
+global g_tz_mc long 7
+global g_tz_crit long 7
+global g_tz_ok long 7
+global g_cpu_khz long 20
+global g_cpu_ok long 20
+global g_cppc_ref ulong 20
+global g_cppc_del ulong 20
+global g_cppc_ok long 20
+
+note Summary metadata slots:
+note 0=zones_ok 1=cpus_ok 2=cppc_ok 3=a725_avg_khz 4=x925_avg_khz
+note 5=t_gpu_mc 6=t_soc_mc 7=t_unc_mc 8=t_die_max_mc 9=ts_mono_ns
+note 10=a725_del_ratio_pm 11=x925_del_ratio_pm 12=hw_writes
+global g_wmeta long 16
+
+note Sysfs path fragments (strictly read-only thermal + cpufreq + acpi_cppc)
+text ws_p_tz_pre "/sys/class/thermal/thermal_zone"
+text ws_p_tz_temp "/temp"
+text ws_p_tz_crit "/trip_point_0_temp"
+text ws_p_cpu_pre "/sys/devices/system/cpu/cpu"
+text ws_p_cpu_freq "/cpufreq/scaling_cur_freq"
+text ws_p_cpu_cppc "/acpi_cppc/feedback_ctrs"
+
+note Sensor formatting labels
+text ws_lbl_hdr "OMEGA-WATTD SENSE driver=ZERO_NVIDIA actuator_mode=DRY_RUN_READONLY hw_writes=0\n"
+text ws_lbl_z0 "zone0[TSOC]"
+text ws_lbl_z1 "zone1[TS0E]"
+text ws_lbl_z2 "zone2[TS0P]"
+text ws_lbl_z3 "zone3[TS1E]"
+text ws_lbl_z4 "zone4[TS1P]"
+text ws_lbl_z5 "zone5[TGPU]"
+text ws_lbl_z6 "zone6[TUNC]"
+text ws_lbl_eq "="
+text ws_lbl_c "C"
+text ws_lbl_crit " crit="
+text ws_lbl_na "N/A"
+text ws_lbl_sp " "
+text ws_lbl_nl "\n"
+text ws_lbl_dot "."
+text ws_lbl_minus "-"
+text ws_lbl_summary1 "SUMMARY zones_ok="
+text ws_lbl_summary2 "/7 cpus_ok="
+text ws_lbl_summary3 "/20 cppc_ok="
+text ws_lbl_summary4 "/20 tgpu_mc="
+text ws_lbl_summary5 " tsoc_mc="
+text ws_lbl_summary6 " tunc_mc="
+text ws_lbl_summary7 " tmax_mc="
+text ws_lbl_grace1 "GRACE a725_avg_khz="
+text ws_lbl_grace2 " x925_avg_khz="
+text ws_lbl_grace3 " a725_cppc_pm="
+text ws_lbl_grace4 " x925_cppc_pm="
+text ws_lbl_grace5 " mono_ns="
+text ws_lbl_ref "ref:"
+text ws_lbl_del "del:"
+
+note Buffered output helpers (fd 1 = stdout, fd 2 = stderr)
+fn wd_flush_fd fd int to void
+used = get g_wout_pos 0
+if eq used 0
+ret
+end
+off = ulong 0
+while lt off used bound 16384
+k = write fd g_wout off sub used off
+if le k 0
+break
+end
+off = add off ulong k
+end
+put g_wout_pos 0 0
+end
+
+fn wd_flush to void
+wd_flush_fd 1
+end
+
+fn wd_putb b uchar to void
+used = get g_wout_pos 0
+if ge used 16384
+wd_flush_fd 1
+used = get g_wout_pos 0
+end
+put g_wout used b
+put g_wout_pos 0 add used 1
+end
+
+fn wd_puts s view uchar * to void
+n = len s
+if gt n 16384
+n = ulong 16384
+end
+for i ulong n bound 16384
+wd_putb get s i
+end
+end
+
+fn wd_put_u64 v ulong to void
+if ge v 10
+wd_put_u64 div v 10
+end
+d = rem v 10
+wd_putb uchar add 48 d
+end
+
+fn wd_put_i64 v long to void
+if lt v 0
+wd_putb 45
+note Avoid signed overflow on INT64_MIN by splitting last digit
+q = div v -10
+r = rem v 10
+if lt r 0
+r = neg r
+end
+if gt q 0
+wd_put_u64 ulong q
+end
+wd_putb uchar add 48 ulong r
+ret
+end
+wd_put_u64 ulong v
+end
+
+fn wd_put_fixed3 v long to void
+note Format milli-units (mC or mW) as signed D.DDD
+av = v
+if lt av 0
+wd_putb 45
+av = neg av
+end
+whole = div av 1000
+frac = rem av 1000
+wd_put_u64 ulong whole
+wd_putb 46
+d1 = div frac 100
+d2 = rem div frac 10 10
+d3 = rem frac 10
+wd_putb uchar add 48 ulong d1
+wd_putb uchar add 48 ulong d2
+wd_putb uchar add 48 ulong d3
+end
+
+fn wd_eq_view a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na 4096
+ret false
+end
+for i ulong na bound 4096
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn wd_is_ws c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+if eq c 10
+ret true
+end
+if eq c 13
+ret true
+end
+ret false
+end
+
+note Parse signed decimal integer from byte slice; returns ok via g_wmeta[15] (1=ok, 0=err)
+fn wd_parse_i64 s view uchar * to long
+n = len s
+if or eq n 0 gt n 64
+put g_wmeta 15 0
+ret 0
+end
+i = ulong 0
+while lt i n bound 64
+c = get s i
+if or eq c 32 eq c 9
+i = add i 1
+else
+break
+end
+end
+if ge i n
+put g_wmeta 15 0
+ret 0
+end
+is_neg = false
+if eq get s i 45
+is_neg = true
+i = add i 1
+else
+if eq get s i 43
+i = add i 1
+end
+end
+if ge i n
+put g_wmeta 15 0
+ret 0
+end
+acc = ulong 0
+digits = ulong 0
+while lt i n bound 64
+c = get s i
+if and ge c 48 le c 57
+if gt acc 900000000000000000
+put g_wmeta 15 0
+ret 0
+end
+acc = add mul acc 10 ulong sub c 48
+digits = add digits 1
+i = add i 1
+else
+if wd_is_ws c
+break
+end
+put g_wmeta 15 0
+ret 0
+end
+end
+while lt i n bound 64
+if not wd_is_ws get s i
+put g_wmeta 15 0
+ret 0
+end
+i = add i 1
+end
+if eq digits 0
+put g_wmeta 15 0
+ret 0
+end
+put g_wmeta 15 1
+if is_neg
+ret neg long acc
+end
+ret long acc
+end
+
+note Path builder helpers into g_wpath
+fn ws_path_append pos ulong s view uchar * to ulong
+n = len s
+w = pos
+if gt add w n 250
+ret w
+end
+for i ulong n bound 256
+put g_wpath w get s i
+w = add w 1
+end
+ret w
+end
+
+fn ws_path_append_u64 pos ulong v ulong to ulong
+w = pos
+if ge v 10
+w = ws_path_append_u64 w div v 10
+end
+if lt w 250
+put g_wpath w uchar add 48 rem v 10
+w = add w 1
+end
+ret w
+end
+
+note Strictly read-only sysfs file read into g_wread; returns byte count or -1
+fn ws_read_gpath plen ulong to long
+if or eq plen 0 gt plen 250
+ret -1
+end
+fdl = fopen g_wpath 0 plen 0 0
+if lt fdl 0
+ret -1
+end
+fd = int fdl
+got = ulong 0
+while lt got 250 bound 16
+k = read fd g_wread got sub 250 got
+if lt k 0
+cl1 = fclose fd
+ret -1
+end
+if eq k 0
+break
+end
+got = add got ulong k
+end
+cl2 = fclose fd
+ret long got
+end
+
+note Parse signed long from g_wread[0..n); sets g_wmeta[15] = 1 on success
+fn ws_parse_gread_i64 n ulong to long
+tmp = new uchar 64 0
+m = n
+if gt m 64
+m = ulong 64
+end
+for i ulong m bound 64
+put tmp i get g_wread i
+end
+ret wd_parse_i64 part tmp 0 m
+end
+
+note Parse unsigned ulong from g_wread starting at off until non-digit; returns end pos in g_wmeta[14]
+fn ws_parse_gread_u64_at off ulong n ulong to ulong
+i = off
+acc = ulong 0
+digits = ulong 0
+while lt i n bound 256
+c = get g_wread i
+if and ge c 48 le c 57
+acc = add mul acc 10 ulong sub c 48
+digits = add digits 1
+i = add i 1
+else
+break
+end
+end
+put g_wmeta 14 long i
+if eq digits 0
+put g_wmeta 15 0
+ret 0
+end
+put g_wmeta 15 1
+ret acc
+end
+
+note Find 4-byte literal prefix (like "ref:" or "del:") in g_wread[0..n); returns index after prefix or n
+fn ws_find_tag4 n ulong tag view uchar * to ulong
+if or lt n 4 ne len tag 4
+ret n
+end
+lim = sub n 3
+for i ulong lim bound 256
+if eq get g_wread i get tag 0
+if eq get g_wread add i 1 get tag 1
+if eq get g_wread add i 2 get tag 2
+if eq get g_wread add i 3 get tag 3
+ret add i 4
+end
+end
+end
+end
+end
+ret n
+end
+
+fn ws_read_one_zone z ulong to void
+put g_tz_ok z 0
+put g_tz_mc z 0
+put g_tz_crit z 104800
+p = ws_path_append 0 ws_p_tz_pre
+p = ws_path_append_u64 p z
+p = ws_path_append p ws_p_tz_temp
+nr = ws_read_gpath p
+if gt nr 0
+val = ws_parse_gread_i64 ulong nr
+if eq get g_wmeta 15 1
+put g_tz_mc z val
+put g_tz_ok z 1
+end
+end
+p2 = ws_path_append 0 ws_p_tz_pre
+p2 = ws_path_append_u64 p2 z
+p2 = ws_path_append p2 ws_p_tz_crit
+nr2 = ws_read_gpath p2
+if gt nr2 0
+cv = ws_parse_gread_i64 ulong nr2
+if eq get g_wmeta 15 1
+put g_tz_crit z cv
+end
+end
+end
+
+fn ws_read_one_cpu c ulong to void
+put g_cpu_ok c 0
+put g_cpu_khz c 0
+p = ws_path_append 0 ws_p_cpu_pre
+p = ws_path_append_u64 p c
+p = ws_path_append p ws_p_cpu_freq
+nr = ws_read_gpath p
+if gt nr 0
+val = ws_parse_gread_i64 ulong nr
+if eq get g_wmeta 15 1
+put g_cpu_khz c val
+put g_cpu_ok c 1
+end
+end
+put g_cppc_ok c 0
+put g_cppc_ref c 0
+put g_cppc_del c 0
+p2 = ws_path_append 0 ws_p_cpu_pre
+p2 = ws_path_append_u64 p2 c
+p2 = ws_path_append p2 ws_p_cpu_cppc
+nr2 = ws_read_gpath p2
+if gt nr2 0
+un = ulong nr2
+ir = ws_find_tag4 un ws_lbl_ref
+id = ws_find_tag4 un ws_lbl_del
+if and lt ir un lt id un
+rv = ws_parse_gread_u64_at ir un
+ok1 = get g_wmeta 15
+dv = ws_parse_gread_u64_at id un
+ok2 = get g_wmeta 15
+if and eq ok1 1 eq ok2 1
+put g_cppc_ref c rv
+put g_cppc_del c dv
+put g_cppc_ok c 1
+end
+end
+end
+end
+
+note Check whether Grace CPU index is A725 E-core (0..4, 10..14) vs X925 P-core (5..9, 15..19)
+fn ws_is_a725 c ulong to bool
+if lt c 5
+ret true
+end
+if and ge c 10 lt c 15
+ret true
+end
+ret false
+end
+
+fn ws_sense_zones to void
+zok = long 0
+tmax = long 0
+for z ulong 7
+ws_read_one_zone z
+if eq get g_tz_ok z 1
+zok = add zok 1
+tv = get g_tz_mc z
+if gt tv tmax
+tmax = tv
+end
+end
+end
+put g_wmeta 0 zok
+put g_wmeta 5 get g_tz_mc 5
+put g_wmeta 6 get g_tz_mc 0
+put g_wmeta 7 get g_tz_mc 6
+put g_wmeta 8 tmax
+end
+
+fn ws_sense_cpus to void
+cok = long 0
+cpok = long 0
+a_sum = long 0
+a_cnt = long 0
+x_sum = long 0
+x_cnt = long 0
+for c ulong 20
+ws_read_one_cpu c
+if eq get g_cpu_ok c 1
+cok = add cok 1
+fv = get g_cpu_khz c
+if ws_is_a725 c
+a_sum = add a_sum fv
+a_cnt = add a_cnt 1
+else
+x_sum = add x_sum fv
+x_cnt = add x_cnt 1
+end
+end
+if eq get g_cppc_ok c 1
+cpok = add cpok 1
+end
+end
+put g_wmeta 1 cok
+put g_wmeta 2 cpok
+if gt a_cnt 0
+put g_wmeta 3 div a_sum a_cnt
+else
+put g_wmeta 3 0
+end
+if gt x_cnt 0
+put g_wmeta 4 div x_sum x_cnt
+else
+put g_wmeta 4 0
+end
+end
+
+fn ws_sense_all to void
+put g_wmeta 12 0
+put g_wmeta 9 monons
+ws_sense_zones
+ws_sense_cpus
+ws_compute_cppc_ratios
+end
+
+fn ws_compute_cppc_ratios to void
+a_pm = long 0
+a_n = long 0
+x_pm = long 0
+x_n = long 0
+for c ulong 20
+if eq get g_cppc_ok c 1
+rv = get g_cppc_ref c
+dv = get g_cppc_del c
+if gt rv 0
+note Scale safely before multiplying by 1000 to prevent ulong wrap even after decades of uptime
+rs = shr rv 10
+ds = shr dv 10
+if or gt rs 10000000000000 gt ds 10000000000000
+rs = shr rv 20
+ds = shr dv 20
+end
+if gt rs 0
+pm = long div mul ds 1000 rs
+if ws_is_a725 c
+a_pm = add a_pm pm
+a_n = add a_n 1
+else
+x_pm = add x_pm pm
+x_n = add x_n 1
+end
+end
+end
+end
+end
+if gt a_n 0
+put g_wmeta 10 div a_pm a_n
+else
+put g_wmeta 10 0
+end
+if gt x_n 0
+put g_wmeta 11 div x_pm x_n
+else
+put g_wmeta 11 0
+end
+end
+
+note Derive conservative 2-node thermal state from live sensors (or safe fallback if offline)
+fn ws_fill_thermal_state st edit WattThermal to void
+tgpu = get g_wmeta 5
+tunc = get g_wmeta 7
+zok = get g_wmeta 0
+if lt zok 6
+put st t_die 45000
+put st t_sink 40000
+put st t_amb 25000
+ret
+end
+note Node 1 = live Blackwell TGPU (zone5); Node 2 = conservative vapor-chamber proxy from TUNC/TGPU
+tsink = sub tunc 4000
+if gt tsink tgpu
+tsink = sub tgpu 2000
+end
+if lt tsink 25000
+tsink = long 25000
+end
+put st t_die tgpu
+put st t_sink tsink
+put st t_amb 25000
+end
+
+fn ws_print_zone_lbl z ulong to void
+if eq z 0
+wd_puts ws_lbl_z0
+ret
+end
+if eq z 1
+wd_puts ws_lbl_z1
+ret
+end
+if eq z 2
+wd_puts ws_lbl_z2
+ret
+end
+if eq z 3
+wd_puts ws_lbl_z3
+ret
+end
+if eq z 4
+wd_puts ws_lbl_z4
+ret
+end
+if eq z 5
+wd_puts ws_lbl_z5
+ret
+end
+wd_puts ws_lbl_z6
+end
+
+fn ws_print_sense to void
+wd_puts ws_lbl_hdr
+for z ulong 7
+ws_print_zone_lbl z
+wd_puts ws_lbl_eq
+if eq get g_tz_ok z 1
+wd_put_fixed3 get g_tz_mc z
+wd_puts ws_lbl_c
+wd_puts ws_lbl_crit
+wd_put_fixed3 get g_tz_crit z
+wd_puts ws_lbl_c
+else
+wd_puts ws_lbl_na
+end
+wd_puts ws_lbl_nl
+end
+wd_puts ws_lbl_summary1
+wd_put_i64 get g_wmeta 0
+wd_puts ws_lbl_summary2
+wd_put_i64 get g_wmeta 1
+wd_puts ws_lbl_summary3
+wd_put_i64 get g_wmeta 2
+wd_puts ws_lbl_summary4
+wd_put_i64 get g_wmeta 5
+wd_puts ws_lbl_summary5
+wd_put_i64 get g_wmeta 6
+wd_puts ws_lbl_summary6
+wd_put_i64 get g_wmeta 7
+wd_puts ws_lbl_summary7
+wd_put_i64 get g_wmeta 8
+wd_puts ws_lbl_nl
+wd_puts ws_lbl_grace1
+wd_put_i64 get g_wmeta 3
+wd_puts ws_lbl_grace2
+wd_put_i64 get g_wmeta 4
+wd_puts ws_lbl_grace3
+wd_put_i64 get g_wmeta 10
+wd_puts ws_lbl_grace4
+wd_put_i64 get g_wmeta 11
+wd_puts ws_lbl_grace5
+wd_put_i64 get g_wmeta 9
+wd_puts ws_lbl_nl
+wd_flush
+end
