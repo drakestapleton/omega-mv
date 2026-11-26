@@ -8,6 +8,8 @@ om2
 
 text bwe_pass "test_omega_blackwell_engine: PASS\n"
 text bwe_fail "test_omega_blackwell_engine: FAIL\n"
+text bwe_hay_clean "00400000-00410000 r-xp /bin/omega\n"
+text bwe_hay_dirty "7f000000-7f010000 r-xp /usr/lib/libcuda.so.1\n"
 
 global g_bwe_chk ulong 1
 global g_bwe_fail ulong 1
@@ -17,6 +19,15 @@ fn bwe_chk cond bool to void
   if not cond
     put g_bwe_fail 0 add get g_bwe_fail 0 1
   end
+end
+
+fn bwe_pb_u32 idx ulong to uint
+  off = mul idx 4
+  b0 = uint get obwe_pb_bytes off
+  b1 = shl uint get obwe_pb_bytes add off 1 8
+  b2 = shl uint get obwe_pb_bytes add off 2 16
+  b3 = shl uint get obwe_pb_bytes add off 3 24
+  ret or or b0 b1 or b2 b3
 end
 
 fn test_round_and_cbank to void
@@ -29,25 +40,31 @@ fn test_round_and_cbank to void
   cb = new uint 224 0
   va = ulong 0x0000123456789000
   obwe_fill_cbank cb va
-  note Verify cbank populated non-zero control words
-  nz = ulong 0
-  for i ulong 224
-    if ne get cb i 0
-      nz = add nz 1
-    end
-  end
-  bwe_chk gt nz 0
+  bwe_chk eq get cb 0 641859584
+  bwe_chk eq get cb 68 uint shr va 32
+  bwe_chk eq get cb 69 uint and va 0xffffffff
+  bwe_chk eq get cb 210 uint shr add va 896 32
+  bwe_chk eq get cb 211 uint and add va 896 0xffffffff
+  bwe_chk eq get cb 212 uint shr add va 924 32
+  bwe_chk eq get cb 213 uint and add va 924 0xffffffff
+  bwe_chk eq get cb 216 64
+  bwe_chk eq get cb 223 16776640
 end
 
 fn test_pushbuffer_packets to void
   put obwe_pb_len 0 0
+  put obwe_pb_overflow 0 0
   obwe_emit_setup
   n1 = get obwe_pb_len 0
-  bwe_chk gt n1 0
+  bwe_chk eq n1 18
+  bwe_chk eq bwe_pb_u32 0 0x20012061
+  bwe_chk eq bwe_pb_u32 1 0x0000cec0
 
   obwe_emit_dma ulong 0x0000000100000000 16
   n2 = get obwe_pb_len 0
-  bwe_chk gt n2 n1
+  bwe_chk eq sub n2 n1 9
+  bwe_chk eq bwe_pb_u32 add n1 4 64
+  bwe_chk eq bwe_pb_u32 add n1 8 0x6010206d
 
   q = new uint 96 0
   for i ulong 96
@@ -55,15 +72,30 @@ fn test_pushbuffer_packets to void
   end
   obwe_emit_inline ulong 0x0000000200000000 q
   n3 = get obwe_pb_len 0
-  bwe_chk ge sub n3 n2 96
+  bwe_chk eq sub n3 n2 99
+  bwe_chk eq bwe_pb_u32 add n2 3 0x1000
+  bwe_chk eq bwe_pb_u32 add n2 98 0x105f
 
   obwe_emit_rel ulong 0x0000000300000000 uint 0x44444444
   n4 = get obwe_pb_len 0
-  bwe_chk gt n4 n3
+  bwe_chk eq sub n4 n3 6
+  bwe_chk eq bwe_pb_u32 add n3 3 0x44444444
+  bwe_chk eq bwe_pb_u32 add n3 5 0x00100001
 
   obwe_emit_l2_flush
   n5 = get obwe_pb_len 0
-  bwe_chk gt n5 n4
+  bwe_chk eq sub n5 n4 5
+  bwe_chk eq bwe_pb_u32 n4 0x2004000a
+  bwe_chk eq bwe_pb_u32 add n4 4 0x80000000
+  bwe_chk eq get obwe_pb_overflow 0 0
+
+  note Overflow guard at 1024 words
+  put obwe_pb_len 0 1024
+  obwe_pb_put 0xdeadbeef
+  bwe_chk eq get obwe_pb_overflow 0 1
+  bwe_chk eq get obwe_pb_len 0 1024
+  put obwe_pb_len 0 0
+  put obwe_pb_overflow 0 0
 end
 
 fn test_backend_and_zero_cuda to void
@@ -74,16 +106,88 @@ fn test_backend_and_zero_cuda to void
   obwe_run_info info
   bwe_chk eq get info 0 0
 
-  note Zero-CUDA static ELF & runtime invariants
+  note Busy lock refuses open & shutdown
+  put obwe_busy 0 1
+  bwe_chk eq obwe_be_open 1
+  bwe_chk eq obwe_shutdown 1
+  put obwe_busy 0 0
+  bwe_chk eq obwe_shutdown 0
+
+  note Zero-CUDA static ELF & runtime invariants + needle scanner control
   bwe_chk eq obws_verify_zero_libcuda_linkage 0
   bwe_chk eq obws_verify_zero_cuda_symbols 0
   bwe_chk eq obws_verify_zero_libcuda_runtime 0
+  bwe_chk not obws_contains_needle bwe_hay_clean len bwe_hay_clean obws_needle_cuda
+  bwe_chk obws_contains_needle bwe_hay_dirty len bwe_hay_dirty obws_needle_cuda
+end
+
+fn test_submit_wrapper_helpers to void
+  note Stage vecadd program
+  clen = obws_stage_vecadd
+  bwe_chk eq clen 512
+
+  note Stage A/B with exact bit-complement poison (including 0xdeadbeef & wrap)
+  a = new uint 1024 0
+  b = new uint 1024 0
+  dst = new uint 1024 0
+  put a 0 0xdead0000
+  put b 0 0x0000beef
+  put a 1 0xffffffff
+  put b 1 1
+  put a 2 17
+  put b 2 25
+  obws_stage_ab 3 a b
+  bwe_chk eq get oge_job_poison 0 xor uint 0xdeadbeef 0xffffffff
+  bwe_chk eq get oge_job_poison 1 0xffffffff
+  bwe_chk eq get oge_job_poison 2 xor uint 42 0xffffffff
+
+  note Oracle passes matching sums and catches single-word corruption
+  put oge_job_out 0 0xdeadbeef
+  put oge_job_out 1 0
+  put oge_job_out 2 42
+  bwe_chk eq obws_verify_vec 3 dst 0
+  bwe_chk eq get dst 0 0xdeadbeef
+  bwe_chk eq get dst 2 42
+  put oge_job_out 1 7
+  bwe_chk eq obws_verify_vec 3 dst 1
+
+  note obws_check_and_fill enforces marker1, marker2, sem, and elapsed_ns
+  ex = new ulong 10 0
+  put obwe_info 0 1000
+  put obwe_info 1 1450
+  put obwe_info 2 ulong OBWE_MARKER1_PAYLOAD
+  put obwe_info 3 ulong OBWE_MARKER2_PAYLOAD
+  put obwe_info 4 ulong OBWE_SEM_DONE
+  bwe_chk eq obws_check_and_fill ex 0
+  bwe_chk eq get ex 1 1000
+  bwe_chk eq get ex 2 1450
+  bwe_chk eq get ex 3 450
+  bwe_chk eq get ex 4 ulong OBWE_MARKER1_PAYLOAD
+  bwe_chk eq get ex 5 ulong OBWE_MARKER2_PAYLOAD
+  bwe_chk eq get ex 6 ulong OBWE_SEM_DONE
+
+  put obwe_info 2 0
+  bwe_chk eq obws_check_and_fill ex 3
+  put obwe_info 2 ulong OBWE_MARKER1_PAYLOAD
+  put obwe_info 3 0
+  bwe_chk eq obws_check_and_fill ex 4
+  put obwe_info 3 ulong OBWE_MARKER2_PAYLOAD
+  put obwe_info 4 5
+  bwe_chk eq obws_check_and_fill ex 5
+  for i ulong 5
+    put obwe_info i 0
+  end
+
+  note Wrapper bounds guard refuses n == 0 and n == 1025 without opening GPU
+  bwe_chk eq obws_execute_vector 0 a b dst ex 1
+  bwe_chk eq obws_execute_vector 1025 a b dst ex 1
 end
 
 fn main to int
   test_round_and_cbank
   test_pushbuffer_packets
   test_backend_and_zero_cuda
+  test_submit_wrapper_helpers
   if eq get g_bwe_fail 0 0
     ign = write 1 bwe_pass 0 len bwe_pass
     ret 0

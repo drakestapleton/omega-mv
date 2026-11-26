@@ -1735,17 +1735,12 @@ $(GPU_RECONV_TEST): tests/gpu_reconv_test.c tests/bw_warp_sim.h src/omega_gpu_el
 test-gpu-reconv: $(GPU_RECONV_TEST)
 	./$(GPU_RECONV_TEST) --host-only
 
-# omega #492: IMAD.HI.U32 with a register Rc. The chip reads Rc as a 64-bit register pair (nvcc 13.0
-# sm_121 oracle, evidence/IMADHI-RC-ORACLE-nvcc13.0-20261016; chip probe pending), so the four warp
-# simulators model an even Rc as the pair Rc+1:Rc and refuse an odd Rc, and replay the PR #487
-# odd-column pack (it must come out wrong, as on the chip). One binary per simulator header.
+# omega #492: IMAD.HI.U32 with a register Rc. Pure seeded OM-2 test (tests/test_gpu_imadhi_rc.om,
+# built as $(OUT_DIR)/test_gpu_imadhi_rc_om in mk/tests-root-3-om.mk): verifies the 64-bit register-pair
+# Rc model, SM121 encoder word (0x7227, Rc byte 0x06), odd-Rc refusal, PR #487 replay, and SHF.R + IADD3 fix.
 .PHONY: test-gpu-imadhi-rc
-GPU_IMADHI_SIMS = bw_warp_sim bw_warp_sim_tc bw_warp_sim_k bw_warp_sim_pa
-GPU_IMADHI_TESTS = $(GPU_IMADHI_SIMS:%=$(OUT_DIR)/gpu_imadhi_rc_test_%)
-$(OUT_DIR)/gpu_imadhi_rc_test_%: tests/gpu_imadhi_rc_test.c tests/%.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -Itests -DSIM_HEADER='"$*.h"' -o $@ tests/gpu_imadhi_rc_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-imadhi-rc: $(GPU_IMADHI_TESTS)
-	@for t in $(GPU_IMADHI_TESTS); do ./$$t || exit 1; done
+test-gpu-imadhi-rc: $(OUT_DIR)/test_gpu_imadhi_rc_om
+	./$(OUT_DIR)/test_gpu_imadhi_rc_om
 
 # FB-1 cut 5: native gqa_attention (f32 KV) and paged_attention (bf16 KV, + batch).
 # head_dim 128 (Qwen3-4B): the same battery with --hd 128 through both host simulators; GB10 parity PASS 126/0
