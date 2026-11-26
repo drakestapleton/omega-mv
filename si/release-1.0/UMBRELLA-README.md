@@ -112,17 +112,16 @@ Lead with Homebrew (zero notarization gatekeeping):
 brew tap drakestapleton/omega https://interplane.io/drakestapleton/homebrew-omega.git
 brew install drakestapleton/omega/omc
 ```
-Or verify a Terminal bundle with `install-si-1.0.sh` (clears `com.apple.quarantine` and runs ad-hoc `codesign -s - -f` **only after** SHA-256 verification succeeds):
+Then install **Omega Helix** to train your own custom `OLLMSP01` DNA model strands:
 ```sh
-sh si/release-1.0/install-si-1.0.sh --verify-bundle ./si-1.0-macos-arm64 --install --prefix "$HOME/.local"
+git clone https://interplane.io/drakestapleton/omega-helix.git && cd omega-helix
+sh install.sh
+omega-helix          # Studio web UI (http://127.0.0.1:18420)
+omega-helix agent    # Machine-readable JSON cookbook for AI agents
 ```
 
 ### 4. Windows 10/11 (WSL 2 + Online Compiler)
-No native Windows `.exe` is shipped. Inside **WSL 2** (`x86_64`), verify and install the static `x86linux` ELF bundle:
-```sh
-sh si/release-1.0/install-si-1.0.sh --verify-bundle ./si-1.0-x86linux-bundle --install --prefix "$HOME/.local"
-```
-For zero-install browser compilation under Omega's kernel sandbox (`execpure`), use `https://interplane.io/omega/compile/`.
+No native Windows `.exe` is shipped. Inside **WSL 2** (`x86_64`), verify the static `x86linux` `omc` archive from `https://interplane.io/omega/#downloads` with `sha256sum -c`, then clone and install `omega-helix` inside WSL 2. For zero-install browser compilation under Omega's kernel sandbox (`execpure`), use `https://interplane.io/omega/compile/`.
 
 ---
 
