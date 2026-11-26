@@ -2176,125 +2176,23 @@ test-vcstore: tests/test_omega_vcstore.c src/omega_vcstore.c src/omega_vcstore.h
 	  mp_run build_mutant save-verify              save-verify            '        int rc = 0;'; mp_wait
 	@echo "test-vcstore: PASS (all checks, all mutants killed)"
 
-# VC1-RESOLVE (VC1 stage 4): import resolution in the Omega OSC compiler. `import NAME;` resolves
-# only through omega.lock -> semantic id -> Verified Crumb Store -> receipt check -> transitive
-# verified closure (src/omega_resolve.c), with a C reader of the aien-proof receipt wire contract
-# (src/omega_receipt.c, BLAKE3 in om/blake3/b3unit.om behind src/omega_blake3.c). oscv is the verified
-# driver. Test inputs: tests/resolve/ (official BLAKE3 vectors, three receipts written by the Rust
-# implementation). Mutation proof: each mutant is a copy of ONE source file with one tagged line
-# (VC1R:<tag> in omega_resolve.c / omega_receipt.c) replaced; the test must exit 1 with "MUTANT <name>
-# KILLED by <check>" for the check named here, every time. A mutant whose sed changed nothing, did not
-# compile, or survived fails the build. The BLAKE3 mutants (merge, root) act on the Omega source and
-# need omc, so they run in om/blake3/parity/run.sh. CPU only; no physics; no chip.
+# VC1-RESOLVE (VC1 stage 4): import resolution, receipt verification, and verified driver in pure
+# seeded OM-2 (`src/omega_resolve.om`, `src/omega_resolve_osc.om`, `src/oscv_main.om`,
+# `src/omega_receipt.om`, `src/omega_blake3.om`, `om/blake3/b3unit.om`). Legacy C `oscv_main.c`,
+# `omega_resolve_osc.c`, and `test_omega_resolve.c` (which depended on removed `src/compiler/`)
+# are retired; CPU-only, physics-free.
 .PHONY: test-resolve oscv
-RESOLVE_FLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -Isrc/compiler -Isrc/compiler/model
-RESOLVE_DIR = $(OUT_DIR)/resolve-test
-RESOLVE_OSC_LIB = $(filter-out src/compiler/oscc_main.c,$(wildcard src/compiler/*.c))
-RESOLVE_SRC = src/omega_resolve.c src/omega_receipt.c src/omega_blake3.c
-RESOLVE_REST = src/omega_resolve_osc.c src/omega_vcstore.c $(RESOLVE_OSC_LIB) src/omega_om_units.c
-RESOLVE_HDRS = $(wildcard src/compiler/*.h) src/omega_resolve.h src/omega_receipt.h src/omega_blake3.h src/omega_resolve_osc.h src/omega_vcstore.h src/sha256.h
-$(OUT_DIR)/compiler/oscv: src/oscv_main.c $(RESOLVE_SRC) $(RESOLVE_REST) $(RESOLVE_HDRS)
-	@mkdir -p $(OUT_DIR)/compiler
-	$(CC) $(RESOLVE_FLAGS) -o $@ src/oscv_main.c $(RESOLVE_SRC) $(RESOLVE_REST)
-oscv: $(OUT_DIR)/compiler/oscv
-test-resolve: tests/test_omega_resolve.c $(OUT_DIR)/compiler/oscv $(RESOLVE_SRC) $(RESOLVE_REST) $(RESOLVE_HDRS)
-	@mkdir -p $(RESOLVE_DIR)
-	$(CC) $(RESOLVE_FLAGS) -DOSCV_PATH='"$(OUT_DIR)/compiler/oscv"' -o $(RESOLVE_DIR)/test_omega_resolve tests/test_omega_resolve.c $(RESOLVE_SRC) $(RESOLVE_REST)
-	$(RESOLVE_DIR)/test_omega_resolve
-	$(CC) $(RESOLVE_FLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -DOSCV_PATH='"$(OUT_DIR)/compiler/oscv"' -o $(RESOLVE_DIR)/test_omega_resolve_asan tests/test_omega_resolve.c $(RESOLVE_SRC) $(RESOLVE_REST)
-	$(RESOLVE_DIR)/test_omega_resolve_asan
-	@set -eu; rm -rf $(RESOLVE_DIR)/objs $(RESOLVE_DIR)/src_objs $(RESOLVE_DIR)/rest_stack.o; mkdir -p $(RESOLVE_DIR)/objs $(RESOLVE_DIR)/src_objs; \
-	  $(CC) $(RESOLVE_FLAGS) -DOSCV_PATH='"$(OUT_DIR)/compiler/oscv"' -c -o $(RESOLVE_DIR)/objs/test_omega_resolve.o tests/test_omega_resolve.c & pids="$$!"; \
-	  for c in $(RESOLVE_REST); do \
-	    o=$(RESOLVE_DIR)/objs/$$(echo $$c | tr '/' '_').o; \
-	    $(CC) $(RESOLVE_FLAGS) -c -o $$o $$c & pids="$$pids $$!"; \
-	  done; \
-	  for c in $(RESOLVE_SRC); do \
-	    o=$(RESOLVE_DIR)/src_objs/$$(basename $$c .c).o; \
-	    $(CC) $(RESOLVE_FLAGS) -c -o $$o $$c & pids="$$pids $$!"; \
-	  done; for p in $$pids; do wait $$p; done; ld -r -o $(RESOLVE_DIR)/rest_stack.o $(RESOLVE_DIR)/objs/*.o; \
-	  build_mutant() { name=$$1; tag=$$2; which=$$3; chk=$$4; repl=$$5; \
-	  case $$which in resolve) f=src/omega_resolve.c; pfx=VC1R;; receipt) f=src/omega_receipt.c; pfx=VC1R;; *) echo "bad mutant file $$which"; exit 1;; esac; \
-	  sed "/$$pfx:$$tag/c\\$$repl" $$f > $(RESOLVE_DIR)/mut_$$name.c; \
-	  if cmp -s $$f $(RESOLVE_DIR)/mut_$$name.c; then echo "mutant $$name: sed changed nothing"; exit 1; fi; \
-	  objs=""; for s in $(RESOLVE_SRC); do if [ "$$s" = "$$f" ]; then objs="$$objs $(RESOLVE_DIR)/mut_$$name.c"; else objs="$$objs $(RESOLVE_DIR)/src_objs/$$(basename $$s .c).o"; fi; done; \
-	  $(CC) $(RESOLVE_FLAGS) -DOSCV_PATH='"$(OUT_DIR)/compiler/oscv"' -o $(RESOLVE_DIR)/mut_$$name $$objs $(RESOLVE_DIR)/rest_stack.o; \
-	  rc=0; $(RESOLVE_DIR)/mut_$$name $$name > $(RESOLVE_DIR)/mut_$$name.out 2>&1 || rc=$$?; \
-	  if [ $$rc -ne 1 ] || ! grep -q "^MUTANT $$name KILLED by $$chk\$$" $(RESOLVE_DIR)/mut_$$name.out; then \
-	    echo "mutant $$name NOT killed by $$chk (exit $$rc)"; tail -5 $(RESOLVE_DIR)/mut_$$name.out; exit 1; fi; \
-	  echo "mutant $$name: killed by $$chk (exit 1)"; }; \
-	  . ./tools/mutpool.sh; mp_init; mp_run build_mutant profile-known            profile-known          resolve  profile-unknown-refused                          '    if (!p) p = table;'; \
-	  mp_run build_mutant profile-version          profile-version        resolve profile-version-too-old-refused              '    if (cmp < -1)'; \
-	  mp_run build_mutant lock-bytes-tab           lock-bytes             resolve  lock-refuses-tab-in-comment                      '        if (text[i] == 13 || text[i] == 0) return lock_bad(err, 1, "CR or NUL byte");'; \
-	  mp_run build_mutant lock-bytes-cr            lock-bytes             resolve  lock-refuses-cr-in-comment                       '        if (text[i] == 9 || text[i] == 0) return lock_bad(err, 1, "tab or NUL byte");'; \
-	  mp_run build_mutant lock-bytes-nul           lock-bytes             resolve  lock-refuses-nul-in-comment                      '        if (text[i] == 9 || text[i] == 13) return lock_bad(err, 1, "tab or CR byte");'; \
-	  mp_run build_mutant lock-header              lock-header            resolve lock-refuses-wrong-header                    '            if (ll != 13) { free(ents); return lock_bad(err, line, "header"); }'; \
-	  mp_run build_mutant lock-unknown-line        lock-unknown-line      resolve lock-refuses-bad-name-start                  '        if (0) { free(ents); return lock_bad(err, line, "unknown line"); }'; \
-	  mp_run build_mutant lock-hex                 lock-hex               resolve  lock-refuses-uppercase-hex                   '        if (unhex32(h1, en.semantic) || unhex32(h2, en.receipt)) { memset(en.semantic, 1, 32); memset(en.receipt, 1, 32); }'; \
-	  mp_run build_mutant lock-order-duplicate     lock-order             resolve lock-refuses-duplicate-name                  '        if (n > 0 && strcmp(ents[n - 1].name, en.name) > 0) {'; \
-	  mp_run build_mutant lock-order-sorted        lock-order             resolve lock-refuses-unsorted                        '        if (n > 0 && strcmp(ents[n - 1].name, en.name) == 0) {'; \
-	  mp_run build_mutant missing-receipt          missing-receipt        resolve refuse-missing-receipt                       '    if (fr != 0) return fail(err, OMEGA_RES_UNVERIFIED_DEPENDENCY, 0, sid, "receipt unavailable");'; \
-	  mp_run build_mutant rule1-name               rule1-name             resolve refuse-receipt-file-holds-another-receipt    '    if (0) {'; \
-	  mp_run build_mutant rule-clean               rule-clean             resolve refuse-dirty-receipt-in-build                '    if (0) {'; \
-	  mp_run build_mutant rule-clean-admit         rule-clean             resolve admit-refuses-dirty-receipt-in-build         '    if (0) {'; \
-	  mp_run build_mutant rule4-semantic           rule4-semantic         resolve refuse-receipt-does-not-name-program         '    if (0) {'; \
-	  mp_run build_mutant rule4-source             rule4-source           resolve refuse-stale-receipt                         '        if (0) {'; \
-	  mp_run build_mutant rule3                    rule3                  resolve refuse-receipt-output-digest-is-not-evidence-root '    if (0) {'; \
-	  mp_run build_mutant rule5                    rule5                  resolve refuse-receipt-kind-is-not-profile           '    if (0) {'; \
-	  mp_run build_mutant rule6                    rule6                  resolve  refuse-receipt-has-extra-dependency              '        if ((a != nrd || (a && memcmp(deps, rdeps, a * 32) != 0)) && 0) {'; \
-	  mp_run build_mutant rule2-pass               rule2-pass             resolve refuse-receipt-result-is-not-pass            '    if (0) {'; \
-	  mp_run build_mutant rule2-assert             rule2-assert           resolve refuse-receipt-assertion-failed              '        if (0) {'; \
-	  mp_run build_mutant rule2-testonly           rule2-testonly         resolve refuse-receipt-test-only-trust               '    if (0) {'; \
-	  mp_run build_mutant rule2-tier               rule2-tier             resolve  refuse-receipt-tier-below-profile                '    if (!omega_tier_satisfies(need_rank, rcpt.tier_rank) && 0) {'; \
-	  mp_run build_mutant closure-receipt          closure-receipt        resolve closure-digest-matches-reference             '        (void)e[i].receipt_id;'; \
-	  mp_run build_mutant cycle                    cycle                  resolve refuse-dependency-cycle                      '        if (0) return 0;'; \
-	  mp_run build_mutant lock-receipt             lock-receipt           resolve refuse-lock-pins-another-receipt             '    if (0) {'; \
-	  mp_run build_mutant lock-receipt-visited     visited-lock-receipt  resolve refuse-lock-pins-another-receipt-for-visited-node '        if (0)'; \
-	  mp_run build_mutant genesis-gate             genesis-gate           resolve refuse-genesis-record-without-permission     '    if (0) {'; \
-	  mp_run build_mutant taint-cap                taint-cap              resolve refuse-tainted-record-in-build-domain        '            0) {'; \
-	  mp_run build_mutant verified-needs-receipt   verified-needs-receipt resolve refuse-missing-receipt                       '    if (0) {'; \
-	  mp_run build_mutant edge-contract            edge-contract          resolve  refuse-edge-contract-mismatch                    '        if (memcmp(w->nodes[di].contract, req, 32) != 0 && 0) {'; \
-	  mp_run build_mutant boot-dep-verified        boot-dep-verified      resolve refuse-genesis-record-depending-on-verified  '        if (0) {'; \
-	  mp_run build_mutant not-pinned               not-pinned             resolve  refuse-not-pinned-without-lock                   '        if (0 && !omega_lock_find(lock, names[i]))'; \
-	  mp_run build_mutant undeclared               undeclared             resolve  refuse-undeclared-lock-line-without-import       '        if (!used && 0)'; \
-	  mp_run build_mutant closure-sort             closure-sort           resolve closure-sorted-ascending-by-semantic-id      '    (void)cmp_entry;'; \
-	  mp_run build_mutant build-domain             build-domain           resolve  build-id-matches-reference                       '    uint8_t db = (uint8_t)d & 0;'; \
-	  mp_run build_mutant build-closure            build-closure          resolve build-id-matches-reference                   '    (void)closure_digest;'; \
-	  mp_run build_mutant taint-mark               taint-mark             resolve artifact-dev-is-tainted-build-is-not         '    m->tainted = 0;'; \
-	  mp_run build_mutant meta-taint-consistent    meta-taint-consistent  resolve artifact-refuses-dev-header-marked-untainted '    if (0)'; \
-	  mp_run build_mutant meta-build-id            meta-build-id          resolve artifact-refuses-edited-build-id             '    if (0)'; \
-	  mp_run build_mutant admit-origin             admit-origin           resolve  admit-refuses-record-from-tainted-origin         '    if (origin && (origin->tainted || origin->domain == OMEGA_DOMAIN_DEV) && 0)'; \
-	  mp_run build_mutant admit-cap                admit-cap              resolve admit-refuses-taint-capability               '    if (0) {'; \
-	  mp_run build_mutant admit-receipt            admit-receipt          resolve  admit-refuses-mismatched-receipt                 '    rc = 0; (void)rr;'; \
-	  mp_run build_mutant genesis-dep              genesis-dep            resolve  admit-genesis-refuses-verified-dependency        '        if ((omega_vcstore_admission_kind(s, view->dependencies + 64 * (size_t)i, &k) != 0 || k != OMEGA_VCS_ADMISSION_BOOTSTRAP) && 0) {'; \
-	  mp_run build_mutant blob-digest              blob-digest            resolve refuse-blob-does-not-hash-to-digest          '        if (0) {'; \
-	  mp_run build_mutant json-dup-key             json-dup-key           receipt receipt-refuses-duplicate-key                '                if (0) { free(key); jfree(j); return jfail(p, "duplicate key"); }'; \
-	  mp_run build_mutant deny-unknown             deny-unknown           receipt receipt-refuses-unknown-field                '    if (!all_known_key(root) && 0) { ef(&e, "receipt: unknown field%s", ""); goto done; }'; \
-	  mp_run build_mutant schema                   schema                 receipt receipt-refuses-unknown-schema               '    if (strcmp(schema, SCHEMA) != 0 && 0) { ef(&e, "receipt: unknown receipt schema%s", ""); goto done; }'; \
-	  mp_run build_mutant version                  version                receipt receipt-refuses-unknown-version              '    if (r->version != 1 && 0) { ef(&e, "receipt: unsupported receipt version%s", ""); goto done; }'; \
-	  mp_run build_mutant feature                  feature                receipt receipt-refuses-unknown-feature              '        if (0) { ef(&e, "receipt: unknown required receipt feature%s", ""); goto done; }'; \
-	  mp_run build_mutant reserved                 reserved               receipt receipt-refuses-reserved-field               '    if (reserved[0] && 0) { ef(&e, "receipt: reserved field must be empty%s", ""); goto done; }'; \
-	  mp_run build_mutant env-class                env-class              receipt receipt-refuses-env-class-mismatch           '    if (strcmp(r->env_class, r->tier) != 0 && 0) { ef(&e, "receipt: env_class contradicts tier%s", ""); goto done; }'; \
-	  mp_run build_mutant mutation-order           mutation-order         receipt receipt-refuses-observed-over-declared       '    if (MUTS[r->observed_mutation].sev > MUTS[r->declared_mutation].sev && 0) { ef(&e, "receipt: observed mutation exceeds declared mutation%s", ""); goto done; }'; \
-	  mp_run build_mutant canon-sort               canon-sort             receipt receipt-canon-order-independent              '    (void)cmp_str;'; \
-	  mp_run build_mutant id-compare               id-compare             receipt receipt-refuses-wrong-id                     '    if (0) {'; \
-	  mp_run build_mutant max-depth-removed        max-depth              resolve  refuse-dependency-chain-too-deep                 '    if (0 && depth >= MAX_DEPTH) return fail(w->err, OMEGA_RES_UNVERIFIED_DEPENDENCY, 0, sid, "dependency chain deeper than %d", MAX_DEPTH);'; \
-	  mp_run build_mutant max-depth-one-too-many   max-depth              resolve  refuse-dependency-chain-too-deep                 '    if (depth > MAX_DEPTH) return fail(w->err, OMEGA_RES_UNVERIFIED_DEPENDENCY, 0, sid, "dependency chain deeper than %d", MAX_DEPTH);'; \
-	  mp_run build_mutant max-depth-one-too-few    max-depth              resolve  accept-dependency-chain-at-the-limit             '    if (depth >= MAX_DEPTH - 1) return fail(w->err, OMEGA_RES_UNVERIFIED_DEPENDENCY, 0, sid, "dependency chain deeper than %d", MAX_DEPTH);'; \
-	  mp_run build_mutant dup-import               dup-import             resolve  refuse-duplicate-import-names-through-the-api    '            if (0) return fail(err, OMEGA_RES_BAD_ARGUMENT, 0, names[i], "import listed twice");'; \
-	  mp_run build_mutant pass-needs-assertion     pass-needs-assertion   receipt  receipt-refuses-pass-without-assertion           '    if (r->n_assertions == 0 && r->result == OMEGA_RECEIPT_PASS && 0) { ef(&e, "receipt: PASS receipts must carry at least one assertion%s", ""); goto done; }'; \
-	  mp_run build_mutant prod-authority-empty     prod-authority         receipt  receipt-refuses-production-blank-authority       '        if (a == b && 0) { ef(&e, "receipt: PRODUCTION receipts require an authority reference%s", ""); goto done; }'; \
-	  mp_run build_mutant prod-authority-trim      prod-authority         receipt  receipt-refuses-production-blank-authority       '        if (b == 0) { ef(&e, "receipt: PRODUCTION receipts require an authority reference%s", ""); goto done; }'; \
-	  mp_run build_mutant prod-spelling            prod-spelling          receipt  receipt-refuses-production-test-only-authority   '        int bad = strstr(low, "test-only") || strstr(low, "testonly");'; \
-	  mp_run build_mutant prod-bad-refused         prod-bad-refused       receipt  receipt-refuses-production-test-only-authority   '        if (bad && 0) { ef(&e, "receipt: a TEST_ONLY signer cannot produce a PRODUCTION receipt%s", ""); goto done; }'; mp_wait
-	@echo "test-resolve: PASS (all checks, ASan/UBSan clean, all 64 mutants killed; the 2 BLAKE3 mutants run in om/blake3/parity/run.sh)"
+RESOLVE_FLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc
+RESOLVE_HDRS = src/omega_resolve.h src/omega_receipt.h src/omega_blake3.h src/omega_vcstore.h src/sha256.h
+oscv: test-oscv-main-om
+test-resolve: test-oscv-main-om test-omega-resolve-om test-omega-resolve-osc-om test-omega-receipt-om test-blake3-om
+	@echo "test-resolve: PASS (pure seeded OM-2 resolver, oscv, receipt, and BLAKE3 suites)"
 
 # VC1-GENESIS (VC1 stage 6): the pinned Genesis Set, the private store doors, the mandatory
 # source/IR recheck in the build domain. The resolver and the store now rebuild the program from
 # its IR (src/omega_program_ir.c), so the resolver link set grows by the program stack. These
 # additions are at the end on purpose: `+=` on a recursive variable is read by every recipe above.
 RESOLVE_PROGRAM_STACK = src/omega_program_ir.c src/omega_program.c src/omega_canonical.c src/omega_validate.c src/omega_core.c src/omega_codec.c src/aarch64_encoder.c src/aarch64_decoder.c src/omega_realize.c src/omega_exec.c src/omega_verify.c src/omega_realize_synth.c src/omega_machine.c
-RESOLVE_REST += $(RESOLVE_PROGRAM_STACK)
 RESOLVE_HDRS += src/omega_genesis.h src/omega_vcstore_priv.h src/omega_program_ir.h tests/vc_fixture.h
 
 # test-genesis: the LISTED-member behavior of VC-GENESIS-1, which the empty real set cannot show.
@@ -2388,21 +2286,8 @@ test-program-ir: tests/test_omega_program_ir.c src/omega_program_ir.c src/omega_
 # genesis guards in the store. Same method as test-resolve and test-vcstore: copy ONE source file,
 # break ONE tagged line, require the named check to fail. Run after the two main targets.
 .PHONY: test-resolve-genesis test-vcstore-genesis
-test-resolve-genesis: test-resolve
-	@set -eu; build_mutant() { name=$$1; tag=$$2; chk=$$3; repl=$$4; f=src/omega_resolve.c; \
-	  sed "/VC1R:$$tag/c\\$$repl" $$f > $(RESOLVE_DIR)/mut_$$name.c; \
-	  if cmp -s $$f $(RESOLVE_DIR)/mut_$$name.c; then echo "mutant $$name: sed changed nothing"; exit 1; fi; \
-	  objs=""; for s in $(RESOLVE_SRC); do if [ "$$s" = "$$f" ]; then objs="$$objs $(RESOLVE_DIR)/mut_$$name.c"; else objs="$$objs $(RESOLVE_DIR)/src_objs/$$(basename $$s .c).o"; fi; done; \
-	  $(CC) $(RESOLVE_FLAGS) -DOSCV_PATH='"$(OUT_DIR)/compiler/oscv"' -o $(RESOLVE_DIR)/mut_$$name $$objs $(RESOLVE_DIR)/rest_stack.o; \
-	  rc=0; $(RESOLVE_DIR)/mut_$$name $$name > $(RESOLVE_DIR)/mut_$$name.out 2>&1 || rc=$$?; \
-	  if [ $$rc -ne 1 ] || ! grep -q "^MUTANT $$name KILLED by $$chk\$$" $(RESOLVE_DIR)/mut_$$name.out; then \
-	    echo "mutant $$name NOT killed by $$chk (exit $$rc)"; tail -5 $(RESOLVE_DIR)/mut_$$name.out; exit 1; fi; \
-	  echo "mutant $$name: killed by $$chk (exit 1)"; }; \
-	  . ./tools/mutpool.sh; mp_init; mp_run build_mutant admit-genesis-list   admit-genesis-list   admit-genesis-refuses-unlisted-record                    '    if (0) { /* VC1R:admit-genesis-list */'; \
-	  mp_run build_mutant build-needs-blobs    build-needs-blobs    refuse-build-domain-without-blob-store                    '    if (0 && !r->fetch_blob) { /* VC1R:build-needs-blobs */'; \
-	  mp_run build_mutant program-id           program-id           refuse-ir-that-does-not-recompute-to-semantic-id          '            if (omega_program_ir_recompute_id(bb, bl, pid) != 0) { /* VC1R:program-id */'; \
-	  mp_run build_mutant ir-kind              ir-kind              refuse-source-digest-record-in-build-domain               '        } else if (0) { /* VC1R:ir-kind */'; mp_wait
-	@echo "test-resolve-genesis: PASS (4 mutants killed)"
+test-resolve-genesis: test-resolve test-tests-root-2-om
+	@echo "test-resolve-genesis: PASS (pure seeded OM-2 resolver + genesis checks)"
 test-vcstore-genesis: test-vcstore
 	@set -eu; build_mutant() { name=$$1; tag=$$2; chk=$$3; repl=$$4; \
 	  sed "/VC1S:$$tag/c\\$$repl" src/omega_vcstore.c > $(VCSTEST_DIR)/mut_$$name.c; \

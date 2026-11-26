@@ -4,13 +4,10 @@
 # $(C2_OMC) (seed/out/omc), reusing seed/ng/sha256.om and protocol/omnet/om/{sha512,ed25519}/ +
 # protocol/uor-gpu/ed_sign.om with zero C code.
 # The untrusted solver c2sat is pure seeded OM-2 (src/checker2/untrusted/c2sat.om, built with C2_OMC).
-# Only test_c2_blast_native.c remains minimal C (executable mmap + siglongjmp native ABI cross-check,
-# invoking the pure OM-2 checker2 binary with zero checker2 C dependencies).
+# Legacy OSC-1 producer harnesses (osc_emit_ir.c, test_c2_blast_native.c) that required the removed
+# src/compiler/ (oscc, removed in bb7f2dd68) are retired; those targets fail closed MISSING_IMPLEMENTATION.
 #   make checker2                build/checker2/checker2
-#   make test-checker2-pure      pure OM-2 receipt and LRAT unit tests (no legacy oscc required)
-#   make test-checker2           receipt, checker, LRAT, corpus + differential, native blaster cross-check,
-#                                and GUARD mutant negative controls
-#   make test-checker2-mutants   negative controls only: each GUARD line removed must fail a test
+#   make test-checker2-pure      pure OM-2 receipt, LRAT, and c2sat unit tests (no legacy oscc required)
 ifndef CHECKER2_MK
 CHECKER2_MK := 1
 .PHONY: checker2 test-checker2 test-checker2-pure test-checker2-owner-receipt test-checker2-lrat test-checker2-unit test-checker2-mutants test-checker2-differential test-checker2-blast-native
@@ -64,50 +61,17 @@ $(C2_DIR)/c2sat: src/checker2/untrusted/c2sat.om $(C2_OMC)
 	@mkdir -p $(C2_DIR)
 	$(C2_OMC) < src/checker2/untrusted/c2sat.om > $@.tmp && chmod +x $@.tmp && mv $@.tmp $@
 
-# producer side, used only by the differential (links the producer library, never checker2)
-# NOTE (bb7f2dd68): legacy C compiler src/compiler/ (osc_front.h, oscc) was removed during OM-2 cutover.
-C2_PRODUCER_LIB = $(filter-out src/compiler/oscc_main.c,$(wildcard src/compiler/*.c)) src/omega_om_units.c
-$(C2_DIR)/osc_emit_ir: tests/checker2/producer/osc_emit_ir.c $(C2_PRODUCER_LIB) $(wildcard src/compiler/*.h)
-	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -Isrc -Isrc/compiler -o $@ tests/checker2/producer/osc_emit_ir.c $(C2_PRODUCER_LIB)
-
-test-checker2-pure: $(C2_DIR)/checker2 $(C2_DIR)/test_c2_receipt $(C2_DIR)/test_c2_lrat
+test-checker2-pure: $(C2_DIR)/checker2 $(C2_DIR)/c2sat $(C2_DIR)/test_c2_receipt $(C2_DIR)/test_c2_lrat
 	$(C2_DIR)/checker2 version
 	$(C2_DIR)/test_c2_receipt tests/checker2/fixtures
 	$(C2_DIR)/test_c2_lrat
-
-test-checker2-differential: $(OUT_DIR)/compiler/oscc $(C2_DIR)/osc_emit_ir $(C2_DIR)/checker2
-	sh tests/checker2/differential.sh $(OUT_DIR)/compiler/oscc $(C2_DIR)/osc_emit_ir $(C2_DIR)/checker2 $(C2_DIR)/differential
-
-# 20 bounded programs proved by bit-blasting + c2sat + checker2 LRAT replay, plus negative controls
-test-checker2-lrat: $(C2_DIR)/osc_emit_ir $(C2_DIR)/checker2 $(C2_DIR)/checker2_other $(C2_DIR)/c2sat $(C2_DIR)/test_c2_lrat $(C2_DIR)/test_c2_blast test-checker2-differential
-	$(C2_DIR)/test_c2_lrat
-	sh tests/checker2/lrat.sh $(C2_DIR)/osc_emit_ir $(C2_DIR)/checker2 $(C2_DIR)/c2sat $(C2_DIR)/lrat $(C2_DIR)/checker2_other
-	ls -1 $(C2_IRDIR)/*.ir > $(C2_DIR)/corpus.list
-	ls -1 $(C2_DIR)/lrat/*.ir > $(C2_DIR)/lrat.list
-	$(C2_DIR)/test_c2_blast $(C2_DIR)/corpus.list $(C2_DIR)/lrat.list
-
-# blaster semantics against oscc's compiled AArch64 code, run as a black box (minimal C harness
-# kept for executable mmap + siglongjmp; invokes pure OM-2 checker2 prove-cnf with zero C checker deps)
-$(C2_DIR)/test_c2_blast_native: tests/checker2/test_c2_blast_native.c
-	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_blast_native.c
-
-test-checker2-blast-native: $(OUT_DIR)/compiler/oscc $(C2_DIR)/checker2 $(C2_DIR)/test_c2_blast_native
-	sh tests/checker2/blast_native.sh $(OUT_DIR)/compiler/oscc $(C2_DIR)/test_c2_blast_native $(C2_DIR)/checker2 $(C2_DIR)/blast_native
-
-test-checker2-unit: $(C2_DIR)/test_c2_receipt $(C2_DIR)/test_c2_ir test-checker2-differential test-checker2-lrat test-checker2-blast-native test-checker2-owner-receipt
-	$(C2_DIR)/test_c2_receipt tests/checker2/fixtures
-	ls -1 $(C2_IRDIR)/*.ir > $(C2_DIR)/corpus.list
-	$(C2_DIR)/test_c2_ir $(C2_DIR)/corpus.list
 
 # positive production case: the receipt signed on Drake's YubiKey (spec section 11; fails PENDING until signed)
 test-checker2-owner-receipt: $(C2_DIR)/checker2
 	sh tests/checker2/owner_receipt.sh $(C2_DIR)/checker2 tests/checker2/fixtures/owner-receipt $(C2_DIR)/owner-receipt
 
-test-checker2-mutants: test-checker2-differential test-checker2-lrat
-	sh tests/checker2/mutants.sh "$(C2_OMC)" "$(C2_DIR)/mutants" "$(C2_IRDIR)" "$(C2_DIR)/lrat"
-
-test-checker2: test-checker2-unit test-checker2-mutants
+test-checker2-differential test-checker2-lrat test-checker2-blast-native test-checker2-unit test-checker2-mutants test-checker2:
+	@echo "MISSING_IMPLEMENTATION: $@ requires removed legacy src/compiler/ (oscc, removed in bb7f2dd68); run test-checker2-pure for pure seeded OM-2 checker2 verification" >&2
+	@exit 3
 
 endif
