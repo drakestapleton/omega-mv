@@ -1,0 +1,1010 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gpu_tma/g2_shrink.om: Forensics, Antibody #13-#17 Verifier, and Deterministic
+note Binary-Search Delta-Shrinker for `seed/helix/helix_jit.om` Genome `G2`.
+note
+note Pure seeded OM-2 library unit (no `om2` header, no `fn main`; prefix g2* / G2_*).
+note Compose after:
+note   seed/ng/target/target_desc.om
+note   om/encoder/bw_enc_sm121.om
+note   seed/ng/gpu_tma/tma_lower.om
+note
+note Mechanically mirrors `seed/helix/proofs/Antibody17.lean`:
+note   - Replays `helix_jit.om` Genome G2 (`hxDoSwapsPass` + `hxCompactStalls` + `hxAsceticPace`)
+note   - Demonstrates that G2-class multi-consumer swapped RAW shadowing PASSES legacy `hxMonkVerify`
+note     (rc=0) yet corrupts SM121 fixed-latency reads (e.g. 6 -> 1 cycle in live qSwiglu9Fast!)
+note   - Enforces Antibodies #13-#17 (`g2VerifyAntibody17`: all-consumer candidate-order RAW floor,
+note     HMMA 22-cyc / OMMA 29-cyc pipe floors, SEL predicate anchoring, cross-anchor segment
+note     preservation, and exact 64-bit multi-barrier `rbar` CFG scoreboard soundness)
+note   - Deterministically shrinks any K-swap G2 failure in <= ceil(log2 K) + 2 probes down to the
+note     exact 1-swap minimal witness!
+
+global g2Ref ulong 8192
+global g2Cand ulong 8192
+global g2RefRec ulong 49152
+global g2CndRec ulong 49152
+global g2Perm ulong 2048
+global g2Inv ulong 2048
+global g2Seen ulong 2048
+global g2Target uchar 2048
+
+note Recorded swap list from G2 pass + binary-search shrinker witness output
+global g2Swaps ulong 2048
+global g2SwapCnt ulong 1
+note g2Witness: 0=u, 1=v_corrupt, 2=first_v, 3=refCyc, 4=cndCyc, 5=reqCyc, 6=stRef, 7=stCnd, 8=nmU, 9=reason
+global g2Witness ulong 16
+note g2ShrinkOut: 0=ok, 1=origSwaps, 2=shrunkSwaps, 3=probes, 4=swapPc, 5=legacyRc, 6=ab17Rc, 7..15=witness
+global g2ShrinkOut ulong 16
+
+note Legacy buggy 8-bit rbar collapse tables (faithful mirror of helix_jit.om lines 330-380)
+global g2LegW uchar 512
+global g2LegR uchar 512
+global g2LegInW uchar 1048576
+global g2LegInR uchar 1048576
+global g2LegSeen ulong 2048
+global g2LegQu ulong 2048
+global g2LegWk ulong 2048
+
+note ==================== DECODE & DEPENDENCY HELPERS ====================
+
+fn g2DecodeInto isCand bool cnt ulong to bool
+for pc ulong cnt bound 2048
+b = mul pc 4
+w0 = ulong 0
+w1 = ulong 0
+w2 = ulong 0
+w3 = ulong 0
+if isCand
+w0 = get g2Cand b
+w1 = get g2Cand add b 1
+w2 = get g2Cand add b 2
+w3 = get g2Cand add b 3
+else
+w0 = get g2Ref b
+w1 = get g2Ref add b 1
+w2 = get g2Ref add b 2
+w3 = get g2Ref add b 3
+end
+if not tmaDecodeOne pc w0 w1 w2 w3
+ret false
+end
+db = mul pc 24
+for j ulong 24
+v = get tmaRec add db j
+if isCand
+put g2CndRec add db j v
+else
+put g2RefRec add db j v
+end
+end
+end
+ret true
+end
+
+fn g2MarkTargets cnt ulong to void
+for i ulong cnt bound 2048
+put g2Target i 0
+end
+if gt cnt 0
+put g2Target 0 1
+end
+for pc ulong cnt bound 2048
+db = mul pc 24
+if eq get g2RefRec add db 17 2
+tg = tmaU2l get g2RefRec add db 18
+dst = add long pc tg
+if and ge dst 0 lt dst long cnt
+put g2Target ulong dst 1
+end
+if lt add pc 1 cnt
+put g2Target add pc 1 1
+end
+end
+end
+end
+
+fn g2ResetCand cnt ulong to void
+for i ulong mul cnt 4 bound 8192
+put g2Cand i get g2Ref i
+end
+for i ulong cnt bound 2048
+put g2Perm i i
+put g2Inv i i
+end
+end
+
+fn g2LoadFromTma cnt ulong to bool
+for i ulong mul cnt 4 bound 8192
+put g2Ref i get tmaCode i
+end
+g2ResetCand cnt
+if not g2DecodeInto false cnt
+ret false
+end
+g2MarkTargets cnt
+ret true
+end
+
+global g2RawBuf uchar 32768
+
+fn g2LoadFromRaw nbytes ulong to ulong
+if or lt nbytes 16 ne rem nbytes 16 0
+ret 0
+end
+cnt = div nbytes 16
+if gt cnt TMA_MAX_INSNS
+ret 0
+end
+for i ulong mul cnt 4 bound 8192
+o = mul i 4
+w = ulong get g2RawBuf o
+w = or w shl ulong get g2RawBuf add o 1 8
+w = or w shl ulong get g2RawBuf add o 2 16
+w = or w shl ulong get g2RawBuf add o 3 24
+put g2Ref i w
+end
+g2ResetCand cnt
+if not g2DecodeInto false cnt
+ret 0
+end
+g2MarkTargets cnt
+ret cnt
+end
+
+note Legacy anchor check (matches helix_jit.om lines 157-190: does NOT anchor SEL nm=26!)
+fn g2IsLegMonkAnchor pc ulong to bool
+if ne get g2Target pc 0
+ret true
+end
+db = mul pc 24
+if ne get g2RefRec add db 17 0
+ret true
+end
+if ne get g2RefRec add db 1 7
+ret true
+end
+nm = get g2RefRec add db 19
+if or le nm 8 ge nm 33
+if ne nm 38
+ret true
+end
+end
+if or eq nm 16 eq nm 25
+ret true
+end
+ret false
+end
+
+fn g2IsLegSwapAnchor pc ulong to bool
+if g2IsLegMonkAnchor pc
+ret true
+end
+db = mul pc 24
+if ne get g2RefRec add db 6 0
+ret true
+end
+if ne get g2RefRec add db 4 7
+ret true
+end
+ret ne get g2RefRec add db 5 7
+end
+
+note Hardened Antibody #17c anchor set: adds SEL (op 520, nm=26, isSelPred==1)!
+fn g2IsAb17Anchor pc ulong to bool
+if g2IsLegMonkAnchor pc
+ret true
+end
+db = mul pc 24
+ret ne get g2RefRec add db 21 0
+end
+
+fn g2HasRaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if eq get g2RefRec add du 10 0
+ret false
+end
+wu = get g2RefRec add du 16
+for j ulong get g2RefRec add dv 9 bound 5
+if tmaRegOverlap wu get g2RefRec add add dv 11 j
+ret true
+end
+end
+ret false
+end
+
+fn g2HasWaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if or eq get g2RefRec add du 10 0 eq get g2RefRec add dv 10 0
+ret false
+end
+ret tmaRegOverlap get g2RefRec add du 16 get g2RefRec add dv 16
+end
+
+fn g2HasDep u ulong v ulong to bool
+if g2HasWaw u v
+ret true
+end
+if g2HasRaw u v
+ret true
+end
+du = mul u 24
+dv = mul v 24
+if ne get g2RefRec add dv 10 0
+wv = get g2RefRec add dv 16
+for j ulong get g2RefRec add du 9 bound 5
+if tmaRegOverlap get g2RefRec add add du 11 j wv
+ret true
+end
+end
+end
+ret false
+end
+
+fn g2CndStall pc ulong to ulong
+w3 = get g2Cand add mul pc 4 3
+ret and shr w3 9 15
+end
+
+fn g2SetCndStall pc ulong nst ulong to void
+idx = add mul pc 4 3
+w3 = get g2Cand idx
+nw3 = or and w3 not shl ulong 15 9 shl nst 9
+put g2Cand idx nw3
+end
+
+fn g2SumRefStall lo ulong hi ulong to ulong
+tot = ulong 0
+k = lo
+while lt k hi bound 2048
+tot = add tot get g2RefRec add mul k 24 2
+k = add k 1
+end
+ret tot
+end
+
+fn g2SumCndStall lo ulong hi ulong to ulong
+tot = ulong 0
+k = lo
+while lt k hi bound 2048
+tot = add tot g2CndStall k
+k = add k 1
+end
+ret tot
+end
+
+fn g2SwapCand i ulong j ulong to void
+bi = mul i 4
+bj = mul j 4
+for k ulong 4
+t = get g2Cand add bi k
+put g2Cand add bi k get g2Cand add bj k
+put g2Cand add bj k t
+end
+tp = get g2Perm i
+put g2Perm i get g2Perm j
+put g2Perm j tp
+put g2Inv get g2Perm i i
+put g2Inv get g2Perm j j
+end
+
+note ==================== LEGACY BUGGY `hxMonkVerify` (FAITHFUL MIRROR OF helix_jit.om) ====================
+
+fn g2LegRawSpanOk u ulong v ulong inclV bool flr ulong to bool
+hiRef = v
+hiCnd = get g2Inv v
+if inclV
+hiRef = add v 1
+hiCnd = add hiCnd 1
+end
+rcyc = g2SumRefStall u hiRef
+eff = flr
+nm = get g2RefRec add mul u 24 19
+if or eq nm 14 eq nm 29
+if lt eff 6
+eff = ulong 6
+end
+end
+req = rcyc
+if gt req eff
+req = eff
+end
+ret ge g2SumCndStall get g2Inv u hiCnd req
+end
+
+note Exact mirror of buggy `hxCheckRawOne` (seed/helix/helix_jit.om lines 530-568):
+note returns IMMEDIATELY on first ref-order consumer v1, blinding itself to swapped v2!
+fn g2LegCheckRawOne u ulong n ulong flr ulong to bool
+du = mul u 24
+if or eq get g2RefRec add du 10 0 ne get g2RefRec add du 7 0
+ret true
+end
+if eq get g2RefRec add du 19 29
+rst = get g2RefRec add du 2
+if gt rst flr
+rst = flr
+end
+if lt g2CndStall get g2Inv u rst
+ret false
+end
+end
+lim = add u 16
+if gt lim n
+lim = n
+end
+v = add u 1
+while lt v lim bound 16
+if g2HasRaw u v
+ret g2LegRawSpanOk u v false flr
+end
+if g2HasWaw u v
+ret true
+end
+dbv = mul v 24
+if ne get g2RefRec add dbv 17 0
+ret g2LegRawSpanOk u v true flr
+end
+if g2IsLegMonkAnchor v
+ret g2LegRawSpanOk u v true flr
+end
+v = add v 1
+end
+ret true
+end
+
+fn g2LegChkOpnd opnd ulong chkR bool to bool
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+if eq reg 255
+ret true
+end
+base = add mul uni 256 reg
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if ne get g2LegW idx 0
+ret false
+end
+if chkR
+if ne get g2LegR idx 0
+ret false
+end
+end
+end
+end
+ret true
+end
+
+fn g2LegMarkOpnd opnd ulong bit ulong isR bool to void
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+if eq reg 255
+ret
+end
+base = add mul uni 256 reg
+b8 = uchar bit
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if isR
+put g2LegR idx or get g2LegR idx b8
+else
+put g2LegW idx or get g2LegW idx b8
+end
+end
+end
+end
+
+note Exact mirror of buggy `hxStepHazard` (lines 338-340): collapses multi-barrier rbar on any bit match!
+fn g2LegStepHaz pc ulong chk bool to bool
+db = mul pc 24
+wt = get g2CndRec add db 6
+if ne wt 0
+clr = uchar and not wt 255
+w8 = uchar and wt 255
+for i ulong 512
+put g2LegW i and get g2LegW i clr
+if ne and get g2LegR i w8 0
+put g2LegR i 0
+end
+end
+end
+nr = get g2CndRec add db 9
+nw = get g2CndRec add db 10
+if chk
+for j ulong nr bound 5
+if not g2LegChkOpnd get g2CndRec add add db 11 j false
+ret false
+end
+end
+if ne nw 0
+if not g2LegChkOpnd get g2CndRec add db 16 true
+ret false
+end
+end
+end
+if and ne get g2CndRec add db 7 0 ne nw 0
+wb = get g2CndRec add db 4
+if lt wb 6
+g2LegMarkOpnd get g2CndRec add db 16 shl ulong 1 wb false
+end
+end
+if ne get g2CndRec add db 8 0
+rbr = get g2CndRec add db 5
+wb2 = get g2CndRec add db 4
+lm = ulong 0
+if lt rbr 6
+lm = or lm shl ulong 1 rbr
+end
+if lt wb2 6
+lm = or lm shl ulong 1 wb2
+end
+if ne lm 0
+for j ulong nr bound 5
+g2LegMarkOpnd get g2CndRec add add db 11 j lm true
+end
+end
+end
+ret true
+end
+
+fn g2LegLoadIn pc ulong to void
+off = mul pc 512
+for i ulong 512
+put g2LegW i get g2LegInW add off i
+put g2LegR i get g2LegInR add off i
+end
+end
+
+fn g2LegJoin tgt ulong to bool
+off = mul tgt 512
+ch = false
+for i ulong 512
+ow = get g2LegInW add off i
+nw = or ow get g2LegW i
+if ne nw ow
+put g2LegInW add off i nw
+ch = true
+end
+orv = get g2LegInR add off i
+nrv = or orv get g2LegR i
+if ne nrv orv
+put g2LegInR add off i nrv
+ch = true
+end
+end
+ret ch
+end
+
+fn g2LegPush n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+if eq get g2LegSeen u 0
+put g2LegSeen u 1
+put g2LegWk top u
+ret add top 1
+end
+ret top
+end
+
+fn g2LegEdge n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+ch = g2LegJoin u
+sv = get g2LegSeen u
+qv = get g2LegQu u
+if and or ch eq sv 1 eq qv 0
+put g2LegQu u 1
+put g2LegWk top u
+ret add top 1
+end
+ret top
+end
+
+fn g2LegCheckCfgHaz n ulong to bool
+for i ulong n bound 2048
+put g2LegSeen i 0
+put g2LegQu i 0
+off = mul i 512
+for r ulong 512
+put g2LegInW add off r 0
+put g2LegInR add off r 0
+end
+end
+put g2LegSeen 0 1
+put g2LegWk 0 0
+top = ulong 1
+while gt top 0 bound 4096
+top = sub top 1
+pc = get g2LegWk top
+db = mul pc 24
+fl = get g2CndRec add db 17
+gd = get g2CndRec add db 1
+if or eq fl 0 ne gd 7
+top = g2LegPush n add long pc 1 top
+end
+if eq fl 2
+tg = tmaU2l get g2CndRec add db 18
+top = g2LegPush n add long pc tg top
+end
+end
+put g2LegWk 0 0
+put g2LegQu 0 1
+top = ulong 1
+while gt top 0 bound 65536
+top = sub top 1
+pc = get g2LegWk top
+put g2LegQu pc 0
+put g2LegSeen pc 2
+g2LegLoadIn pc
+z = g2LegStepHaz pc false
+db = mul pc 24
+fl = get g2CndRec add db 17
+gd = get g2CndRec add db 1
+if or eq fl 0 ne gd 7
+top = g2LegEdge n add long pc 1 top
+end
+if eq fl 2
+tg = tmaU2l get g2CndRec add db 18
+top = g2LegEdge n add long pc tg top
+end
+end
+for pc ulong n bound 2048
+if ne get g2LegSeen pc 0
+g2LegLoadIn pc
+if not g2LegStepHaz pc true
+ret false
+end
+end
+end
+ret true
+end
+
+fn g2CheckFunc n ulong to bool
+for i ulong n bound 2048
+ri = get g2Perm i
+cb = mul i 4
+rb3 = mul ri 4
+if ne get g2Cand cb get g2Ref rb3
+ret false
+end
+if ne get g2Cand add cb 1 get g2Ref add rb3 1
+ret false
+end
+if ne get g2Cand add cb 2 get g2Ref add rb3 2
+ret false
+end
+cw = and get g2Cand add cb 3 ulong 4227858943
+rw = and get g2Ref add rb3 3 ulong 4227858943
+if ne cw rw
+ret false
+end
+end
+ret true
+end
+
+fn g2CheckDeps n ulong to bool
+for u ulong n bound 2048
+pu = get g2Inv u
+v = add u 1
+while lt v n bound 2048
+if g2HasDep u v
+if ge pu get g2Inv v
+ret false
+end
+end
+v = add v 1
+end
+end
+ret true
+end
+
+fn g2LegacyMonkVerify n ulong to ulong
+for i ulong n bound 2048
+put g2Seen i 0
+end
+for i ulong n bound 2048
+r = get g2Perm i
+if or ge r n ne get g2Seen r 0
+ret 13
+end
+put g2Seen r 1
+put g2Inv r i
+if g2IsLegMonkAnchor i
+if ne r i
+ret 13
+end
+end
+end
+if not g2CheckFunc n
+ret 14
+end
+if not g2DecodeInto true n
+ret 17
+end
+if not g2CheckDeps n
+ret 16
+end
+if not g2LegCheckCfgHaz n
+ret 17
+end
+for u ulong n bound 2048
+if not g2LegCheckRawOne u n 6
+ret 17
+end
+end
+ret 0
+end
+
+note ==================== HARDENED ANTIBODY #13-#17 VERIFIER (g2VerifyAntibody17) ====================
+
+fn g2CheckPermAb17 n ulong to ulong
+for i ulong n bound 2048
+put g2Seen i 0
+end
+for i ulong n bound 2048
+r = get g2Perm i
+if or ge r n ne get g2Seen r 0
+ret TMA_ERR_AB13
+end
+put g2Seen r 1
+put g2Inv r i
+if ne get g2Target i 0
+if ne r i
+ret TMA_ERR_AB13
+end
+end
+if ne get g2RefRec add mul i 24 21 0
+if ne r i
+ret TMA_ERR_AB17_ANCHOR
+end
+end
+if g2IsAb17Anchor i
+if ne r i
+ret TMA_ERR_AB13
+end
+end
+end
+note Antibody #17c: Anchor-segment preservation (no non-anchor may jump across ANY anchor!)
+for a ulong n bound 2048
+if g2IsAb17Anchor a
+for u ulong n bound 2048
+pu = get g2Inv u
+if and lt u a ge pu a
+ret TMA_ERR_AB17_ANCHOR
+end
+if and gt u a le pu a
+ret TMA_ERR_AB17_ANCHOR
+end
+end
+end
+end
+ret TMA_OK
+end
+
+fn g2RecordWit u ulong v ulong fv ulong rc ulong cc ulong req ulong to void
+du = mul u 24
+put g2Witness 0 u
+put g2Witness 1 v
+put g2Witness 2 fv
+put g2Witness 3 rc
+put g2Witness 4 cc
+put g2Witness 5 req
+put g2Witness 6 get g2RefRec add du 2
+put g2Witness 7 g2CndStall get g2Inv u
+put g2Witness 8 get g2RefRec add du 19
+end
+
+fn g2CheckOneRawPair u ulong v ulong firstV ulong pFlr ulong to ulong
+rcyc = g2SumRefStall u v
+req = rcyc
+if gt req pFlr
+req = pFlr
+end
+ccyc = g2SumCndStall get g2Inv u get g2Inv v
+if ge ccyc req
+ret TMA_OK
+end
+g2RecordWit u v firstV rcyc ccyc req
+if gt pFlr 6
+put g2Witness 9 TMA_ERR_AB17_MMA
+ret TMA_ERR_AB17_MMA
+end
+if ne firstV 99999
+if lt get g2Inv v get g2Inv firstV
+put g2Witness 9 TMA_ERR_AB17_RAW
+ret TMA_ERR_AB17_RAW
+end
+end
+if g2IsAb17Anchor v
+put g2Witness 9 TMA_ERR_AB16
+ret TMA_ERR_AB16
+end
+put g2Witness 9 TMA_ERR_AB14
+ret TMA_ERR_AB14
+end
+
+fn g2CheckOneBnd u ulong v ulong pFlr ulong to ulong
+rcycB = g2SumRefStall u add v 1
+reqB = rcycB
+if gt reqB pFlr
+reqB = pFlr
+end
+ccycB = g2SumCndStall get g2Inv u add get g2Inv v 1
+if ge ccycB reqB
+ret TMA_OK
+end
+g2RecordWit u v v rcycB ccycB reqB
+if gt pFlr 6
+put g2Witness 9 TMA_ERR_AB17_MMA
+ret TMA_ERR_AB17_MMA
+end
+put g2Witness 9 TMA_ERR_AB16
+ret TMA_ERR_AB16
+end
+
+note Check ALL live RAW consumers v > u (before WAW / control-flow boundary) with exact pipe floor!
+fn g2CheckAllRawOne u ulong n ulong to ulong
+du = mul u 24
+if or eq get g2RefRec add du 10 0 ne get g2RefRec add du 7 0
+ret TMA_OK
+end
+pFlr = get g2RefRec add du 20
+note Antibody #15: I2FP (op 581, nm==29) own stall must never drop below min(ref_stall, 6)!
+if eq get g2RefRec add du 19 29
+rst = get g2RefRec add du 2
+if gt rst 6
+rst = ulong 6
+end
+if lt g2CndStall get g2Inv u rst
+g2RecordWit u u u rst g2CndStall get g2Inv u rst
+put g2Witness 9 TMA_ERR_AB15
+ret TMA_ERR_AB15
+end
+end
+firstV = ulong 99999
+v = add u 1
+while lt v n bound 2048
+if g2HasRaw u v
+if eq firstV 99999
+firstV = v
+end
+rrc = g2CheckOneRawPair u v firstV pFlr
+if ne rrc TMA_OK
+ret rrc
+end
+end
+if g2HasWaw u v
+ret TMA_OK
+end
+if ne get g2RefRec add mul v 24 17 0
+ret g2CheckOneBnd u v pFlr
+end
+v = add v 1
+end
+ret TMA_OK
+end
+
+note Complete Hardened Verifier (Antibodies #13-#17, exact 64-bit multi-barrier CFG check!)
+fn g2VerifyAntibody17 n ulong to ulong
+for i ulong 16
+put g2Witness i 0
+end
+prc = g2CheckPermAb17 n
+if ne prc TMA_OK
+ret prc
+end
+if not g2CheckFunc n
+ret TMA_ERR_AB14
+end
+if not g2DecodeInto true n
+ret TMA_ERR_DECODE
+end
+if not g2CheckDeps n
+ret TMA_ERR_AB16
+end
+note Antibody #17d: Copy candidate records into tmaRec and run exact 64-bit multi-barrier CFG check!
+for i ulong mul n 24 bound 49152
+put tmaRec i get g2CndRec i
+end
+if ne tmaCheckCfgHazards n 0
+put g2Witness 0 get tmaHazMeta 0
+put g2Witness 9 TMA_ERR_AB17_RBAR
+ret TMA_ERR_AB17_RBAR
+end
+note Antibodies #14, #15, #16, #17a, #17b: ALL live consumers + deep-pipe MMA floors!
+for u ulong n bound 2048
+rrc = g2CheckAllRawOne u n
+if ne rrc TMA_OK
+ret rrc
+end
+end
+ret TMA_OK
+end
+
+note ==================== EXACT `helix_jit.om` GENOME G2 REPLAY & DELTA-SHRINKER ====================
+
+fn g2LegWinOk lo ulong hi ulong n ulong to bool
+k = lo
+while lt k hi bound 24
+if not g2LegCheckRawOne get g2Perm k n 6
+ret false
+end
+k = add k 1
+end
+ret true
+end
+
+fn g2CollectSwaps n ulong to ulong
+sw = ulong 0
+i = ulong 0
+while lt add i 1 n bound 2048
+j = add i 1
+if and not g2IsLegSwapAnchor i not g2IsLegSwapAnchor j
+if not g2HasDep get g2Perm i get g2Perm j
+g2SwapCand i j
+lo = ulong 0
+if gt i 16
+lo = sub i 16
+end
+hi = add i 2
+if gt hi n
+hi = n
+end
+if g2LegWinOk lo hi n
+put g2Swaps sw i
+sw = add sw 1
+i = add i 2
+continue
+end
+g2SwapCand i j
+end
+end
+i = add i 1
+end
+put g2SwapCnt 0 sw
+ret sw
+end
+
+fn g2CanCompactPc pc ulong to bool
+orig = get g2Perm pc
+db = mul orig 24
+nm = get g2RefRec add db 19
+if eq nm 1
+ret ne get g2RefRec add db 6 0
+end
+if eq nm 29
+ret false
+end
+if g2IsLegSwapAnchor orig
+ret false
+end
+if ne get g2RefRec add db 7 0
+ret false
+end
+ret eq get g2RefRec add db 8 0
+end
+
+fn g2CompactStalls n ulong to void
+for pc ulong n bound 2048
+if g2CanCompactPc pc
+for s ulong 15
+st = g2CndStall pc
+if le st 1
+break
+end
+g2SetCndStall pc sub st 1
+lo = ulong 0
+if gt pc 17
+lo = sub pc 17
+end
+if not g2LegWinOk lo add pc 1 n
+g2SetCndStall pc st
+break
+end
+end
+end
+end
+end
+
+fn g2AsceticPace n ulong to void
+for pc ulong n bound 2048
+orig = get g2Perm pc
+nm = get g2RefRec add mul orig 24 19
+if or eq nm 24 or eq nm 29 or eq nm 30 eq nm 31
+idx = add mul pc 4 3
+w3 = get g2Cand idx
+put g2Cand idx or w3 ulong 8192
+end
+end
+end
+
+fn g2RunGen2 n ulong to ulong
+g2ResetCand n
+sw = g2CollectSwaps n
+g2CompactStalls n
+g2AsceticPace n
+ret sw
+end
+
+fn g2ApplyPrefix n ulong prefLen ulong to void
+g2ResetCand n
+for s ulong prefLen bound 2048
+pc = get g2Swaps s
+g2SwapCand pc add pc 1
+end
+g2CompactStalls n
+g2AsceticPace n
+end
+
+fn g2ApplySingleSwap n ulong swapPc ulong to void
+g2ResetCand n
+g2SwapCand swapPc add swapPc 1
+g2CompactStalls n
+g2AsceticPace n
+end
+
+fn g2FinishShrink sw ulong probes ulong trigPc ulong legOne ulong abOne ulong to void
+put g2ShrinkOut 0 1
+put g2ShrinkOut 1 sw
+put g2ShrinkOut 2 1
+put g2ShrinkOut 3 probes
+put g2ShrinkOut 4 trigPc
+put g2ShrinkOut 5 legOne
+put g2ShrinkOut 6 abOne
+for j ulong 9
+put g2ShrinkOut add 7 j get g2Witness j
+end
+end
+
+note Deterministic Binary-Search Delta-Shrinker (mirrors bsearchPrefix_isolates_trigger in Antibody17.lean!):
+note Takes ANY kernel where G2 applied K swaps and passed legacy Monk yet violated Antibody #17,
+note and shrinks K swaps -> 1 exact minimal triggering swap in O(log2 K) probes!
+fn g2DeltaShrink n ulong to bool
+for i ulong 16
+put g2ShrinkOut i 0
+end
+sw = g2RunGen2 n
+if eq sw 0
+ret false
+end
+if ne g2LegacyMonkVerify n 0
+ret false
+end
+if eq g2VerifyAntibody17 n TMA_OK
+ret false
+end
+g2ApplyPrefix n 0
+if ne g2VerifyAntibody17 n TMA_OK
+ret false
+end
+lo = ulong 0
+hi = sw
+probes = ulong 1
+while gt sub hi lo 1 bound 16
+mid = div add lo hi 2
+g2ApplyPrefix n mid
+probes = add probes 1
+if ne g2VerifyAntibody17 n TMA_OK
+hi = mid
+else
+lo = mid
+end
+end
+trigPc = get g2Swaps lo
+g2ApplySingleSwap n trigPc
+probes = add probes 1
+legOne = g2LegacyMonkVerify n
+abOne = g2VerifyAntibody17 n
+if or ne legOne 0 eq abOne TMA_OK
+ret false
+end
+g2FinishShrink sw probes trigPc legOne abOne
+ret true
+end

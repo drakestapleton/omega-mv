@@ -1,0 +1,1651 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gpu_tma/tma_lower.om: Automatic ΩIR Tensor/Tile Graph Lowering to Multi-Stage
+note Double/Triple-Buffered Async SMEM + OMMA.SF.16864 NVFP4 / HMMA.16816 BF16 Tensor Core +
+note Persistent L2-Swizzled SM121 SASS with Zero-DRAM-Spill Register Epilogue Fusion
+note (Scale / RMSNorm / SiLU), Full CFG 64-bit Multi-Barrier Scoreboard Verification,
+note Antibodies #13-#17 Enforcement, and Blackwell QMD v05.00 Descriptor Emission.
+note
+note Pure seeded OM-2 library unit (no `om2` header, no `fn main`; prefix tma* / TMA_*).
+note Compose after:
+note   seed/ng/target/target_desc.om
+note   om/encoder/bw_enc_sm121.om
+
+const TMA_QZ ulong 255
+const TMA_MAX_INSNS ulong 2048
+const TMA_SM121_SMEM_CAP ulong 101376
+const TMA_QMD_WORDS ulong 96
+const TMA_QMD_BYTES ulong 384
+
+note MMA / Tile Lowering Modes
+const TMA_MODE_NVFP4_OMMA ulong 1
+const TMA_MODE_BF16_HMMA ulong 2
+
+note Epilogue Zero-DRAM-Spill Fusion Bitmask Flags
+const TMA_FUSE_SCALE ulong 1
+const TMA_FUSE_RMSNORM ulong 2
+const TMA_FUSE_SILU ulong 4
+
+note Lowering & Pre-Emit Refusal Codes (fail-closed: 0 = PASS, nonzero = refused before QMD emit)
+const TMA_OK ulong 0
+const TMA_ERR_TARGET ulong 1
+const TMA_ERR_SMEM ulong 2
+const TMA_ERR_REGS ulong 3
+const TMA_ERR_STAGES ulong 4
+const TMA_ERR_ENCODE ulong 5
+const TMA_ERR_DECODE ulong 6
+const TMA_ERR_ALIGN ulong 7
+const TMA_ERR_HAZARD ulong 8
+const TMA_ERR_OVERLAP ulong 9
+const TMA_ERR_SPILL ulong 10
+const TMA_ERR_AB13 ulong 13
+const TMA_ERR_AB14 ulong 14
+const TMA_ERR_AB15 ulong 15
+const TMA_ERR_AB16 ulong 16
+const TMA_ERR_AB17_RAW ulong 171
+const TMA_ERR_AB17_MMA ulong 172
+const TMA_ERR_AB17_ANCHOR ulong 173
+const TMA_ERR_AB17_RBAR ulong 174
+
+note SM121 Pipeline Classes (mirrors seed/helix/proofs/Antibody17.lean)
+const TMA_PIPE_ALU6 ulong 6
+const TMA_PIPE_HMMA22 ulong 22
+const TMA_PIPE_OMMA29 ulong 29
+
+note ΩIR Tensor/Tile Graph Input Descriptor (16 fields):
+note   0=tid, 1=mode (OMMA/HMMA), 2=M, 3=N, 4=K, 5=tileM, 6=tileN, 7=tileK,
+note   8=stages (2 or 3), 9=l2Swizzle, 10=nRegs (64 or 128), 11=threads,
+note   12=fuseMask (SCALE|RMSNORM|SILU), 13=persistent (0/1), 14=codeVa, 15=padMode
+global tmaGraph ulong 16
+
+note Computed Tile Plan & Verification Metrics (16 fields):
+note   0=status, 1=smemBytes, 2=stageStride, 3=gridX, 4=gridY, 5=gridZ,
+note   6=insns, 7=maxReg, 8=hazards, 9=overlapMma, 10=stgCount, 11=ommaCount,
+note   12=hmmaCount, 13=qmdValid, 14=lastAbCode, 15=bankPadBytes
+global tmaPlan ulong 16
+
+note Emitted SM121 SASS Buffer (up to 2048 insns x 4 u32 words = 32 KiB) + Guard State
+global tmaCode ulong 8192
+global tmaPc ulong 1
+global tmaGuard ulong 1
+global tmaErr ulong 1
+
+note Emitted Blackwell QMD v05.00 Descriptor (96 u32 words = 384 bytes, 256-byte aligned)
+global tmaQmd uint 96
+
+note Shared SM121 Decoder & Full-CFG 64-bit Multi-Barrier Scoreboard State (2048 insns x 24 ulongs)
+note Record layout matches gpu/nvidia/om/codegen/bw_hazard.om + OMMA.SF.16864 (nm=38):
+note   0=op, 1=guard, 2=stall, 3=yield, 4=wbar, 5=rbar, 6=wait, 7=var, 8=late,
+note   9=nr, 10=nw, 11..15=reads[0..4], 16=write, 17=flow (0/1/2), 18=target, 19=nm,
+note   20=pipeFloor, 21=isSelPred, 22=alignErr, 23=maxGpr
+global tmaRec ulong 49152
+global tmaTarget uchar 2048
+global tmaWbar ulong 512
+global tmaRbar ulong 512
+global tmaInW ulong 1048576
+global tmaInR ulong 1048576
+global tmaSeen ulong 2048
+global tmaQu ulong 2048
+global tmaWk ulong 2048
+global tmaHazMeta ulong 8
+
+note ==================== SM121 128-BIT DECODER (bw_hazard + hx_dec_ext + OMMA.SF.16864) ====================
+
+fn tmaU2l x ulong to long
+if lt x ulong 9223372036854775808
+ret long x
+end
+ret sub long -1 long xor x ulong 18446744073709551615
+end
+
+fn tmaL2u v long to ulong
+if ge v long 0
+ret ulong v
+end
+ret xor ulong sub long -1 v ulong 18446744073709551615
+end
+
+fn tmaU2i x ulong to long
+if lt x ulong 2147483648
+ret long x
+end
+ret sub long x 4294967296
+end
+
+fn tmaMemSz w2 ulong to long
+s = and shr w2 9 7
+if le s 4
+ret long 1
+end
+if eq s 5
+ret long 2
+end
+if eq s 6
+ret long 4
+end
+ret long -1
+end
+
+fn tmaAtSz w2 ulong to long
+s = and shr w2 9 7
+if or eq s 2 eq s 3
+ret long 2
+end
+ret long 1
+end
+
+fn tmaAddR base ulong reg ulong n long uni ulong to void
+if or eq reg 255 le n 0
+ret
+end
+k = get tmaRec add base 9
+if ge k 5
+ret
+end
+put tmaRec add add base 11 k or or reg shl ulong n 8 shl uni 16
+put tmaRec add base 9 add k 1
+if eq uni 0
+hi = sub add reg ulong n 1
+if gt hi get tmaRec add base 23
+put tmaRec add base 23 hi
+end
+end
+end
+
+fn tmaAddW base ulong reg ulong n long uni ulong to void
+if or eq reg 255 le n 0
+ret
+end
+if ge get tmaRec add base 10 1
+ret
+end
+put tmaRec add base 16 or or reg shl ulong n 8 shl uni 16
+put tmaRec add base 10 1
+if eq uni 0
+hi = sub add reg ulong n 1
+if gt hi get tmaRec add base 23
+put tmaRec add base 23 hi
+end
+end
+end
+
+fn tmaSetNm base ulong id ulong vr ulong lt8 ulong pFlr ulong to void
+put tmaRec add base 19 id
+put tmaRec add base 7 vr
+put tmaRec add base 8 lt8
+put tmaRec add base 20 pFlr
+end
+
+fn tmaDecBra base ulong w0 ulong w1 ulong to void
+s = shr w1 2
+if ne and w1 2147483648 0
+s = or s 3221225472
+end
+u = or and shl s 6 4294967295 and shr w0 18 63
+t = add tmaU2i u 1
+if gt t 2147483647
+t = sub t 4294967296
+end
+put tmaRec add base 17 2
+put tmaRec add base 18 tmaL2u t
+tmaSetNm base 6 0 0 TMA_PIPE_ALU6
+end
+
+fn tmaDecMem2 base ulong op ulong w0 ulong w1 ulong w2 ulong to bool
+rd = and shr w0 16 255
+ra = shr w0 24
+de = ne and w2 134217728 0
+n = tmaMemSz w2
+if lt n 0
+ret false
+end
+if eq op 2436
+tmaAddW base rd n 0
+tmaAddR base ra 1 0
+if de
+tmaAddR base and w1 255 1 1
+end
+if eq n 4
+if ne rem rd 4 0
+put tmaRec add base 22 1
+end
+end
+tmaSetNm base 36 1 1 TMA_PIPE_ALU6
+ret true
+end
+if or eq op 904 eq op 2440
+tmaAddR base ra 1 0
+tmaAddR base and w1 255 n 0
+if de
+tmaAddR base and w2 255 1 1
+end
+tmaSetNm base 37 0 1 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2946
+tmaAddW base rd n 0
+tmaAddR base ra 1 0
+tmaSetNm base 11 1 1 TMA_PIPE_ALU6
+ret true
+end
+if eq op 1964
+tmaAddW base rd n 1
+tmaAddR base ra 1 1
+tmaSetNm base 12 1 1 TMA_PIPE_ALU6
+ret true
+end
+ret false
+end
+
+fn tmaDecMem base ulong op ulong w0 ulong w1 ulong w2 ulong to bool
+rd = and shr w0 16 255
+ra = shr w0 24
+an = long 1
+if ne and w2 256 0
+an = long 2
+end
+de = ne and w2 134217728 0
+if eq op 2433
+n = tmaMemSz w2
+if lt n 0
+ret false
+end
+tmaAddW base rd n 0
+tmaAddR base ra an 0
+if de
+tmaAddR base and w1 255 1 1
+end
+if eq n 4
+if ne rem rd 4 0
+put tmaRec add base 22 1
+end
+end
+if eq n 2
+if ne rem rd 2 0
+put tmaRec add base 22 1
+end
+end
+tmaSetNm base 33 1 1 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2438
+n = tmaMemSz w2
+if lt n 0
+ret false
+end
+tmaAddR base ra an 0
+tmaAddR base and w1 255 n 0
+if de
+tmaAddR base and w2 255 1 1
+end
+tmaSetNm base 34 0 1 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2472
+atn = tmaAtSz w2
+tmaAddW base rd atn 0
+tmaAddR base ra an 0
+tmaAddR base and w1 255 atn 0
+if de
+tmaAddR base and w2 255 1 1
+end
+tmaSetNm base 35 1 1 TMA_PIPE_ALU6
+ret true
+end
+if eq op 937
+tmaAddW base rd 2 0
+tmaAddR base ra 2 0
+tmaAddR base and w1 255 2 0
+tmaAddR base and w2 255 2 0
+tmaSetNm base 35 1 1 TMA_PIPE_ALU6
+ret true
+end
+ret tmaDecMem2 base op w0 w1 w2
+end
+
+fn tmaDecFlt base ulong op ulong w0 ulong w1 ulong w2 ulong to bool
+rd = and shr w0 16 255
+ra = shr w0 24
+r1 = and w1 255
+if eq op 545
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 22 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 544
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 23 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 547
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaAddR base and w2 255 1 0
+tmaSetNm base 24 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 523
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 25 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 520
+note Antibody #17c: SEL reads predicate P0 despite guard=7 -> flag isSelPred=1!
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+put tmaRec add base 21 1
+tmaSetNm base 26 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 521
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 27 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 574
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 28 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 581
+tmaAddW base rd 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 29 0 0 TMA_PIPE_ALU6
+ret true
+end
+if or eq op 773 eq op 776
+tmaAddW base rd 1 0
+tmaAddR base r1 1 0
+if eq op 773
+tmaSetNm base 30 1 0 TMA_PIPE_ALU6
+else
+tmaSetNm base 31 1 0 TMA_PIPE_ALU6
+end
+ret true
+end
+if eq op 3977
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaSetNm base 32 1 0 TMA_PIPE_ALU6
+ret true
+end
+ret false
+end
+
+fn tmaDecInt2 base ulong op ulong w0 ulong w1 ulong w2 ulong to bool
+rd = and shr w0 16 255
+ra = shr w0 24
+r1 = and w1 255
+if eq op 524
+nw = long 1
+if ne and w2 65536 0
+nw = long 2
+end
+tmaAddR base ra nw 0
+tmaAddR base r1 nw 0
+tmaSetNm base 16 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2060
+nw = long 1
+if ne and w2 65536 0
+nw = long 2
+end
+tmaAddR base ra nw 0
+tmaSetNm base 16 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 3084
+tmaAddR base ra 1 0
+tmaAddR base r1 1 1
+tmaSetNm base 16 0 0 TMA_PIPE_ALU6
+ret true
+end
+if or eq op 572 eq op 634
+tmaAddW base rd 4 0
+tmaAddR base ra 4 0
+tmaAddR base r1 2 0
+tmaAddR base and w2 255 4 0
+if eq op 572
+tmaSetNm base 18 0 0 TMA_PIPE_HMMA22
+else
+tmaSetNm base 19 0 0 TMA_PIPE_HMMA22
+end
+ret true
+end
+if eq op 1151
+note Blackwell SM121 OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X (w0 base 29823 = 0x747f)
+tmaAddW base rd 4 0
+tmaAddR base ra 4 0
+tmaAddR base r1 2 0
+tmaAddR base and w2 255 4 0
+tmaAddR base and shr w1 8 255 1 0
+tmaAddR base and shr w1 20 255 1 0
+tmaSetNm base 38 0 0 TMA_PIPE_OMMA29
+ret true
+end
+if eq op 2073
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base and w2 255 1 0
+tmaSetNm base 20 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 537
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaAddR base and w2 255 1 0
+tmaSetNm base 20 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2066
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base and w2 255 1 0
+tmaSetNm base 21 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 530
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaAddR base and w2 255 1 0
+tmaSetNm base 21 0 0 TMA_PIPE_ALU6
+ret true
+end
+ret tmaDecFlt base op w0 w1 w2
+end
+
+fn tmaDecInt1 base ulong op ulong w0 ulong w1 ulong w2 ulong to bool
+rd = and shr w0 16 255
+ra = shr w0 24
+r1 = and w1 255
+if eq op 2328
+tmaSetNm base 1 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2845
+tmaSetNm base 2 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2450
+tmaSetNm base 3 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2447
+tmaAddR base ra 1 0
+tmaSetNm base 4 0 1 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2381
+put tmaRec add base 17 1
+tmaSetNm base 5 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2375
+tmaDecBra base w0 w1
+ret true
+end
+if eq op 2373
+tmaSetNm base 7 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2369
+tmaSetNm base 8 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 514
+tmaAddW base rd 1 0
+tmaAddR base r1 1 0
+tmaSetNm base 9 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2050
+tmaAddW base rd 1 0
+tmaSetNm base 9 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2329
+tmaAddW base rd 1 0
+tmaSetNm base 10 1 0 TMA_PIPE_ALU6
+ret true
+end
+if or eq op 548 eq op 528
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaAddR base and w2 255 1 0
+if eq op 548
+tmaSetNm base 13 0 0 TMA_PIPE_ALU6
+else
+tmaSetNm base 17 0 0 TMA_PIPE_ALU6
+end
+ret true
+end
+if or eq op 2084 eq op 2064
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base and w2 255 1 0
+if eq op 2084
+tmaSetNm base 13 0 0 TMA_PIPE_ALU6
+else
+tmaSetNm base 17 0 0 TMA_PIPE_ALU6
+end
+ret true
+end
+if eq op 3108
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 1
+tmaAddR base and w2 255 1 0
+tmaSetNm base 13 0 0 TMA_PIPE_ALU6
+ret true
+end
+if or eq op 2085 eq op 549
+tmaAddW base rd 2 0
+tmaAddR base ra 1 0
+if eq op 549
+tmaAddR base r1 1 0
+end
+tmaAddR base and w2 255 2 0
+tmaSetNm base 14 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 565
+tmaAddW base rd 2 0
+tmaAddR base ra 2 0
+tmaAddR base r1 2 0
+tmaSetNm base 17 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 2101
+tmaAddW base rd 2 0
+tmaAddR base ra 2 0
+tmaSetNm base 17 0 0 TMA_PIPE_ALU6
+ret true
+end
+if eq op 551
+tmaAddW base rd 1 0
+tmaAddR base ra 1 0
+tmaAddR base r1 1 0
+tmaAddR base and w2 255 1 0
+tmaSetNm base 15 0 0 TMA_PIPE_ALU6
+ret true
+end
+ret tmaDecInt2 base op w0 w1 w2
+end
+
+fn tmaDecodeOne pc ulong w0 ulong w1 ulong w2 ulong w3 ulong to bool
+base = mul pc 24
+for i ulong 24
+put tmaRec add base i 0
+end
+op = and w0 4095
+wb = and shr w3 14 7
+rbr = and shr w3 17 7
+if or eq wb 6 eq rbr 6
+ret false
+end
+put tmaRec base op
+put tmaRec add base 1 and shr w0 12 15
+put tmaRec add base 2 and shr w3 9 15
+put tmaRec add base 3 and shr w3 13 1
+put tmaRec add base 4 wb
+put tmaRec add base 5 rbr
+put tmaRec add base 6 and shr w3 20 63
+if tmaDecInt1 base op w0 w1 w2
+ret true
+end
+ret tmaDecMem base op w0 w1 w2
+end
+
+fn tmaDecodeCode cnt ulong to bool
+for pc ulong cnt bound 2048
+b = mul pc 4
+w0 = get tmaCode b
+w1 = get tmaCode add b 1
+w2 = get tmaCode add b 2
+w3 = get tmaCode add b 3
+if not tmaDecodeOne pc w0 w1 w2 w3
+ret false
+end
+end
+ret true
+end
+
+note ==================== FULL-CFG EXACT 64-BIT MULTI-BARRIER SCOREBOARD CHECKER ====================
+note Fixes Antibody #17d: uses exact 64-bit barrier-set kill masks (tmaKillMask) so waiting
+note barrier b1 NEVER drops an unwaited barrier b2 != b1 on the same address register!
+
+fn tmaKillMask wt ulong to ulong
+k = ulong 0
+for m ulong 64
+if and gt m 0 ne and m wt 0
+k = or k shl ulong 1 m
+end
+end
+ret k
+end
+
+fn tmaChkOpnd opnd ulong chkR bool to bool
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+if eq reg 255
+ret true
+end
+base = add mul uni 256 reg
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if ne get tmaWbar idx 0
+ret false
+end
+if chkR
+if ne get tmaRbar idx 0
+ret false
+end
+end
+end
+end
+ret true
+end
+
+fn tmaMarkOpnd opnd ulong bit ulong isR bool to void
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+if eq reg 255
+ret
+end
+base = add mul uni 256 reg
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if isR
+put tmaRbar idx or get tmaRbar idx bit
+else
+put tmaWbar idx or get tmaWbar idx bit
+end
+end
+end
+end
+
+fn tmaApplyWait wt ulong to void
+if eq wt 0
+ret
+end
+km = xor tmaKillMask wt ulong 18446744073709551615
+for i ulong 512
+put tmaWbar i and get tmaWbar i km
+put tmaRbar i and get tmaRbar i km
+end
+end
+
+fn tmaStepCfg pc ulong chk bool to bool
+db = mul pc 24
+tmaApplyWait get tmaRec add db 6
+nr = get tmaRec add db 9
+nw = get tmaRec add db 10
+if chk
+for j ulong nr bound 5
+if not tmaChkOpnd get tmaRec add add db 11 j false
+put tmaHazMeta 0 pc
+put tmaHazMeta 1 1
+ret false
+end
+end
+if ne nw 0
+if not tmaChkOpnd get tmaRec add db 16 true
+put tmaHazMeta 0 pc
+put tmaHazMeta 1 2
+ret false
+end
+end
+end
+wb = get tmaRec add db 4
+rbr = get tmaRec add db 5
+if and ne nw 0 or ne wb 7 ne get tmaRec add db 7 0
+wbit = ulong 1
+if lt wb 6
+wbit = shl ulong 1 shl ulong 1 wb
+end
+tmaMarkOpnd get tmaRec add db 16 wbit false
+end
+if or ne get tmaRec add db 8 0 ne rbr 7
+mm = ulong 0
+if lt rbr 6
+mm = or mm shl ulong 1 rbr
+end
+if lt wb 6
+mm = or mm shl ulong 1 wb
+end
+if ne mm 0
+rbit = shl ulong 1 mm
+for j ulong nr bound 5
+tmaMarkOpnd get tmaRec add add db 11 j rbit true
+end
+end
+end
+ret true
+end
+
+fn tmaLoadIn pc ulong to void
+off = mul pc 512
+for i ulong 512
+put tmaWbar i get tmaInW add off i
+put tmaRbar i get tmaInR add off i
+end
+end
+
+fn tmaJoinTo tgt ulong to bool
+off = mul tgt 512
+ch = false
+for i ulong 512
+ow = get tmaInW add off i
+nw = or ow get tmaWbar i
+if ne nw ow
+put tmaInW add off i nw
+ch = true
+end
+orv = get tmaInR add off i
+nrv = or orv get tmaRbar i
+if ne nrv orv
+put tmaInR add off i nrv
+ch = true
+end
+end
+ret ch
+end
+
+fn tmaReachPush n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+if eq get tmaSeen u 0
+put tmaSeen u 1
+put tmaWk top u
+ret add top 1
+end
+ret top
+end
+
+fn tmaEdgePush n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+ch = tmaJoinTo u
+sv = get tmaSeen u
+qv = get tmaQu u
+if and or ch eq sv 1 eq qv 0
+put tmaQu u 1
+put tmaWk top u
+ret add top 1
+end
+ret top
+end
+
+fn tmaZeroCfg n ulong to void
+for i ulong n bound 2048
+put tmaSeen i 0
+put tmaQu i 0
+off = mul i 512
+for r ulong 512
+put tmaInW add off r 0
+put tmaInR add off r 0
+end
+end
+end
+
+fn tmaReachCfg n ulong to void
+put tmaSeen 0 1
+put tmaWk 0 0
+top = ulong 1
+while gt top 0 bound 4096
+top = sub top 1
+pc = get tmaWk top
+db = mul pc 24
+fl = get tmaRec add db 17
+gd = get tmaRec add db 1
+if or eq fl 0 ne gd 7
+top = tmaReachPush n add long pc 1 top
+end
+if eq fl 2
+tg = tmaU2l get tmaRec add db 18
+top = tmaReachPush n add long pc tg top
+end
+end
+end
+
+note Returns total CFG scoreboard hazards (0 = clean) and fills overlapMma metric!
+fn tmaCheckCfgHazards n ulong to ulong
+tmaZeroCfg n
+tmaReachCfg n
+put tmaWk 0 0
+put tmaQu 0 1
+top = ulong 1
+while gt top 0 bound 65536
+top = sub top 1
+pc = get tmaWk top
+put tmaQu pc 0
+put tmaSeen pc 2
+tmaLoadIn pc
+z = tmaStepCfg pc false
+db = mul pc 24
+fl = get tmaRec add db 17
+gd = get tmaRec add db 1
+if or eq fl 0 ne gd 7
+top = tmaEdgePush n add long pc 1 top
+end
+if eq fl 2
+tg = tmaU2l get tmaRec add db 18
+top = tmaEdgePush n add long pc tg top
+end
+end
+haz = ulong 0
+ovMma = ulong 0
+for pc ulong n bound 2048
+if ne get tmaSeen pc 0
+tmaLoadIn pc
+if not tmaStepCfg pc true
+haz = add haz 1
+end
+nm = get tmaRec add mul pc 24 19
+if or eq nm 18 eq nm 38
+hasFlight = false
+for r ulong 256
+if ne get tmaWbar r 0
+hasFlight = true
+break
+end
+end
+if hasFlight
+ovMma = add ovMma 1
+end
+end
+end
+end
+put tmaPlan 8 haz
+put tmaPlan 9 ovMma
+ret haz
+end
+
+note ==================== SELF-CONTAINED ANTIBODIES #13-#17 CHECKER OVER tmaRec ====================
+
+fn tmaRegOverlap a ulong b ulong to bool
+if or eq a 0 eq b 0
+ret false
+end
+ra = and a 255
+na = and shr a 8 255
+ua = and shr a 16 1
+rb2 = and b 255
+nb = and shr b 8 255
+ub = and shr b 16 1
+if ne ua ub
+ret false
+end
+if or eq ra 255 eq rb2 255
+ret false
+end
+if or le add ra na rb2 le add rb2 nb ra
+ret false
+end
+ret true
+end
+
+fn tmaHasRaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if eq get tmaRec add du 10 0
+ret false
+end
+wu = get tmaRec add du 16
+for j ulong get tmaRec add dv 9 bound 5
+if tmaRegOverlap wu get tmaRec add add dv 11 j
+ret true
+end
+end
+ret false
+end
+
+fn tmaHasWaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if or eq get tmaRec add du 10 0 eq get tmaRec add dv 10 0
+ret false
+end
+ret tmaRegOverlap get tmaRec add du 16 get tmaRec add dv 16
+end
+
+fn tmaMarkTargets n ulong to void
+for i ulong n bound 2048
+put tmaTarget i 0
+end
+if gt n 0
+put tmaTarget 0 1
+end
+for pc ulong n bound 2048
+db = mul pc 24
+if eq get tmaRec add db 17 2
+tg = tmaU2l get tmaRec add db 18
+dst = add long pc tg
+if and ge dst 0 lt dst long n
+put tmaTarget ulong dst 1
+end
+if lt add pc 1 n
+put tmaTarget add pc 1 1
+end
+end
+end
+end
+
+fn tmaIsAnchor pc ulong to bool
+if ne get tmaTarget pc 0
+ret true
+end
+db = mul pc 24
+if ne get tmaRec add db 17 0
+ret true
+end
+if ne get tmaRec add db 1 7
+ret true
+end
+if ne get tmaRec add db 21 0
+ret true
+end
+nm = get tmaRec add db 19
+if or le nm 8 ge nm 33
+if ne nm 38
+ret true
+end
+end
+if or eq nm 16 eq nm 25
+ret true
+end
+ret false
+end
+
+fn tmaSumStall lo ulong hi ulong to ulong
+tot = ulong 0
+k = lo
+while lt k hi bound 2048
+tot = add tot get tmaRec add mul k 24 2
+k = add k 1
+end
+ret tot
+end
+
+note Verify ALL-consumer RAW pipe floors (Antibodies #14, #15, #16, #17a, #17b) on tmaRec[0..n)!
+fn tmaCheckAllRawFloors n ulong to ulong
+tmaMarkTargets n
+for u ulong n bound 2048
+du = mul u 24
+if and ne get tmaRec add du 10 0 eq get tmaRec add du 7 0
+pFlr = get tmaRec add du 20
+nm = get tmaRec add du 19
+if eq nm 29
+if lt get tmaRec add du 2 6
+ret TMA_ERR_AB15
+end
+end
+lim = add u 32
+if gt lim n
+lim = n
+end
+v = add u 1
+while lt v lim bound 32
+if tmaHasRaw u v
+cyc = tmaSumStall u v
+if lt cyc pFlr
+if gt pFlr 6
+ret TMA_ERR_AB17_MMA
+end
+if tmaIsAnchor v
+ret TMA_ERR_AB16
+end
+ret TMA_ERR_AB14
+end
+end
+if tmaHasWaw u v
+break
+end
+if ne get tmaRec add mul v 24 17 0
+cycB = tmaSumStall u add v 1
+if lt cycB pFlr
+if gt pFlr 6
+ret TMA_ERR_AB17_MMA
+end
+ret TMA_ERR_AB16
+end
+break
+end
+v = add v 1
+end
+end
+end
+ret TMA_OK
+end
+
+note ==================== SM121 SASS EMISSION HELPERS ====================
+
+fn tmaCw st ulong wb ulong rbr ulong wt ulong yld ulong to ulong
+a = or shl st 9 shl yld 13
+b = or shl wb 14 shl rbr 17
+ret or or a b shl wt 20
+end
+
+fn tmaAlu6 to ulong
+ret tmaCw 6 7 7 0 0
+end
+
+fn tmaCmp14 to ulong
+ret tmaCw 14 7 7 0 0
+end
+
+fn tmaEmitRaw o edit ulong 16 atPc ulong to void
+w = new ulong 4 0
+if ne get tmaGuard 0 0
+put o 9 1
+end
+if eq get tmaGuard 0 2
+put o 10 1
+end
+put tmaGuard 0 0
+if ne get o 2 TMA_QZ
+put o 12 1
+end
+if ne get o 3 TMA_QZ
+put o 13 1
+end
+if ne enc1 view o edit w 0
+put tmaErr 0 1
+ret
+end
+base = mul atPc 4
+for i ulong 4
+put tmaCode add base i get w i
+end
+end
+
+fn tmaOp op ulong dst ulong a ulong b ulong imm ulong ctrl ulong to void
+o = new ulong 16 0
+put o 0 op
+put o 1 dst
+put o 2 a
+put o 3 b
+put o 4 TMA_QZ
+put o 5 4
+put o 6 and imm 4294967295
+put o 7 ctrl
+pc = get tmaPc 0
+if ge pc TMA_MAX_INSNS
+put tmaErr 0 1
+ret
+end
+tmaEmitRaw edit o pc
+put tmaPc 0 add pc 1
+end
+
+fn tmaOp4 op ulong dst ulong a ulong b ulong c ulong ctrl ulong to void
+o = new ulong 16 0
+put o 0 op
+put o 1 dst
+put o 2 a
+put o 3 b
+put o 4 c
+put o 5 4
+put o 6 0
+put o 7 ctrl
+pc = get tmaPc 0
+if ge pc TMA_MAX_INSNS
+put tmaErr 0 1
+ret
+end
+tmaEmitRaw edit o pc
+put tmaPc 0 add pc 1
+end
+
+fn tmaOpImm op ulong dst ulong a ulong c ulong imm ulong ctrl ulong to void
+o = new ulong 16 0
+put o 0 op
+put o 1 dst
+put o 2 a
+put o 3 TMA_QZ
+put o 4 c
+put o 5 4
+put o 6 and imm 4294967295
+put o 7 ctrl
+pc = get tmaPc 0
+if ge pc TMA_MAX_INSNS
+put tmaErr 0 1
+ret
+end
+tmaEmitRaw edit o pc
+put tmaPc 0 add pc 1
+end
+
+note Direct Blackwell SM121 OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X (silicon-verified on GB10!)
+fn tmaEmitOmma rD ulong rA ulong rB ulong rSa ulong rSb ulong stall ulong to void
+pc = get tmaPc 0
+if ge pc TMA_MAX_INSNS
+put tmaErr 0 1
+ret
+end
+base = mul pc 4
+w = ulong 29823
+w = or w shl and rD 255 16
+w = or w shl and rA 255 24
+put tmaCode base w
+w = or 1879048192 and rB 255
+w = or w shl and rSa 255 8
+w = or w shl and rSb 255 20
+put tmaCode add base 1 w
+put tmaCode add base 2 or 278016 and rD 255
+put tmaCode add base 3 tmaCw stall 7 7 0 0
+put tmaPc 0 add pc 1
+end
+
+fn tmaLit d ulong x ulong to void
+tmaOp 2 d TMA_QZ TMA_QZ x tmaAlu6
+end
+
+fn tmaF32 d ulong x f32 to void
+tmaLit d ulong bitcast uint x
+end
+
+fn tmaWait mask ulong to void
+tmaOp 0 TMA_QZ TMA_QZ TMA_QZ 0 tmaCw 6 7 7 mask 0
+end
+
+fn tmaBarSync to void
+tmaWait 63
+tmaOp 48 TMA_QZ TMA_QZ TMA_QZ 0 tmaCw 6 7 7 0 0
+end
+
+note Emit 4-tile interleaved Tensor Core MMA wave (respecting 29-cyc OMMA / 22-cyc HMMA floor!)
+fn tmaEmitMmaWave mode ulong to void
+if eq mode TMA_MODE_NVFP4_OMMA
+note 4 interleaved OMMA.SF.16864 tiles: 3x8 + 15 = 39 cycles >= 29-cycle SM121 acc RAW floor!
+tmaEmitOmma 24 40 44 46 47 8
+tmaEmitOmma 28 40 44 46 47 8
+tmaEmitOmma 48 40 44 46 47 8
+tmaEmitOmma 52 40 44 46 47 15
+else
+note 4 interleaved HMMA.16816.F32.BF16 tiles: 3x4 + 10 = 22 cycles >= 22-cycle SM121 acc RAW floor!
+tmaOp4 16 24 40 44 24 tmaCw 4 7 7 0 0
+tmaOp4 16 28 40 44 28 tmaCw 4 7 7 0 0
+tmaOp4 16 48 40 44 48 tmaCw 4 7 7 0 0
+tmaOp4 16 52 40 44 52 tmaCw 10 7 7 0 0
+end
+end
+
+note Stage one async SMEM phase: store srcReg[0..3] to SMEM[smBaseReg], sync, load MMA frags on wb=4!
+note Preserves any OTHER async LDG barrier (e.g. wb=2 or wb=0) actively in flight!
+fn tmaStageConsume srcBase ulong smBaseReg ulong mode ulong to void
+tmaOpImm 8 56 14 smBaseReg 16 tmaAlu6
+tmaLit 59 4
+tmaOp 14 57 56 59 0 tmaAlu6
+tmaOp 14 58 57 59 0 tmaAlu6
+tmaOp 14 59 58 59 0 tmaAlu6
+tmaOp 50 TMA_QZ 56 srcBase 0 tmaCw 4 7 5 0 1
+tmaOp 50 TMA_QZ 57 add srcBase 1 0 tmaCw 4 7 5 0 1
+tmaOp 50 TMA_QZ 58 add srcBase 2 0 tmaCw 4 7 5 0 1
+tmaOp 50 TMA_QZ 59 add srcBase 3 0 tmaCw 4 7 5 0 1
+tmaWait 32
+tmaOp 48 TMA_QZ TMA_QZ TMA_QZ 0 tmaCw 6 7 7 0 0
+note Load MMA fragments from SMEM[smBaseReg] on wb=4, rbar=5 (leaving wb=0 or wb=2 in flight!)
+tmaOp 58 40 smBaseReg TMA_QZ 0 tmaCw 2 4 5 0 1
+tmaOp 49 44 smBaseReg TMA_QZ 0 tmaCw 2 4 5 0 1
+tmaOp 49 45 smBaseReg TMA_QZ 0 tmaCw 2 4 5 0 1
+tmaOp 49 46 smBaseReg TMA_QZ 0 tmaCw 2 4 5 0 1
+tmaOp 49 47 smBaseReg TMA_QZ 0 tmaCw 2 4 5 0 1
+tmaWait 48
+tmaEmitMmaWave mode
+end
+
+note Zero-DRAM-Spill Register Epilogue Fusion: Scale / RMSNorm / SiLU in R24..R27 before final STG!
+fn tmaEmitFusedEpilogue fuseMask ulong to void
+if ne and fuseMask TMA_FUSE_SCALE 0
+note Fused NVFP4/BF16 output scale (2^-8 = 0.00390625f32) in registers: 0 DRAM spill!
+tmaF32 46 0.00390625f32
+for j ulong 4
+tmaOp 32 add 24 j add 24 j 46 0 tmaAlu6
+end
+end
+if ne and fuseMask TMA_FUSE_RMSNORM 0
+note Fused warp-butterfly RMSNorm in registers (SHFL.BFLY + MUFU.RSQ): 0 DRAM spill, 0 SMEM spill!
+tmaF32 56 0.0f32
+for j ulong 4
+tmaOp4 33 56 add 24 j add 24 j 56 tmaAlu6
+end
+d = ulong 16
+while ge d 1 bound 5
+tmaOp 60 57 56 TMA_QZ d tmaCw 4 0 7 0 1
+tmaOp 30 56 56 57 0 tmaCw 6 7 7 1 0
+d = shr d 1
+end
+tmaF32 57 0.0078125f32
+tmaF32 58 0.000001f32
+tmaOp4 33 56 56 57 58 tmaAlu6
+tmaOp 41 56 56 TMA_QZ 0 tmaCw 4 0 7 0 1
+tmaWait 1
+for j ulong 4
+tmaOp 32 add 24 j add 24 j 56 0 tmaAlu6
+end
+end
+if ne and fuseMask TMA_FUSE_SILU 0
+note Fused SiLU(x) = x * rcp(1 + exp2(-log2(e) * x)) in registers: 0 DRAM spill!
+tmaF32 57 -1.44269504f32
+tmaF32 58 1.0f32
+for j ulong 4
+rj = add 24 j
+tmaOp 32 56 rj 57 0 tmaAlu6
+tmaOp 47 56 56 TMA_QZ 0 tmaCw 4 0 7 0 1
+tmaWait 1
+tmaOp 30 56 56 58 0 tmaAlu6
+tmaOp 40 56 56 TMA_QZ 0 tmaCw 4 0 7 0 1
+tmaWait 1
+tmaOp 32 rj rj 56 0 tmaAlu6
+end
+end
+end
+
+note ==================== COMPILE-TIME TARGET-DESC CONTRACT & TILE PLANNER ====================
+
+fn tmaSetGraph tid ulong mode ulong M ulong N ulong K ulong tileM ulong to void
+put tmaGraph 0 tid
+put tmaGraph 1 mode
+put tmaGraph 2 M
+put tmaGraph 3 N
+put tmaGraph 4 K
+put tmaGraph 5 tileM
+end
+
+fn tmaSetGraph2 tileN ulong tileK ulong stages ulong swiz ulong nRegs ulong threads ulong to void
+put tmaGraph 6 tileN
+put tmaGraph 7 tileK
+put tmaGraph 8 stages
+put tmaGraph 9 swiz
+put tmaGraph 10 nRegs
+put tmaGraph 11 threads
+end
+
+fn tmaSetGraph3 fuseMask ulong persistent ulong codeVa ulong to void
+put tmaGraph 12 fuseMask
+put tmaGraph 13 persistent
+put tmaGraph 14 codeVa
+put tmaGraph 15 1
+end
+
+fn tmaPlanSmem to void
+mode = get tmaGraph 1
+tM = get tmaGraph 5
+tN = get tmaGraph 6
+tK = get tmaGraph 7
+rowBytes = mul tK 2
+scaleBytes = ulong 0
+if eq mode TMA_MODE_NVFP4_OMMA
+rowBytes = div tK 2
+scaleBytes = mul add tM tN div tK 16
+end
+stageRaw = add mul add tM tN add rowBytes 16 scaleBytes
+stageStride = mul div add stageRaw 255 256 256
+put tmaPlan 1 mul get tmaGraph 8 stageStride
+put tmaPlan 2 stageStride
+put tmaPlan 15 mul add tM tN 16
+end
+
+fn tmaPlanGrid to void
+tM = get tmaGraph 5
+tN = get tmaGraph 6
+gx = div add get tmaGraph 2 sub tM 1 tM
+gy = div add get tmaGraph 3 sub tN 1 tN
+if eq get tmaGraph 13 1
+if gt mul gx gy 48
+gx = ulong 48
+gy = ulong 1
+end
+end
+put tmaPlan 3 gx
+put tmaPlan 4 gy
+put tmaPlan 5 1
+end
+
+fn tmaPlanContract to ulong
+stages = get tmaGraph 8
+if or lt stages 2 gt stages 4
+ret TMA_ERR_STAGES
+end
+if eq get tmaGraph 5 0
+ret TMA_ERR_TARGET
+end
+if or eq get tmaGraph 6 0 eq get tmaGraph 7 0
+ret TMA_ERR_TARGET
+end
+nRegs = get tmaGraph 10
+if or gt nRegs 128 lt nRegs 32
+ret TMA_ERR_REGS
+end
+if gt get tmaGraph 11 1024
+ret TMA_ERR_REGS
+end
+tmaPlanSmem
+smemBytes = get tmaPlan 1
+reqMma = MMA_16816_BF16
+reqFeat = FEAT_HMMA16816
+if eq get tmaGraph 1 TMA_MODE_NVFP4_OMMA
+reqMma = MMA_16832_FP8
+reqFeat = FEAT_FP8
+end
+reqTdRegs = nRegs
+if gt reqTdRegs 64
+reqTdRegs = ulong 64
+end
+tdSetReq EXEC_SIMT_WARP smemBytes reqTdRegs 32 reqMma reqFeat
+rc = tdCheckKernelContract get tmaGraph 0
+if eq rc TDK_ERR_SMEM
+ret TMA_ERR_SMEM
+end
+if eq rc TDK_ERR_REGS
+ret TMA_ERR_REGS
+end
+if ne rc TDK_OK
+ret TMA_ERR_TARGET
+end
+if gt smemBytes TMA_SM121_SMEM_CAP
+ret TMA_ERR_SMEM
+end
+tmaPlanGrid
+ret TMA_OK
+end
+
+note Emit Blackwell QMD v05.00 Descriptor (96 words = 384 B, 256-byte aligned; mirrors launch.om!)
+fn tmaPackQmd to bool
+va = get tmaGraph 14
+if ne rem va 256 0
+put tmaPlan 13 0
+ret false
+end
+for i ulong TMA_QMD_WORDS
+put tmaQmd i 0
+end
+put tmaQmd 4 uint 20905984
+put tmaQmd 9 uint 3
+put tmaQmd 10 uint 1638400
+put tmaQmd 32 uint and shr va 4 4294967295
+put tmaQmd 33 uint or and shr va 36 2097151 20971520
+put tmaQmd 34 uint or get tmaGraph 11 65536
+put tmaQmd 35 uint or 1 shl get tmaGraph 10 8
+put tmaQmd 36 uint get tmaPlan 1
+put tmaQmd 39 uint get tmaPlan 3
+put tmaQmd 40 uint get tmaPlan 4
+put tmaQmd 41 uint get tmaPlan 5
+put tmaQmd 59 uint and shr va 8 4294967295
+put tmaPlan 13 1
+ret true
+end
+
+fn tmaEmitPrologue to void
+swiz = get tmaGraph 9
+if eq swiz 0
+swiz = ulong 4
+end
+tmaOp 7 4 TMA_QZ TMA_QZ 856 tmaCw 4 2 7 0 1
+for i ulong 4
+tmaOp 5 mul i 2 TMA_QZ TMA_QZ add 896 mul i 8 tmaCw 4 0 7 0 1
+end
+tmaOp 3 14 TMA_QZ TMA_QZ 33 tmaCw 4 0 7 0 1
+tmaOp 3 15 TMA_QZ TMA_QZ 37 tmaCw 4 0 7 0 1
+tmaOp 3 18 TMA_QZ TMA_QZ 38 tmaCw 4 0 7 0 1
+tmaOp 3 19 TMA_QZ TMA_QZ 39 tmaCw 4 0 7 0 1
+tmaWait 7
+note Persistent L2-Swizzled Tile Coordinate Mapping (bid.x/bid.y grouped by swiz for 24 MiB L2!)
+tmaLit 11 swiz
+tmaOpImm 8 16 18 15 swiz tmaAlu6
+tmaOp 18 17 16 TMA_QZ sub swiz 1 tmaAlu6
+tmaOpImm 8 16 15 17 16 tmaAlu6
+note Double/Triple-Buffered SMEM Stage Base Offsets (R22 = stage 0, R23 = stage 1)
+tmaLit 22 0
+tmaLit 23 get tmaPlan 2
+note Zero 16 FP32 Tensor Core Accumulators (R24..27, R28..31, R48..51, R52..55 <= R61!)
+for d ulong 4
+tmaF32 add 24 d 0.0f32
+tmaF32 add 28 d 0.0f32
+tmaF32 add 48 d 0.0f32
+tmaF32 add 52 d 0.0f32
+end
+end
+
+fn tmaEmitKLoop to void
+mode = get tmaGraph 1
+nK = div get tmaGraph 4 get tmaGraph 7
+if lt nK 2
+nK = ulong 2
+end
+tmaOpImm 9 16 14 0 16 tmaAlu6
+tmaOpImm 9 20 14 2 16 tmaAlu6
+tmaLit 12 0
+tmaLit 13 nK
+note Prologue Async Stage 0 Pre-Fetch (LDG.E.128 -> R32..35 on wb=0, rbar=1)!
+tmaOp 57 32 16 TMA_QZ 0 tmaCw 2 0 1 0 1
+tmaWait 2
+tmaLit 59 1
+tmaOpImm 9 16 59 16 64 tmaAlu6
+note Software-Pipelined 2-Stage Ping-Pong K-Loop (Stage 1 LDG overlaps Stage 0 MMA, & vice versa!)
+mLoop = get tmaPc 0
+tmaOp 57 36 20 TMA_QZ 0 tmaCw 2 2 3 0 1
+tmaWait 1
+tmaStageConsume 32 22 mode
+tmaOp 57 32 16 TMA_QZ 0 tmaCw 2 0 1 0 1
+tmaWait 12
+tmaLit 59 1
+tmaOpImm 9 20 59 20 64 tmaAlu6
+tmaStageConsume 36 23 mode
+tmaWait 2
+tmaLit 59 1
+tmaOpImm 9 16 59 16 64 tmaAlu6
+tmaLit 59 2
+tmaOp 14 12 12 59 0 tmaAlu6
+tmaOp 28 TMA_QZ 12 13 0 tmaCmp14
+put tmaGuard 0 2
+tmaOp 46 TMA_QZ TMA_QZ TMA_QZ sub mLoop get tmaPc 0 tmaAlu6
+note Drain final Stage 0 async load cleanly before fused epilogue
+tmaWait 1
+tmaStageConsume 32 22 mode
+end
+
+fn tmaEmitEpiloguePad to void
+tmaEmitFusedEpilogue get tmaGraph 12
+tmaOpImm 9 56 14 4 16 tmaAlu6
+tmaOp 12 TMA_QZ 56 24 0 tmaCw 4 7 1 0 1
+tmaWait 63
+tmaOp 45 TMA_QZ TMA_QZ TMA_QZ 0 tmaCw 6 7 7 0 0
+while true bound 2048
+p = get tmaPc 0
+if and ge p 32 eq rem p 8 0
+break
+end
+tmaOp 0 TMA_QZ TMA_QZ TMA_QZ 0 tmaCw 6 7 7 0 0
+end
+end
+
+fn tmaEmitKLoop3Stage to void
+mode = get tmaGraph 1
+nK = div get tmaGraph 4 get tmaGraph 7
+if lt nK 3
+nK = ulong 3
+end
+tmaOpImm 9 16 14 0 16 tmaAlu6
+tmaOpImm 9 20 14 2 16 tmaAlu6
+tmaOpImm 9 66 14 0 32 tmaAlu6
+tmaLit 64 mul get tmaPlan 2 2
+tmaLit 12 0
+tmaLit 13 nK
+note Prologue: pre-fetch BOTH Stage 0 (wb=0 -> R32..35) AND Stage 1 (wb=1 -> R36..39)!
+tmaOp 57 32 16 TMA_QZ 0 tmaCw 2 0 5 0 1
+tmaWait 32
+tmaLit 59 1
+tmaOpImm 9 16 59 16 64 tmaAlu6
+tmaOp 57 36 20 TMA_QZ 0 tmaCw 2 1 5 0 1
+tmaWait 32
+tmaLit 59 1
+tmaOpImm 9 20 59 20 64 tmaAlu6
+note 3-Stage Ring-Buffered K-Loop (2 async loads simultaneously in flight during every MMA wave!)
+mLoop = get tmaPc 0
+note Phase 0: issue Stage 2 (wb=2 -> R60..63), wait Stage 0 (wb=0|rbar=5), consume Stage 0 (SMEM[R22])
+tmaOp 57 60 66 TMA_QZ 0 tmaCw 2 2 5 0 1
+tmaWait 33
+tmaLit 59 1
+tmaOpImm 9 66 59 66 64 tmaAlu6
+tmaStageConsume 32 22 mode
+note Phase 1: issue Stage 0 (wb=0 -> R32..35), wait Stage 1 (wb=1|rbar=5), consume Stage 1 (SMEM[R23])
+tmaOp 57 32 16 TMA_QZ 0 tmaCw 2 0 5 0 1
+tmaWait 34
+tmaLit 59 1
+tmaOpImm 9 16 59 16 64 tmaAlu6
+tmaStageConsume 36 23 mode
+note Phase 2: issue Stage 1 (wb=1 -> R36..39), wait Stage 2 (wb=2|rbar=5), consume Stage 2 (SMEM[R64])
+tmaOp 57 36 20 TMA_QZ 0 tmaCw 2 1 5 0 1
+tmaWait 36
+tmaLit 59 1
+tmaOpImm 9 20 59 20 64 tmaAlu6
+tmaStageConsume 60 64 mode
+note Advance kTile += 3; loop invariant: wb=0 (R32..35) AND wb=1 (R36..39) in flight!
+tmaLit 59 3
+tmaOp 14 12 12 59 0 tmaAlu6
+tmaOp 28 TMA_QZ 12 13 0 tmaCmp14
+put tmaGuard 0 2
+tmaOp 46 TMA_QZ TMA_QZ TMA_QZ sub mLoop get tmaPc 0 tmaAlu6
+note Drain final two in-flight stages (Stage 0 wb=0, Stage 1 wb=1) cleanly!
+tmaWait 1
+tmaStageConsume 32 22 mode
+tmaWait 2
+tmaStageConsume 36 23 mode
+end
+
+note Emit complete multi-stage async SMEM + Tensor Core + L2-swizzled + fused-epilogue SM121 kernel!
+fn tmaEmitKernelBody to void
+put tmaPc 0 0
+put tmaGuard 0 0
+put tmaErr 0 0
+tmaEmitPrologue
+if ge get tmaGraph 8 3
+tmaEmitKLoop3Stage
+else
+tmaEmitKLoop
+end
+tmaEmitEpiloguePad
+end
+
+fn tmaScanMetrics cnt ulong to ulong
+maxReg = ulong 0
+stgCnt = ulong 0
+ommaCnt = ulong 0
+hmmaCnt = ulong 0
+for pc ulong cnt bound 2048
+db = mul pc 24
+if ne get tmaRec add db 22 0
+ret TMA_ERR_ALIGN
+end
+hi = get tmaRec add db 23
+if gt hi maxReg
+maxReg = hi
+end
+nm = get tmaRec add db 19
+if eq nm 34
+stgCnt = add stgCnt 1
+end
+if eq nm 38
+ommaCnt = add ommaCnt 1
+end
+if eq nm 18
+hmmaCnt = add hmmaCnt 1
+end
+end
+put tmaPlan 6 cnt
+put tmaPlan 7 maxReg
+put tmaPlan 10 stgCnt
+put tmaPlan 11 ommaCnt
+put tmaPlan 12 hmmaCnt
+ret TMA_OK
+end
+
+note Verify decoded tmaCode[0..cnt) against ALL SM121 invariants BEFORE emitting QMD!
+fn tmaVerifyBuffer cnt ulong nRegs ulong expectOverlap bool to ulong
+if or eq cnt 0 gt cnt TMA_MAX_INSNS
+ret TMA_ERR_DECODE
+end
+if not tmaDecodeCode cnt
+ret TMA_ERR_DECODE
+end
+mrc = tmaScanMetrics cnt
+if ne mrc TMA_OK
+ret mrc
+end
+if ge get tmaPlan 7 sub nRegs 2
+ret TMA_ERR_REGS
+end
+if ne tmaCheckCfgHazards cnt 0
+ret TMA_ERR_HAZARD
+end
+if expectOverlap
+if lt get tmaPlan 9 2
+ret TMA_ERR_OVERLAP
+end
+end
+if gt get tmaPlan 10 1
+ret TMA_ERR_SPILL
+end
+abRc = tmaCheckAllRawFloors cnt
+put tmaPlan 14 abRc
+if ne abRc TMA_OK
+ret abRc
+end
+ret TMA_OK
+end
+
+note Complete Automatic Pipeline: Plan -> TargetDesc Contract -> Emit SASS -> Verify -> Pack QMD!
+fn tmaLowerAndEmit to ulong
+for i ulong 16
+put tmaPlan i 0
+end
+rc = tmaPlanContract
+if ne rc TMA_OK
+put tmaPlan 0 rc
+put tmaPlan 13 0
+ret rc
+end
+tmaEmitKernelBody
+if ne get tmaErr 0 0
+put tmaPlan 0 TMA_ERR_ENCODE
+put tmaPlan 13 0
+ret TMA_ERR_ENCODE
+end
+cnt = get tmaPc 0
+vrc = tmaVerifyBuffer cnt get tmaGraph 10 true
+if ne vrc TMA_OK
+put tmaPlan 0 vrc
+put tmaPlan 13 0
+ret vrc
+end
+if not tmaPackQmd
+put tmaPlan 0 TMA_ERR_ALIGN
+ret TMA_ERR_ALIGN
+end
+put tmaPlan 0 TMA_OK
+ret TMA_OK
+end
