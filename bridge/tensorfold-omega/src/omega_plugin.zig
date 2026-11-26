@@ -374,9 +374,31 @@ test "EGP3 structural checker positive and negative controls" {
 
     try std.testing.expectEqual(@as(u64, 0), try checkEgp3Cert(&cert));
 
-    // Tamper Rule 1 RHS operand (swap c -> 0): MUST be refused with nonzero code 8.
-    cert[36 + 5 * 32 + 3 * 4] = 0;
-    try std.testing.expectEqual(@as(u64, 8), try checkEgp3Cert(&cert));
+    // Negative control 1: Tamper Rule 1 RHS operand (swap c -> 0): MUST refuse with code 8.
+    var bad_rhs = cert;
+    bad_rhs[36 + 5 * 32 + 3 * 4] = 0;
+    try std.testing.expectEqual(@as(u64, 8), try checkEgp3Cert(&bad_rhs));
+
+    // Negative control 2: Tamper RHS AND switch rule_id to 3 (must NOT fail open): MUST refuse with code 8.
+    var bad_rule3 = bad_rhs;
+    std.mem.writeInt(u32, bad_rule3[228..232], 3, .little);
+    try std.testing.expectEqual(@as(u64, 8), try checkEgp3Cert(&bad_rule3));
+
+    // Negative control 3: Invalid rule_id = 19: MUST refuse with code 7.
+    var bad_rule19 = cert;
+    std.mem.writeInt(u32, bad_rule19[228..232], 19, .little);
+    try std.testing.expectEqual(@as(u64, 7), try checkEgp3Cert(&bad_rule19));
+
+    // Negative control 4: Disconnected root_before=0, root_after=1 with valid step 4->5: MUST refuse with code 11.
+    var disconn = cert;
+    std.mem.writeInt(u32, disconn[24..28], 0, .little);
+    std.mem.writeInt(u32, disconn[28..32], 1, .little);
+    try std.testing.expectEqual(@as(u64, 11), try checkEgp3Cert(&disconn));
+
+    // Negative control 5: tc=0 with root_before=4 != root_after=5: MUST refuse with code 11.
+    var zero_trace = cert[0..228].*;
+    std.mem.writeInt(u32, zero_trace[32..36], 0, .little);
+    try std.testing.expectEqual(@as(u64, 11), try checkEgp3Cert(&zero_trace));
 }
 
 test "ABI v2 null and alias probes return status 32" {
