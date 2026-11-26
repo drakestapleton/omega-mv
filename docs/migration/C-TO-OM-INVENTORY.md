@@ -20,6 +20,8 @@ Updated 2026-11-24 with Waves 54–78 (100% OSH retirement, 100% handwritten `sr
 
 Updated 2026-11-25 (Phase 1A CPU tools port): added `tools/turing_cal_eval.om` (`mk/turing_exp001_eval.mk` `turing-cal-eval` cut over to `seed/out/omc`, differential parity verified 83/83 + byte-identical `det.txt` vs ASan C `turing-cal-eval_asan`), `tools/gen/abstract/gabs.om` (`mk/gen-abstract.mk` `test-gen-abstract-parity`), and `tools/own30b_decode_profile.om` (`Makefile` `check-own30b-decode-profile`), and decoupled `tests/gpu_tern_test.c` / `Makefile` `$(GPU_TERN_TEST)` from `OMA_RZ_SRCS` / `src/algebra/realize_common.h` (C/H sources retained where receipt/manifest/ASan-oracle/remaining C callers require them).
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-1): cut over root `Makefile` `all` / `$(TARGET)` (`build/omegatool`), `test`, `test-m5`..`test-m15`, `test-r16-surface`, and `mk/omegatool-path.mk` (`test-omegatool-path`) to pure seeded OM-2 (`tools/omegatool.om`, physics-free, zero C); retired `tools/omegatool.c` and `tests/omegatool_path/physics_dir_test.c` (`PARITY.tsv` ref `f9bf35bde`).
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage

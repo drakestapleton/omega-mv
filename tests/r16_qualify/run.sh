@@ -32,7 +32,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAILS=$((FAILS
 W=$SCR/w
 mkdir -p "$W/tools"
 cp "$HERE/tools/r16_qualify.sh" "$HERE/tools/aienos_lock_source.sh" "$W/tools/"
-G6FILES="src/omega_accelerator_world.c src/runtime/rx_generation.c src/omega_world_gates.c tools/omegatool.c src/runtime/rx_native_bind.c src/omega_evidence.c src/omega_verify.c src/runtime/rx_resident_gpu.c src/runtime/rx_seq_reference.c src/runtime/rx_world.c src/runtime/rx_living.c src/runtime/rx_operator.c tests/runtime/rx_r13_living.c"
+G6FILES="src/omega_accelerator_world.c src/runtime/rx_generation.c src/omega_world_gates.c tools/omegatool.om src/runtime/rx_native_bind.c src/omega_evidence.c src/omega_verify.c src/runtime/rx_resident_gpu.c src/runtime/rx_seq_reference.c src/runtime/rx_world.c src/runtime/rx_living.c src/runtime/rx_operator.c tests/runtime/rx_r13_living.c"
 for p in $G6FILES; do mkdir -p "$W/$(dirname "$p")"; cp "$HERE/$p" "$W/$p"; done
 printf 'build/\n' > "$W/.gitignore"
 g() { git -C "$W" -c user.name=r16 -c user.email=r16@invalid -c commit.gpgsign=false "$@"; }
