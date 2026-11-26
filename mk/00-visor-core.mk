@@ -1,17 +1,6 @@
-# Omega Visor V1 (lead-owned). The `omega` binary is pure seeded OM-2 and
-# PHYSICS-FREE: it is compiled directly from $(OMEGA_OM_SRCS) by seed/out/omc.
-# Every Visor lane and its test is pure OM-2. The only Visor C left is what the
-# runtime-linked, test-only binary links: visor_effect_request.c (mk/visor-authority.mk,
-# test-effect-cap64).
-VISOR_CORE = omega_om_units omega_canonical omega_validate omega_core omega_codec aarch64_encoder aarch64_decoder \
-	omega_realize omega_realize_synth omega_machine omega_exec omega_verify omega_program omega_synthesis omega_library \
-	omega_vector omega_blackwell_qmd omega_blackwell_encoder omega_blackwell_realize
-VISOR_CORE_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(VISOR_CORE)))
-VISOR_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -MMD -MP -D_GNU_SOURCE -O2 -Isrc -Isrc/visor
-VISOR_SRCS = src/visor/visor_effect_request.c
-VISOR_OBJS = $(patsubst src/visor/%.c,$(OUT_DIR)/visor/%.o,$(VISOR_SRCS))
-VISOR_DEPS = $(VISOR_OBJS:.o=.d)
--include $(VISOR_DEPS)
+# Omega Visor V1 (lead-owned). The `omega` binary and every Visor lane and test
+# are 100% pure seeded OM-2 and PHYSICS-FREE: compiled directly from $(OMEGA_OM_SRCS)
+# by seed/out/omc (zero Visor C remains).
 OMEGA_BIN = $(OUT_DIR)/omega
 # Seeded compiler for the pure OM-2 Visor lane tests.
 VISOR_OMC ?= seed/out/omc
@@ -26,11 +15,8 @@ OMEGA_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) src/visor/visor_program.om 
 	src/visor/visor_effect_request.om src/visor/visor_parse_command.om src/visor/visor_console_hooks.om \
 	tools/omega_ops.om tools/omega_wire.om src/visor/visor_console.om tools/omega.om
 
-$(OUT_DIR)/visor $(OUT_DIR)/tests-visor $(OUT_DIR)/tests-language:
+$(OUT_DIR)/tests-visor $(OUT_DIR)/tests-language:
 	mkdir -p $@
-
-$(OUT_DIR)/visor/%.o: src/visor/%.c | $(OUT_DIR)/visor
-	$(CC) $(VISOR_CFLAGS) -c $< -o $@
 
 $(OMEGA_BIN): $(OMEGA_OM_SRCS) seed/out/omc | $(OUT_DIR)
 	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(OMEGA_OM_SRCS)) | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
