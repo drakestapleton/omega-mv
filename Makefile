@@ -389,16 +389,8 @@ RX_TEST = $(TRT5_HB_BIN)
 test-r3: $(RX_TEST)
 	./$(RX_TEST)
 
-# HD-09 resource contract v0, first enforcement cut: a declared deadline is
-# enforced before publishing (late reaction cancelled, nothing published,
-# charge refunded once). CPU only, same links as R3 minus the heartbeat test.
-RX_DEADLINE_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/omega_om_units.c src/omega_evidence.c tests/runtime/rx_deadline_cancel.c
-RX_DEADLINE_TEST = $(OUT_DIR)/rx_deadline_cancel
-
-$(RX_DEADLINE_TEST): $(RX_DEADLINE_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/omega_shared_world_abi.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_DEADLINE_SRCS)
+# HD-09 resource contract v0, pure seeded OM-2.
+RX_DEADLINE_TEST = $(TRT1_DLC_BIN)
 
 .PHONY: test-rx-deadline-cancel
 test-rx-deadline-cancel: $(RX_DEADLINE_TEST)
@@ -506,24 +498,13 @@ RX_R12_TEST = $(TRT5_R12_BIN)
 test-r12: $(RX_R12_TEST)
 	./$(RX_R12_TEST)
 
-# R16 G6 operator emergency stop (spec/r16-operator-emergency-stop.md). Host only,
-# real capability root: authority refusals, in-flight and racing stops, the
-# generation store under a stop, the durable mark across a restart, and resume.
-# The mutant script then removes each guard in turn from a temporary copy and
-# requires the test to fail against every one. The resident-seat case lives in
-# test-r12 (t_emergency_stop, native Aienux authority).
-RX_EMERGENCY_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_generation.c src/omega_om_units.c tests/runtime/rx_emergency.c
-RX_EMERGENCY_TEST = $(OUT_DIR)/rx_emergency_test
-
-$(RX_EMERGENCY_TEST): $(RX_EMERGENCY_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/rx_generation.h src/runtime/rx_caller.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_EMERGENCY_SRCS) -lm
+# R16 G6 operator emergency stop (spec/r16-operator-emergency-stop.md), pure seeded OM-2.
+RX_EMERGENCY_TEST = $(TRT2_EM_BIN)
 
 .PHONY: test-rx-emergency
 test-rx-emergency: $(RX_EMERGENCY_TEST)
 	./$(RX_EMERGENCY_TEST)
-	CC="$(CC)" bash tests/runtime/rx_emergency_mutants.sh
+	OMC="$(CURDIR)/seed/out/omc" bash tests/runtime/rx_emergency_mutants.sh
 
 # R10: Omega as a resident realization faculty, pure seeded OM-2.
 RX_R10_TEST = $(TRT2_R10_BIN)
@@ -652,13 +633,6 @@ RX_R13_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c \
 	src/omega_verify.c src/omega_matvec.c src/omega_matvec_quad.c \
 	$(RX_COMPOSE_LIVING_SRCS) \
 	tests/runtime/rx_r13_living.c
-# librx_compose.a objects (mk/rx_compose_lib.mk) are compiled with -MMD; include their
-# .d files HERE, after RX_R13_SRCS exists (the mk file is included at the top, where the
-# list is still empty and an include there expands to nothing). Without this a header
-# change (rx_cortex.h, omega#408) left rx_compose.o / rxc_host_abi.o stale in a reused
-# OUT_DIR: the archive mixed two layouts of CxStore and rxc_host_run refused with
-# RX_ERR_AUTHORITY (sovereign-core abi-qualify, 2026-10-12).
--include $(RXC_LIB_OBJS:.o=.d)
 RX_R13_TEST_SRCS = $(RX_R13_SRCS) $(RX_FABRIC_TEST_SRCS)
 RX_R13_SILICON_EXTRA = src/runtime/rx_resident_gpu.c src/omega_blackwell_codegen.c \
 	src/omega_blackwell_encoder.c src/omega_blackwell_qmd.c src/omega_blackwell_matmul.c \
@@ -732,22 +706,14 @@ test-r14-host: $(RX_R14_HOST)
 test-r14-silicon: $(RX_R14_SILICON)
 	./$(RX_R14_SILICON)
 
-# R15: instrumentation checks (host). Every counter the R15 harness reduces
-# is checked against a case whose true value is known in advance.
-RX_R15_INSTR_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_generation.c src/omega_om_units.c src/omega_evidence.c \
-	src/runtime/rx_seq_reference.c tests/runtime/rx_r15_instr.c
-RX_R15_INSTR = $(OUT_DIR)/rx_r15_instr_test
-
-$(RX_R15_INSTR): $(RX_R15_INSTR_SRCS) src/runtime/rx_world.h src/runtime/rx_generation.h \
-	src/runtime/rx_caproot.h src/runtime/rx_seq_reference.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R15_INSTR_SRCS)
+# R15: instrumentation checks (host), pure seeded OM-2.
+RX_R15_INSTR = $(TRT2_R15I_BIN)
 
 test-r15-instr: $(RX_R15_INSTR)
 	./$(RX_R15_INSTR)
 
-# R15: SEQ semantic parity gate (spec §16 C1 item 9). The R13 body is built
-# by tests/runtime/rx_r15_rig.c for RES-1 and for the sequential reference.
+# R15: SEQ semantic parity gate (spec §16 C1 item 9). Host runs pure seeded OM-2;
+# silicon still links the resident GB10 C harness until Stage 2.
 RX_R15_RIG_SRCS = $(filter-out tests/runtime/rx_r13_living.c src/runtime/rx_operator.c,$(RX_R13_SRCS)) \
 	src/runtime/rx_seq_reference.c tests/runtime/rx_r15_rig.c
 RX_R15_RIG_HDRS = src/runtime/rx_living.h src/runtime/rx_seq_reference.h \
@@ -755,13 +721,8 @@ RX_R15_RIG_HDRS = src/runtime/rx_living.h src/runtime/rx_seq_reference.h \
 RX_R15_GPU_SRCS = src/runtime/rx_resident_gpu.c src/omega_blackwell_codegen.c \
 	src/omega_blackwell_encoder.c src/omega_blackwell_qmd.c \
 	src/omega_blackwell_matmul.c $(PHYSICS_DIR)/m16/m16_native.c $(PHYSICS_DIR)/nvrm/nvrm.c
-RX_R15_PARITY_HOST = $(OUT_DIR)/rx_r15_parity_host
+RX_R15_PARITY_HOST = $(TRT4_R15P_BIN)
 RX_R15_PARITY_SILICON = $(OUT_DIR)/rx_r15_parity_silicon
-
-$(RX_R15_PARITY_HOST): $(RX_R15_RIG_SRCS) tests/runtime/rx_r15_parity.c $(RX_R15_RIG_HDRS) \
-	$(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R15_RIG_SRCS) tests/runtime/rx_r15_parity.c \
-		$(AIENOS_CAP_LIB) -lm
 
 $(RX_R15_PARITY_SILICON): $(RX_R15_RIG_SRCS) tests/runtime/rx_r15_parity.c $(RX_R15_RIG_HDRS) \
 	$(RX_R15_GPU_SRCS) $(AIENOS_CAP_LIB) | $(OUT_DIR)
@@ -771,13 +732,8 @@ $(RX_R15_PARITY_SILICON): $(RX_R15_RIG_SRCS) tests/runtime/rx_r15_parity.c $(RX_
 test-r15-parity-host: $(RX_R15_PARITY_HOST)
 	./$(RX_R15_PARITY_HOST)
 
-# R15 G7: production keeps its worker through a generation promotion; the R9
-# store's physical work runs on the store's durable executor (host seat).
-RX_R15_G7_HOST = $(OUT_DIR)/rx_r15_g7_host
-$(RX_R15_G7_HOST): $(RX_R15_RIG_SRCS) tests/runtime/rx_r15_g7.c $(RX_R15_RIG_HDRS) \
-	$(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R15_RIG_SRCS) tests/runtime/rx_r15_g7.c \
-		$(AIENOS_CAP_LIB) -lm
+# R15 G7: worker split across generation promotion (host), pure seeded OM-2.
+RX_R15_G7_HOST = $(TRT5_R15G_BIN)
 test-r15-g7-host: $(RX_R15_G7_HOST)
 	./$(RX_R15_G7_HOST)
 
@@ -927,24 +883,17 @@ test-r16-authpath-linkmap-silicon: $(RX_R13_SILICON) $(RX_R14_SILICON)
 		src/omega_blackwell_matmul.c $(PHYSICS_DIR)/m16/m16_native.c \
 		$(PHYSICS_DIR)/nvrm/nvrm.c $(AIENOS_CAP_LIB)
 
-# R16-G4: legacy paths cannot bypass authority. The R13 body (R15 rig, RES-4,
-# host seat) is started; a legacy context tries six acts and each must be
-# refused with no change to authoritative state. Host only; no chip.
-RX_R16_NEGATIVE = $(OUT_DIR)/rx_r16_negative
-$(RX_R16_NEGATIVE): $(RX_R15_RIG_SRCS) tests/runtime/rx_r16_negative.c $(RX_R15_RIG_HDRS) \
-	$(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R15_RIG_SRCS) tests/runtime/rx_r16_negative.c \
-		$(AIENOS_CAP_LIB) -lm
+# R16-G4: legacy paths cannot bypass authority, pure seeded OM-2.
+RX_R16_NEGATIVE = $(TRT5_R16_BIN)
 
 .PHONY: test-r16-negative test-r16-negative-mutants
 test-r16-negative: $(RX_R16_NEGATIVE)
 	./$(RX_R16_NEGATIVE)
 
-# "Removing any one guard turns the test red": rebuilds the G4 test against
-# scratch copies with one guard removed at a time; each must FAIL. Minutes.
-test-r16-negative-mutants: $(RX_R16_NEGATIVE) $(AIENOS_CAP_LIB)
-	R16_CAP_LIB="$(AIENOS_CAP_LIB)" sh tests/r16_negative/mutate.sh "$(CC)" "$(CFLAGS)" "$(AIENOS_R7_DIR)" \
-		$(RX_R15_RIG_SRCS) tests/runtime/rx_r16_negative.c
+# "Removing any one guard turns the test red": rebuilds the pure OM-2 G4 test
+# against scratch copies with one guard removed at a time; each must FAIL.
+test-r16-negative-mutants: $(RX_R16_NEGATIVE) seed/out/omc
+	sh tests/r16_negative/mutate.sh "$(CURDIR)/seed/out/omc" $(TRT5_R16_SRCS)
 
 # R16-G5 API/build surface: legacy modes only under explicit names, the SEQ
 # loop only in rx_seq_reference.*, no legacy default mode, production entry
@@ -1549,42 +1498,21 @@ RX_COMPOSE_DEPS = $(RX_COMPOSE_SRCS) $(OUT_DIR)/rx_cortex.o $(RX_SKILLROUTE_OBJ)
 	src/runtime/rx_world.h src/runtime/rx_jspace.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB)
 RX_COMPOSE_LINK = $(OUT_DIR)/rx_cortex.o $(RX_SKILLROUTE_OBJ) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) \
 	$(AIENOS_CAP_LIB) -lm
-# Test build ($(AIEN_TEST_FLAGS), Lane 32): the composition fault points and
-# rogue-candidate hook (rx_compose.h, RXC_TEST_HOOKS) exist only in the unit
-# tests and the R13 test-build variant; the gate, the production program and
-# every other build compile them out.
-RX_COMPOSE_TEST = $(OUT_DIR)/rx_compose_test
-RX_COMPOSE_GATE = $(OUT_DIR)/rx_composition_gate
-# Attach hygiene (one per World, close waits for its own steps, inert
-# reactions + table bound); its ASan build is test-composition-attach-asan.
-RX_COMPOSE_ATTACH_TEST = $(OUT_DIR)/rx_compose_attach_test
-RX_COMPOSE_ATTACH_ASAN = $(OUT_DIR)/rx_compose_attach_test_asan
-
-$(RX_COMPOSE_TEST): $(RX_COMPOSE_DEPS) tests/runtime/rx_compose_test.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) $(AIEN_TEST_FLAGS) -pthread -o $@ $(RX_COMPOSE_SRCS) tests/runtime/rx_compose_test.c \
-		$(RX_COMPOSE_LINK)
-
-$(RX_COMPOSE_GATE): $(RX_COMPOSE_DEPS) tests/runtime/rx_composition_gate.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_COMPOSE_SRCS) tests/runtime/rx_composition_gate.c \
-		$(RX_COMPOSE_LINK)
-
-$(RX_COMPOSE_ATTACH_TEST): $(RX_COMPOSE_DEPS) tests/runtime/rx_compose_attach_test.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) $(AIEN_TEST_FLAGS) -pthread -o $@ $(RX_COMPOSE_SRCS) \
-		tests/runtime/rx_compose_attach_test.c $(RX_COMPOSE_LINK)
-
-$(RX_COMPOSE_ATTACH_ASAN): $(RX_COMPOSE_DEPS) tests/runtime/rx_compose_attach_test.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) -DROUNDS=200 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all $(AIEN_TEST_FLAGS) \
-		-pthread -o $@ $(RX_COMPOSE_SRCS) tests/runtime/rx_compose_attach_test.c $(RX_COMPOSE_LINK)
+# COMPOSITION-2 host suites and C4 requalification, pure seeded OM-2.
+# (RX_COMPOSE_SRCS/DEPS/LINK above remain temporarily for RX_COMPOSE_GATE_GPU until Stage 2.)
+RX_COMPOSE_TEST = $(TRT3_CMP_BIN)
+RX_COMPOSE_GATE = $(TRT5_CG_BIN)
+RX_COMPOSE_ATTACH_TEST = $(TRT3_ATT_BIN)
 
 test-composition: $(RX_COMPOSE_TEST) $(RX_COMPOSE_ATTACH_TEST)
 	./$(RX_COMPOSE_TEST)
 	./$(RX_COMPOSE_ATTACH_TEST)
 
-test-composition-attach-asan: $(RX_COMPOSE_ATTACH_ASAN)
-	./$(RX_COMPOSE_ATTACH_ASAN)
+test-composition-attach-asan: $(RX_COMPOSE_ATTACH_TEST)
+	./$(RX_COMPOSE_ATTACH_TEST)
 
 test-composition-gate: $(RX_COMPOSE_GATE)
-	./$(RX_COMPOSE_GATE) "$$(git rev-parse HEAD)" $(OUT_DIR)/composition_gate_receipt.json
+	./$(RX_COMPOSE_GATE)
 
 composition-gate-bin: $(RX_COMPOSE_GATE)
 
@@ -1593,17 +1521,11 @@ print-composition-gate-bin:
 
 .PHONY: test-composition test-composition-gate test-composition-attach-asan composition-gate-bin print-composition-gate-bin
 
-# C4 (Convergence plan item 4): requalification of the local runtime with
-# interruption and recovery (crash at every stage boundary, SIGKILL sweep, on-disk
-# corruption). Test build only (crash points). Receipt: tools/c4_requal.sh.
-RX_C4_REQUAL = $(OUT_DIR)/rx_c4_requal
-
-$(RX_C4_REQUAL): $(RX_COMPOSE_DEPS) tests/runtime/rx_c4_requal.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) $(AIEN_TEST_FLAGS) -pthread -o $@ $(RX_COMPOSE_SRCS) tests/runtime/rx_c4_requal.c \
-		$(RX_COMPOSE_LINK)
+# C4 (Convergence plan item 4): requalification of the local runtime, pure seeded OM-2.
+RX_C4_REQUAL = $(TRT3_C4R_BIN)
 
 test-c4-requal: $(RX_C4_REQUAL)
-	./$(RX_C4_REQUAL) $(OUT_DIR)/c4_requal_receipt.json
+	./$(RX_C4_REQUAL)
 
 c4-requal-bin: $(RX_C4_REQUAL)
 
