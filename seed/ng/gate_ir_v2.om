@@ -1,0 +1,1346 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gate_ir_v2.om: Standalone Pure-OM-2 Verification Gate for Stage 0 (ΩIR v2).
+note Verifies:
+note   Stage 1: In-process ΩIR v1 backward-compatibility, v2 contract round-trip, canonical
+note            per-function SEMANTIC_ID determinism & sensitivity, and 9 malformed v2/tag refusals.
+note   Stage 2: Infix frontend contract parsing (@pure/@exact/@tol/@err/@deadline/@hard_deadline/@power)
+note            and 6 fail-closed negative controls (including @ operator regression guard).
+note   Stage 3: OMPK v1/v2 contract & purity propagation in sem_pack.om and 4 negative controls.
+note   Stage 4 (when invoked as `gate_ir_v2 NG NGCHECK SCRATCH`): Live subprocess end-to-end
+note            verification using the real compiled `ng` and `ngcheck` binaries:
+note              - v1 backward compatibility (front-ir, ngcheck, ir-copy, sem-id)
+note              - v2 contract round-trip & structural purity PASS (closed pure callees)
+note              - infix-vs-prefix bit-identical SEMANTIC_ID & ΩIR v2 bytes
+note              - OMPK v2 @ng pack + @ng realize + tampered/malformed refusals
+note              - 7 fail-closed structural purity refusals (host, global write, global read,
+note                impure callee, edit param, exit, signed chk.add) -> ngcheck exit 22 (EFFECT)
+note              - 7 fail-closed malformed v2 / front-end contract refusals -> exit 13 / 11 / 30
+note
+note Link order (program mode, no om2 header — ir.om provides om2 at line 1):
+note   seed/ng/src/ir.om seed/ng/sha256.om seed/ng/target/target_desc.om
+note   seed/ng/pack/sem_pack.om seed/ng/infix/infix_front.om seed/ng/gate_ir_v2.om
+
+global gv_dig uchar 24
+global gv_chk ulong 1
+global gv_neg ulong 1
+global gv_cli_chk ulong 1
+global gv_cli_neg ulong 1
+
+global gv_b1 uchar 65536
+global gv_b2 uchar 65536
+global gv_b3 uchar 65536
+global gv_h1 uchar 32
+global gv_h2 uchar 32
+global gv_h3 uchar 32
+
+note Subprocess CLI state (Stage 4)
+global gv_ngp uchar 2048
+global gv_ngl ulong 1
+global gv_ckp uchar 2048
+global gv_ckl ulong 1
+global gv_scp uchar 2048
+global gv_scl ulong 1
+global gv_pa uchar 4096
+global gv_pl ulong 1
+global gv_av uchar 8192
+global gv_an ulong 2
+global gv_st uchar 4
+global gv_io uchar 131072
+global gv_io2 uchar 131072
+global gv_io3 uchar 131072
+
+text gv_m_hdr "=== OMEGA NG STAGE 0 (OIR v2) VERIFICATION GATE ===\n"
+text gv_m_pass "GATE-IR-V2 PASS checks="
+text gv_m_neg " neg_controls="
+text gv_m_cli " cli_checks="
+text gv_m_cneg " cli_neg="
+text gv_m_nl "\n"
+text gv_m_fail "GATE-IR-V2 FAIL check="
+
+text gv_h_fi "@ng front-ir\n"
+text gv_h_ic "@ng ir-copy\n"
+text gv_h_op "@ng opt\n"
+text gv_h_sd "@ng sem-id\n"
+text gv_h_pk "@ng pack\n"
+text gv_h_rl "@ng realize\n"
+
+text gv_f_in "/in.bin"
+text gv_f_out "/out.bin"
+text gv_f_err "/err.bin"
+text gv_f_ir1 "/v1.ir"
+text gv_f_ir2 "/v2.ir"
+text gv_f_ir2b "/v2_ix.ir"
+text gv_f_pk2 "/v2.ompk"
+text gv_f_s1 "/sem_px.txt"
+text gv_f_s2 "/sem_ix.txt"
+
+text gv_pfx_acc "ACCEPT "
+text gv_pfx_rlz "NG-REALIZE PASS"
+text gv_sub_c0 " pure=1 tier=1 err=0 deadline=500 hard=0 power=15000\n"
+text gv_sub_c1 " pure=1 tier=2 err=128 deadline=250 hard=1 power=9000\n"
+
+note ---- Source Fixtures ----
+text gv_src_v1 "om2\nfn step x ulong to ulong\nret add mul x 3 7\nend\nfn main to int\nret int and step 5 255\nend\n"
+
+text gv_src_v2_px "om2\n@pure\n@exact\n@deadline 500\n@power 15000\nfn sq x ulong to ulong\nret mul x x\nend\n@pure\n@tol 128\n@hard_deadline 250\n@power 9000\nfn mix x ulong y ulong to ulong\nret add sq x mul y 3\nend\nfn main to int\nret int and mix 4 5 255\nend\n"
+
+note Infix equivalent with DIFFERENT local names (a, b vs x, y), comments, and DIFFERENT attr order!
+text gv_src_v2_ix "om2\n// Pure exact squarer in infix NG\n@power(15000)\n@deadline(500)\n@exact\n@pure\nfn sq(a: ulong) -> ulong {\n  return a * a\n}\n// Pure bounded-error caller with hard deadline\n@power(9000)\n@hard_deadline(250)\n@err(128)\n@tol\n@pure\nfn mix(a: ulong, b: ulong) -> ulong {\n  return sq(a) + (b * 3)\n}\nfn main() -> int {\n  return int(mix(4, 5) & 255)\n}\n"
+
+note Structural purity negative controls (impure functions marked @pure -> ngcheck MUST refuse exit 22)
+text gv_neg_host "om2\ntext msg \"hi\"\n@pure\nfn bad_io to ulong\nw = write 1 msg 0 len msg\nret ulong w\nend\nfn main to int\nret int and bad_io 255\nend\n"
+text gv_neg_gwr "om2\nglobal g_cell ulong 4\n@pure\nfn bad_gwr x ulong to ulong\nput g_cell 0 x\nret x\nend\nfn main to int\nret int and bad_gwr 9 255\nend\n"
+text gv_neg_grd "om2\nglobal g_cell ulong 4\n@pure\nfn bad_grd to ulong\nret get g_cell 0\nend\nfn main to int\nret int and bad_grd 255\nend\n"
+text gv_neg_cal "om2\nglobal g_cell ulong 4\nfn imp_helper x ulong to ulong\nput g_cell 0 x\nret x\nend\n@pure\nfn bad_call x ulong to ulong\nret imp_helper x\nend\nfn main to int\nret int and bad_call 3 255\nend\n"
+text gv_neg_edt "om2\n@pure\nfn bad_edit a edit ulong 4 to ulong\nret 1\nend\nfn main to int\nb = new ulong 4 0\nret int and bad_edit b 255\nend\n"
+text gv_neg_ext "om2\n@pure\nfn bad_exit x ulong to ulong\nif eq x 0\nexit 1\nend\nret x\nend\nfn main to int\nret int and bad_exit 1 255\nend\n"
+text gv_neg_chk "om2\n@pure\nfn bad_signed a int b int to int\nret add a b\nend\nfn main to int\nret bad_signed 1 2\nend\n"
+
+note Front-end malformed contract negative controls
+text gv_neg_fe1 "om2\n@exact\n@tol 10\nfn f x ulong to ulong\nret x\nend\nfn main to int\nret int and f 1 255\nend\n"
+text gv_neg_fe2 "om2\nfn main to int\n@pure\nret 0\nend\n"
+
+note Infix negative controls
+text gv_ix_n1 "om2\n@exact\n@tol(10)\nfn f(x: ulong) -> ulong { return x }\nfn main() -> int { return int(f(1) & 255) }\n"
+text gv_ix_n2 "om2\n@exact\n@err(5)\nfn f(x: ulong) -> ulong { return x }\nfn main() -> int { return int(f(1) & 255) }\n"
+text gv_ix_n3 "om2\n@hard_deadline\nfn f(x: ulong) -> ulong { return x }\nfn main() -> int { return int(f(1) & 255) }\n"
+text gv_ix_n4 "om2\n@bogus_contract\nfn f(x: ulong) -> ulong { return x }\nfn main() -> int { return int(f(1) & 255) }\n"
+text gv_ix_n5 "om2\n@pure\nglobal g: [ulong; 4];\nfn main() -> int { return 0 }\n"
+text gv_ix_n6 "om2\nfn main() -> int {\n  x = ulong(1) @ 2\n  return int(x)\n}\n"
+
+fn gv_wrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn gv_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put gv_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 gv_dig p sub 24 p
+ret
+end
+end
+end
+
+fn gv_fail code ulong to int
+gv_wrt gv_m_fail
+gv_num code
+gv_wrt gv_m_nl
+ret int code
+end
+
+fn gv_add_chk n ulong to void
+put gv_chk 0 add get gv_chk 0 n
+end
+
+fn gv_add_neg to void
+put gv_neg 0 add get gv_neg 0 1
+end
+
+note Load buf[0..n) into arena region 0 (payload) for ir_read
+fn gv_load_in_b1 n ulong to void
+if ne ar_need 0 add n 16 0
+ar_die
+end
+for i ulong n bound 65536
+ar_bp 0 i get gv_b1 i
+end
+put ar_inl 0 n
+end
+
+fn gv_load_in_b2 n ulong to void
+if ne ar_need 0 add n 16 0
+ar_die
+end
+for i ulong n bound 65536
+ar_bp 0 i get gv_b2 i
+end
+put ar_inl 0 n
+end
+
+fn gv_hash_fn f uint dst ulong to bool
+m = ir_wfn_sem f
+if gt m len sh_dat
+ret false
+end
+for i ulong m bound 65536
+put sh_dat i ar_bg 1 i
+end
+sh_all m
+for i ulong 32
+b = get sh_dig i
+if eq dst 1
+put gv_h1 i b
+else
+if eq dst 2
+put gv_h2 i b
+else
+put gv_h3 i b
+end
+end
+end
+ret true
+end
+
+fn gv_heq a ulong b ulong to bool
+for i ulong 32
+va = uchar 0
+vb = uchar 0
+if eq a 1
+va = get gv_h1 i
+else
+if eq a 2
+va = get gv_h2 i
+else
+va = get gv_h3 i
+end
+end
+if eq b 1
+vb = get gv_h1 i
+else
+if eq b 2
+vb = get gv_h2 i
+else
+vb = get gv_h3 i
+end
+end
+if ne va vb
+ret false
+end
+end
+ret true
+end
+
+note Build a small v1 module (main -> 42)
+fn gv_build_v1 to ulong
+ir_init
+f = ir_fnew 2 0 8
+b = ir_blk f
+c42 = ir_res ir_op b 1 8 42 0
+o = ir_op b 63 0 0 2
+ir_set o 0 ir_ftok f
+ir_set o 1 c42
+ret ir_wr
+end
+
+note Build a v2 module: f0 (@pure @exact deadline=500 power=15000),
+note f1 (@pure @tol err=128 hard_deadline=250 power=9000 calling f0), f2 (export main)
+fn gv_build_v2 to ulong
+ir_init
+f0 = ir_fnew 0 0 5
+ir_fset_mode f0 1 1 0
+ir_fset_phys f0 0 500 15000
+p0 = ir_fpar f0 5
+b0 = ir_blk f0
+om = ir_op b0 12 5 0 2
+ir_set om 0 p0
+ir_set om 1 p0
+r0 = ir_op b0 63 0 0 2
+ir_set r0 0 ir_ftok f0
+ir_set r0 1 ir_res om
+
+f1 = ir_fnew 0 0 5
+ir_fset_mode f1 1 2 1
+ir_fset_phys f1 128 250 9000
+p1 = ir_fpar f1 5
+b1 = ir_blk f1
+oc = ir_op b1 64 5 0 3
+ir_set oc 0 ir_ftok f1
+ir_set oc 1 f0
+ir_set oc 2 p1
+r1 = ir_op b1 63 0 0 2
+ir_set r1 0 ir_otok oc
+ir_set r1 1 ir_res oc
+
+fm = ir_fnew 2 0 8
+bm = ir_blk fm
+c42 = ir_res ir_op bm 1 8 42 0
+rm = ir_op bm 63 0 0 2
+ir_set rm 0 ir_ftok fm
+ir_set rm 1 c42
+ret ir_wr
+end
+
+note ---- Stage 1: In-Process ΩIR v1 Compatibility, v2 Round-Trip, SEMANTIC_ID & Malformed Refusals ----
+
+fn gv_stage1_ir to int
+note 1a. v1 round-trip & version/tag check
+n1 = gv_build_v1
+if or lt n1 32 gt n1 65536
+ret gv_fail 10
+end
+for i ulong n1 bound 65536
+put gv_b1 i ar_bg 1 i
+end
+if or ne get gv_b1 7 9 ne get gv_b1 21 49
+ret gv_fail 11
+end
+if not gv_hash_fn 1 1
+ret gv_fail 12
+end
+gv_load_in_b1 n1
+if ne ir_read 0 n1 0
+ret gv_fail 13
+end
+if ne ir_ver 9
+ret gv_fail 14
+end
+n1b = ir_wr
+if ne n1b n1
+ret gv_fail 15
+end
+for i ulong n1 bound 65536
+if ne ar_bg 1 i get gv_b1 i
+ret gv_fail 16
+end
+end
+
+note 1b. v2 contract round-trip & version/tag check
+n2 = gv_build_v2
+if or lt n2 100 gt n2 65536
+ret gv_fail 17
+end
+for i ulong n2 bound 65536
+put gv_b2 i ar_bg 1 i
+end
+if or ne get gv_b2 7 10 ne get gv_b2 21 50
+ret gv_fail 18
+end
+note Confirm v1 main (h1) == v2 default-zero-contract main (h2) SEMANTIC_ID!
+if not gv_hash_fn 3 2
+ret gv_fail 19
+end
+if not gv_heq 1 2
+ret gv_fail 20
+end
+note Snapshot f0 SEMANTIC_ID (h1)
+if not gv_hash_fn 1 1
+ret gv_fail 21
+end
+gv_load_in_b2 n2
+if ne ir_read 0 n2 0
+ret gv_fail 22
+end
+if ne ir_ver 10
+ret gv_fail 23
+end
+if or ne ulong get i_fpur 1 1 ne ulong get i_fprc 1 1
+ret gv_fail 24
+end
+if or ne ulong get i_fhd 1 0 ne get i_ferr 1 0
+ret gv_fail 25
+end
+if or ne get i_fdl 1 500 ne get i_fpwr 1 15000
+ret gv_fail 26
+end
+if or ne ulong get i_fpur 2 1 ne ulong get i_fprc 2 2
+ret gv_fail 27
+end
+if or ne ulong get i_fhd 2 1 ne get i_ferr 2 128
+ret gv_fail 28
+end
+if or ne get i_fdl 2 250 ne get i_fpwr 2 9000
+ret gv_fail 29
+end
+if not gv_hash_fn 1 2
+ret gv_fail 30
+end
+if not gv_heq 1 2
+ret gv_fail 31
+end
+note Changing power_mw on f0 MUST change its SEMANTIC_ID!
+ir_fset_phys 1 0 500 15001
+if not gv_hash_fn 1 3
+ret gv_fail 32
+end
+if gv_heq 1 3
+ret gv_fail 33
+end
+note Restore f0 contract and verify exact byte-for-byte v2 ir_wr round-trip
+ir_fset_phys 1 0 500 15000
+n2b = ir_wr
+if ne n2b n2
+ret gv_fail 34
+end
+for i ulong n2 bound 65536
+if ne ar_bg 1 i get gv_b2 i
+ret gv_fail 35
+end
+end
+gv_add_chk 16
+
+note 1c. 9 fail-closed malformed v2 / tag mismatch negative controls on ir_read
+note f0 contract starts at offset 50 in gv_b2:
+note [50]=pur(1) [51]=prc(1) [52]=hd(0) [53]=rsv(0) [54..61]=err(0) [62..69]=dl(500) [70..77]=pwr(15000)
+if or ne get gv_b2 50 1 ne get gv_b2 51 1
+ret gv_fail 36
+end
+
+note NC-IR1: purity_flag = 2 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 50 2
+if ne ir_read 0 n2 13
+ret gv_fail 37
+end
+gv_add_neg
+
+note NC-IR2: precision_tier = 3 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 51 3
+if ne ir_read 0 n2 13
+ret gv_fail 38
+end
+gv_add_neg
+
+note NC-IR3: hard_deadline = 2 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 52 2
+if ne ir_read 0 n2 13
+ret gv_fail 39
+end
+gv_add_neg
+
+note NC-IR4: reserved = 1 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 53 1
+if ne ir_read 0 n2 13
+ret gv_fail 40
+end
+gv_add_neg
+
+note NC-IR5: @exact (tier=1) with err_bound = 1 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 54 1
+if ne ir_read 0 n2 13
+ret gv_fail 41
+end
+gv_add_neg
+
+note NC-IR6: unspecified tier (0) with err_bound = 7 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 51 0
+ar_bp 0 54 7
+if ne ir_read 0 n2 13
+ret gv_fail 42
+end
+gv_add_neg
+
+note NC-IR7: hard_deadline = 1 with deadline_us = 0 -> class 13
+gv_load_in_b2 n2
+ar_bp 0 52 1
+for j ulong 8
+ar_bp 0 add 62 j 0
+end
+if ne ir_read 0 n2 13
+ret gv_fail 43
+end
+gv_add_neg
+
+note NC-IR8: version 10 with v1 tag ("omega.ng.ir.v1") -> class 11
+gv_load_in_b2 n2
+ar_bp 0 21 49
+if ne ir_read 0 n2 11
+ret gv_fail 44
+end
+gv_add_neg
+
+note NC-IR9: version 9 with v2 tag ("omega.ng.ir.v2") -> class 11
+gv_load_in_b1 n1
+ar_bp 0 21 50
+if ne ir_read 0 n1 11
+ret gv_fail 45
+end
+gv_add_neg
+gv_add_chk 9
+ret 0
+end
+
+note ---- Stage 2: Infix Frontend Contract Parsing & 6 Negative Controls ----
+
+fn gv_run_ix src view uchar * to ulong
+n = len src
+for i ulong n bound 65536
+put ix_src i get src i
+end
+put ix_slen 0 n
+ret ix_lower
+end
+
+fn gv_stage2_infix to int
+if ne gv_run_ix gv_src_v2_ix IX_OK
+ret gv_fail 50
+end
+if lt get ix_olen 0 64
+ret gv_fail 51
+end
+gv_add_chk 2
+
+if eq gv_run_ix gv_ix_n1 IX_OK
+ret gv_fail 52
+end
+gv_add_neg
+if eq gv_run_ix gv_ix_n2 IX_OK
+ret gv_fail 53
+end
+gv_add_neg
+if eq gv_run_ix gv_ix_n3 IX_OK
+ret gv_fail 54
+end
+gv_add_neg
+if eq gv_run_ix gv_ix_n4 IX_OK
+ret gv_fail 55
+end
+gv_add_neg
+if eq gv_run_ix gv_ix_n5 IX_OK
+ret gv_fail 56
+end
+gv_add_neg
+note Regression guard: bare `@` inside expression MUST remain IX_ERR_INVALID_OP (2)!
+if ne gv_run_ix gv_ix_n6 IX_ERR_INVALID_OP
+ret gv_fail 57
+end
+gv_add_neg
+gv_add_chk 6
+ret 0
+end
+
+note ---- Stage 3: OMPK v1/v2 Contract & Purity Propagation + 4 Negative Controls ----
+
+fn gv_stage3_pack to int
+tdInitAll
+tdCacheInit
+pk_reset_all
+
+note 3a. OMPK v1 backward compatibility
+n1 = gv_build_v1
+pk_reset_builder
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+for i ulong n1 bound 4096
+rc = pk_ir_push ar_bg 1 i
+if ne rc PK_OK
+ret gv_fail 60
+end
+end
+if ne pk_pack PK_OK
+ret gv_fail 61
+end
+if or ne pk_get_ver 1 ne pk_verify PK_OK
+ret gv_fail 62
+end
+if or ne pk_get_purity 0 ne pk_get_deadline_us 0
+ret gv_fail 63
+end
+
+note 3b. OMPK v2 with contract + canonical per-function SEMANTIC_ID
+n2 = gv_build_v2
+for i ulong n2 bound 4096
+put gv_b3 i ar_bg 1 i
+end
+if not gv_hash_fn 2 1
+ret gv_fail 64
+end
+pk_reset_builder
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+pk_set_func_id_from_sh
+pk_set_contract 1 2 1 128 250 9000
+for i ulong n2 bound 4096
+rc = pk_ir_push get gv_b3 i
+if ne rc PK_OK
+ret gv_fail 65
+end
+end
+if ne pk_pack PK_OK
+ret gv_fail 66
+end
+if ne pk_verify PK_OK
+ret gv_fail 67
+end
+if or ne pk_get_ver 2 ne pk_get_purity 1
+ret gv_fail 68
+end
+if or ne pk_get_precision 2 ne pk_get_hard_dl 1
+ret gv_fail 69
+end
+if or ne pk_get_err_bound 128 ne pk_get_deadline_us 250
+ret gv_fail 70
+end
+if ne pk_get_power_mw 9000
+ret gv_fail 71
+end
+if ne pk_store_put PK_OK
+ret gv_fail 72
+end
+sl = get pk_last_slot 0
+if ne pk_store_load sl PK_OK
+ret gv_fail 73
+end
+if or ne pk_verify PK_OK ne pk_get_power_mw 9000
+ret gv_fail 74
+end
+xFeat = tdGet TID_X925 TDF_FEAT
+if ne pk_realize_on_arrive TID_X925 xFeat 1 7 PK_OK
+ret gv_fail 75
+end
+gv_add_chk 12
+
+note 3c. 4 fail-closed OMPK v2 negative controls
+note NC-PK1: malformed contract at pack time (@exact + err=5) -> PK_ERR_CONTRACT (22)
+pk_reset_builder
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+pk_set_contract 1 1 0 5 100 1000
+rc = pk_ir_push 97
+if ne pk_pack PK_ERR_CONTRACT
+ret gv_fail 76
+end
+gv_add_neg
+
+note NC-PK2: tamper purity_flag byte [128] = 3 -> PK_ERR_CONTRACT (22)
+if ne pk_store_load sl PK_OK
+ret gv_fail 77
+end
+put pk_buf 128 uchar 3
+if ne pk_verify PK_ERR_CONTRACT
+ret gv_fail 78
+end
+gv_add_neg
+
+note NC-PK3: 1-bit tamper in OMPK v2 payload -> PK_ERR_DIGEST (13)
+if ne pk_store_load sl PK_OK
+ret gv_fail 79
+end
+put pk_buf PK_V2_HDR_LEN xor get pk_buf PK_V2_HDR_LEN uchar 1
+if ne pk_verify PK_ERR_DIGEST
+ret gv_fail 80
+end
+gv_add_neg
+
+note NC-PK4: corrupt OMPK v2 ext tag [132] -> PK_ERR_VERSION (11)
+if ne pk_store_load sl PK_OK
+ret gv_fail 81
+end
+put pk_buf 132 uchar 0
+if ne pk_verify PK_ERR_VERSION
+ret gv_fail 82
+end
+gv_add_neg
+gv_add_chk 4
+ret 0
+end
+
+note ---- Stage 4: Live Subprocess End-to-End with Real `ng` and `ngcheck` ----
+
+fn gv_spath suf view uchar * to void
+n = get gv_scl 0
+for i ulong n bound 2048
+put gv_pa i get gv_scp i
+end
+m = len suf
+for j ulong m bound 128
+put gv_pa add n j get suf j
+end
+put gv_pl 0 add n m
+end
+
+fn gv_wfile suf view uchar * n ulong use2 bool to bool
+gv_spath suf
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret false
+end
+o = ulong 0
+while lt o n bound 131072
+k = long 0
+if use2
+k = write int fd gv_io2 o sub n o
+else
+k = write int fd gv_io o sub n o
+end
+if le k 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k
+end
+r = fclose int fd
+ret true
+end
+
+fn gv_rfile suf view uchar * dst ulong to long
+gv_spath suf
+fd = fopen gv_pa 0 get gv_pl 0 0 0
+if lt fd 0
+ret long -1
+end
+n = ulong 0
+while lt n 131072 bound 2048
+k = long 0
+if eq dst 1
+k = read int fd gv_io n sub 131072 n
+else
+if eq dst 2
+k = read int fd gv_io2 n sub 131072 n
+else
+k = read int fd gv_io3 n sub 131072 n
+end
+end
+if lt k 0
+r = fclose int fd
+ret long -1
+end
+if eq k 0
+r = fclose int fd
+ret long n
+end
+n = add n ulong k
+end
+r = fclose int fd
+ret long n
+end
+
+fn gv_write_in_txt hdr view uchar * body view uchar * to bool
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret false
+end
+if gt len hdr 0
+k1 = write int fd hdr 0 len hdr
+if ne k1 long len hdr
+r = fclose int fd
+ret false
+end
+end
+k2 = write int fd body 0 len body
+r = fclose int fd
+ret eq k2 long len body
+end
+
+fn gv_write_in_ix hdr view uchar * to bool
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret false
+end
+k1 = write int fd hdr 0 len hdr
+if ne k1 long len hdr
+r = fclose int fd
+ret false
+end
+n = get ix_olen 0
+o = ulong 0
+while lt o n bound 524288
+k2 = write int fd ix_out o sub n o
+if le k2 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k2
+end
+r = fclose int fd
+ret true
+end
+
+fn gv_write_in_bin hdr view uchar * n ulong use2 bool to bool
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret false
+end
+if gt len hdr 0
+k1 = write int fd hdr 0 len hdr
+if ne k1 long len hdr
+r = fclose int fd
+ret false
+end
+end
+o = ulong 0
+while lt o n bound 131072
+k2 = long 0
+if use2
+k2 = write int fd gv_io2 o sub n o
+else
+k2 = write int fd gv_io o sub n o
+end
+if le k2 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k2
+end
+r = fclose int fd
+ret true
+end
+
+fn gv_exec useNg bool to ulong
+put gv_av 0 1
+put gv_av 1 0
+if useNg
+n = get gv_ngl 0
+put gv_av 2 uchar and n 255
+put gv_av 3 uchar shr n 8
+for i ulong n bound 2048
+put gv_av add 4 i get gv_ngp i
+end
+put gv_an 0 add 4 n
+else
+n = get gv_ckl 0
+put gv_av 2 uchar and n 255
+put gv_av 3 uchar shr n 8
+for i ulong n bound 2048
+put gv_av add 4 i get gv_ckp i
+end
+put gv_an 0 add 4 n
+end
+gv_spath gv_f_in
+fi = fopen gv_pa 0 get gv_pl 0 0 0
+gv_spath gv_f_out
+fo = fopen gv_pa 0 get gv_pl 0 577 420
+gv_spath gv_f_err
+fe = fopen gv_pa 0 get gv_pl 0 577 420
+if or lt fi 0 or lt fo 0 lt fe 0
+ret 255
+end
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fe 2 0
+r = execprog gv_av 0 get gv_an 0
+exit 127
+end
+r = fclose int fi
+r = fclose int fo
+r = fclose int fe
+w = waitpid int pid gv_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get gv_st 0 0
+ret add 256 ulong get gv_st 0
+end
+ret ulong get gv_st 1
+end
+
+fn gv_io_starts pfx view uchar * n ulong to bool
+m = len pfx
+if lt n m
+ret false
+end
+for i ulong m bound 64
+if ne get gv_io i get pfx i
+ret false
+end
+end
+ret true
+end
+
+fn gv_io_contains sub_s view uchar * n ulong to bool
+m = len sub_s
+if or eq m 0 lt n m
+ret false
+end
+lim = add sub n m 1
+for i ulong lim bound 131072
+ok = true
+for j ulong m bound 128
+if ne get gv_io add i j get sub_s j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn gv_cli_v1_compat to int
+note 1. Plain prefix .om -> @ng front-ir -> v1 (ver=9, omega.ng.ir.v1) -> ngcheck ACCEPT -> ir-copy exact -> sem-id OK
+if not gv_write_in_txt gv_h_fi gv_src_v1
+ret gv_fail 100
+end
+if ne gv_exec true 0
+ret gv_fail 101
+end
+n1 = gv_rfile gv_f_out 1
+if lt n1 32
+ret gv_fail 102
+end
+if or ne get gv_io 7 9 ne get gv_io 21 49
+ret gv_fail 103
+end
+if not gv_wfile gv_f_ir1 ulong n1 false
+ret gv_fail 104
+end
+n1r = gv_rfile gv_f_ir1 2
+if not gv_write_in_bin gv_m_nl 0 true
+ret gv_fail 105
+end
+note Feed raw v1.ir to ngcheck (empty hdr -> write raw bytes)
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret gv_fail 105
+end
+kw = write int fd gv_io2 0 ulong n1r
+rc0 = fclose int fd
+if ne kw n1r
+ret gv_fail 105
+end
+if ne gv_exec false 0
+ret gv_fail 106
+end
+an = gv_rfile gv_f_out 1
+if not gv_io_starts gv_pfx_acc ulong an
+ret gv_fail 107
+end
+if not gv_write_in_bin gv_h_ic ulong n1r true
+ret gv_fail 108
+end
+if ne gv_exec true 0
+ret gv_fail 109
+end
+cn = gv_rfile gv_f_out 1
+if ne cn n1r
+ret gv_fail 110
+end
+for i ulong ulong cn bound 131072
+if ne get gv_io i get gv_io2 i
+ret gv_fail 111
+end
+end
+if not gv_write_in_bin gv_h_sd ulong n1r true
+ret gv_fail 112
+end
+if ne gv_exec true 0
+ret gv_fail 113
+end
+put gv_cli_chk 0 add get gv_cli_chk 0 5
+ret 0
+end
+
+fn gv_cli_v2_rt to int
+note 2. Prefix v2 .om -> @ng front-ir -> v2 (ver=10, omega.ng.ir.v2) -> ngcheck ACCEPT -> ir-copy -> opt -> sem-id
+if not gv_write_in_txt gv_h_fi gv_src_v2_px
+ret gv_fail 120
+end
+if ne gv_exec true 0
+ret gv_fail 121
+end
+n2 = gv_rfile gv_f_out 1
+if lt n2 80
+ret gv_fail 122
+end
+if or ne get gv_io 7 10 ne get gv_io 21 50
+ret gv_fail 123
+end
+if not gv_wfile gv_f_ir2 ulong n2 false
+ret gv_fail 124
+end
+n2r = gv_rfile gv_f_ir2 2
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret gv_fail 125
+end
+kw = write int fd gv_io2 0 ulong n2r
+rc0 = fclose int fd
+if ne gv_exec false 0
+ret gv_fail 126
+end
+an = gv_rfile gv_f_out 1
+if not gv_io_starts gv_pfx_acc ulong an
+ret gv_fail 127
+end
+note @ng ir-copy byte-exact on v2
+if not gv_write_in_bin gv_h_ic ulong n2r true
+ret gv_fail 128
+end
+if ne gv_exec true 0
+ret gv_fail 129
+end
+cn = gv_rfile gv_f_out 1
+if ne cn n2r
+ret gv_fail 130
+end
+for i ulong ulong cn bound 131072
+if ne get gv_io i get gv_io2 i
+ret gv_fail 131
+end
+end
+ret 0
+end
+
+fn gv_cli_v2_opt_sem to int
+n2r = gv_rfile gv_f_ir2 2
+if lt n2r 80
+ret gv_fail 132
+end
+note @ng opt preserves v2 contracts and still passes ngcheck
+if not gv_write_in_bin gv_h_op ulong n2r true
+ret gv_fail 132
+end
+if ne gv_exec true 0
+ret gv_fail 133
+end
+on = gv_rfile gv_f_out 1
+if or lt on 80 ne get gv_io 7 10
+ret gv_fail 134
+end
+gv_spath gv_f_in
+fd2 = fopen gv_pa 0 get gv_pl 0 577 420
+kw2 = write int fd2 gv_io 0 ulong on
+rc2 = fclose int fd2
+if ne gv_exec false 0
+ret gv_fail 135
+end
+note @ng sem-id on prefix v2 -> verify exact contract tags & save to /sem_px.txt
+if not gv_write_in_bin gv_h_sd ulong n2r true
+ret gv_fail 136
+end
+if ne gv_exec true 0
+ret gv_fail 137
+end
+s1n = gv_rfile gv_f_out 1
+if lt s1n 140
+ret gv_fail 138
+end
+if not gv_io_contains gv_sub_c0 ulong s1n
+ret gv_fail 139
+end
+if not gv_io_contains gv_sub_c1 ulong s1n
+ret gv_fail 140
+end
+if not gv_wfile gv_f_s1 ulong s1n false
+ret gv_fail 141
+end
+ret 0
+end
+
+fn gv_cli_v2_infix to int
+note 3. Infix v2 .om -> ix_lower -> @ng front-ir -> ngcheck ACCEPT -> @ng sem-id -> BIT-IDENTICAL to prefix!
+n2r = gv_rfile gv_f_ir2 2
+if ne gv_run_ix gv_src_v2_ix IX_OK
+ret gv_fail 142
+end
+if not gv_write_in_ix gv_h_fi
+ret gv_fail 143
+end
+if ne gv_exec true 0
+ret gv_fail 144
+end
+n2x = gv_rfile gv_f_out 1
+if ne n2x n2r
+ret gv_fail 145
+end
+for i ulong ulong n2x bound 131072
+if ne get gv_io i get gv_io2 i
+ret gv_fail 146
+end
+end
+if not gv_wfile gv_f_ir2b ulong n2x false
+ret gv_fail 147
+end
+if not gv_write_in_bin gv_h_sd ulong n2x false
+ret gv_fail 148
+end
+if ne gv_exec true 0
+ret gv_fail 149
+end
+s2n = gv_rfile gv_f_out 1
+s1r = gv_rfile gv_f_s1 3
+if ne s2n s1r
+ret gv_fail 150
+end
+for i ulong ulong s2n bound 131072
+if ne get gv_io i get gv_io3 i
+ret gv_fail 151
+end
+end
+ret 0
+end
+
+fn gv_cli_v2_pack to int
+note 4. OMPK v2 via @ng pack -> @ng realize -> NG-REALIZE PASS + 2 OMPK v2 CLI negative controls
+n2r = gv_rfile gv_f_ir2 2
+if not gv_write_in_bin gv_h_pk ulong n2r true
+ret gv_fail 152
+end
+if ne gv_exec true 0
+ret gv_fail 153
+end
+pkn = gv_rfile gv_f_out 1
+if lt pkn 200
+ret gv_fail 154
+end
+if or ne get gv_io 0 79 ne get gv_io 4 2
+ret gv_fail 155
+end
+if or ne get gv_io 128 1 ne get gv_io 129 1
+ret gv_fail 156
+end
+if not gv_wfile gv_f_pk2 ulong pkn false
+ret gv_fail 157
+end
+pkr = gv_rfile gv_f_pk2 2
+if not gv_write_in_bin gv_h_rl ulong pkr true
+ret gv_fail 158
+end
+if ne gv_exec true 0
+ret gv_fail 159
+end
+rln = gv_rfile gv_f_out 1
+if not gv_io_starts gv_pfx_rlz ulong rln
+ret gv_fail 160
+end
+note CLI Neg OMPK-1: corrupt v2 purity byte [128]=9 -> @ng realize MUST exit 22 (PK_ERR_CONTRACT)
+put gv_io2 128 uchar 9
+if not gv_write_in_bin gv_h_rl ulong pkr true
+ret gv_fail 161
+end
+if ne gv_exec true 22
+ret gv_fail 162
+end
+put gv_cli_neg 0 add get gv_cli_neg 0 1
+note CLI Neg OMPK-2: 1-bit tamper in OMPK v2 payload -> @ng realize MUST exit 13 (PK_ERR_DIGEST)
+pkr = gv_rfile gv_f_pk2 2
+last = sub ulong pkr 1
+put gv_io2 last xor get gv_io2 last uchar 1
+if not gv_write_in_bin gv_h_rl ulong pkr true
+ret gv_fail 163
+end
+if ne gv_exec true 13
+ret gv_fail 164
+end
+put gv_cli_neg 0 add get gv_cli_neg 0 1
+put gv_cli_chk 0 add get gv_cli_chk 0 10
+ret 0
+end
+
+fn gv_cli_v2_and_infix to int
+r = gv_cli_v2_rt
+if ne r 0
+ret r
+end
+r = gv_cli_v2_opt_sem
+if ne r 0
+ret r
+end
+r = gv_cli_v2_infix
+if ne r 0
+ret r
+end
+ret gv_cli_v2_pack
+end
+
+note Helper: compile impure @pure source with @ng front-ir, then confirm ngcheck refuses with exit 22 (EFFECT)!
+fn gv_cli_neg_impure src view uchar * fail_code ulong to int
+if not gv_write_in_txt gv_h_fi src
+ret gv_fail fail_code
+end
+if ne gv_exec true 0
+ret gv_fail add fail_code 1
+end
+n = gv_rfile gv_f_out 1
+if lt n 32
+ret gv_fail add fail_code 2
+end
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+if lt fd 0
+ret gv_fail add fail_code 2
+end
+kw = write int fd gv_io 0 ulong n
+rc = fclose int fd
+if ne gv_exec false 22
+ret gv_fail add fail_code 3
+end
+put gv_cli_neg 0 add get gv_cli_neg 0 1
+ret 0
+end
+
+fn gv_cli_neg_purity to int
+r = gv_cli_neg_impure gv_neg_host 170
+if ne r 0
+ret r
+end
+r = gv_cli_neg_impure gv_neg_gwr 175
+if ne r 0
+ret r
+end
+r = gv_cli_neg_impure gv_neg_grd 180
+if ne r 0
+ret r
+end
+r = gv_cli_neg_impure gv_neg_cal 185
+if ne r 0
+ret r
+end
+r = gv_cli_neg_impure gv_neg_edt 190
+if ne r 0
+ret r
+end
+r = gv_cli_neg_impure gv_neg_ext 195
+if ne r 0
+ret r
+end
+r = gv_cli_neg_impure gv_neg_chk 200
+if ne r 0
+ret r
+end
+ret 0
+end
+
+fn gv_cli_neg_mut_one off ulong val uchar exp_rc ulong fail_code ulong to int
+n2 = gv_rfile gv_f_ir2 2
+if lt n2 80
+ret gv_fail fail_code
+end
+put gv_io2 off val
+gv_spath gv_f_in
+fd = fopen gv_pa 0 get gv_pl 0 577 420
+kw = write int fd gv_io2 0 ulong n2
+rc = fclose int fd
+if ne gv_exec false exp_rc
+ret gv_fail add fail_code 1
+end
+if not gv_write_in_bin gv_h_ic ulong n2 true
+ret gv_fail add fail_code 2
+end
+if ne gv_exec true exp_rc
+ret gv_fail add fail_code 3
+end
+put gv_cli_neg 0 add get gv_cli_neg 0 1
+ret 0
+end
+
+fn gv_cli_neg_malformed to int
+note Verify exact f0 contract offset in /v2.ir (offset 50: pur=1, prc=1, hd=0, rsv=0)
+n2 = gv_rfile gv_f_ir2 2
+if or lt n2 80 or ne get gv_io2 50 1 ne get gv_io2 51 1
+ret gv_fail 210
+end
+note NC-M1: purity_flag = 2 -> ngcheck 13 & ir-copy 13
+r = gv_cli_neg_mut_one 50 2 13 211
+if ne r 0
+ret r
+end
+note NC-M2: precision_tier = 3 -> ngcheck 13 & ir-copy 13
+r = gv_cli_neg_mut_one 51 3 13 215
+if ne r 0
+ret r
+end
+note NC-M3: reserved = 1 -> ngcheck 13 & ir-copy 13
+r = gv_cli_neg_mut_one 53 1 13 219
+if ne r 0
+ret r
+end
+note NC-M4: @exact (tier=1) + err_bound = 1 -> ngcheck 13 & ir-copy 13
+r = gv_cli_neg_mut_one 54 1 13 223
+if ne r 0
+ret r
+end
+note NC-M5: ver 10 + omega.ng.ir.v1 tag -> ngcheck 11 & ir-copy 11
+r = gv_cli_neg_mut_one 21 49 11 227
+if ne r 0
+ret r
+end
+note NC-FE1: conflicting @exact + @tol in prefix frontend -> @ng front-ir exits 30
+if not gv_write_in_txt gv_h_fi gv_neg_fe1
+ret gv_fail 231
+end
+if ne gv_exec true 30
+ret gv_fail 232
+end
+put gv_cli_neg 0 add get gv_cli_neg 0 1
+note NC-FE2: @pure inside function body -> @ng front-ir exits 30
+if not gv_write_in_txt gv_h_fi gv_neg_fe2
+ret gv_fail 233
+end
+if ne gv_exec true 30
+ret gv_fail 234
+end
+put gv_cli_neg 0 add get gv_cli_neg 0 1
+ret 0
+end
+
+fn gv_stage4_cli to int
+nl = argread 1 gv_ngp 0 2047
+cl = argread 2 gv_ckp 0 2047
+sl = argread 3 gv_scp 0 2047
+if or lt nl 1 or lt cl 1 lt sl 1
+ret gv_fail 99
+end
+put gv_ngl 0 ulong nl
+put gv_ckl 0 ulong cl
+put gv_scl 0 ulong sl
+r = makedir gv_scp 0 ulong sl 493
+rc = gv_cli_v1_compat
+if ne rc 0
+ret rc
+end
+rc = gv_cli_v2_and_infix
+if ne rc 0
+ret rc
+end
+rc = gv_cli_neg_purity
+if ne rc 0
+ret rc
+end
+ret gv_cli_neg_malformed
+end
+
+fn main to int
+z = ar_need 0 65536
+ar_init
+put gv_chk 0 0
+put gv_neg 0 0
+put gv_cli_chk 0 0
+put gv_cli_neg 0 0
+gv_wrt gv_m_hdr
+
+rc = gv_stage1_ir
+if ne rc 0
+ret rc
+end
+rc = gv_stage2_infix
+if ne rc 0
+ret rc
+end
+rc = gv_stage3_pack
+if ne rc 0
+ret rc
+end
+if ne get gv_neg 0 19
+ret gv_fail 98
+end
+
+if ge argcnt 4
+rc = gv_stage4_cli
+if ne rc 0
+ret rc
+end
+if ne get gv_cli_neg 0 16
+ret gv_fail 240
+end
+end
+
+gv_wrt gv_m_pass
+gv_num get gv_chk 0
+gv_wrt gv_m_neg
+gv_num get gv_neg 0
+gv_wrt gv_m_cli
+gv_num get gv_cli_chk 0
+gv_wrt gv_m_cneg
+gv_num get gv_cli_neg 0
+gv_wrt gv_m_nl
+ret 0
+end

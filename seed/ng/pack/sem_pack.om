@@ -28,11 +28,14 @@ const PK_MAGIC_1 ulong 77
 const PK_MAGIC_2 ulong 80
 const PK_MAGIC_3 ulong 75
 const PK_VERSION ulong 1
+const PK_VERSION_2 ulong 2
 const PK_HDR_LEN ulong 128
+const PK_V2_HDR_LEN ulong 160
+const PK_V2_EXT_TAG ulong 844516176
 const PK_DIGEST_LEN ulong 32
 const PK_MAX_IMPORTS ulong 16
 const PK_MAX_IR_LEN ulong 4096
-const PK_MAX_PKG_LEN ulong 4736
+const PK_MAX_PKG_LEN ulong 4768
 const PK_BUF_CAP ulong 8192
 
 const PK_STORE_CAP ulong 32
@@ -53,6 +56,7 @@ const PK_ERR_PROOF ulong 18
 const PK_ERR_CACHE_FULL ulong 19
 const PK_ERR_BAD_TARGET ulong 20
 const PK_ERR_NOT_FOUND ulong 21
+const PK_ERR_CONTRACT ulong 22
 
 note Active OMPK wire buffer and exact byte length
 global pk_buf uchar 8192
@@ -65,6 +69,8 @@ global pk_fid_in uchar 32
 global pk_req_in ulong 6
 global pk_imp_in uchar 512
 global pk_imp_cnt ulong 1
+note OMPK v2 contract staging: 0=active, 1=purity, 2=precision, 3=hard_dl, 4=err_bound, 5=deadline_us, 6=power_mw
+global pk_v2_in ulong 8
 
 note Digest query and last-packed / last-stored metadata
 global pk_query_id uchar 32
@@ -157,10 +163,102 @@ put pk_req_in 4 reqMma
 put pk_req_in 5 reqFeat
 end
 
+fn pk_clear_contract to void
+for i ulong 8
+put pk_v2_in i 0
+end
+end
+
+fn pk_v2_contract_ok pur ulong prc ulong hd ulong rsv ulong err ulong dl ulong to bool
+if or gt pur 1 gt prc 2
+ret false
+end
+if or gt hd 1 ne rsv 0
+ret false
+end
+if and ne prc 2 ne err 0
+ret false
+end
+if and eq hd 1 eq dl 0
+ret false
+end
+ret true
+end
+
+fn pk_set_contract pur ulong prc ulong hd ulong err ulong dl ulong pwr ulong to void
+put pk_v2_in 0 1
+put pk_v2_in 1 pur
+put pk_v2_in 2 prc
+put pk_v2_in 3 hd
+put pk_v2_in 4 err
+put pk_v2_in 5 dl
+put pk_v2_in 6 pwr
+end
+
+fn pk_set_func_id_from_sh to void
+for i ulong 32
+put pk_fid_in i get sh_dig i
+end
+end
+
+fn pk_hdr_len_cur to ulong
+if eq pk_get_u32 4 PK_VERSION_2
+ret PK_V2_HDR_LEN
+end
+ret PK_HDR_LEN
+end
+
+fn pk_get_ver to ulong
+ret pk_get_u32 4
+end
+
+fn pk_get_purity to ulong
+if ne pk_get_u32 4 PK_VERSION_2
+ret 0
+end
+ret ulong get pk_buf 128
+end
+
+fn pk_get_precision to ulong
+if ne pk_get_u32 4 PK_VERSION_2
+ret 0
+end
+ret ulong get pk_buf 129
+end
+
+fn pk_get_hard_dl to ulong
+if ne pk_get_u32 4 PK_VERSION_2
+ret 0
+end
+ret ulong get pk_buf 130
+end
+
+fn pk_get_err_bound to ulong
+if ne pk_get_u32 4 PK_VERSION_2
+ret 0
+end
+ret pk_get_u64 136
+end
+
+fn pk_get_deadline_us to ulong
+if ne pk_get_u32 4 PK_VERSION_2
+ret 0
+end
+ret pk_get_u64 144
+end
+
+fn pk_get_power_mw to ulong
+if ne pk_get_u32 4 PK_VERSION_2
+ret 0
+end
+ret pk_get_u64 152
+end
+
 fn pk_reset_builder to void
 put pk_ir_in_len 0 0
 put pk_imp_cnt 0 0
 pk_clear_func_id
+pk_clear_contract
 for i ulong 6
 put pk_req_in i 0
 end
@@ -269,14 +367,19 @@ end
 ret eq acc 0
 end
 
-note ---- OMPK v1 Packing (pk_pack) ----
+note ---- OMPK v1/v2 Packing (pk_pack) ----
 
 fn pk_write_hdr ic ulong irl ulong to void
 pk_put_u8 0 PK_MAGIC_0
 pk_put_u8 1 PK_MAGIC_1
 pk_put_u8 2 PK_MAGIC_2
 pk_put_u8 3 PK_MAGIC_3
+isv2 = ne get pk_v2_in 0 0
+if isv2
+pk_put_u32 4 PK_VERSION_2
+else
 pk_put_u32 4 PK_VERSION
+end
 useSem = pk_fid_in_is_zero
 for i ulong 32
 b = get sh_dig i
@@ -296,18 +399,51 @@ pk_put_u64 add 72 mul k 8 get pk_req_in k
 end
 pk_put_u32 120 ic
 pk_put_u32 124 irl
+if isv2
+pk_put_u8 128 get pk_v2_in 1
+pk_put_u8 129 get pk_v2_in 2
+pk_put_u8 130 get pk_v2_in 3
+pk_put_u8 131 0
+pk_put_u32 132 PK_V2_EXT_TAG
+pk_put_u64 136 get pk_v2_in 4
+pk_put_u64 144 get pk_v2_in 5
+pk_put_u64 152 get pk_v2_in 6
+end
 end
 
 fn pk_write_body ic ulong irl ulong to void
+hdrLen = PK_HDR_LEN
+if ne get pk_v2_in 0 0
+hdrLen = PK_V2_HDR_LEN
+end
 impBytes = mul ic PK_DIGEST_LEN
 for i ulong impBytes bound 512
-put pk_buf add PK_HDR_LEN i get pk_imp_in i
+put pk_buf add hdrLen i get pk_imp_in i
 end
-irOff = add PK_HDR_LEN impBytes
+irOff = add hdrLen impBytes
 for i ulong irl bound 4096
 put pk_buf add irOff i get pk_ir_in i
 end
 put pk_len 0 add irOff irl
+end
+
+fn pk_in_contract_ok to bool
+pur = get pk_v2_in 1
+prc = get pk_v2_in 2
+hd = get pk_v2_in 3
+ev = get pk_v2_in 4
+dl = get pk_v2_in 5
+ret pk_v2_contract_ok pur prc hd 0 ev dl
+end
+
+fn pk_buf_contract_ok to bool
+pur = ulong get pk_buf 128
+prc = ulong get pk_buf 129
+hd = ulong get pk_buf 130
+rsv = ulong get pk_buf 131
+ev = pk_get_u64 136
+dl = pk_get_u64 144
+ret pk_v2_contract_ok pur prc hd rsv ev dl
 end
 
 fn pk_pack to ulong
@@ -318,6 +454,11 @@ ret PK_ERR_IMPORTS
 end
 if gt irl PK_MAX_IR_LEN
 ret PK_ERR_LENGTH
+end
+if ne get pk_v2_in 0 0
+if not pk_in_contract_ok
+ret PK_ERR_CONTRACT
+end
 end
 pk_sha256_ir_in irl
 pk_write_hdr ic irl
@@ -364,15 +505,30 @@ end
 if not pk_check_magic
 ret PK_ERR_MAGIC
 end
-if ne pk_get_u32 4 PK_VERSION
+ver = pk_get_u32 4
+hdrLen = PK_HDR_LEN
+if eq ver PK_VERSION_2
+if lt blen PK_V2_HDR_LEN
 ret PK_ERR_VERSION
+end
+if ne pk_get_u32 132 PK_V2_EXT_TAG
+ret PK_ERR_VERSION
+end
+if not pk_buf_contract_ok
+ret PK_ERR_CONTRACT
+end
+hdrLen = PK_V2_HDR_LEN
+else
+if ne ver PK_VERSION
+ret PK_ERR_VERSION
+end
 end
 ic = pk_get_u32 120
 if gt ic PK_MAX_IMPORTS
 ret PK_ERR_IMPORTS
 end
 irl = pk_get_u32 124
-irOff = add PK_HDR_LEN mul ic PK_DIGEST_LEN
+irOff = add hdrLen mul ic PK_DIGEST_LEN
 if ne blen add irOff irl
 ret PK_ERR_LENGTH
 end
@@ -436,7 +592,7 @@ end
 
 fn pk_store_copy_bytes slot ulong blen ulong to void
 dataBase = mul slot PK_STORE_STRIDE
-for i ulong blen bound 4736
+for i ulong blen bound 4768
 put pk_store_data add dataBase i get pk_buf i
 end
 put pk_store_len slot blen
@@ -451,12 +607,13 @@ end
 end
 
 fn pk_store_copy_imps slot ulong to void
+hdrLen = pk_hdr_len_cur
 ic = pk_get_u32 120
 put pk_store_icnt slot ic
 impBytes = mul ic PK_DIGEST_LEN
 impBase = mul slot 512
 for i ulong impBytes bound 512
-put pk_store_imps add impBase i get pk_buf add PK_HDR_LEN i
+put pk_store_imps add impBase i get pk_buf add hdrLen i
 end
 end
 
@@ -507,7 +664,7 @@ if gt slen PK_MAX_PKG_LEN
 ret PK_ERR_LENGTH
 end
 dataBase = mul slot PK_STORE_STRIDE
-for i ulong slen bound 4736
+for i ulong slen bound 4768
 put pk_buf i get pk_store_data add dataBase i
 end
 put pk_len 0 slen
