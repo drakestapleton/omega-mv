@@ -34,6 +34,8 @@ Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-6a): completed 100% pure seed
 
 Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-6b): completed 100% pure seeded OM-2 retirement of ALLEN (`src/allen/allen_bind.{c,h}`, `tools/allen.c`; `PARITY.tsv` ref `7130bd1e9`); upgraded `src/allen/allen_bind.om` to the byte-exact Aienux `AIENSUBJ` v0 / `AIENOS-STORE-OBJECT-V1` / `AIENOS_INTENT_v0:` codec with full validation & refusal codes, composed `tools/allen.om` directly with `src/runtime/rx_cortex.om` + `src/runtime/rx_aien.om`, and cut over `mk/allen.mk`, `mk/allen_tool-om.mk`, and `tests/allen/run.sh` (all 10 gates G1..G6 + FORMAT + REPLAY + SUPERSEDE + MISMATCH PASS).
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-6c): completed 100% pure seeded OM-2 retirement of `tests/arboris/` (`tests/arboris/caproot_issuer.c`; `PARITY.tsv` ref `522d71b31`); upgraded `tests/arboris/caproot_issuer.om` with full subprocess `fork`/`pipefds`/`dupfd(fd3)`/`execprog`/`waitpid` support for `<prog>` and `--arboris-silicon`/`--sparse-silicon`/`--arboris-signed-silicon`/`--arboris-benchmark`, and cut over `tests/arboris/host.sh` to compile `$out/caproot-issuer` with `seed/out/omc`.
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage
