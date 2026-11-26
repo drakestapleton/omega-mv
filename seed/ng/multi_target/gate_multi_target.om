@@ -1,0 +1,697 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/multi_target/gate_multi_target.om:
+note Pure seeded Omega verification gate for the Universal Multi-Vendor GPU &
+note Cross-Platform 1.0 Target Matrix.
+note
+note Link order:
+note   cat seed/ng/target/target_desc.om seed/ng/multi_target/vendor_targets.om seed/ng/multi_target/gate_multi_target.om | seed/out/omc
+note (Also compiles cleanly with leading `om2` or `target x86linux` directive.)
+note
+note Verifies:
+note   1. All 16 unified 24-field TargetDesc profiles (GB10 sm_121, RTX 5090 sm_120,
+note      AMD MI300X gfx942, AMD Strix Halo gfx1151, Intel Arc Xe2 drm/xe,
+note      Apple M-series a64macos, Grace X925/A725, x86-64 AVX2/AVX-512 WSL 2,
+note      Universal Tier-0 SPIR-V/WASM) and honest evidence badges.
+note   2. Physical contract enforcement & negative controls:
+note      - sm_121-only FEAT_C2C_COH & FEAT_HMMA16816 refused on gfx1151 (TDK_ERR_FEAT)
+note      - sm_121-only FEAT_C2C_COH refused on discrete RTX 5090 sm_120 (TDK_ERR_FEAT)
+note      - smem > 65536 (e.g. 65537 / 101376 B) refused on gfx1151 & gfx942 (TDK_ERR_SMEM)
+note      - AMX (MMA_161616_AMX) refused on x86-64 AVX2 (TDK_ERR_MMA)
+note      - Wave64 subgroup refused on Wave32 gfx1151 & SIMD16 Intel Xe2 (TDK_ERR_SUBGROUP)
+note      - SIMT GPU kernel refused on Apple M-series CPU (TDK_ERR_EXEC)
+note   3. 3-Tier Universal Realization Router (mt_route):
+note      - Tier-2 Bare-Metal (aienux) selection and Tier-2->Tier-1 explicit downgrade
+note      - Tier-1 Zero-SDK Native selection (nvrm / kfd / drm-xe / ELF / Mach-O)
+note      - Explicit non-silent Tier-1->Tier-0 SPIR-V/WASM fallback when device node absent
+note      - Strict-mode refusal when fallback disallowed
+note      - Contract-safe Tier-0 refusal when vendor-locked kernel cannot run on SPIR-V
+note      - Honest evidence labels: RTX 5090 / MI300X / Strix Halo / Intel Arc Xe2 / Apple M
+note        STRICTLY remain HOST_VERIFIED / PHYSICAL_SILICON=NOT_RUN!
+note   4. Live Spark local silicon probe & auto-calibrator (mt_probe_local):
+note      - Probes live Grace ARMv9 core (MIDR_EL1, L1D=64K, L2=512K/2048K, 10x X925 + 10x A725,
+note        ISA features mask 399 + SVE), matches exact TargetDesc row with zero drift,
+note        and verifies unattached GPU rows stay PHYSICAL_SILICON=NOT_RUN!
+note   5. x86-64 execpure seccomp-BPF policy builder + cBPF verifier + cBPF VM evaluation:
+note      - Verifies 27-insn (216-byte) AUDIT_ARCH_X86_64 (0xc000003e) program structure
+note      - Allows read(0), write(1), write(2), exit(60), exit_group(231), execveat(3, AT_EMPTY_PATH)
+note      - Negative controls KILLED (SECCOMP_RET_KILL_PROCESS = 0x80000000):
+note        socket(41), openat(257), fork(57), execve(59), clone(56), ptrace(101),
+note        read(3), read(arg0_hi=1), write(0), write(3), execveat(dirfd=4), execveat(flags=0),
+note        wrong arch (AUDIT_ARCH_AARCH64, AUDIT_ARCH_I386), plus corrupted-BPF verifier mutant!
+
+global gmDig uchar 24
+global gmChk ulong 1
+global gmCtrl ulong 1
+
+text gmHdr "=== OMEGA NG MULTI-VENDOR GPU & CROSS-PLATFORM 1.0 GATE ===\n"
+text gmProbe1 "LOCAL_PROBE cpu="
+text gmProbe2 " part=0x"
+text gmProbe3 " l1d_kb="
+text gmProbe4 " l2_kb="
+text gmProbe5 " feat="
+text gmProbe6 " matched_tid="
+text gmProbe7 " x925="
+text gmProbe8 " a725="
+text gmProbe9 " drift="
+text gmRoute1 "ROUTE_FALLBACK req_tid="
+text gmRoute2 " sel_tier="
+text gmRoute3 " drv="
+text gmRoute4 " reason="
+text gmRoute5 " host_ev="
+text gmRoute6 " silicon_ev="
+text gmBpf1 "X64_EXECPURE_BPF insns="
+text gmBpf2 " bytes="
+text gmBpf3 " arch="
+text gmBpf4 " neg_killed="
+text gmPass "MULTI-TARGET-GATE PASS checks="
+text gmCtrlMsg " controls="
+text gmFailMsg "MULTI-TARGET-GATE FAIL at check="
+text gmNl "\n"
+
+fn gm_w_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put gmDig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+w = write 1 gmDig p sub 24 p
+ret
+end
+end
+end
+
+fn gm_w_hex3 v ulong to void
+for i ulong 3
+s = sub 8 mul i 4
+d = and shr v s 15
+if lt d 10
+put gmDig i uchar add 48 d
+else
+put gmDig i uchar add 87 d
+end
+end
+w = write 1 gmDig 0 3
+end
+
+fn gm_fail id ulong to int
+w = write 1 gmFailMsg 0 len gmFailMsg
+gm_w_num id
+w = write 1 gmNl 0 len gmNl
+ret int id
+end
+
+fn gm_add_chk n ulong to void
+put gmChk 0 add get gmChk 0 n
+end
+
+fn gm_add_ctrl n ulong to void
+put gmCtrl 0 add get gmCtrl 0 n
+end
+
+note ---- Test 1: All 16 TargetDesc profiles & honest initial evidence badges ----
+fn gm_test_profiles to int
+if ne get tdCount 0 16
+ret gm_fail 1
+end
+note RTX 5090 sm_120: 96 MiB L2, 101376 B SMEM, Wave32, NVFP4+TMA, NO C2C_COH
+if or ne tdGet TID_RTX5090 TDF_ISA ISA_SM120 ne tdGet TID_RTX5090 TDF_SMEM 101376
+ret gm_fail 2
+end
+if or ne tdGet TID_RTX5090 TDF_L2_KB 98304 ne tdGet TID_RTX5090 TDF_MEMDOM 2
+ret gm_fail 3
+end
+if ne and tdGet TID_RTX5090 TDF_FEAT FEAT_C2C_COH 0
+ret gm_fail 4
+end
+note AMD MI300X gfx942: Wave64, 65536 B LDS, MFMA, mach=0x4c (76)
+if or ne tdGet TID_MI300X TDF_ISA ISA_GFX942 ne tdGet TID_MI300X TDF_SUBGROUP 64
+ret gm_fail 5
+end
+if or ne tdGet TID_MI300X TDF_SMEM 65536 ne get mtAuxId TID_MI300X MT_AMDGPU_MACH_GFX942
+ret gm_fail 6
+end
+note AMD Strix Halo gfx1151: Wave32, 65536 B LDS max, WMMA, unified APU memdom=1, mach=0x4a (74)
+if or ne tdGet TID_STRIX_HALO TDF_ISA ISA_GFX1151 ne tdGet TID_STRIX_HALO TDF_SUBGROUP 32
+ret gm_fail 7
+end
+if or ne tdGet TID_STRIX_HALO TDF_SMEM 65536 ne get mtAuxId TID_STRIX_HALO MT_AMDGPU_MACH_GFX1151
+ret gm_fail 8
+end
+note Intel Arc Xe2 drm/xe: SIMD16, 131072 B SLM, XMX DPAS
+if or ne tdGet TID_INTEL_XE2 TDF_ISA ISA_INTEL_XE2 ne tdGet TID_INTEL_XE2 TDF_SUBGROUP 16
+ret gm_fail 9
+end
+if ne tdGet TID_INTEL_XE2 TDF_SMEM 131072
+ret gm_fail 10
+end
+note Apple M-series a64macos: A64 ISA, 29 GPRs (X18 reserved), 128 B cache line, 128 KiB L1D
+if or ne tdGet TID_APPLE_M TDF_ISA ISA_A64 ne tdGet TID_APPLE_M TDF_NGPR 29
+ret gm_fail 11
+end
+if or ne tdGet TID_APPLE_M TDF_LINE 128 ne tdGet TID_APPLE_M TDF_L1D_KB 128
+ret gm_fail 12
+end
+note Universal Tier-0 SPIR-V/WASM: conservative 32768 B SMEM floor
+if or ne tdGet TID_TIER0_UNIV TDF_ISA ISA_SPIRV_WASM ne tdGet TID_TIER0_UNIV TDF_SMEM 32768
+ret gm_fail 13
+end
+note x86-64 AVX2/AVX-512 WSL 2 Linux compatibility & GB10 SM121 C2C coherency
+if eq and tdGet TID_X64_AVX2 TDF_FEAT FEAT_WSL2_LX 0
+ret gm_fail 14
+end
+if eq and tdGet TID_SM121 TDF_FEAT FEAT_C2C_COH 0
+ret gm_fail 15
+end
+note Honest evidence badges: ZERO targets may claim PHYSICAL_SILICON before live probing!
+for tid ulong 16
+if ne get mtSilEv tid MT_EV_NOT_RUN
+ret gm_fail 16
+end
+end
+if or ne get mtHostEv TID_RTX5090 MT_EV_HOST_VERIFIED ne get mtHostEv TID_STRIX_HALO MT_EV_HOST_VERIFIED
+ret gm_fail 17
+end
+if or ne get mtHostEv TID_INTEL_XE2 MT_EV_HOST_VERIFIED ne get mtHostEv TID_APPLE_M MT_EV_HOST_VERIFIED
+ret gm_fail 18
+end
+if ne get mtHostEv TID_X64_AVX2 MT_EV_EMULATED
+ret gm_fail 19
+end
+gm_add_chk 15
+ret 0
+end
+
+note ---- Test 2: Physical Contract Checks & Multi-Vendor Negative Controls ----
+fn gm_test_contracts to int
+note Positive: SM121-only C2C + TMA + NVFP4 kernel ACCEPTED on GB10 SM121
+tdSetReq EXEC_SIMT_WARP 98304 64 32 MMA_16864_NVFP4 or FEAT_C2C_COH or FEAT_TMA FEAT_NVFP4
+if ne tdCheckKernelContract TID_SM121 TDK_OK
+ret gm_fail 20
+end
+note Negative control 1: sm_121-only FEAT_C2C_COH + HMMA refused on Strix Halo gfx1151!
+tdSetReq EXEC_SIMT_WARP 32768 64 32 0 or FEAT_C2C_COH FEAT_HMMA16816
+if ne tdCheckKernelContract TID_STRIX_HALO TDK_ERR_FEAT
+ret gm_fail 21
+end
+gm_add_ctrl 1
+
+note Negative control 2: sm_121-only FEAT_C2C_COH refused on discrete RTX 5090 sm_120!
+tdSetReq EXEC_SIMT_WARP 65536 64 32 MMA_16864_NVFP4 FEAT_C2C_COH
+if ne tdCheckKernelContract TID_RTX5090 TDK_ERR_FEAT
+ret gm_fail 22
+end
+gm_add_ctrl 1
+
+note Positive: RTX 5090 sm_120 accepts discrete NVFP4 + TMA kernel without C2C_COH
+tdSetReq EXEC_SIMT_WARP 98304 64 32 MMA_16864_NVFP4 or FEAT_TMA FEAT_NVFP4
+if ne tdCheckKernelContract TID_RTX5090 TDK_OK
+ret gm_fail 23
+end
+
+note Negative control 3: smem > 65536 (65537 B and 101376 B) MUST be refused on gfx1151!
+tdSetReq EXEC_SIMT_WARP 65537 64 32 0 FEAT_FMA
+if ne tdCheckKernelContract TID_STRIX_HALO TDK_ERR_SMEM
+ret gm_fail 24
+end
+tdSetReq EXEC_SIMT_WARP 101376 64 32 0 FEAT_FMA
+if ne tdCheckKernelContract TID_STRIX_HALO TDK_ERR_SMEM
+ret gm_fail 25
+end
+gm_add_ctrl 1
+
+note Positive: exact 65536 B LDS boundary ACCEPTED on gfx1151 & MI300X gfx942
+tdSetReq EXEC_SIMT_WARP 65536 64 32 MMA_161616_WMMA FEAT_WMMA
+if ne tdCheckKernelContract TID_STRIX_HALO TDK_OK
+ret gm_fail 26
+end
+tdSetReq EXEC_SIMT_WARP 65536 64 64 MMA_161616_MFMA FEAT_MFMA
+if ne tdCheckKernelContract TID_MI300X TDK_OK
+ret gm_fail 27
+end
+
+note Negative control 4: AMX (MMA_161616_AMX) MUST be refused on x86-64 AVX2, accepted on AVX-512!
+tdSetReq EXEC_SCALAR_SIMD 0 12 8 MMA_161616_AMX FEAT_AVX2
+if ne tdCheckKernelContract TID_X64_AVX2 TDK_ERR_MMA
+ret gm_fail 28
+end
+tdSetReq EXEC_SCALAR_SIMD 0 12 16 MMA_161616_AMX FEAT_AVX512
+if ne tdCheckKernelContract TID_X64_AVX512 TDK_OK
+ret gm_fail 29
+end
+gm_add_ctrl 1
+
+note Negative control 5: Wave64 subgroup refused on Wave32 gfx1151 & SIMD16 Intel Xe2!
+tdSetReq EXEC_SIMT_WARP 32768 64 64 0 FEAT_FMA
+if ne tdCheckKernelContract TID_STRIX_HALO TDK_ERR_SUBGROUP
+ret gm_fail 30
+end
+if ne tdCheckKernelContract TID_INTEL_XE2 TDK_ERR_SUBGROUP
+ret gm_fail 31
+end
+gm_add_ctrl 1
+
+note Positive: Intel Arc Xe2 accepts SIMD16 + 131072 B SLM + XMX DPAS kernel
+tdSetReq EXEC_SIMT_WARP 131072 64 16 MMA_81616_DPAS FEAT_XMX_DPAS
+if ne tdCheckKernelContract TID_INTEL_XE2 TDK_OK
+ret gm_fail 32
+end
+
+note Negative control 6: SIMT GPU kernel refused on Apple M-series CPU (TDK_ERR_EXEC)
+note and 30-GPR A64 kernel refused on Apple M-series (29 allocatable GPRs, X18 reserved)!
+tdSetReq EXEC_SIMT_WARP 0 16 32 0 0
+if ne tdCheckKernelContract TID_APPLE_M TDK_ERR_EXEC
+ret gm_fail 33
+end
+tdSetReq EXEC_SCALAR_SIMD 0 30 4 0 FEAT_FMA
+if ne tdCheckKernelContract TID_APPLE_M TDK_ERR_REGS
+ret gm_fail 34
+end
+tdSetReq EXEC_SCALAR_SIMD 0 29 4 MMA_APPLE_AMX FEAT_BF16
+if ne tdCheckKernelContract TID_APPLE_M TDK_OK
+ret gm_fail 35
+end
+gm_add_ctrl 1
+
+gm_add_chk 16
+ret 0
+end
+
+note ---- Test 3: 3-Tier Universal Realization Router (mt_route) ----
+fn gm_test_router to int
+note 3a. Tier-2 Bare-Metal (aienux) selected when supported & present
+tdSetReq EXEC_SCALAR_SIMD 0 20 4 0 FEAT_FMA
+t = mt_route TID_X925 MT_TIER_2_BAREMETAL or MT_ENV_BAREMETAL MT_ENV_LINUX_A64 1
+if or ne t MT_TIER_2_BAREMETAL or ne get mtRouteOut 2 MT_DRV_AIENUX_BM ne get mtRouteOut 4 0
+ret gm_fail 40
+end
+
+note 3b. Tier-2 unavailable on Linux host -> explicit non-silent downgrade to Tier-1 ELF
+t = mt_route TID_X925 MT_TIER_2_BAREMETAL MT_ENV_LINUX_A64 1
+if or ne t MT_TIER_1_NATIVE or ne get mtRouteOut 4 1 ne get mtRouteOut 3 MT_RSN_NO_BAREMETAL
+ret gm_fail 41
+end
+
+note 3c. Tier-1 Zero-SDK Native selected for AMD Strix Halo (/dev/kfd) & Intel Arc Xe2 (drm/xe)
+tdSetReq EXEC_SIMT_WARP 32768 64 32 0 FEAT_FMA
+t = mt_route TID_STRIX_HALO MT_TIER_1_NATIVE or MT_ENV_KFD_NODE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_1_NATIVE or ne get mtRouteOut 2 MT_DRV_AMDKFD ne get mtRouteOut 4 0
+ret gm_fail 42
+end
+if or ne get mtRouteOut 6 MT_EV_HOST_VERIFIED ne get mtRouteOut 7 MT_EV_NOT_RUN
+ret gm_fail 43
+end
+tdSetReq EXEC_SIMT_WARP 32768 64 16 0 FEAT_FMA
+t = mt_route TID_INTEL_XE2 MT_TIER_1_NATIVE or MT_ENV_DRMXE_NODE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_1_NATIVE or ne get mtRouteOut 2 MT_DRV_DRMXE ne get mtRouteOut 7 MT_EV_NOT_RUN
+ret gm_fail 44
+end
+
+note 3d. Explicit non-silent Tier-1 -> Tier-0 SPIR-V fallback when /dev/kfd is absent!
+tdSetReq EXEC_SIMT_WARP 32768 64 32 0 FEAT_FMA
+t = mt_route TID_STRIX_HALO MT_TIER_1_NATIVE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_0_INTEROP or ne get mtRouteOut 2 MT_DRV_SPIRV_CL ne get mtRouteOut 4 1
+ret gm_fail 45
+end
+if or ne get mtRouteOut 3 MT_RSN_NO_DEV_NODE ne get mtRouteOut 7 MT_EV_NOT_RUN
+ret gm_fail 46
+end
+w = write 1 gmRoute1 0 len gmRoute1
+gm_w_num get mtRouteOut 9
+w = write 1 gmRoute2 0 len gmRoute2
+gm_w_num get mtRouteOut 0
+w = write 1 gmRoute3 0 len gmRoute3
+gm_w_num get mtRouteOut 2
+w = write 1 gmRoute4 0 len gmRoute4
+gm_w_num get mtRouteOut 3
+w = write 1 gmRoute5 0 len gmRoute5
+gm_w_num get mtRouteOut 6
+w = write 1 gmRoute6 0 len gmRoute6
+gm_w_num get mtRouteOut 7
+w = write 1 gmNl 0 len gmNl
+
+note 3e. RTX 5090 sm_120 (native SASS encoder PLANNED) -> explicit Tier-0 SPIR-V fallback with NO_NATIVE_ENC
+tdSetReq EXEC_SIMT_WARP 32768 64 32 0 FEAT_FMA
+t = mt_route TID_RTX5090 MT_TIER_1_NATIVE or MT_ENV_NVRM_NODE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_0_INTEROP or ne get mtRouteOut 3 MT_RSN_NO_NATIVE_ENC ne get mtRouteOut 7 MT_EV_NOT_RUN
+ret gm_fail 47
+end
+
+note 3f. Negative control 7: strict mode (allowFallback=0) MUST REFUSE when /dev/kfd absent!
+tdSetReq EXEC_SIMT_WARP 32768 64 32 0 FEAT_FMA
+t = mt_route TID_STRIX_HALO MT_TIER_1_NATIVE MT_ENV_SPIRV_RT 0
+if or ne t MT_TIER_REFUSED or ne get mtRouteOut 3 MT_RSN_STRICT_REFUSE ne get mtRouteOut 10 MT_RSN_NO_DEV_NODE
+ret gm_fail 48
+end
+gm_add_ctrl 1
+
+note 3g. Negative control 8: vendor-locked WMMA or SMEM>32KiB kernel MUST NOT silently fall back to Tier-0 SPIR-V!
+tdSetReq EXEC_SIMT_WARP 65536 64 32 MMA_161616_WMMA FEAT_WMMA
+t = mt_route TID_STRIX_HALO MT_TIER_1_NATIVE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_REFUSED ne get mtRouteOut 3 MT_RSN_TIER0_CONTRACT
+ret gm_fail 49
+end
+gm_add_ctrl 1
+
+note 3h. Negative control 9: broken physical contract (smem=101376 on gfx1151) REFUSED even with fallback=1!
+tdSetReq EXEC_SIMT_WARP 101376 64 32 0 FEAT_FMA
+t = mt_route TID_STRIX_HALO MT_TIER_1_NATIVE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_REFUSED ne get mtRouteOut 3 MT_RSN_CONTRACT_SMEM
+ret gm_fail 50
+end
+gm_add_ctrl 1
+
+note 3i. CPU Tier-1 -> Tier-0 WASM fallback on Apple M-series when macOS host absent
+tdSetReq EXEC_SCALAR_SIMD 0 16 4 0 FEAT_FMA
+t = mt_route TID_APPLE_M MT_TIER_1_NATIVE MT_ENV_WASM_RT 1
+if or ne t MT_TIER_0_INTEROP or ne get mtRouteOut 2 MT_DRV_WASM ne get mtRouteOut 4 1
+ret gm_fail 51
+end
+
+note 3j. Negative control 10: out-of-range tid refused cleanly
+t = mt_route 99 MT_TIER_1_NATIVE MT_ENV_SPIRV_RT 1
+if or ne t MT_TIER_REFUSED ne get mtRouteOut 3 MT_RSN_BAD_TARGET
+ret gm_fail 52
+end
+gm_add_ctrl 1
+
+note 3k. OMPK v1 wire header -> TargetDesc + mt_route integration & fail-closed controls
+mt_ompk_build_hdr EXEC_SIMT_WARP 32768 64 32 0 FEAT_FMA
+t = mt_ompk_route TID_STRIX_HALO MT_TIER_1_NATIVE MT_ENV_SPIRV_RT 1
+if ne t MT_TIER_0_INTEROP
+ret gm_fail 53
+end
+if ne get mtRouteOut 3 MT_RSN_NO_DEV_NODE
+ret gm_fail 54
+end
+note OMPK with 101376 B SMEM refused on Strix Halo (65536 max), accepted on GB10 SM121
+mt_ompk_build_hdr EXEC_SIMT_WARP 101376 64 32 0 FEAT_FMA
+t = mt_ompk_route TID_STRIX_HALO MT_TIER_1_NATIVE MT_ENV_KFD_NODE 1
+if ne t MT_TIER_REFUSED
+ret gm_fail 55
+end
+if ne get mtRouteOut 3 MT_RSN_CONTRACT_SMEM
+ret gm_fail 55
+end
+t = mt_ompk_route TID_SM121 MT_TIER_1_NATIVE MT_ENV_NVRM_NODE 0
+if ne t MT_TIER_1_NATIVE
+ret gm_fail 56
+end
+gm_add_ctrl 1
+
+note OMPK negative controls: corrupted magic and unsupported version MUST be refused!
+put mtOmpkHdr 0 uchar 88
+t = mt_ompk_route TID_SM121 MT_TIER_1_NATIVE MT_ENV_NVRM_NODE 1
+if ne t MT_TIER_REFUSED
+ret gm_fail 57
+end
+if ne get mtRouteOut 3 MT_RSN_OMPK_MAGIC
+ret gm_fail 57
+end
+put mtOmpkHdr 0 uchar 79
+mt_ompk_put32 4 2
+t = mt_ompk_route TID_SM121 MT_TIER_1_NATIVE MT_ENV_NVRM_NODE 1
+if ne t MT_TIER_REFUSED
+ret gm_fail 58
+end
+if ne get mtRouteOut 3 MT_RSN_OMPK_VERSION
+ret gm_fail 58
+end
+gm_add_ctrl 2
+
+gm_add_chk 19
+ret 0
+end
+
+note ---- Test 4: Live Spark Local Silicon Probe & Auto-Calibrator ----
+fn gm_test_live_probe to int
+mtid = mt_probe_local
+w = write 1 gmProbe1 0 len gmProbe1
+gm_w_num get mtProbeOut 1
+w = write 1 gmProbe2 0 len gmProbe2
+gm_w_hex3 get mtProbeOut 4
+w = write 1 gmProbe3 0 len gmProbe3
+gm_w_num get mtProbeOut 5
+w = write 1 gmProbe4 0 len gmProbe4
+gm_w_num get mtProbeOut 6
+w = write 1 gmProbe5 0 len gmProbe5
+gm_w_num get mtProbeOut 7
+w = write 1 gmProbe6 0 len gmProbe6
+gm_w_num mtid
+w = write 1 gmProbe7 0 len gmProbe7
+gm_w_num get mtProbeOut 10
+w = write 1 gmProbe8 0 len gmProbe8
+gm_w_num get mtProbeOut 11
+w = write 1 gmProbe9 0 len gmProbe9
+gm_w_num get mtProbeOut 14
+w = write 1 gmNl 0 len gmNl
+
+note Must succeed and match a valid TargetDesc row (0..15)
+if or ne get mtProbeOut 0 1 ge mtid 16
+ret gm_fail 60
+end
+note On Spark Grace ARMv9: expect Arm implementer 0x41 (65), part 0xd85 (X925) or 0xd87 (A725)
+if eq get mtProbeOut 3 65
+if and ne mtid TID_X925 ne mtid TID_A725
+ret gm_fail 61
+end
+if ne get mtProbeOut 5 64
+ret gm_fail 62
+end
+if eq mtid TID_X925
+if ne get mtProbeOut 6 2048
+ret gm_fail 63
+end
+end
+if eq mtid TID_A725
+if ne get mtProbeOut 6 512
+ret gm_fail 64
+end
+end
+note Live Grace features must include FMA+DOTPROD+I8MM+BF16+SHA+AES (399) and SVE!
+if or ne and get mtProbeOut 7 399 399 ne get mtProbeOut 8 1
+ret gm_fail 65
+end
+note Spark has 10 Cortex-X925 + 10 Cortex-A725 = 20 cores, zero calibration drift!
+if ne get mtProbeOut 10 10
+ret gm_fail 66
+end
+if ne get mtProbeOut 11 10
+ret gm_fail 66
+end
+if ne get mtProbeOut 14 0
+ret gm_fail 66
+end
+end
+note Matched local CPU row is now PHYSICAL_SILICON, while ALL GPUs MUST remain NOT_RUN!
+if ne get mtSilEv mtid MT_EV_PHYSICAL_SILICON
+ret gm_fail 67
+end
+if ne get mtSilEv TID_SM121 MT_EV_NOT_RUN
+ret gm_fail 68
+end
+if ne get mtSilEv TID_RTX5090 MT_EV_NOT_RUN
+ret gm_fail 68
+end
+if ne get mtSilEv TID_MI300X MT_EV_NOT_RUN
+ret gm_fail 69
+end
+if ne get mtSilEv TID_STRIX_HALO MT_EV_NOT_RUN
+ret gm_fail 69
+end
+if ne get mtSilEv TID_INTEL_XE2 MT_EV_NOT_RUN
+ret gm_fail 69
+end
+if ne get mtSilEv TID_APPLE_M MT_EV_NOT_RUN
+ret gm_fail 70
+end
+note Verify tile plan auto-calibrated cleanly for live matched core
+if eq get tdTileOut 2 0
+ret gm_fail 71
+end
+gm_add_chk 12
+ret 0
+end
+
+note ---- Test 5: x86-64 execpure seccomp-BPF Policy Builder + Negative Controls ----
+fn gm_eval_case arch ulong nr ulong a0Lo ulong a0Hi ulong a4Lo ulong a4Hi ulong to ulong
+mt_sec_build arch nr a0Lo a0Hi a4Lo a4Hi
+ret mt_bpf_eval
+end
+
+fn gm_test_x64_bpf to int
+cnt = mt_x64_execpure_spec
+if ne cnt MT_BPF_X64_LEN
+ret gm_fail 80
+end
+if ne mt_bpf_verify 0
+ret gm_fail 81
+end
+note Check sock_fprog header len == 27 and companion UAPI table entries
+if or ne ulong get mtBpfFprog 0 27 ne ulong get mtBpfFprog 1 0
+ret gm_fail 82
+end
+if or ne get mtX64Uapi 0 AUDIT_ARCH_X86_64 ne get mtX64Uapi 5 X64_NR_EXECVEAT
+ret gm_fail 83
+end
+if or ne get mtX64Uapi 11 X64_NR_PRLIMIT64 ne get mtX64Uapi 12 X64_NR_SECCOMP
+ret gm_fail 84
+end
+
+note Allowed x86-64 stdio-only syscalls MUST return SECCOMP_RET_ALLOW (0x7fff0000)
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_READ 0 0 0 0 SECCOMP_RET_ALLOW
+ret gm_fail 85
+end
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_WRITE 1 0 0 0 SECCOMP_RET_ALLOW
+ret gm_fail 86
+end
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_WRITE 2 0 0 0 SECCOMP_RET_ALLOW
+ret gm_fail 87
+end
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_EXIT 0 0 0 0 SECCOMP_RET_ALLOW
+ret gm_fail 88
+end
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_EXIT_GROUP 0 0 0 0 SECCOMP_RET_ALLOW
+ret gm_fail 89
+end
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_EXECVEAT 3 0 X64_AT_EMPTY_PATH 0 SECCOMP_RET_ALLOW
+ret gm_fail 90
+end
+
+note Negative controls: disallowed x86-64 syscalls MUST be KILLED (SECCOMP_RET_KILL_PROCESS)!
+killed = ulong 0
+note socket=41 MUST be killed
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_SOCKET 2 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 91
+end
+killed = add killed 1
+
+note openat=257 MUST be killed
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_OPENAT 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 92
+end
+killed = add killed 1
+
+note fork=57 MUST be killed
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_FORK 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 93
+end
+killed = add killed 1
+
+note execve=59, clone=56, ptrace=101, connect=42 MUST be killed
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_EXECVE 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 94
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_CLONE 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 95
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_PTRACE 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 96
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_CONNECT 3 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 97
+end
+killed = add killed 1
+
+note Argument-boundary negative controls: wrong fd / 64-bit upper-half smuggling / wrong execveat args
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_READ 3 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 98
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_READ 0 1 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 99
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_WRITE 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 100
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_WRITE 3 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 101
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_EXECVEAT 4 0 X64_AT_EMPTY_PATH 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 102
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_X86_64 X64_NR_EXECVEAT 3 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 103
+end
+killed = add killed 1
+
+note Architecture confusion negative controls: AUDIT_ARCH_AARCH64 and AUDIT_ARCH_I386 MUST be killed!
+if ne gm_eval_case AUDIT_ARCH_AARCH64 X64_NR_EXIT 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 104
+end
+killed = add killed 1
+if ne gm_eval_case AUDIT_ARCH_I386 X64_NR_EXIT 0 0 0 0 SECCOMP_RET_KILL_PROC
+ret gm_fail 105
+end
+killed = add killed 1
+
+note Structural verifier negative control: corrupt jf past program end MUST be caught by mt_bpf_verify!
+sav = get mtBpfBytes 11
+put mtBpfBytes 11 uchar 99
+if eq mt_bpf_verify 0
+ret gm_fail 106
+end
+put mtBpfBytes 11 sav
+if ne mt_bpf_verify 0
+ret gm_fail 107
+end
+
+gm_add_ctrl killed
+gm_add_ctrl 1
+gm_add_chk 28
+
+w = write 1 gmBpf1 0 len gmBpf1
+gm_w_num cnt
+w = write 1 gmBpf2 0 len gmBpf2
+gm_w_num mul cnt 8
+w = write 1 gmBpf3 0 len gmBpf3
+gm_w_num AUDIT_ARCH_X86_64
+w = write 1 gmBpf4 0 len gmBpf4
+gm_w_num killed
+w = write 1 gmNl 0 len gmNl
+ret 0
+end
+
+fn main to int
+w = write 1 gmHdr 0 len gmHdr
+put gmChk 0 0
+put gmCtrl 0 0
+mt_init_targets
+tdCacheInit
+
+r = gm_test_profiles
+if ne r 0
+ret r
+end
+r = gm_test_contracts
+if ne r 0
+ret r
+end
+r = gm_test_router
+if ne r 0
+ret r
+end
+r = gm_test_live_probe
+if ne r 0
+ret r
+end
+r = gm_test_x64_bpf
+if ne r 0
+ret r
+end
+
+w = write 1 gmPass 0 len gmPass
+gm_w_num get gmChk 0
+w = write 1 gmCtrlMsg 0 len gmCtrlMsg
+gm_w_num get gmCtrl 0
+w = write 1 gmNl 0 len gmNl
+ret 0
+end
