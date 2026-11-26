@@ -1,0 +1,1037 @@
+note apps/omega-wattd/watt_cbf.om
+note Pure seeded OM-2 fixed-point Joules-per-bit allocator, Arboris anticipatory pre-cooling
+note planner, and discrete 2-node thermal Control Barrier Function (CBF) safety filter.
+note Exact 1:1 fixed-point mirror of seed/helix/proofs/WattCBF.lean.
+note Compose after si/directives/om2.om and apps/omega-wattd/watt_sense.om.
+
+const WATT_P_GPU_HARD_MAX long 80000
+const WATT_P_TOTAL_HARD_MAX long 140000
+const WATT_P_UNC_HARD_MAX long 25000
+const WATT_T_CRIT_MC long 104800
+const WATT_T_CEIL_DEFAULT long 85000
+const WATT_T_CEIL_TRAIN long 78000
+const WATT_T_CEIL_ABS_MAX long 90000
+const WATT_FAN_MIN long 20
+const WATT_FAN_MAX long 100
+
+const WATT_THERMAL_SCALE long 1000
+const WATT_K_GPU_HEAT long 25
+const WATT_K_CPU_HEAT long 5
+const WATT_K_DS_COND long 100
+const WATT_K_SINK_IN long 10
+const WATT_K_FAN_BASE long 2
+const WATT_K_FAN_SLOPE long 8
+const WATT_SINK_SCALE long 100000
+
+const WATT_MODE_IDLE long 0
+const WATT_MODE_DECODE long 1
+const WATT_MODE_TRAIN long 2
+
+fn wc_min a long b long to long
+if le a b
+ret a
+end
+ret b
+end
+
+fn wc_max a long b long to long
+if ge a b
+ret a
+end
+ret b
+end
+
+note Exact mirror of WattCBF.clampNonNeg
+fn wc_clamp_nonneg x long hi long to long
+if le hi 0
+ret 0
+end
+if le x 0
+ret 0
+end
+if ge x hi
+ret hi
+end
+ret x
+end
+
+note Exact mirror of WattCBF.ceilDiv: rounds toward +infinity for b > 0
+fn wc_ceil_div a long b long to long
+requires gt b 0
+if ge a 0
+ret div add a sub b 1 b
+end
+ret neg div neg a b
+end
+
+note Exact mirror of WattCBF.barrierH: h = T_ceil - T_die - tau * dT
+fn wc_barrier_h t_ceil long t_die long tau long dt long to long
+ret sub sub t_ceil t_die mul tau dt
+end
+
+note Exact mirror of WattCBF.dieHeat
+fn wc_die_heat p_gpu long p_cpu long p_unc long to long
+ret add mul WATT_K_GPU_HEAT p_gpu mul WATT_K_CPU_HEAT add p_cpu p_unc
+end
+
+note Exact mirror of WattCBF.dieCoolDs
+fn wc_die_cool_ds st view WattThermal to long
+ret mul WATT_K_DS_COND sub get st t_die get st t_sink
+end
+
+note Exact mirror of WattCBF.nextDieDelta
+fn wc_next_die_delta st view WattThermal p_gpu long p_cpu long p_unc long to long
+heat = wc_die_heat p_gpu p_cpu p_unc
+cool = wc_die_cool_ds st
+ret wc_ceil_div sub heat cool WATT_THERMAL_SCALE
+end
+
+note Exact mirror of WattCBF.nextSinkDelta
+fn wc_next_sink_delta st view WattThermal fan_pct long to long
+td = get st t_die
+ts = get st t_sink
+ta = get st t_amb
+heat_in = mul mul WATT_K_SINK_IN 100 sub td ts
+fan_g = add mul WATT_K_FAN_BASE 100 mul WATT_K_FAN_SLOPE fan_pct
+cool_amb = mul fan_g sub ts ta
+ret wc_ceil_div sub heat_in cool_amb WATT_SINK_SCALE
+end
+
+note Exact mirror of WattCBF.stepThermal
+fn wc_step_thermal st view WattThermal cmd view WattCmd nxt edit WattThermal to void
+dt_die = wc_next_die_delta st get cmd p_gpu get cmd p_cpu get cmd p_unc
+dt_sink = wc_next_sink_delta st get cmd fan_pct
+put nxt t_die add get st t_die dt_die
+put nxt t_sink add get st t_sink dt_sink
+put nxt t_amb get st t_amb
+end
+
+note Exact mirror of WattCBF.policyValid
+fn wc_policy_valid pol view WattPolicy to bool
+if le get pol p_budget 0
+ret false
+end
+if lt get pol p_gpu_budget 0
+ret false
+end
+if le get pol t_ceil 0
+ret false
+end
+if gt get pol t_ceil WATT_T_CEIL_ABS_MAX
+ret false
+end
+if lt get pol tau 0
+ret false
+end
+ret true
+end
+
+note Exact mirror of WattCBF.maxHeatSafe
+fn wc_max_heat_safe st view WattThermal pol view WattPolicy to long
+td = get st t_die
+tc = get pol t_ceil
+if ge td tc
+ret 0
+end
+headroom = sub tc td
+dt_max = div headroom add get pol tau 1
+raw = add mul WATT_THERMAL_SCALE dt_max wc_die_cool_ds st
+if le raw 0
+ret 0
+end
+ret raw
+end
+
+note Exact mirror of WattCBF.safeFanFloor
+fn wc_safe_fan_floor headroom long therm_clamped long to long
+if or ne therm_clamped 0 le headroom 5000
+ret WATT_FAN_MAX
+end
+if le headroom 10000
+ret 85
+end
+if le headroom 18000
+ret 65
+end
+if le headroom 28000
+ret 45
+end
+ret WATT_FAN_MIN
+end
+
+note Stage A helper: power-budget & Trap-14 80 W ceiling clamp (Uncore -> CPU -> GPU)
+fn wc_power_clamp pol view WattPolicy prop view WattProp r edit WattProp to void
+p_bud = wc_min get pol p_budget WATT_P_TOTAL_HARD_MAX
+p_gcap = wc_min WATT_P_GPU_HARD_MAX wc_min get pol p_gpu_budget p_bud
+p_unc1 = wc_clamp_nonneg get prop p_unc wc_min WATT_P_UNC_HARD_MAX p_bud
+rem1 = sub p_bud p_unc1
+p_cpu1 = wc_clamp_nonneg get prop p_cpu rem1
+rem2 = sub rem1 p_cpu1
+p_gpu1 = wc_clamp_nonneg get prop p_gpu wc_min p_gcap rem2
+put r p_unc p_unc1
+put r p_cpu p_cpu1
+put r p_gpu p_gpu1
+put r fan_pct get prop fan_pct
+end
+
+note Stage B helper: discrete thermal CBF water-fill clamp (dieHeat <= maxHeat)
+fn wc_thermal_clamp r view WattProp max_heat long res edit WattCmd to void
+h_unc = wc_min mul WATT_K_CPU_HEAT get r p_unc max_heat
+p_unc2 = div h_unc WATT_K_CPU_HEAT
+rem1 = sub max_heat h_unc
+h_cpu = wc_min mul WATT_K_CPU_HEAT get r p_cpu rem1
+p_cpu2 = div h_cpu WATT_K_CPU_HEAT
+rem2 = sub rem1 h_cpu
+h_gpu = wc_min mul WATT_K_GPU_HEAT get r p_gpu rem2
+p_gpu2 = div h_gpu WATT_K_GPU_HEAT
+put res p_unc p_unc2
+put res p_cpu p_cpu2
+put res p_gpu p_gpu2
+end
+
+note Exact 1:1 mirror of WattCBF.cbfFilter
+fn wc_cbf_filter st view WattThermal pol view WattPolicy prop view WattProp res edit WattCmd to void
+r1 = new WattProp 0 0 0 0
+if not wc_policy_valid pol
+put res p_gpu 0
+put res p_cpu 0
+put res p_unc 0
+put res fan_pct WATT_FAN_MAX
+put res fail_closed 1
+put res clamped 1
+ret
+end
+if ge get st t_die get pol t_ceil
+put res p_gpu 0
+put res p_cpu 0
+put res p_unc 0
+put res fan_pct WATT_FAN_MAX
+put res fail_closed 1
+put res clamped 1
+ret
+end
+wc_power_clamp pol prop r1
+max_h = wc_max_heat_safe st pol
+wc_thermal_clamp r1 max_h res
+tc = long 0
+if lt get res p_unc get r1 p_unc
+tc = 1
+end
+if lt get res p_cpu get r1 p_cpu
+tc = 1
+end
+if lt get res p_gpu get r1 p_gpu
+tc = 1
+end
+headroom = sub get pol t_ceil get st t_die
+ffloor = wc_safe_fan_floor headroom tc
+fan_req_c = wc_max WATT_FAN_MIN get prop fan_pct
+fan_out = wc_min WATT_FAN_MAX wc_max ffloor fan_req_c
+put res fan_pct fan_out
+put res fail_closed 0
+cl = long 0
+if ne get res p_gpu get prop p_gpu
+cl = 1
+end
+if ne get res p_cpu get prop p_cpu
+cl = 1
+end
+if ne get res p_unc get prop p_unc
+cl = 1
+end
+if ne fan_out get prop fan_pct
+cl = 1
+end
+put res clamped cl
+end
+
+note Fixed-point Joules-per-bit metric: TuringYield_J = delta_bits / delta_J = (delta_bits * 1000) / delta_mj
+fn wc_turing_yield_bpj delta_bits long delta_mj long to long
+if or le delta_bits 0 le delta_mj 0
+ret 0
+end
+if gt delta_bits 9000000000000000
+note Avoid overflow on huge bit counts by dividing energy by 1000 J first
+dj = div delta_mj 1000
+if le dj 0
+ret delta_bits
+end
+ret div delta_bits dj
+end
+ret div mul delta_bits 1000 delta_mj
+end
+
+note Mode-aware Watt-budget allocator with TuringYield_J efficiency tilting
+fn wc_allocate_watts p_budget long mode long delta_bits long delta_mj long plan edit WattPlan to void
+bpj = wc_turing_yield_bpj delta_bits delta_mj
+put plan bpj bpj
+put plan precool_active 0
+put plan precool_fan 0
+put plan trough_mw 0
+if le p_budget 0
+put plan p_gpu_req 0
+put plan p_cpu_req 0
+put plan p_unc_req 0
+put plan fan_req WATT_FAN_MAX
+ret
+end
+bud = wc_min p_budget WATT_P_TOTAL_HARD_MAX
+p_unc = long 0
+p_cpu = long 0
+p_gpu = long 0
+fan = long 35
+if eq mode WATT_MODE_IDLE
+p_unc = wc_min 5000 div mul bud 25 100
+p_cpu = wc_min 8000 div mul bud 45 100
+p_gpu = wc_min 5000 sub sub bud p_unc p_cpu
+if lt p_gpu 0
+p_gpu = 0
+end
+fan = 25
+else
+if eq mode WATT_MODE_TRAIN
+p_unc = wc_max 5000 div mul bud 8 100
+p_unc = wc_min p_unc wc_min 15000 bud
+rem_t = sub bud p_unc
+p_cpu = div mul bud 17 100
+if gt p_cpu rem_t
+p_cpu = rem_t
+end
+p_gpu = wc_min WATT_P_GPU_HARD_MAX sub rem_t p_cpu
+fan = 60
+else
+note MODE_DECODE (default): C2C/LPDDR5X + Grace APU + Blackwell GPU balanced split
+p_unc = wc_max 6000 div mul bud 12 100
+p_unc = wc_min p_unc wc_min 18000 bud
+rem_d = sub bud p_unc
+p_cpu = div mul bud 22 100
+if gt p_cpu rem_d
+p_cpu = rem_d
+end
+p_gpu = wc_min WATT_P_GPU_HARD_MAX sub rem_d p_cpu
+fan = 45
+end
+end
+note TuringYield_J tilt: reward high bits/J compute density; shift low bits/J toward C2C/CPU
+if and ne mode WATT_MODE_IDLE gt bpj 0
+if ge bpj 1000
+shift = div mul p_cpu 15 100
+if gt add p_gpu shift WATT_P_GPU_HARD_MAX
+shift = sub WATT_P_GPU_HARD_MAX p_gpu
+end
+if gt shift 0
+p_cpu = sub p_cpu shift
+p_gpu = add p_gpu shift
+end
+else
+if lt bpj 200
+shift2 = div mul p_gpu 10 100
+if gt add p_unc shift2 WATT_P_UNC_HARD_MAX
+shift2 = sub WATT_P_UNC_HARD_MAX p_unc
+end
+if gt shift2 0
+p_gpu = sub p_gpu shift2
+p_unc = add p_unc shift2
+end
+end
+end
+end
+put plan p_gpu_req p_gpu
+put plan p_cpu_req p_cpu
+put plan p_unc_req p_unc
+put plan fan_req fan
+end
+
+fn wc_precool_trough t_ceil long t_die long pc_fan long trough_pct long plan edit WattPlan to void
+put plan precool_active 1
+put plan precool_fan pc_fan
+if gt pc_fan get plan fan_req
+put plan fan_req pc_fan
+end
+cur_g = get plan p_gpu_req
+tr = div mul cur_g trough_pct 100
+new_g = sub cur_g tr
+floor_g = wc_min cur_g 15000
+if ge sub t_ceil t_die 4000
+if lt new_g floor_g
+new_g = floor_g
+tr = sub cur_g new_g
+end
+end
+put plan p_gpu_req new_g
+put plan trough_mw tr
+end
+
+note Arboris anticipatory pre-cooling planner: burst lookahead -> pre-cool fan floor + pre-burst trough
+fn wc_apply_precool st view WattThermal pol view WattPolicy burst_mw long burst_sec long plan edit WattPlan to void
+put plan precool_active 0
+put plan precool_fan 0
+put plan trough_mw 0
+if or le burst_mw 0 le burst_sec 0
+ret
+end
+b_gpu = wc_min burst_mw WATT_P_GPU_HARD_MAX
+dt_b = wc_next_die_delta st b_gpu get plan p_cpu_req get plan p_unc_req
+t_die = get st t_die
+t_ceil = get pol t_ceil
+t_proj = add t_die mul wc_min burst_sec 60 wc_max 0 dt_b
+h_burst = wc_barrier_h t_ceil t_die get pol tau dt_b
+need_pc = false
+if ge t_proj sub t_ceil 4000
+need_pc = true
+end
+if lt h_burst 4000
+need_pc = true
+end
+if ge t_die sub t_ceil 10000
+need_pc = true
+end
+if not need_pc
+ret
+end
+if or ge t_proj t_ceil le h_burst 0
+wc_precool_trough t_ceil t_die WATT_FAN_MAX 35 plan
+else
+wc_precool_trough t_ceil t_die 85 20 plan
+end
+end
+
+note Filter a WattPlan through the formally verified CBF shield into WattCmd
+fn wc_filter_plan st view WattThermal pol view WattPolicy plan view WattPlan cmd edit WattCmd to void
+pr = new WattProp get plan p_gpu_req get plan p_cpu_req get plan p_unc_req get plan fan_req
+wc_cbf_filter st pol pr cmd
+end
+
+note Shared self-verification gate messages (used by both omega-wattd gate and gate_wattd)
+text wg_m_pass "PASS "
+text wg_m_fail "FAIL "
+text wg_m_t1 "T1_live_spark_sense"
+text wg_m_t2 "T2_trap14_88w_90w_lean_match"
+text wg_m_t3 "T3_tgpu_spike_and_overtemp"
+text wg_m_t4 "T4_over_budget_total_clamped"
+text wg_m_t5 "T5_invalid_policy_fail_closed"
+text wg_m_t6 "T6_turing_yield_allocator_modes"
+text wg_m_t7 "T7_arboris_anticipatory_precool"
+text wg_m_t8 "T8_closed_loop_120tick_invariance"
+text wg_m_t9 "T9_live_silicon_full_plan_pipeline"
+text wg_m_t1_det " zones=7/7 cpus=20/20 cppc=20/20 hw_writes=0 tgpu_mc="
+text wg_m_t2_det " raw_90w_h=-700 cbf_gpu_mw=62640 cbf_h=668 fan=100"
+text wg_m_t3_det " raw_tdie_next=78375 raw_h=-1250 cbf_tdie_next<=78000 overtemp_fail_closed=1"
+text wg_m_t4_det " raw_120w>100w cbf_total_mw="
+text wg_m_t5_det " neg_budget=0 zero_budget=0 bad_ceil=0 bad_tau=0 fan=100"
+text wg_m_t6_det " bpj_hi="
+text wg_m_t6_det2 " bpj_lo="
+text wg_m_t7_det " precool_sink_mc="
+text wg_m_t7_det2 " base_sink_mc="
+text wg_m_t7_det3 " burst_gpu_pc="
+text wg_m_t7_det4 " burst_gpu_base="
+text wg_m_t8_det " ticks=120 max_tdie_mc="
+text wg_m_t8_det2 " max_tsink_mc="
+text wg_m_t8_det3 " idempotent=1"
+text wg_m_t9_det " decode_gpu_mw="
+text wg_m_t9_det2 " train_gpu_mw="
+text wg_m_t9_det3 " idle_gpu_mw="
+text wg_m_sum_pass "GATE PASS omega-wattd checks="
+text wg_m_sum_fail "GATE FAIL omega-wattd passed="
+text wg_m_sum_of "/"
+text wg_m_sum_tail " hw_writes=0\n"
+
+fn wg_report ok bool name view uchar * to long
+if ok
+wd_puts wg_m_pass
+wd_puts name
+wd_puts ws_lbl_nl
+ret 1
+end
+wd_puts wg_m_fail
+wd_puts name
+wd_puts ws_lbl_nl
+ret 0
+end
+
+fn wg_t1_live_sense to bool
+ws_sense_all
+ok = true
+if ne get g_wmeta 0 7
+ok = false
+end
+if ne get g_wmeta 1 20
+ok = false
+end
+if ne get g_wmeta 2 20
+ok = false
+end
+tgpu = get g_wmeta 5
+if or le tgpu 10000 ge tgpu 100000
+ok = false
+end
+if ne get g_tz_crit 5 WATT_T_CRIT_MC
+ok = false
+end
+aavg = get g_wmeta 3
+xavg = get g_wmeta 4
+if or lt aavg 338000 gt aavg 2808000
+ok = false
+end
+if or lt xavg 1378000 gt xavg 3900000
+ok = false
+end
+if ne get g_wmeta 12 0
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t1
+wd_puts wg_m_t1_det
+wd_put_i64 tgpu
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t1
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t2a_88w to bool
+st_cool = new WattThermal 44000 40000 25000
+pol_cool = new WattPolicy 120000 120000 85000 2
+pr88 = new WattProp 88000 15000 5000 40
+cmd88 = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st_cool pol_cool pr88 cmd88
+if ne get cmd88 p_gpu 80000
+ret false
+end
+if ne get cmd88 clamped 1
+ret false
+end
+if ne get cmd88 fail_closed 0
+ret false
+end
+ret true
+end
+
+fn wg_t2b_90w_lean to bool
+st90 = new WattThermal 76000 66000 25000
+pol90 = new WattPolicy 110000 80000 78000 2
+pr90 = new WattProp 90000 15000 5000 40
+dt_raw = wc_next_die_delta st90 90000 15000 5000
+if ne wc_barrier_h 78000 76000 2 dt_raw -700
+ret false
+end
+cmd90 = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st90 pol90 pr90 cmd90
+if ne get cmd90 p_gpu 62640
+ret false
+end
+if ne get cmd90 p_cpu 15000
+ret false
+end
+if ne get cmd90 p_unc 5000
+ret false
+end
+if ne get cmd90 fan_pct 100
+ret false
+end
+if ne get cmd90 clamped 1
+ret false
+end
+dt_cbf = wc_next_die_delta st90 get cmd90 p_gpu get cmd90 p_cpu get cmd90 p_unc
+if ne wc_barrier_h 78000 76000 2 dt_cbf 668
+ret false
+end
+nxt90 = new WattThermal 0 0 0
+wc_step_thermal st90 cmd90 nxt90
+if ne get nxt90 t_die 76666
+ret false
+end
+ret true
+end
+
+fn wg_t2_trap14 to bool
+ok = true
+if not wg_t2a_88w
+ok = false
+end
+if not wg_t2b_90w_lean
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t2
+wd_puts wg_m_t2_det
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t2
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t3a_spike to bool
+st = new WattThermal 77500 68000 25000
+pol = new WattPolicy 100000 80000 78000 2
+pr = new WattProp 70000 10000 5000 50
+dt_raw = wc_next_die_delta st 70000 10000 5000
+if ne add 77500 dt_raw 78375
+ret false
+end
+if ne wc_barrier_h 78000 77500 2 dt_raw -1250
+ret false
+end
+cmd = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pr cmd
+nxt = new WattThermal 0 0 0
+wc_step_thermal st cmd nxt
+dt_c = wc_next_die_delta st get cmd p_gpu get cmd p_cpu get cmd p_unc
+if gt get nxt t_die 78000
+ret false
+end
+if lt wc_barrier_h 78000 77500 2 dt_c 0
+ret false
+end
+if ne get cmd fan_pct 100
+ret false
+end
+if ge get cmd p_gpu 70000
+ret false
+end
+ret true
+end
+
+fn wg_t3b_overtemp to bool
+st_hot = new WattThermal 80000 68000 25000
+pol = new WattPolicy 100000 80000 78000 2
+pr = new WattProp 70000 10000 5000 50
+cmd_hot = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st_hot pol pr cmd_hot
+if ne get cmd_hot fail_closed 1
+ret false
+end
+if ne get cmd_hot fan_pct 100
+ret false
+end
+if ne get cmd_hot p_gpu 0
+ret false
+end
+if ne get cmd_hot p_cpu 0
+ret false
+end
+if ne get cmd_hot p_unc 0
+ret false
+end
+ret true
+end
+
+fn wg_t3_tgpu_spike to bool
+ok = true
+if not wg_t3a_spike
+ok = false
+end
+if not wg_t3b_overtemp
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t3
+wd_puts wg_m_t3_det
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t3
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t4_over_budget to bool
+ok = true
+st = new WattThermal 44000 40000 25000
+pol = new WattPolicy 100000 80000 85000 2
+pr = new WattProp 75000 35000 10000 40
+cmd = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pr cmd
+tot = add add get cmd p_gpu get cmd p_cpu get cmd p_unc
+if gt tot 100000
+ok = false
+end
+if or ne get cmd p_gpu 55000 ne get cmd clamped 1
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t4
+wd_puts wg_m_t4_det
+wd_put_i64 tot
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t4
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_check_fail_closed st view WattThermal pol view WattPolicy pr view WattProp to bool
+cmd = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pr cmd
+if ne get cmd fail_closed 1
+ret false
+end
+if or ne get cmd p_gpu 0 or ne get cmd p_cpu 0 ne get cmd p_unc 0
+ret false
+end
+if ne get cmd fan_pct 100
+ret false
+end
+ret true
+end
+
+fn wg_t5_invalid_refused to bool
+ok = true
+st = new WattThermal 44000 40000 25000
+pr = new WattProp 50000 15000 5000 30
+p_neg = new WattPolicy -10000 80000 85000 2
+p_zero = new WattPolicy 0 80000 85000 2
+p_hi_ceil = new WattPolicy 100000 80000 95000 2
+p_lo_ceil = new WattPolicy 100000 80000 0 2
+p_neg_tau = new WattPolicy 100000 80000 85000 -1
+if not wg_check_fail_closed st p_neg pr
+ok = false
+end
+if not wg_check_fail_closed st p_zero pr
+ok = false
+end
+if not wg_check_fail_closed st p_hi_ceil pr
+ok = false
+end
+if not wg_check_fail_closed st p_lo_ceil pr
+ok = false
+end
+if not wg_check_fail_closed st p_neg_tau pr
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t5
+wd_puts wg_m_t5_det
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t5
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t6_allocator to bool
+ok = true
+pl_hi = new WattPlan 0 0 0 0 0 0 0 0
+pl_lo = new WattPlan 0 0 0 0 0 0 0 0
+pl_id = new WattPlan 0 0 0 0 0 0 0 0
+wc_allocate_watts 90000 WATT_MODE_TRAIN 500000 100000 pl_hi
+wc_allocate_watts 90000 WATT_MODE_TRAIN 10000 100000 pl_lo
+wc_allocate_watts 25000 WATT_MODE_IDLE 0 0 pl_id
+if ne get pl_hi bpj 5000
+ok = false
+end
+if ne get pl_lo bpj 100
+ok = false
+end
+if le get pl_hi p_gpu_req get pl_lo p_gpu_req
+ok = false
+end
+tot_hi = add add get pl_hi p_gpu_req get pl_hi p_cpu_req get pl_hi p_unc_req
+tot_id = add add get pl_id p_gpu_req get pl_id p_cpu_req get pl_id p_unc_req
+if or gt tot_hi 90000 gt get pl_hi p_gpu_req WATT_P_GPU_HARD_MAX
+ok = false
+end
+if or gt tot_id 25000 gt get pl_id p_gpu_req 5000
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t6
+wd_puts wg_m_t6_det
+wd_put_i64 get pl_hi bpj
+wd_puts wg_m_t6_det2
+wd_put_i64 get pl_lo bpj
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t6
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t7_step_pc st edit WattThermal pol view WattPolicy to void
+pl = new WattPlan 0 0 0 0 0 0 0 0
+cmd = new WattCmd 0 0 0 0 0 0
+nxt = new WattThermal 0 0 0
+wc_allocate_watts 100000 WATT_MODE_TRAIN 0 0 pl
+wc_apply_precool st pol 75000 5 pl
+wc_filter_plan st pol pl cmd
+wc_step_thermal st cmd nxt
+put st t_die get nxt t_die
+put st t_sink get nxt t_sink
+end
+
+fn wg_t7_step_bs st edit WattThermal pol view WattPolicy to void
+pr = new WattProp 65000 15000 8000 45
+cmd = new WattCmd 0 0 0 0 0 0
+nxt = new WattThermal 0 0 0
+wc_cbf_filter st pol pr cmd
+wc_step_thermal st cmd nxt
+put st t_die get nxt t_die
+put st t_sink get nxt t_sink
+end
+
+fn wg_t7_precool to bool
+ok = true
+pol = new WattPolicy 100000 80000 78000 2
+st_pc = new WattThermal 75500 66000 25000
+st_bs = new WattThermal 75500 66000 25000
+pl_pc = new WattPlan 0 0 0 0 0 0 0 0
+wc_allocate_watts 100000 WATT_MODE_TRAIN 0 0 pl_pc
+wc_apply_precool st_pc pol 75000 5 pl_pc
+if ne get pl_pc precool_active 1
+ok = false
+end
+if lt get pl_pc precool_fan 85
+ok = false
+end
+if le get pl_pc trough_mw 0
+ok = false
+end
+for t ulong 5
+wg_t7_step_pc st_pc pol
+wg_t7_step_bs st_bs pol
+end
+if ge get st_pc t_sink get st_bs t_sink
+ok = false
+end
+if ge get st_pc t_die get st_bs t_die
+ok = false
+end
+pr_burst = new WattProp 75000 15000 8000 85
+cmd_pc = new WattCmd 0 0 0 0 0 0
+cmd_bs = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st_pc pol pr_burst cmd_pc
+wc_cbf_filter st_bs pol pr_burst cmd_bs
+if le get cmd_pc p_gpu get cmd_bs p_gpu
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t7
+wd_puts wg_m_t7_det
+wd_put_i64 get st_pc t_sink
+wd_puts wg_m_t7_det2
+wd_put_i64 get st_bs t_sink
+wd_puts wg_m_t7_det3
+wd_put_i64 get cmd_pc p_gpu
+wd_puts wg_m_t7_det4
+wd_put_i64 get cmd_bs p_gpu
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t7
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t8_step_check st edit WattThermal pol view WattPolicy pr_adv view WattProp to bool
+cmd = new WattCmd 0 0 0 0 0 0
+cmd2 = new WattCmd 0 0 0 0 0 0
+pr_re = new WattProp 0 0 0 0
+nxt = new WattThermal 0 0 0
+wc_cbf_filter st pol pr_adv cmd
+pg = get cmd p_gpu
+pc = get cmd p_cpu
+pu = get cmd p_unc
+if gt pg 80000
+ret false
+end
+if gt add add pg pc pu 110000
+ret false
+end
+if lt get cmd fan_pct 20
+ret false
+end
+if gt get cmd fan_pct 100
+ret false
+end
+dt = wc_next_die_delta st pg pc pu
+h = wc_barrier_h 78000 get st t_die 2 dt
+if lt h 0
+ret false
+end
+put pr_re p_gpu pg
+put pr_re p_cpu pc
+put pr_re p_unc pu
+put pr_re fan_pct get cmd fan_pct
+wc_cbf_filter st pol pr_re cmd2
+if ne get cmd2 p_gpu pg
+ret false
+end
+if ne get cmd2 p_cpu pc
+ret false
+end
+if ne get cmd2 p_unc pu
+ret false
+end
+wc_step_thermal st cmd nxt
+put st t_die get nxt t_die
+put st t_sink get nxt t_sink
+if gt get st t_die 78000
+ret false
+end
+if gt get st t_sink 78000
+ret false
+end
+ret true
+end
+
+fn wg_t8_closed_loop to bool
+ok = true
+note Hot-start right near 78 C ceiling so thermal CBF actively clamps against barrier wall
+st = new WattThermal 76500 68000 25000
+pol = new WattPolicy 110000 80000 78000 2
+pr_adv = new WattProp 120000 50000 20000 0
+max_td = long 0
+max_ts = long 0
+for tick ulong 120
+if not wg_t8_step_check st pol pr_adv
+ok = false
+end
+if gt get st t_die max_td
+max_td = get st t_die
+end
+if gt get st t_sink max_ts
+max_ts = get st t_sink
+end
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t8
+wd_puts wg_m_t8_det
+wd_put_i64 max_td
+wd_puts wg_m_t8_det2
+wd_put_i64 max_ts
+wd_puts wg_m_t8_det3
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t8
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wg_t9_eval st view WattThermal budget long mode long ceil_mc long burst_mw long to long
+pol = new WattPolicy budget WATT_P_GPU_HARD_MAX ceil_mc 2
+pl = new WattPlan 0 0 0 0 0 0 0 0
+cmd = new WattCmd 0 0 0 0 0 0
+wc_allocate_watts budget mode 240000 100000 pl
+if gt burst_mw 0
+wc_apply_precool st pol burst_mw 5 pl
+end
+wc_filter_plan st pol pl cmd
+if ne get cmd fail_closed 0
+ret -1
+end
+if gt get cmd p_gpu WATT_P_GPU_HARD_MAX
+ret -1
+end
+if gt add add get cmd p_gpu get cmd p_cpu get cmd p_unc budget
+ret -1
+end
+ret get cmd p_gpu
+end
+
+fn wg_t9_live_pipeline to bool
+st = new WattThermal 0 0 0
+ws_fill_thermal_state st
+gd = wg_t9_eval st 90000 WATT_MODE_DECODE 85000 0
+g_tr = wg_t9_eval st 100000 WATT_MODE_TRAIN 78000 75000
+gi = wg_t9_eval st 25000 WATT_MODE_IDLE 85000 0
+ok = true
+if lt gd 0
+ok = false
+end
+if lt g_tr 0
+ok = false
+end
+if lt gi 0
+ok = false
+end
+if ne get g_wmeta 12 0
+ok = false
+end
+if ok
+wd_puts wg_m_pass
+wd_puts wg_m_t9
+wd_puts wg_m_t9_det
+wd_put_i64 gd
+wd_puts wg_m_t9_det2
+wd_put_i64 g_tr
+wd_puts wg_m_t9_det3
+wd_put_i64 gi
+wd_puts ws_lbl_nl
+else
+wd_puts wg_m_fail
+wd_puts wg_m_t9
+wd_puts ws_lbl_nl
+end
+ret ok
+end
+
+fn wc_run_core_gate to int
+passed = long 0
+if wg_t1_live_sense
+passed = add passed 1
+end
+if wg_t2_trap14
+passed = add passed 1
+end
+if wg_t3_tgpu_spike
+passed = add passed 1
+end
+if wg_t4_over_budget
+passed = add passed 1
+end
+if wg_t5_invalid_refused
+passed = add passed 1
+end
+if wg_t6_allocator
+passed = add passed 1
+end
+if wg_t7_precool
+passed = add passed 1
+end
+if wg_t8_closed_loop
+passed = add passed 1
+end
+if wg_t9_live_pipeline
+passed = add passed 1
+end
+if eq passed 9
+wd_puts wg_m_sum_pass
+wd_put_i64 passed
+wd_puts wg_m_sum_of
+wd_put_i64 9
+wd_puts wg_m_sum_tail
+wd_flush
+ret 0
+end
+wd_puts wg_m_sum_fail
+wd_put_i64 passed
+wd_puts wg_m_sum_of
+wd_put_i64 9
+wd_puts wg_m_sum_tail
+wd_flush
+ret 1
+end

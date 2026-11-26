@@ -1,0 +1,399 @@
+note apps/omega-wattd/wattd_main.om
+note Pure seeded OM-2 CLI for omega-wattd whole-unit power, thermal CBF, and fan planning.
+note Compose: cat si/directives/om2.om apps/omega-wattd/watt_sense.om apps/omega-wattd/watt_cbf.om apps/omega-wattd/wattd_main.om | seed/out/omc > omega-wattd
+note Strictly READ-ONLY / DRY-RUN on physical actuators: zero sysfs/EC/GSP/UEFI/SPI/PCIe writes.
+
+note CLI argument scratch buffer and parsed config slots:
+note g_cli[0]=watts_mw  g_cli[1]=tgpu_ceil_mc  g_cli[2]=ceil_set  g_cli[3]=mode
+note g_cli[4]=tau       g_cli[5]=burst_mw      g_cli[6]=burst_sec g_cli[7]=delta_bits
+note g_cli[8]=delta_mj  g_cli[9]=tgpu_ovr_set  g_cli[10]=tgpu_ovr g_cli[11]=tsink_ovr_set
+note g_cli[12]=tsink_ovr g_cli[13]=want_apply  g_cli[14]=bad_arg
+global g_cli long 16
+global g_argbuf uchar 128
+
+text wm_cmd_sense "sense"
+text wm_cmd_plan "plan"
+text wm_cmd_gate "gate"
+text wm_cmd_help "--help"
+text wm_cmd_h "-h"
+
+text wm_f_watts "--watts"
+text wm_f_ceil "--tgpu-ceil"
+text wm_f_mode "--mode"
+text wm_f_tau "--tau"
+text wm_f_bmw "--burst-mw"
+text wm_f_bsec "--burst-sec"
+text wm_f_bits "--delta-bits"
+text wm_f_mj "--delta-mj"
+text wm_f_tgpu "--tgpu-mc"
+text wm_f_tsink "--tsink-mc"
+text wm_f_apply "--apply"
+
+text wm_m_idle "idle"
+text wm_m_decode "decode"
+text wm_m_train "train"
+
+text wm_usage "usage: omega-wattd <sense|plan|gate>\n  sense  Read live Spark thermal_zone0..6 (incl. TGPU zone5), Grace cpufreq, ACPI CPPC (zero nvidia.ko)\n  plan   [--watts W] [--tgpu-ceil C] [--mode decode|train|idle] [--tau S]\n         [--burst-mw MW] [--burst-sec S] [--delta-bits B] [--delta-mj MJ]\n         [--tgpu-mc MC] [--tsink-mc MC]  (strictly DRY-RUN / READ-ONLY, hw_writes=0)\n  gate   Run full live-silicon + CBF + pre-cooling + negative-control verification suite\n"
+text wm_err_cmd "omega-wattd: unknown subcommand (use sense, plan, or gate)\n"
+text wm_err_arg "omega-wattd: invalid or missing argument\n"
+text wm_err_apply "omega-wattd: --apply REFUSED (Stage-1 read-only dry-run build; physical GSP/EC/cpufreq writes require explicit Stage-2 hardware qualification window; hw_writes=0)\n"
+
+text wm_pl_hdr "OMEGA-WATTD PLAN actuator_mode=DRY_RUN_READONLY hw_writes=0 mode="
+text wm_pl_sense "SENSE live_zones="
+text wm_pl_tdie " t_die_mc="
+text wm_pl_tsink " t_sink_mc="
+text wm_pl_tamb " t_amb_mc="
+text wm_pl_pol "POLICY budget_mw="
+text wm_pl_gcap " gpu_hard_max_mw=80000 t_ceil_mc="
+text wm_pl_tau " tau_s="
+text wm_pl_alloc "ALLOC bpj="
+text wm_pl_precool " precool_active="
+text wm_pl_pcfan " precool_fan_pct="
+text wm_pl_trough " trough_mw="
+text wm_pl_prop "PROPOSED p_gpu_mw="
+text wm_pl_pcpu " p_cpu_mw="
+text wm_pl_punc " p_unc_mw="
+text wm_pl_pfan " fan_pct="
+text wm_pl_cbf "CBF_SAFE p_gpu_mw="
+text wm_pl_ptot " p_total_mw="
+text wm_pl_fc " fail_closed="
+text wm_pl_cl " clamped="
+text wm_pl_bar "BARRIER h_mc="
+text wm_pl_dt " dt_die_mc="
+text wm_pl_tdn " t_die_next_mc="
+text wm_pl_tsn " t_sink_next_mc="
+text wm_pl_gsp "GSP_DRYRUN_RPC driver=580.173.02_REF ids=0x20800513,0x20802068,0x2080206e,0x2080206f,0x2080200a,0x20800ad0,0x20800afd,0x20800ad1 issued=0\n"
+
+fn wm_read_arg idx int to ulong
+if lt idx 0
+ret 0
+end
+n = argread ulong idx g_argbuf 0 120
+if lt n 0
+ret 0
+end
+ret ulong n
+end
+
+fn wm_arg_eq idx int lit view uchar * to bool
+n = wm_read_arg idx
+if eq n 0
+ret false
+end
+tmp = new uchar 128 0
+for i ulong n bound 128
+put tmp i get g_argbuf i
+end
+ret wd_eq_view part tmp 0 n lit
+end
+
+fn wm_arg_i64 idx int to long
+n = wm_read_arg idx
+if eq n 0
+put g_wmeta 15 0
+ret 0
+end
+tmp = new uchar 128 0
+for i ulong n bound 128
+put tmp i get g_argbuf i
+end
+ret wd_parse_i64 part tmp 0 n
+end
+
+fn wm_init_cli_defaults to void
+put g_cli 0 90000
+put g_cli 1 WATT_T_CEIL_DEFAULT
+put g_cli 2 0
+put g_cli 3 WATT_MODE_DECODE
+put g_cli 4 2
+put g_cli 5 0
+put g_cli 6 0
+put g_cli 7 0
+put g_cli 8 0
+put g_cli 9 0
+put g_cli 10 0
+put g_cli 11 0
+put g_cli 12 0
+put g_cli 13 0
+put g_cli 14 0
+end
+
+fn wm_parse_mode_val idx int to bool
+if wm_arg_eq idx wm_m_idle
+put g_cli 3 WATT_MODE_IDLE
+ret true
+end
+if wm_arg_eq idx wm_m_decode
+put g_cli 3 WATT_MODE_DECODE
+ret true
+end
+if wm_arg_eq idx wm_m_train
+put g_cli 3 WATT_MODE_TRAIN
+ret true
+end
+ret false
+end
+
+fn wm_parse_plan_args argc int to bool
+wm_init_cli_defaults
+i = int 2
+while lt i argc bound 64
+if wm_arg_eq i wm_f_apply
+put g_cli 13 1
+i = add i 1
+continue
+end
+if ge add i 1 argc
+put g_cli 14 1
+ret false
+end
+if wm_arg_eq i wm_f_mode
+if not wm_parse_mode_val add i 1
+put g_cli 14 1
+ret false
+end
+i = add i 2
+continue
+end
+val = wm_arg_i64 add i 1
+if ne get g_wmeta 15 1
+put g_cli 14 1
+ret false
+end
+if wm_arg_eq i wm_f_watts
+if or lt val -1000000 gt val 1000000
+put g_cli 14 1
+ret false
+end
+put g_cli 0 mul val 1000
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_ceil
+if or lt val -1000 gt val 1000
+put g_cli 14 1
+ret false
+end
+put g_cli 1 mul val 1000
+put g_cli 2 1
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_tau
+if or lt val -1000 gt val 3600
+put g_cli 14 1
+ret false
+end
+put g_cli 4 val
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_bmw
+if or lt val -1000000 gt val 1000000
+put g_cli 14 1
+ret false
+end
+put g_cli 5 val
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_bsec
+if or lt val -1000 gt val 3600
+put g_cli 14 1
+ret false
+end
+put g_cli 6 val
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_bits
+if or lt val -1000000000000000 gt val 1000000000000000
+put g_cli 14 1
+ret false
+end
+put g_cli 7 val
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_mj
+if or lt val -1000000000000000 gt val 1000000000000000
+put g_cli 14 1
+ret false
+end
+put g_cli 8 val
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_tgpu
+if or lt val -50000 gt val 200000
+put g_cli 14 1
+ret false
+end
+put g_cli 9 1
+put g_cli 10 val
+i = add i 2
+continue
+end
+if wm_arg_eq i wm_f_tsink
+if or lt val -50000 gt val 200000
+put g_cli 14 1
+ret false
+end
+put g_cli 11 1
+put g_cli 12 val
+i = add i 2
+continue
+end
+put g_cli 14 1
+ret false
+end
+note Default training target ceiling is 78 C when --tgpu-ceil was not overridden
+if and eq get g_cli 3 WATT_MODE_TRAIN eq get g_cli 2 0
+put g_cli 1 WATT_T_CEIL_TRAIN
+end
+ret true
+end
+
+fn wm_put_mode_name m long to void
+if eq m WATT_MODE_IDLE
+wd_puts wm_m_idle
+ret
+end
+if eq m WATT_MODE_TRAIN
+wd_puts wm_m_train
+ret
+end
+wd_puts wm_m_decode
+end
+
+fn wm_print_plan st view WattThermal pol view WattPolicy pl view WattPlan cmd view WattCmd to void
+nxt = new WattThermal 0 0 0
+wc_step_thermal st cmd nxt
+dt = wc_next_die_delta st get cmd p_gpu get cmd p_cpu get cmd p_unc
+h = wc_barrier_h get pol t_ceil get st t_die get pol tau dt
+ptot = add add get cmd p_gpu get cmd p_cpu get cmd p_unc
+wd_puts wm_pl_hdr
+wm_put_mode_name get g_cli 3
+wd_puts ws_lbl_nl
+wd_puts wm_pl_sense
+wd_put_i64 get g_wmeta 0
+wd_puts wm_pl_tdie
+wd_put_i64 get st t_die
+wd_puts wm_pl_tsink
+wd_put_i64 get st t_sink
+wd_puts wm_pl_tamb
+wd_put_i64 get st t_amb
+wd_puts ws_lbl_nl
+wd_puts wm_pl_pol
+wd_put_i64 get pol p_budget
+wd_puts wm_pl_gcap
+wd_put_i64 get pol t_ceil
+wd_puts wm_pl_tau
+wd_put_i64 get pol tau
+wd_puts ws_lbl_nl
+wd_puts wm_pl_alloc
+wd_put_i64 get pl bpj
+wd_puts wm_pl_precool
+wd_put_i64 get pl precool_active
+wd_puts wm_pl_pcfan
+wd_put_i64 get pl precool_fan
+wd_puts wm_pl_trough
+wd_put_i64 get pl trough_mw
+wd_puts ws_lbl_nl
+wd_puts wm_pl_prop
+wd_put_i64 get pl p_gpu_req
+wd_puts wm_pl_pcpu
+wd_put_i64 get pl p_cpu_req
+wd_puts wm_pl_punc
+wd_put_i64 get pl p_unc_req
+wd_puts wm_pl_pfan
+wd_put_i64 get pl fan_req
+wd_puts ws_lbl_nl
+wd_puts wm_pl_cbf
+wd_put_i64 get cmd p_gpu
+wd_puts wm_pl_pcpu
+wd_put_i64 get cmd p_cpu
+wd_puts wm_pl_punc
+wd_put_i64 get cmd p_unc
+wd_puts wm_pl_ptot
+wd_put_i64 ptot
+wd_puts wm_pl_pfan
+wd_put_i64 get cmd fan_pct
+wd_puts wm_pl_fc
+wd_put_i64 get cmd fail_closed
+wd_puts wm_pl_cl
+wd_put_i64 get cmd clamped
+wd_puts ws_lbl_nl
+wd_puts wm_pl_bar
+wd_put_i64 h
+wd_puts wm_pl_dt
+wd_put_i64 dt
+wd_puts wm_pl_tdn
+wd_put_i64 get nxt t_die
+wd_puts wm_pl_tsn
+wd_put_i64 get nxt t_sink
+wd_puts ws_lbl_nl
+wd_puts wm_pl_gsp
+wd_flush
+end
+
+fn wm_run_plan argc int to int
+if not wm_parse_plan_args argc
+wd_puts wm_err_arg
+wd_flush_fd 2
+ret 1
+end
+if eq get g_cli 13 1
+wd_puts wm_err_apply
+wd_flush_fd 2
+ret 2
+end
+ws_sense_all
+st = new WattThermal 0 0 0
+ws_fill_thermal_state st
+if eq get g_cli 9 1
+put st t_die get g_cli 10
+end
+if eq get g_cli 11 1
+put st t_sink get g_cli 12
+end
+pol = new WattPolicy get g_cli 0 WATT_P_GPU_HARD_MAX get g_cli 1 get g_cli 4
+pl = new WattPlan 0 0 0 0 0 0 0 0
+cmd = new WattCmd 0 0 0 0 0 0
+wc_allocate_watts get pol p_budget get g_cli 3 get g_cli 7 get g_cli 8 pl
+wc_apply_precool st pol get g_cli 5 get g_cli 6 pl
+wc_filter_plan st pol pl cmd
+wm_print_plan st pol pl cmd
+if ne get cmd fail_closed 0
+ret 1
+end
+ret 0
+end
+
+fn main to int
+ac = int argcnt
+if lt ac 2
+wd_puts wm_usage
+wd_flush
+ret 0
+end
+if or wm_arg_eq 1 wm_cmd_help wm_arg_eq 1 wm_cmd_h
+wd_puts wm_usage
+wd_flush
+ret 0
+end
+if wm_arg_eq 1 wm_cmd_sense
+ws_sense_all
+ws_print_sense
+ret 0
+end
+if wm_arg_eq 1 wm_cmd_plan
+ret wm_run_plan ac
+end
+if wm_arg_eq 1 wm_cmd_gate
+ret wc_run_core_gate
+end
+wd_puts wm_err_cmd
+wd_flush_fd 2
+ret 1
+end
