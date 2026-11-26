@@ -598,4 +598,20 @@ Host and GB10 silicon qualification probes, SM121 disassembly golden files, comp
 
 ## `seed/helix/`
 
-Proof-Carrying Evolutionary Helix (Phases 1–4): independent second tiny W^X seed ladder (`rung0/seedB0.b0` 396 B → `rung1/hexB1` → `rung2/omB2` pure stack-machine compiler) for 7-way cross-OS/ISA Diverse Double Compilation against Strand A (`seed0.hex` 408 B) and Strand B (`seed/ng`), pure-Omega RFC 8032 Ed25519 receipt signer/verifier (`sign_ddc.om`), Monk SM121 proof-rung verifier (`monk_check.om`), verified GB10 e-graph optimizer (`egraph_opt.om`), standalone Strand A dual-checker trust anchor (`dual_checker.om`), production `q36` SM121 kernel extractor (`extract_q36_kernels.om`), Arboris nervous-system + SM121 Predator (`arboris_predator.om`, `arboris_nervous_bench.om`), 11-antibody adversarial Immune System (`immune.om`), Lean 4 formal proofs (`proofs/{HelixSoundness,HelixAntibodies,HelixKernelIR}.lean`), dual-seed bootstrap (`helix-from-seeds.sh`), and single-command zero-C/Python/CUDA cold-regrowth harness (`cold-regrowth.sh`).
+Proof-Carrying Evolutionary Helix (Phases 1–4): independent second tiny W^X seed ladder (`rung0/seedB0.b0` 396 B → `rung1/hexB1` → `rung2/omB2` pure stack-machine compiler) for 7-way cross-OS/ISA Diverse Double Compilation against Strand A (`seed0.hex` 408 B) and Strand B (`seed/ng`), pure-Omega RFC 8032 Ed25519 receipt signer/verifier (`sign_ddc.om`), Monk SM121 proof-rung verifier (`monk_check.om`), verified GB10 e-graph optimizer (`egraph_opt.om`), standalone Strand A dual-checker trust anchor (`dual_checker.om`), production `q36` SM121 kernel extractor (`extract_q36_kernels.om`), Arboris nervous-system + SM121 Predator (`arboris_predator.om`, `arboris_nervous_bench.om`), 16-antibody adversarial Immune System (`immune.om`, Antibody `#17a–#17d`), Lean 4 formal proofs (`proofs/{HelixSoundness,HelixAntibodies,HelixKernelIR,NgEGraphIR,Antibody17,WattCBF}.lean`), dual-seed bootstrap (`helix-from-seeds.sh`), and single-command zero-C/Python/CUDA cold-regrowth harness (`cold-regrowth.sh`).
+
+## `seed/ddc/`, `seed/modules/rm6/` & `seed/conformance/`
+
+Omega 1.0 compiler trust, separate compilation, and stability gates in pure seeded OM-2: `seed/ddc/` (`gate_ddc.om` 3-path Wheeler Diverse Double Compilation + Trusting-Trust negative control, `gate_bdisp.om` `#669` imm19/imm26 branch displacement extremes, `INDEPENDENCE.md`); `seed/modules/rm6/` (`modlink.om` digest-addressed module linker + `gate_rm6.om`); `seed/conformance/` (`gate_om_1_0_conformance.om` RM11 C1/C2 conformance suite paired with `docs/OM-1.0-PROFILE.md`).
+
+## `bridge/abi-v2-spec/`, `bridge/rust-trace/` & `bridge/tensorfold-omega/`
+
+RM7 `omega-bridge` ABI v2 formal contract & multi-language qualification (`bridge/abi-v2-spec/`: normative `ABI-V2-SPEC.md`, 22-export `abi_v2_qual.om`, 6-language + C-BTI + FR-7 `shlib`/`dlvsym` `gate_abi_v2.sh` & pure OM-2 `gate_abi_v2.om`), universal byte-traceable `#![forbid(unsafe_code)]` Rust FFI hook (`bridge/rust-trace/` + `proof/TraceBridge.lean`), and zero-touch Zig ABI v2 TensorFold plugin (`bridge/tensorfold-omega/`).
+
+## `apps/om-codemode/`, `apps/om-route/`, `apps/omega-hive-feed/` & `apps/omega-wattd/`
+
+Standalone pure seeded OM-2 Sovereign Intelligence applications: `apps/om-codemode/` (`execpure` Landlock+seccomp sub-ms compute sandbox + credential redactor + x86-64 BPF spec), `apps/om-route/` (dual OpenAI + Anthropic loopback router with live Spark thermal admission), `apps/omega-hive-feed/` (zero-JS CSP-safe live public hive pulse & historical model-usage SVG engine), and `apps/omega-wattd/` (whole-unit thermal/power Control Barrier Function planner paired with `WattCBF.lean`, strictly read-only dry-run on actuators).
+
+## `si/release-1.0/`
+
+Sovereign Intelligence 1.0 Umbrella Release Toolkit, Operator Runbook Pack & Launch Media Kit: `MANIFEST-1.0.tsv` + `si_release_gate.om` (fail-closed Big-Bang 1.0 hold until all 10 repos pass), `STANDALONE-REPOS.tsv` + `export_standalone.om`, `install-si-1.0.sh` + `gate_installer.om`, `UMBRELLA-README.md` (with Omega NG & Sovereign Intelligent Agent Manifesto), `aienux_boot_audit.md` + `PHYSICAL-BOOT-RUNBOOK.md` (`DRA-938` console-only checklist), `gate_si_1_0.om`, and `launch-kit/` (`LAUNCH-KIT.md`, `llms.txt`, `orca-automations.tsv`, 6 `< 1 MB` JPEG assets, `SHA256SUMS.txt`, `gate_launch_kit.om`).
