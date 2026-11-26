@@ -298,9 +298,12 @@ end
 ret 0
 end
 
-note ---- 3. Standalone EGP3 Single-Cert Structural Proof Checker ----
+note ---- 3. Standalone EGP3 Single-Cert Structural Proof Checker (All 18 Rules + UF Root Connectivity) ----
 note Mirrors seed/ng/verify/egp3_checker.om binary wire layout (magic "EGP3", opcodes 1..11, rules 1..18).
-note Returns 0 on PASS, nonzero refusal code 1..11 on invalid cert or rewrite step.
+note Returns 0 on PASS, nonzero fail-closed refusal code 1..11:
+note   1=too short, 2=bad magic, 3=bad cert_count, 4=bad header bounds, 5=length mismatch,
+note   6=trace node OOB, 7=invalid/unimplemented rule_id, 8=rule structural mismatch,
+note   9=invalid node opcode/width, 10=DAG cycle/OOB child, 11=disconnected root_before/root_after.
 
 fn tf_rdu32 cert view uchar * off ulong to ulong
 b0 = ulong get cert off
@@ -314,66 +317,312 @@ fn tf_node_field cert view uchar * idx ulong fld ulong to ulong
 ret tf_rdu32 cert add 36 add mul idx 32 mul fld 4
 end
 
-fn tf_check_egp3_rule cert view uchar * rule ulong lhs ulong rhs ulong nc ulong to ulong
+fn tf_uf_find par edit ulong 4096 x ulong to ulong
+r = x
+while ne get par r r bound 4097
+p = get par r
+put par r get par p
+r = get par r
+end
+ret r
+end
+
+fn tf_uf_union par edit ulong 4096 a ulong b ulong to void
+ra = tf_uf_find par a
+rb = tf_uf_find par b
+if ne ra rb
+put par ra rb
+end
+end
+
+fn tf_uf_eq par edit ulong 4096 a ulong b ulong to bool
+ret eq tf_uf_find par a tf_uf_find par b
+end
+
+fn tf_mask_w v ulong wb ulong to ulong
+if eq wb 32
+ret and v 4294967295
+end
+ret v
+end
+
+fn tf_node_val cert view uchar * idx ulong to ulong
+lo = tf_node_field cert idx 4
+hi = tf_node_field cert idx 5
+ret or lo shl hi 32
+end
+
+fn tf_is_const cert view uchar * idx ulong want ulong to bool
+if ne tf_node_field cert idx 0 1
+ret false
+end
+wb = tf_rdu32 cert 16
+ret eq tf_mask_w tf_node_val cert idx wb tf_mask_w want wb
+end
+
+fn tf_chk_bin_id cert view uchar * par edit ulong 4096 lhs ulong rhs ulong op_c ulong to bool
+note op_c packs (want_op << 8) | want_const (0 or 1)
+wop = shr op_c 8
+wc = and op_c 255
+if ne tf_node_field cert lhs 0 wop
+ret false
+end
+if not tf_is_const cert tf_node_field cert lhs 2 wc
+ret false
+end
+ret tf_uf_eq par tf_node_field cert lhs 1 rhs
+end
+
+fn tf_chk_comm cert view uchar * par edit ulong 4096 lhs ulong rhs ulong wop ulong to bool
+if ne tf_node_field cert lhs 0 wop
+ret false
+end
+if ne tf_node_field cert rhs 0 wop
+ret false
+end
+if not tf_uf_eq par tf_node_field cert lhs 1 tf_node_field cert rhs 2
+ret false
+end
+ret tf_uf_eq par tf_node_field cert lhs 2 tf_node_field cert rhs 1
+end
+
+fn tf_chk_assoc cert view uchar * par edit ulong 4096 lhs ulong rhs ulong wop ulong to bool
+if ne tf_node_field cert lhs 0 wop
+ret false
+end
+if ne tf_node_field cert rhs 0 wop
+ret false
+end
+la = tf_node_field cert lhs 1
+rb = tf_node_field cert rhs 2
+if or ne tf_node_field cert la 0 wop ne tf_node_field cert rb 0 wop
+ret false
+end
+if not tf_uf_eq par tf_node_field cert la 1 tf_node_field cert rhs 1
+ret false
+end
+if not tf_uf_eq par tf_node_field cert la 2 tf_node_field cert rb 1
+ret false
+end
+ret tf_uf_eq par tf_node_field cert lhs 2 tf_node_field cert rb 2
+end
+
+fn tf_chk_self_zero cert view uchar * par edit ulong 4096 lhs ulong rhs ulong wop ulong to bool
+if ne tf_node_field cert lhs 0 wop
+ret false
+end
+if not tf_uf_eq par tf_node_field cert lhs 1 tf_node_field cert lhs 2
+ret false
+end
+ret tf_is_const cert rhs 0
+end
+
+fn tf_chk_r1_2 cert view uchar * par edit ulong 4096 lhs ulong rhs ulong comm ulong to bool
+if or ne tf_node_field cert lhs 0 3 ne tf_node_field cert rhs 0 6
+ret false
+end
+mf = ulong 1
+cf = ulong 2
+if ne comm 0
+mf = 2
+cf = 1
+end
+mn = tf_node_field cert lhs mf
+if ne tf_node_field cert mn 0 5
+ret false
+end
+if not tf_uf_eq par tf_node_field cert mn 1 tf_node_field cert rhs 1
+ret false
+end
+if not tf_uf_eq par tf_node_field cert mn 2 tf_node_field cert rhs 2
+ret false
+end
+ret tf_uf_eq par tf_node_field cert lhs cf tf_node_field cert rhs 3
+end
+
+fn tf_chk_r18 cert view uchar * par edit ulong 4096 lhs ulong rhs ulong to bool
+if or ne tf_node_field cert lhs 0 5 ne tf_node_field cert rhs 0 7
+ret false
+end
+if not tf_uf_eq par tf_node_field cert lhs 1 tf_node_field cert rhs 1
+ret false
+end
+kn = tf_node_field cert rhs 2
+if ne tf_node_field cert kn 0 1
+ret false
+end
+k = tf_node_val cert kn
+if ge k tf_rdu32 cert 16
+ret false
+end
+ret tf_is_const cert tf_node_field cert lhs 2 shl ulong 1 k
+end
+
+fn tf_chk_rule_lo cert view uchar * par edit ulong 4096 rule ulong lhs ulong rhs ulong to ulong
+if eq rule 1
+if tf_chk_r1_2 cert par lhs rhs 0
+ret 0
+end
+ret 8
+end
+if eq rule 2
+if tf_chk_r1_2 cert par lhs rhs 1
+ret 0
+end
+ret 8
+end
+if eq rule 3
+if tf_chk_bin_id cert par lhs rhs 768
+ret 0
+end
+ret 8
+end
+if eq rule 4
+if ne tf_node_field cert lhs 0 3
+ret 8
+end
+if not tf_is_const cert tf_node_field cert lhs 1 0
+ret 8
+end
+if tf_uf_eq par tf_node_field cert lhs 2 rhs
+ret 0
+end
+ret 8
+end
+if eq rule 5
+if tf_chk_bin_id cert par lhs rhs 1281
+ret 0
+end
+ret 8
+end
+if eq rule 6
+if ne tf_node_field cert lhs 0 5
+ret 8
+end
+if not tf_is_const cert tf_node_field cert lhs 2 0
+ret 8
+end
+if tf_is_const cert rhs 0
+ret 0
+end
+ret 8
+end
+if eq rule 7
+if tf_chk_comm cert par lhs rhs 3
+ret 0
+end
+ret 8
+end
+if eq rule 8
+if tf_chk_comm cert par lhs rhs 5
+ret 0
+end
+ret 8
+end
+if eq rule 9
+if tf_chk_assoc cert par lhs rhs 3
+ret 0
+end
+ret 8
+end
+ret 7
+end
+
+fn tf_chk_rule_hi cert view uchar * par edit ulong 4096 rule ulong lhs ulong rhs ulong to ulong
+if eq rule 10
+if tf_chk_assoc cert par lhs rhs 5
+ret 0
+end
+ret 8
+end
+if eq rule 11
+if ne tf_node_field cert lhs 0 9
+ret 8
+end
+if not tf_uf_eq par tf_node_field cert lhs 1 tf_node_field cert lhs 2
+ret 8
+end
+if tf_uf_eq par tf_node_field cert lhs 1 rhs
+ret 0
+end
+ret 8
+end
+if eq rule 12
+if or ne tf_node_field cert lhs 0 6 ne tf_node_field cert rhs 0 5
+ret 8
+end
+if not tf_is_const cert tf_node_field cert lhs 3 0
+ret 8
+end
+if not tf_uf_eq par tf_node_field cert lhs 1 tf_node_field cert rhs 1
+ret 8
+end
+if tf_uf_eq par tf_node_field cert lhs 2 tf_node_field cert rhs 2
+ret 0
+end
+ret 8
+end
+if eq rule 13
+if tf_chk_bin_id cert par lhs rhs 1024
+ret 0
+end
+ret 8
+end
+if eq rule 14
+if tf_chk_self_zero cert par lhs rhs 4
+ret 0
+end
+ret 8
+end
+if eq rule 15
+if tf_chk_self_zero cert par lhs rhs 11
+ret 0
+end
+ret 8
+end
+if eq rule 16
+if tf_chk_bin_id cert par lhs rhs 2560
+ret 0
+end
+ret 8
+end
+if eq rule 17
+if tf_chk_bin_id cert par lhs rhs 1792
+ret 0
+end
+ret 8
+end
+if eq rule 18
+if tf_chk_r18 cert par lhs rhs
+ret 0
+end
+ret 8
+end
+ret 7
+end
+
+fn tf_check_egp3_rule cert view uchar * par edit ulong 4096 rule ulong lhs ulong rhs ulong to ulong
+nc = tf_rdu32 cert 20
 if or ge lhs nc ge rhs nc
 ret 6
 end
 if or eq rule 0 gt rule 18
 ret 7
 end
-if eq rule 1
-note Rule 1: add(mul(a,b), c) = fma(a,b,c)
-if ne tf_node_field cert lhs 0 3
-ret 8
+if le rule 9
+ret tf_chk_rule_lo cert par rule lhs rhs
 end
-if ne tf_node_field cert rhs 0 6
-ret 8
-end
-la = tf_node_field cert lhs 1
-if ne tf_node_field cert la 0 5
-ret 8
-end
-if ne tf_node_field cert la 1 tf_node_field cert rhs 1
-ret 8
-end
-if ne tf_node_field cert la 2 tf_node_field cert rhs 2
-ret 8
-end
-if ne tf_node_field cert lhs 2 tf_node_field cert rhs 3
-ret 8
-end
-ret 0
-end
-if eq rule 2
-note Rule 2: add(c, mul(a,b)) = fma(a,b,c)
-if ne tf_node_field cert lhs 0 3
-ret 8
-end
-if ne tf_node_field cert rhs 0 6
-ret 8
-end
-lm = tf_node_field cert lhs 2
-if ne tf_node_field cert lm 0 5
-ret 8
-end
-if ne tf_node_field cert lm 1 tf_node_field cert rhs 1
-ret 8
-end
-if ne tf_node_field cert lm 2 tf_node_field cert rhs 2
-ret 8
-end
-if ne tf_node_field cert lhs 1 tf_node_field cert rhs 3
-ret 8
-end
-ret 0
-end
-ret 0
+ret tf_chk_rule_hi cert par rule lhs rhs
 end
 
 fn tf_check_egp3_nodes cert view uchar * nc ulong to ulong
+wb = tf_rdu32 cert 16
 for i ulong nc bound 4097
 op = tf_node_field cert i 0
 if or eq op 0 gt op 11
+ret 9
+end
+if ne tf_node_field cert i 6 wb
 ret 9
 end
 if gt op 2
@@ -427,16 +676,24 @@ rc = tf_check_egp3_nodes cert nc
 if ne rc 0
 ret rc
 end
+par = new ulong 4096 0
+for i ulong nc bound 4097
+put par i i
+end
 toff = add 36 mul nc 32
 for t ulong tc bound 8193
 so = add toff mul t 12
 rl = tf_rdu32 cert so
 lh = tf_rdu32 cert add so 4
 rh = tf_rdu32 cert add so 8
-rc2 = tf_check_egp3_rule cert rl lh rh nc
+rc2 = tf_check_egp3_rule cert par rl lh rh
 if ne rc2 0
 ret rc2
 end
+tf_uf_union par lh rh
+end
+if not tf_uf_eq par tf_rdu32 cert 24 tf_rdu32 cert 28
+ret 11
 end
 ret 0
 end
