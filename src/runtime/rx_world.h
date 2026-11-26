@@ -410,6 +410,7 @@ typedef struct {
     bool have_last;
     bool have_two;
     bool resident_seat;         /* handed to the graphics seat; fn is not called */
+    bool resident_crumb_reserved; /* holds 1 causal-log receipt slot until accept/loss/destroy */
     bool deferred;              /* fn returned RX_FN_DEFER; waits for rx_world_resume */
     bool resume_pending;        /* resumed before the deferring run returned */
     /* I11: popped while a running writer of one of its inputs had not yet
@@ -631,6 +632,7 @@ typedef struct RxWorld {
     RxCrumb *crumbs;
     uint64_t n_crumbs;
     uint64_t crumb_cap;
+    uint64_t reserved_crumbs;   /* receipt slots reserved for in-flight resident claims */
 
     pthread_t workers[RX_MAX_WORKERS];
     uint32_t n_workers;
@@ -852,7 +854,8 @@ int  rx_world_operator_authorize(RxWorld *w, uint32_t subject, const RxCallerCre
 
 /* A stimulus from outside the organism (sensor, human input). Requires a
  * capability for (external_subject, object resource, WRITE). Returns the
- * causal id of the EXTERNAL crumb, or a negative error. */
+ * causal id of the EXTERNAL crumb, or a negative error (including RX_ERR_FULL
+ * without changing an object when the causal log has no room). */
 int64_t rx_world_publish_external(RxWorld *w, RxCapRef cap,
                                   const RxMutation *muts, uint32_t n);
 

@@ -182,12 +182,20 @@ static void add_parent(RxCrumb *k, uint64_t p) {
     if (k->n_parents < RX_MAX_PARENTS) k->parents[k->n_parents++] = p;
 }
 
+/* Reserve room for one crumb. Caller holds mu through the matching append, so
+ * no other publisher can consume the checked slot. */
+static int crumb_preflight(RxWorld *w) {
+    if (w->reserved_crumbs >= w->crumb_cap ||
+        w->n_crumbs >= w->crumb_cap - w->reserved_crumbs) {
+        w->stats.crumb_overflow++;
+        return RX_ERR_FULL;
+    }
+    return RX_OK;
+}
+
 /* Append a crumb; returns its id (0 if the log is full). Caller holds mu. */
 static uint64_t crumb_append(RxWorld *w, RxCrumb *k) {
-    if (w->n_crumbs >= w->crumb_cap) {
-        w->stats.crumb_overflow++;
-        return 0;
-    }
+    if (crumb_preflight(w) != RX_OK) return 0;
     k->id = w->n_crumbs + 1;
     /* Canonical parent order: ascending. */
     for (uint32_t i = 1; i < k->n_parents; i++) {
@@ -210,6 +218,39 @@ static uint64_t crumb_append(RxWorld *w, RxCrumb *k) {
     if (k->reaction < w->n_reactions) w->reactions[k->reaction].last_crumb = k->id;
     if (w->recorder) w->recorder(w->recorder_ctx, w, &w->crumbs[w->n_crumbs - 1]);
     return k->id;
+}
+
+/* A successful preflight under mu makes append failure an internal invariant
+ * violation. Continuing after visible state changed would expose it without a
+ * causal id, so publication paths must fail closed instead. */
+static uint64_t crumb_append_preflighted(RxWorld *w, RxCrumb *k) {
+    uint64_t id = crumb_append(w, k);
+    if (id == 0) abort();
+    return id;
+}
+
+/* Pin one causal-log receipt slot for a resident claim across the asynchronous
+ * seat window so concurrent publishers cannot starve completion or cancel. */
+static int crumb_reserve(RxWorld *w, RxReaction *r) {
+    if (!r || r->resident_crumb_reserved) abort();
+    if (crumb_preflight(w) != RX_OK) return RX_ERR_FULL;
+    w->reserved_crumbs++;
+    r->resident_crumb_reserved = true;
+    return RX_OK;
+}
+
+static void crumb_release_reservation(RxWorld *w, RxReaction *r) {
+    if (r && r->resident_crumb_reserved) {
+        r->resident_crumb_reserved = false;
+        if (w->reserved_crumbs > 0) w->reserved_crumbs--;
+    }
+}
+
+static uint64_t crumb_append_reserved(RxWorld *w, RxReaction *r, RxCrumb *k) {
+    if (!r || !r->resident_crumb_reserved || w->reserved_crumbs == 0) abort();
+    r->resident_crumb_reserved = false;
+    w->reserved_crumbs--;
+    return crumb_append_preflighted(w, k);
 }
 
 /* R6 containment engaged. The crumb names the reaction, the limit and the
@@ -1754,6 +1795,12 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
             if (d->caps[i].resource == w->objects[id].resource)
                 w->objects[id].cap = need_ref(w, d, i);
         }
+        if (crumb_reserve(w, r) != RX_OK) {
+            set_state(w, r, RX_REJECTED);
+            w->stats.rejected++;
+            end_activation(w, rid);
+            return;
+        }
         uint64_t seq = 0;
         int pr = rx_resident_post_claim(w, in, id, r->wake_cause, &seq);
         if (pr != RX_OK) {
@@ -1762,7 +1809,7 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
             k.kind = RX_CRUMB_FAILED;
             k.reason = pr;
             k.t_end_ns = now_ns();
-            crumb_append(w, &k);
+            crumb_append_reserved(w, r, &k);
             w->stats.failed++;
             end_activation(w, rid);
             return;
@@ -1903,6 +1950,14 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
         end_activation(w, rid);
         return;
     }
+    /* Reserve causal evidence before staging, a binder reaches its point of no
+     * return, or any canonical object changes. mu stays held through append. */
+    if (crumb_preflight(w) != RX_OK) {
+        set_state(w, r, RX_REJECTED);
+        w->stats.rejected++;
+        end_activation(w, rid);
+        return;
+    }
     /* 3. Mutations inside the declared write set, targets not stale. */
     PendingWrite pw[RX_MAX_WRITES];
     uint32_t n_pw = 0;
@@ -1946,7 +2001,7 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
         note_value(w, r, 0, 0);
     }
     k.t_end_ns = now_ns();
-    uint64_t cid = crumb_append(w, &k);
+    uint64_t cid = crumb_append_preflighted(w, &k);
     set_state(w, r, RX_COMMITTED);
     if (k.n_outputs) {
         w->stats.commits++;
@@ -2167,6 +2222,12 @@ void rx_world_destroy(RxWorld *w) {
     pthread_cond_broadcast(&w->work_cv);
     pthread_mutex_unlock(&w->mu);
     for (uint32_t i = 0; i < w->n_workers; i++) pthread_join(w->workers[i], NULL);
+    for (uint32_t i = 0; i < w->n_reactions; i++) {
+        if (w->reactions[i].resident_crumb_reserved) {
+            crumb_release_reservation(w, &w->reactions[i]);
+            w->reactions[i].resident_seat = false;
+        }
+    }
     if (w->recorder_release) w->recorder_release(w->recorder_ctx);
     w->recorder = NULL;
     w->recorder_release = NULL;
@@ -2194,6 +2255,10 @@ int rx_world_create(RxWorld *w, uint32_t type, RxPersist persist, uint64_t resou
     for (uint32_t i = 0; i < RX_MAX_OBJECTS; i++) {
         RxObject *o = &w->objects[i];
         if (o->live) continue;
+        if (crumb_preflight(w) != RX_OK) {
+            pthread_mutex_unlock(&w->mu);
+            return RX_ERR_FULL;
+        }
         o->live = true;
         o->type = type;
         o->persist = persist;
@@ -2224,7 +2289,7 @@ int rx_world_create(RxWorld *w, uint32_t type, RxPersist persist, uint64_t resou
         k.outputs[0].version = 1;
         k.outputs[0].mask = RX_ALL_FIELDS;
         k.t_start_ns = k.t_end_ns = now_ns();
-        uint64_t cid = crumb_append(w, &k);
+        uint64_t cid = crumb_append_preflighted(w, &k);
         for (uint32_t f = 0; f < RX_MAX_FIELDS; f++) o->field_writer[f] = cid;
         rx_coherent_project(w, i);
         out->id = i;
@@ -2254,6 +2319,10 @@ int rx_world_retire(RxWorld *w, RxObjRef ref) {
         pthread_mutex_unlock(&w->mu);
         return RX_ERR_FULL;
     }
+    if (crumb_preflight(w) != RX_OK) {
+        pthread_mutex_unlock(&w->mu);
+        return RX_ERR_FULL;
+    }
     uint32_t next_gen = o->generation + 1u;
     o->live = false;
     o->generation = next_gen;
@@ -2268,7 +2337,7 @@ int rx_world_retire(RxWorld *w, RxObjRef ref) {
     k.inputs[0].version = o->version;
     k.inputs[0].mask = RX_ALL_FIELDS;
     k.t_start_ns = k.t_end_ns = now_ns();
-    crumb_append(w, &k);
+    crumb_append_preflighted(w, &k);
     pthread_mutex_unlock(&w->mu);
     return RX_OK;
 }
@@ -2457,6 +2526,10 @@ int64_t rx_world_publish_external(RxWorld *w, RxCapRef cap, const RxMutation *mu
                                        w->objects[muts[i].obj.id].resource, RX_RIGHT_WRITE, NULL);
         if (rc != RX_CAP_OK) { pthread_mutex_unlock(&w->mu); return RX_ERR_AUTHORITY; }
     }
+    if (crumb_preflight(w) != RX_OK) {
+        pthread_mutex_unlock(&w->mu);
+        return RX_ERR_FULL;
+    }
     PendingWrite pw[RX_MAX_WRITES];
     uint32_t n_pw = 0;
     int rc = stage_mutations(w, muts, n, NULL, 0, pw, &n_pw);
@@ -2474,7 +2547,7 @@ int64_t rx_world_publish_external(RxWorld *w, RxCapRef cap, const RxMutation *mu
     k.t_start_ns = now_ns();
     commit_writes(w, pw, n_pw, &k);
     k.t_end_ns = now_ns();
-    uint64_t cid = crumb_append(w, &k);
+    uint64_t cid = crumb_append_preflighted(w, &k);
     finish_writes(w, pw, n_pw, cid, false);
     pthread_mutex_unlock(&w->mu);
     return (int64_t)cid;
@@ -2509,7 +2582,7 @@ static void seat_fail(RxWorld *w, uint32_t rid, RxCrumb *k, RxCrumbKind kind, in
     k->kind = kind;
     k->reason = reason;
     k->t_end_ns = now_ns();
-    crumb_append(w, k);
+    crumb_append_reserved(w, r, k);
     r->resident_seat = false;
     w->stats.resident_closed++;
     if (kind == RX_CRUMB_INVALIDATED) w->stats.invalidations++;
@@ -2518,9 +2591,23 @@ static void seat_fail(RxWorld *w, uint32_t rid, RxCrumb *k, RxCrumbKind kind, in
     end_activation(w, rid);
 }
 
+static bool g2c_ring_empty(const RxWorld *w) {
+    const OmegaSharedWorldRing *ring =
+        (const OmegaSharedWorldRing *)(w->coherent + rx_world_off_g2c());
+    uint64_t h = __atomic_load_n(&ring->head, __ATOMIC_RELAXED);
+    uint64_t t = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+    return h >= t;
+}
+
 int rx_resident_accept(RxWorld *w) {
     if (!w || !w->coherent) return RX_ERR_ARG;
     pthread_mutex_lock(&w->mu);
+    /* Empty polls must still answer RX_ERR_NOT_FOUND without counting overflow. */
+    if (g2c_ring_empty(w)) {
+        w->stats.gpu_polls_empty++;
+        pthread_mutex_unlock(&w->mu);
+        return RX_ERR_NOT_FOUND;
+    }
     OmegaSharedWorldDesc d;
     int tr = rx_resident_take_result(w, &d);
     if (tr == RX_ERR_NOT_FOUND || tr == RX_ERR_ARG) {
@@ -2573,7 +2660,7 @@ int rx_resident_accept(RxWorld *w) {
         k.kind = RX_CRUMB_CANCELLED;
         k.reason = RX_ERR_HALTED;
         k.t_end_ns = now_ns();
-        crumb_append(w, &k);
+        crumb_append_reserved(w, r, &k);
         r->resident_seat = false;
         w->stats.resident_closed++;
         w->stats.resident_halted++;
@@ -2673,7 +2760,7 @@ int rx_resident_accept(RxWorld *w) {
     k.kind = RX_CRUMB_COMMIT;
     k.t_end_ns = now_ns();
     note_value(w, r, 1, f1);
-    uint64_t cid = crumb_append(w, &k);
+    uint64_t cid = crumb_append_reserved(w, r, &k);
     set_state(w, r, RX_COMMITTED);
     w->stats.commits++;
     r->commits++;
@@ -2728,7 +2815,8 @@ int rx_resident_seat_lost(RxWorld *w, int retry) {
         k.kind = RX_CRUMB_FAILED;
         k.reason = RX_ERR_SEAT_LOST;
         k.t_end_ns = now_ns();
-        uint64_t fid = crumb_append(w, &k);
+        uint64_t fid = r->resident_crumb_reserved ? crumb_append_reserved(w, r, &k)
+                                                  : crumb_append(w, &k);
         r->resident_seat = false;
         w->stats.resident_closed++;
         w->stats.failed++;
