@@ -9,7 +9,7 @@
 
 | Artifact | Path / Origin | Pinned Identity |
 |---|---|---|
-| Seeded compiler (`omc`) | `seed/out/omc` (`seed/out/omc.sha256`, `om/units.sh` `OMC_PIN`) | SHA-256 `180323d7dc549360c351621f4969dec1e7778cff5a30b01298bc21911b0842e2` |
+| Seeded compiler (`omc`) | `seed/out/omc` (`seed/out/omc.sha256`, `om/units.sh` `OMC_PIN`) | SHA-256 `85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134` |
 | Bridge lock (`om/omega-bridge.lock`) | External `omega-bridge` repo commit pinned for `om/units.sh` (`NATIVE_PIN`) | Commit `9a0669d3a2e3f90535149c1838a01911f31d6c56`, `src/native.om` SHA-256 `9788b27a92c8dd365de7052439653de62f89634189a34cb6b3f582cae65dda83` |
 | In-tree bridge generator | `bridge/omega-bridge/src/native.om` (imported at `1e24af598fb2`) | SHA-256 `9b850656591efe6d19a0075930ead944e84dd14aef1f41450385e531b9bdf80f` |
 | Pure-Omega ELF64 `ET_DYN` builder | `bridge/shlib/shlib.om` | Pure seeded OM-2 (`OMOBJ001` -> ELF64 `ET_DYN`, zero C/linker) |
