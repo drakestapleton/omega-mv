@@ -1,26 +1,17 @@
-# GPU code buffer sizing (src/omega_gpu_code_alloc.h): the 2 KB instruction prefetch tail after every
-# kernel (omega#323). Host only: no device, no physics headers. Parts: the size rule on the live C header
-# that the GPU paths include, a NO_TAIL mutant of it that must fail; the same rule and mutant on the pure
-# OM-2 port src/omega_gpu_code_alloc.om (the mutant is one edit of the .om); and a source scan that
-# refuses the page-only code sizing idioms the six variable-size upload sites and five fixed-size sites
-# used before.
+# GPU code buffer sizing (src/omega_gpu_code_alloc.om): the 2 KB instruction
+# prefetch tail after every kernel (omega#323). Pure seeded OM-2, host only:
+# no device, no physics headers. Runs the pure OM-2 size rule test, the NO_TAIL
+# mutant, and the source scan refusing page-only code sizing idioms.
 CODE_ALLOC_OMC ?= seed/out/omc
 CODE_ALLOC_OM_SRCS := src/omega_gpu_code_alloc.om tests/test_omega_gpu_code_alloc.om
 CODE_ALLOC_NO_TAIL_SED := s/^tail = OMEGA_GPU_CODE_PREFETCH_TAIL$$/tail = ulong 0/
 CODE_ALLOC_SCAN_SRC := src/*.c src/runtime/*.c
 CODE_ALLOC_SCAN_RE := code_size \+ 0x[fF]{3}|session_alloc\([^,]*code_size|alloc[a-z_]*\([^,]*, *(0x[0-9a-fA-F]+|OMEGA_DS_MAX_CODE_BYTES), *&[a-z_>.-]*code_mem\)
 .PHONY: test-gpu-code-alloc
-$(OUT_DIR)/test_omega_gpu_code_alloc: tests/test_omega_gpu_code_alloc.c src/omega_gpu_code_alloc.h
-	@mkdir -p $(OUT_DIR)
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o $@ tests/test_omega_gpu_code_alloc.c
 $(OUT_DIR)/test_omega_gpu_code_alloc_om: $(CODE_ALLOC_OM_SRCS) $(CODE_ALLOC_OMC)
 	@mkdir -p $(OUT_DIR)
 	(printf 'om2\n'; sed '/^om2$$/d' $(CODE_ALLOC_OM_SRCS)) | $(CODE_ALLOC_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
-test-gpu-code-alloc: $(OUT_DIR)/test_omega_gpu_code_alloc $(OUT_DIR)/test_omega_gpu_code_alloc_om
-	./$(OUT_DIR)/test_omega_gpu_code_alloc
-	@$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -DOMEGA_GPU_CODE_ALLOC_MUTANT_NO_TAIL -Isrc -o $(OUT_DIR)/test_omega_gpu_code_alloc_no_tail tests/test_omega_gpu_code_alloc.c
-	@if ./$(OUT_DIR)/test_omega_gpu_code_alloc_no_tail >$(OUT_DIR)/test_omega_gpu_code_alloc_no_tail.log 2>&1; then echo "MUTANT SURVIVED: NO_TAIL"; exit 1; fi
-	@echo "NO_TAIL mutant: killed ($$(grep -c '^FAIL:' $(OUT_DIR)/test_omega_gpu_code_alloc_no_tail.log) failing checks)"
+test-gpu-code-alloc: $(OUT_DIR)/test_omega_gpu_code_alloc_om
 	./$(OUT_DIR)/test_omega_gpu_code_alloc_om
 	@sed '$(CODE_ALLOC_NO_TAIL_SED)' src/omega_gpu_code_alloc.om > $(OUT_DIR)/omega_gpu_code_alloc_no_tail.om
 	@if cmp -s $(OUT_DIR)/omega_gpu_code_alloc_no_tail.om src/omega_gpu_code_alloc.om; then echo "MUTANT BROKEN: OM NO_TAIL edit changed nothing"; exit 1; fi
