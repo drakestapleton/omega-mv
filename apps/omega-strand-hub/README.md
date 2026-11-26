@@ -1,6 +1,6 @@
 # Omega Helix Strand Exchange & Clip Studio (`om-strand-hub`)
 
-Pure seeded-Omega (`om2`) zero-JS HTTP server implementing the **Interplane Open-Source Helix Strand Exchange** and **Strand Clip Editor (`spclip`)**. Compiles with `seed/out/omc` into a single static AArch64 Linux ELF (~186 KiB, zero libc, zero C, zero Python, zero CUDA, zero telemetry).
+Pure seeded-Omega (`om2`) zero-JS HTTP server implementing the **Interplane Open-Source Helix Strand Exchange** and **Strand Clip Editor (`spclip`)**. Compiles with `seed/out/omc` into a single static AArch64 Linux ELF (~202 KiB, zero libc, zero C, zero Python, zero CUDA, zero telemetry).
 
 ## Architecture & Security Boundaries
 
@@ -34,8 +34,8 @@ Pure seeded-Omega (`om2`) zero-JS HTTP server implementing the **Interplane Open
 | `POST` | `/strands/clip` | Compose & persist (`action=save`, `201`) or directly download (`action=download`, `200`) verified `.spclip` |
 | `GET`/`HEAD` | `/strands/clip/<clip_sha256>.spclip` | Download stored deterministic `.spclip` manifest |
 | `POST` | `/strands/clip/verify` | Standalone fail-closed `.spclip` manifest verifier (JSON receipt `200` / `400`) |
-| `GET`/`HEAD` | `/strands/clips/index.tsv` | Deterministic `.spclip` catalog (TSV) |
-| `GET`/`HEAD` | `/strands/clips/index.json` | Deterministic `.spclip` catalog (JSON, `omega.spclip_hub.v1`) |
+| `GET`/`HEAD` | `/strands/clips/index.tsv` | Deterministic `.spclip` catalog (TSV, supports `?trunk=`) |
+| `GET`/`HEAD` | `/strands/clips/index.json` | Deterministic `.spclip` catalog (JSON, `omega.spclip_hub.v1`, includes `strands[]` & `?trunk=`) |
 
 ## Build & Run (AArch64 Linux / DGX Spark)
 
@@ -52,7 +52,7 @@ Arguments (all optional):
 
 ## Pure-Omega Verification Gate (`gate.om`)
 
-Compiles and executes 44 live loopback end-to-end checks (positive uploads, trunk filtering, bit-exact downloads, restart persistence, XSS/JSON escaping, Clip Editor + Anti-DNA PoE + 3-strand compaction, real 14.17 MB GB10-trained `OLLMSP01` packs, plus adversarial negative controls for magic/truncation/trailing-byte/FNV-tamper/NaN-weight/Merkle-lineage/SHA256-mismatch/path-traversal/oversized/request-smuggling/incompatible-trunks/invalid-weights/tampered-`.spclip`):
+Compiles and executes 52 live loopback end-to-end checks (positive uploads, trunk filtering, bit-exact downloads, restart persistence, XSS/JSON escaping, Clip Editor + Anti-DNA PoE + 3-strand compaction, child-strand `spclip:` lineage linking, real 14.17 MB GB10-trained `OLLMSP01` packs, plus adversarial negative controls for magic/truncation/trailing-byte/FNV-tamper/NaN-weight/Merkle-lineage/SHA256-mismatch/path-traversal/oversized/request-smuggling/incompatible-trunks/pairwise-parent-trunk-conflict/invalid-weights/forged-and-tampered-`.spclip`/Trap-4 DoS long headers, URIs, filenames, weights, and 68+ distinct trunks):
 
 ```sh
 seed/out/omc < apps/omega-strand-hub/main.om > /tmp/om-strand-hub
@@ -62,7 +62,7 @@ chmod +x /tmp/om-strand-hub /tmp/strand-hub-gate
   [optional_real_pack1.sp] [optional_real_pack2.sp]
 ```
 
-Expected output: `STRAND_HUB_GATE pass=44 fail=0` (41 without optional real `.sp` pack arguments), exit `0`.
+Expected output: `STRAND_HUB_GATE pass=52 fail=0` (49 without optional real `.sp` pack arguments), exit `0`.
 
 ## Suggested Nginx Route Wiring (`/etc/nginx/sites-enabled/interplane.io`)
 
