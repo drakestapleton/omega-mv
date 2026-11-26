@@ -1,0 +1,1737 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/om-codemode/codemode.om:
+note Pure seeded OM-2 sub-millisecond "Code Mode" pure-compute sandbox CLI.
+note
+note Features:
+note   1. Fail-closed streaming FIPS 180-4 SHA-256 verification of the pinned `omc` binary
+note      before compiling or executing anything (exit 69 on any pin mismatch).
+note   2. Compiles untrusted `.om` snippets under bounded prlimit + timeout; preserves exact
+note      `omc` error codes (1..30) on malformed source and never executes refused output.
+note   3. Runs compiled static ELFs under Omega's kernel-enforced `execpure` sandbox
+note      (Landlock ABI-3 + seccomp-BPF stdio-only + 0 children + 128 MiB AS + wall timeout).
+note   4. Redacts sensitive credential patterns (`Bearer `, `sk-`, `ghp_`, `AKIA`, `xoxb-`)
+note      from both captured stdout and stderr before emitting deterministic receipts.
+note   5. Embeds the verified 27-insn (216-byte) AUDIT_ARCH_X86_64 (0xc000003e) stdio-only
+note      seccomp-BPF policy spec + cBPF VM verifier for x86linux cross-target readiness.
+om2
+
+const CM_MAX_SRC ulong 65536
+const CM_MAX_CAP ulong 32768
+const CM_MAX_RED ulong 65536
+const CM_MAX_OUTBUF ulong 131072
+const CM_DEF_CTMO_MS ulong 4000
+const CM_DEF_RTMO_MS ulong 1000
+const CM_BPF_INSNS ulong 27
+
+const CM_BPF_LD_W_ABS ulong 32
+const CM_BPF_JMP_JEQ_K ulong 21
+const CM_BPF_RET_K ulong 6
+const CM_AUDIT_X64 ulong 3221225534
+const CM_AUDIT_A64 ulong 3221225655
+const CM_SECCOMP_ALLOW ulong 2147418112
+const CM_SECCOMP_KILL ulong 2147483648
+
+note Status table g_st[0..15]:
+note 0=comp_rc, 1=comp_us, 2=bin_bytes, 3=run_rc, 4=run_us, 5=redacted_cnt,
+note 6=ctmo_ms, 7=rtmo_ms, 8=has_omc, 9=has_pin, 10=has_snip, 11=seq,
+note 12=rout_trunc, 13=rerr_trunc, 14=pin_from_file, 15=snip_stdin
+global g_st ulong 16
+
+note CLI paths & buffers
+global g_omc uchar 512
+global g_omcl ulong 1
+global g_pin uchar 128
+global g_pinl ulong 1
+global g_pinf uchar 512
+global g_pinfl ulong 1
+global g_snip uchar 512
+global g_snipl ulong 1
+global g_arg uchar 512
+
+note Source, temp paths, packed argv, captured & redacted I/O
+global g_src uchar 65536
+global g_srcl ulong 1
+global g_tom uchar 128
+global g_toml ulong 1
+global g_tbin uchar 128
+global g_tbinl ulong 1
+global g_pk uchar 1024
+global g_pkl ulong 1
+global g_pkr ulong 1
+global g_cerr uchar 8192
+global g_cerrl ulong 1
+global g_rout uchar 32768
+global g_routl ulong 1
+global g_rerr uchar 32768
+global g_rerrl ulong 1
+global g_red_o uchar 65536
+global g_red_ol ulong 1
+global g_red_e uchar 65536
+global g_red_el ulong 1
+global g_junk uchar 4096
+global g_outb uchar 131072
+global g_outbl ulong 1
+
+note Streaming FIPS 180-4 SHA-256 state + computed digests
+text t_sha_kiv "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+global s_k uint 72
+global s_w uint 64
+global s_v uint 8
+global s_h uint 8
+global s_blk uchar 64
+global s_dig uchar 32
+global s_hex uchar 64
+global s_st ulong 4
+global s_chunk uchar 65536
+global g_omc_hex uchar 64
+global g_snip_hex uchar 64
+global g_bpf_hex uchar 64
+
+note Embedded AUDIT_ARCH_X86_64 execpure seccomp-BPF filter (27 insns = 216 bytes)
+global g_bpf_n ulong 1
+global g_bpf_u64 ulong 32
+global g_bpf_b uchar 256
+global g_secd uchar 64
+
+note Static texts
+text t_usage "usage: om-codemode run <snippet.om|-> --omc <omc> (--pin <hex64> | --pin-file <file>) [--timeout-ms <ms>]\n       om-codemode x64-bpf-spec\n       om-codemode version\n"
+text t_ver "om-codemode 1.0-pure-om2 sandbox=execpure_aarch64 x64_bpf_arch=0xc000003e x64_bpf_insns=27\n"
+text t_cmd_run "run"
+text t_cmd_bpf "x64-bpf-spec"
+text t_cmd_ver "version"
+text t_flg_omc "--omc"
+text t_flg_pin "--pin"
+text t_flg_pinf "--pin-file"
+text t_flg_tmo "--timeout-ms"
+text t_flg_ctmo "--compile-timeout-ms"
+text t_dash "-"
+text t_devnull "/dev/null"
+text t_tmp_pre "/tmp/omcm-"
+text t_ext_om ".om"
+text t_ext_bin ".bin"
+text t_redacted "[REDACTED]"
+text t_pat_bearer "Bearer "
+text t_pat_sk "sk-"
+text t_pat_ghp "ghp_"
+text t_pat_akia "AKIA"
+text t_pat_xoxb "xoxb-"
+
+text t_rcpt_pfx "CODEMODE_RECEIPT v=1 status="
+text t_st_ok "OK"
+text t_st_nz "NONZERO_EXIT"
+text t_st_trap "TRAP"
+text t_st_sig "SIGNAL_KILLED"
+text t_st_tmo "TIMEOUT"
+text t_st_cerr "COMPILE_ERROR"
+text t_st_ref "REFUSED"
+text t_kv_sbx " sandbox=execpure_aarch64"
+text t_kv_rsn " reason="
+text t_rsn_pin "omc_pin_mismatch"
+text t_rsn_pinf "omc_pin_invalid"
+text t_rsn_omcio "omc_read_error"
+text t_rsn_srcio "snippet_read_error"
+text t_rsn_srcbig "snippet_too_large"
+text t_kv_omc " omc_sha256="
+text t_kv_exp " expected_pin="
+text t_kv_snip " snippet_sha256="
+text t_kv_bin " bin_bytes="
+text t_kv_cus " compile_us="
+text t_kv_rus " run_us="
+text t_kv_rc " exit_code="
+text t_kv_omcerr " omc_error="
+text t_kv_trap " trap_code="
+text t_kv_sig " signal="
+text t_kv_red " redacted="
+text t_kv_x64 " x64_bpf_arch=0xc000003e x64_bpf_insns=27 x64_bpf_sha256="
+text t_out_beg "STDOUT_BEGIN len="
+text t_out_end "\nSTDOUT_END\n"
+text t_err_beg "STDERR_BEGIN len="
+text t_err_end "\nSTDERR_END\n"
+text t_bpf_hdr "X64_EXECPURE_BPF_SPEC arch=0xc000003e arch_dec=3221225534 insns=27 bytes=216 allowlist=read:0,write:1,exit:60,exit_group:231,execveat:322 default=SECCOMP_RET_KILL_PROCESS sha256="
+text t_bpf_vm "X64_EXECPURE_BPF_VM verify=OK allow_ok=6 neg_killed="
+text t_bpf_row "BPF_INSN "
+text t_sp " "
+text t_nl "\n"
+
+note ============================================================================
+note Buffered stdout writer (g_outb)
+note ============================================================================
+
+fn ob_flush to void
+  n = get g_outbl 0
+  if eq n 0
+    ret
+  end
+  off = ulong 0
+  while lt off n bound 1024
+    k = write 1 g_outb off sub n off
+    if le k 0
+      break
+    end
+    off = add off ulong k
+  end
+  put g_outbl 0 0
+end
+
+fn ob_byte c uchar to void
+  n = get g_outbl 0
+  if ge n CM_MAX_OUTBUF
+    ob_flush
+    n = ulong 0
+  end
+  put g_outb n c
+  put g_outbl 0 add n 1
+end
+
+fn ob_txt t view uchar * to void
+  for i ulong len t bound 2048
+    ob_byte get t i
+  end
+end
+
+fn ob_u64 v ulong to void
+  buf = new uchar 24 0
+  p = ulong 24
+  n = v
+  if eq n 0
+    ob_byte 48
+    ret
+  end
+  while gt n 0 bound 24
+    p = sub p 1
+    put buf p uchar add 48 rem n 10
+    n = div n 10
+  end
+  while lt p 24 bound 24
+    ob_byte get buf p
+    p = add p 1
+  end
+end
+
+fn ob_hex_omc to void
+  for i ulong 64
+    ob_byte get g_omc_hex i
+  end
+end
+
+fn ob_hex_snip to void
+  for i ulong 64
+    ob_byte get g_snip_hex i
+  end
+end
+
+fn ob_hex_bpf to void
+  for i ulong 64
+    ob_byte get g_bpf_hex i
+  end
+end
+
+fn ob_pin to void
+  n = get g_pinl 0
+  for i ulong n bound 128
+    ob_byte get g_pin i
+  end
+end
+
+note ============================================================================
+note Streaming FIPS 180-4 SHA-256 (zero binary size cap)
+note ============================================================================
+
+fn sha_init_k to void
+  if ne get s_st 0 0
+    ret
+  end
+  put s_st 0 1
+  p = ulong 0
+  for i ulong 72
+    v = ulong 0
+    while lt get t_sha_kiv p 48 bound 4
+      p = add p 1
+    end
+    while ge get t_sha_kiv p 48 bound 11
+      v = add mul v 10 ulong sub get t_sha_kiv p 48
+      p = add p 1
+      if ge p len t_sha_kiv
+        put s_k i uint v
+        ret
+      end
+    end
+    put s_k i uint v
+  end
+end
+
+fn sha_s0 a uint to uint
+  ret xor xor rotr a 2 rotr a 13 rotr a 22
+end
+
+fn sha_s1 e uint to uint
+  ret xor xor rotr e 6 rotr e 11 rotr e 25
+end
+
+fn sha_g0 x uint to uint
+  ret xor xor rotr x 7 rotr x 18 shr x 3
+end
+
+fn sha_g1 x uint to uint
+  ret xor xor rotr x 17 rotr x 19 shr x 10
+end
+
+fn sha_maj a uint b uint c uint to uint
+  ret xor xor and a b and a c and b c
+end
+
+fn sha_be o ulong to uint
+  b0 = shl uint get s_blk o 24
+  b1 = shl uint get s_blk add o 1 16
+  b2 = shl uint get s_blk add o 2 8
+  b3 = uint get s_blk add o 3
+  ret or or b0 b1 or b2 b3
+end
+
+fn sha_rnd i ulong to void
+  e = get s_v 4
+  t1 = add get s_v 7 sha_s1 e
+  t1 = add t1 xor and e get s_v 5 and not e get s_v 6
+  t1 = add t1 add get s_k i get s_w i
+  a = get s_v 0
+  t2 = add sha_s0 a sha_maj a get s_v 1 get s_v 2
+  put s_v 7 get s_v 6
+  put s_v 6 get s_v 5
+  put s_v 5 e
+  put s_v 4 add get s_v 3 t1
+  put s_v 3 get s_v 2
+  put s_v 2 get s_v 1
+  put s_v 1 a
+  put s_v 0 add t1 t2
+end
+
+fn sha_compress to void
+  for t ulong 16
+    put s_w t sha_be mul t 4
+  end
+  for t ulong 48
+    u = add t 16
+    x = add sha_g1 get s_w sub u 2 get s_w sub u 7
+    put s_w u add x add sha_g0 get s_w sub u 15 get s_w sub u 16
+  end
+  for j ulong 8
+    put s_v j get s_h j
+  end
+  for i ulong 64
+    sha_rnd i
+  end
+  for j ulong 8
+    put s_h j add get s_h j get s_v j
+  end
+end
+
+fn sha_start to void
+  sha_init_k
+  for j ulong 8
+    put s_h j get s_k add j 64
+  end
+  put s_st 1 0
+  put s_st 2 0
+end
+
+fn sha_push b uchar to void
+  f = get s_st 1
+  put s_blk f b
+  f = add f 1
+  put s_st 2 add get s_st 2 1
+  if eq f 64
+    sha_compress
+    put s_st 1 0
+  else
+    put s_st 1 f
+  end
+end
+
+fn sha_hex_nib d ulong to uchar
+  if lt d 10
+    ret uchar add 48 d
+  end
+  ret uchar add 87 d
+end
+
+fn sha_finish to void
+  tot = get s_st 2
+  bits = mul tot 8
+  sha_push 128
+  while ne get s_st 1 56 bound 65
+    sha_push 0
+  end
+  for j ulong 8
+    sh = mul sub 7 j 8
+    sha_push uchar and shr bits sh 255
+  end
+  for j ulong 8
+    v = get s_h j
+    o = mul j 4
+    put s_dig o uchar and shr v 24 255
+    put s_dig add o 1 uchar and shr v 16 255
+    put s_dig add o 2 uchar and shr v 8 255
+    put s_dig add o 3 uchar and v 255
+  end
+  for i ulong 32
+    b = ulong get s_dig i
+    put s_hex mul i 2 sha_hex_nib shr b 4
+    put s_hex add mul i 2 1 sha_hex_nib and b 15
+  end
+end
+
+fn sha_hash_omc_file to bool
+  fd = fopen g_omc 0 get g_omcl 0 0 0
+  if lt fd 0
+    ret false
+  end
+  sha_start
+  while true bound 16384
+    k = read int fd s_chunk 0 65536
+    if lt k 0
+      x = fclose int fd
+      ret false
+    end
+    if eq k 0
+      break
+    end
+    n = ulong k
+    for i ulong n bound 65536
+      sha_push get s_chunk i
+    end
+  end
+  x = fclose int fd
+  sha_finish
+  for i ulong 64
+    put g_omc_hex i get s_hex i
+  end
+  ret true
+end
+
+fn sha_hash_src to void
+  sha_start
+  n = get g_srcl 0
+  for i ulong n bound 65536
+    sha_push get g_src i
+  end
+  sha_finish
+  for i ulong 64
+    put g_snip_hex i get s_hex i
+  end
+end
+
+note ============================================================================
+note Embedded AUDIT_ARCH_X86_64 execpure seccomp-BPF spec + cBPF VM self-check
+note ============================================================================
+
+fn bpf_emit code ulong jt ulong jf ulong k ulong to void
+  idx = get g_bpf_n 0
+  if ge idx 32
+    ret
+  end
+  lo = or and code 65535 shl and jt 255 16
+  hi = or shl and jf 255 24 shl and k 4294967295 32
+  put g_bpf_u64 idx or lo hi
+  o = mul idx 8
+  put g_bpf_b o uchar and code 255
+  put g_bpf_b add o 1 uchar and shr code 8 255
+  put g_bpf_b add o 2 uchar and jt 255
+  put g_bpf_b add o 3 uchar and jf 255
+  put g_bpf_b add o 4 uchar and k 255
+  put g_bpf_b add o 5 uchar and shr k 8 255
+  put g_bpf_b add o 6 uchar and shr k 16 255
+  put g_bpf_b add o 7 uchar and shr k 24 255
+  put g_bpf_n 0 add idx 1
+end
+
+fn bpf_build_x64 to void
+  put g_bpf_n 0 0
+  note pc=0..1: arch == AUDIT_ARCH_X86_64 (0xc000003e)
+  bpf_emit CM_BPF_LD_W_ABS 0 0 4
+  bpf_emit CM_BPF_JMP_JEQ_K 0 24 CM_AUDIT_X64
+  note pc=2: nr
+  bpf_emit CM_BPF_LD_W_ABS 0 0 0
+  note pc=3..7: read(0) only
+  bpf_emit CM_BPF_JMP_JEQ_K 0 4 0
+  bpf_emit CM_BPF_LD_W_ABS 0 0 20
+  bpf_emit CM_BPF_JMP_JEQ_K 0 20 0
+  bpf_emit CM_BPF_LD_W_ABS 0 0 16
+  bpf_emit CM_BPF_JMP_JEQ_K 17 18 0
+  note pc=8..13: write(1|2) only
+  bpf_emit CM_BPF_JMP_JEQ_K 0 5 1
+  bpf_emit CM_BPF_LD_W_ABS 0 0 20
+  bpf_emit CM_BPF_JMP_JEQ_K 0 15 0
+  bpf_emit CM_BPF_LD_W_ABS 0 0 16
+  bpf_emit CM_BPF_JMP_JEQ_K 12 0 1
+  bpf_emit CM_BPF_JMP_JEQ_K 11 12 2
+  note pc=14..15: exit(60), exit_group(231)
+  bpf_emit CM_BPF_JMP_JEQ_K 10 0 60
+  bpf_emit CM_BPF_JMP_JEQ_K 9 0 231
+  note pc=16..24: execveat(3, ..., AT_EMPTY_PATH=4096)
+  bpf_emit CM_BPF_JMP_JEQ_K 0 9 322
+  bpf_emit CM_BPF_LD_W_ABS 0 0 20
+  bpf_emit CM_BPF_JMP_JEQ_K 0 7 0
+  bpf_emit CM_BPF_LD_W_ABS 0 0 16
+  bpf_emit CM_BPF_JMP_JEQ_K 0 5 3
+  bpf_emit CM_BPF_LD_W_ABS 0 0 52
+  bpf_emit CM_BPF_JMP_JEQ_K 0 3 0
+  bpf_emit CM_BPF_LD_W_ABS 0 0 48
+  bpf_emit CM_BPF_JMP_JEQ_K 0 1 4096
+  note pc=25: ALLOW, pc=26: KILL_PROCESS
+  bpf_emit CM_BPF_RET_K 0 0 CM_SECCOMP_ALLOW
+  bpf_emit CM_BPF_RET_K 0 0 CM_SECCOMP_KILL
+
+  sha_start
+  nb = mul get g_bpf_n 0 8
+  for i ulong nb bound 256
+    sha_push get g_bpf_b i
+  end
+  sha_finish
+  for i ulong 64
+    put g_bpf_hex i get s_hex i
+  end
+end
+
+fn bpf_u16 o ulong to ulong
+  ret or ulong get g_bpf_b o shl ulong get g_bpf_b add o 1 8
+end
+
+fn bpf_u32 o ulong to ulong
+  b0 = ulong get g_bpf_b o
+  b1 = shl ulong get g_bpf_b add o 1 8
+  b2 = shl ulong get g_bpf_b add o 2 16
+  b3 = shl ulong get g_bpf_b add o 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn sec_put32 o ulong v ulong to void
+  put g_secd o uchar and v 255
+  put g_secd add o 1 uchar and shr v 8 255
+  put g_secd add o 2 uchar and shr v 16 255
+  put g_secd add o 3 uchar and shr v 24 255
+end
+
+fn sec_get32 o ulong to ulong
+  b0 = ulong get g_secd o
+  b1 = shl ulong get g_secd add o 1 8
+  b2 = shl ulong get g_secd add o 2 16
+  b3 = shl ulong get g_secd add o 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn bpf_eval_run to ulong
+  n = get g_bpf_n 0
+  pc = ulong 0
+  acc = ulong 0
+  while lt pc n bound 64
+    o = mul pc 8
+    code = bpf_u16 o
+    k = bpf_u32 add o 4
+    if eq code CM_BPF_LD_W_ABS
+      if ne rem k 4 0
+        ret 999999
+      end
+      if gt add k 4 64
+        ret 999999
+      end
+      acc = sec_get32 k
+      pc = add pc 1
+    else
+      if eq code CM_BPF_JMP_JEQ_K
+        if eq acc k
+          pc = add add pc 1 ulong get g_bpf_b add o 2
+        else
+          pc = add add pc 1 ulong get g_bpf_b add o 3
+        end
+      else
+        if eq code CM_BPF_RET_K
+          ret k
+        end
+        ret 999999
+      end
+    end
+  end
+  ret 999999
+end
+
+fn bpf_eval_case arch ulong nr ulong a0Lo ulong a0Hi ulong a4Lo ulong to ulong
+  for i ulong 64
+    put g_secd i 0
+  end
+  sec_put32 0 nr
+  sec_put32 4 arch
+  sec_put32 16 a0Lo
+  sec_put32 20 a0Hi
+  sec_put32 48 a4Lo
+  ret bpf_eval_run
+end
+
+fn cmd_x64_bpf_spec to int
+  bpf_build_x64
+  note Self-verify 6 allowed syscalls and 9 disallowed negative controls
+  if ne bpf_eval_case CM_AUDIT_X64 0 0 0 0 CM_SECCOMP_ALLOW
+    ret 1
+  end
+  if ne bpf_eval_case CM_AUDIT_X64 1 1 0 0 CM_SECCOMP_ALLOW
+    ret 2
+  end
+  if ne bpf_eval_case CM_AUDIT_X64 1 2 0 0 CM_SECCOMP_ALLOW
+    ret 3
+  end
+  if ne bpf_eval_case CM_AUDIT_X64 60 0 0 0 CM_SECCOMP_ALLOW
+    ret 4
+  end
+  if ne bpf_eval_case CM_AUDIT_X64 231 0 0 0 CM_SECCOMP_ALLOW
+    ret 5
+  end
+  if ne bpf_eval_case CM_AUDIT_X64 322 3 0 4096 CM_SECCOMP_ALLOW
+    ret 6
+  end
+  nk = ulong 0
+  note Disallowed: socket=41, openat=257, fork=57, execve=59, read(3), write(3), execveat(flags=0), wrong arch, hi-bits
+  if ne bpf_eval_case CM_AUDIT_X64 41 2 0 0 CM_SECCOMP_KILL
+    ret 7
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 257 0 0 0 CM_SECCOMP_KILL
+    ret 8
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 57 0 0 0 CM_SECCOMP_KILL
+    ret 9
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 59 0 0 0 CM_SECCOMP_KILL
+    ret 10
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 0 3 0 0 CM_SECCOMP_KILL
+    ret 11
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 1 3 0 0 CM_SECCOMP_KILL
+    ret 12
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 322 3 0 0 CM_SECCOMP_KILL
+    ret 13
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_A64 60 0 0 0 CM_SECCOMP_KILL
+    ret 14
+  end
+  nk = add nk 1
+  if ne bpf_eval_case CM_AUDIT_X64 0 0 1 0 CM_SECCOMP_KILL
+    ret 15
+  end
+  nk = add nk 1
+
+  ob_txt t_bpf_hdr
+  ob_hex_bpf
+  ob_txt t_nl
+  ob_txt t_bpf_vm
+  ob_u64 nk
+  ob_txt t_nl
+  n = get g_bpf_n 0
+  for pc ulong n bound 32
+    o = mul pc 8
+    ob_txt t_bpf_row
+    ob_u64 pc
+    ob_txt t_sp
+    ob_u64 bpf_u16 o
+    ob_txt t_sp
+    ob_u64 ulong get g_bpf_b add o 2
+    ob_txt t_sp
+    ob_u64 ulong get g_bpf_b add o 3
+    ob_txt t_sp
+    ob_u64 bpf_u32 add o 4
+    ob_txt t_sp
+    ob_u64 get g_bpf_u64 pc
+    ob_txt t_nl
+  end
+  ob_flush
+  ret 0
+end
+
+note ============================================================================
+note Credential Redaction Engine (Bearer , sk-, ghp_, AKIA, xoxb-)
+note ============================================================================
+
+fn is_tok_char c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if and ge c 65 le c 90
+    ret true
+  end
+  if and ge c 97 le c 122
+    ret true
+  end
+  if or eq c 45 eq c 95
+    ret true
+  end
+  if or eq c 46 eq c 43
+    ret true
+  end
+  if or eq c 47 eq c 61
+    ret true
+  end
+  ret false
+end
+
+fn match_pat_at which ulong pos ulong blen ulong pat view uchar * to bool
+  pl = len pat
+  if gt add pos pl blen
+    ret false
+  end
+  for i ulong pl bound 16
+    b = uchar 0
+    if eq which 0
+      b = get g_rout add pos i
+    else
+      b = get g_rerr add pos i
+    end
+    if ne b get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn red_match_len which ulong pos ulong blen ulong to ulong
+  if match_pat_at which pos blen t_pat_bearer
+    ret len t_pat_bearer
+  end
+  if match_pat_at which pos blen t_pat_sk
+    ret len t_pat_sk
+  end
+  if match_pat_at which pos blen t_pat_ghp
+    ret len t_pat_ghp
+  end
+  if match_pat_at which pos blen t_pat_akia
+    ret len t_pat_akia
+  end
+  if match_pat_at which pos blen t_pat_xoxb
+    ret len t_pat_xoxb
+  end
+  ret 0
+end
+
+fn red_put which ulong c uchar to void
+  if eq which 0
+    n = get g_red_ol 0
+    if lt n CM_MAX_RED
+      put g_red_o n c
+      put g_red_ol 0 add n 1
+    end
+  else
+    n = get g_red_el 0
+    if lt n CM_MAX_RED
+      put g_red_e n c
+      put g_red_el 0 add n 1
+    end
+  end
+end
+
+fn red_get_src which ulong idx ulong to uchar
+  if eq which 0
+    ret get g_rout idx
+  end
+  ret get g_rerr idx
+end
+
+fn redact_stream which ulong to void
+  blen = ulong 0
+  if eq which 0
+    put g_red_ol 0 0
+    blen = get g_routl 0
+  else
+    put g_red_el 0 0
+    blen = get g_rerrl 0
+  end
+  i = ulong 0
+  while lt i blen bound 65536
+    ml = red_match_len which i blen
+    if gt ml 0
+      note Consume prefix + trailing credential token characters
+      j = add i ml
+      while lt j blen bound 4096
+        if not is_tok_char red_get_src which j
+          break
+        end
+        j = add j 1
+      end
+      note Only redact if there is at least 1 token char after the prefix
+      if gt j add i ml
+        for k ulong len t_redacted bound 16
+          red_put which get t_redacted k
+        end
+        put g_st 5 add get g_st 5 1
+        i = j
+        continue
+      end
+    end
+    red_put which red_get_src which i
+    i = add i 1
+  end
+end
+
+note ============================================================================
+note Subprocess, packed argv, prlimit, pipe draining & timeout helpers
+note ============================================================================
+
+fn pk_reset to void
+  put g_pk 0 0
+  put g_pk 1 0
+  put g_pkl 0 2
+end
+
+fn pk_open to void
+  n = get g_pkl 0
+  if ge n 1020
+    ret
+  end
+  put g_pkr 0 n
+  put g_pk n 0
+  put g_pk add n 1 0
+  put g_pkl 0 add n 2
+  c = add or ulong get g_pk 0 shl ulong get g_pk 1 8 1
+  put g_pk 0 uchar and c 255
+  put g_pk 1 uchar shr c 8
+end
+
+fn pk_byte c uchar to void
+  n = get g_pkl 0
+  if lt n 1022
+    put g_pk n c
+    put g_pkl 0 add n 1
+    r = get g_pkr 0
+    k = add or ulong get g_pk r shl ulong get g_pk add r 1 8 1
+    put g_pk r uchar and k 255
+    put g_pk add r 1 uchar shr k 8
+  end
+end
+
+fn pk_omc to void
+  pk_reset
+  pk_open
+  n = get g_omcl 0
+  for i ulong n bound 512
+    pk_byte get g_omc i
+  end
+end
+
+fn pk_bin to void
+  pk_reset
+  pk_open
+  n = get g_tbinl 0
+  for i ulong n bound 128
+    pk_byte get g_tbin i
+  end
+end
+
+fn tmp_om_b c uchar to void
+  n = get g_toml 0
+  if lt n 126
+    put g_tom n c
+    put g_toml 0 add n 1
+  end
+end
+
+fn tmp_bin_b c uchar to void
+  n = get g_tbinl 0
+  if lt n 126
+    put g_tbin n c
+    put g_tbinl 0 add n 1
+  end
+end
+
+fn tmp_both_u64 v ulong to void
+  buf = new uchar 24 0
+  p = ulong 24
+  n = v
+  if eq n 0
+    tmp_om_b 48
+    tmp_bin_b 48
+    ret
+  end
+  while gt n 0 bound 24
+    p = sub p 1
+    put buf p uchar add 48 rem n 10
+    n = div n 10
+  end
+  while lt p 24 bound 24
+    c = get buf p
+    tmp_om_b c
+    tmp_bin_b c
+    p = add p 1
+  end
+end
+
+fn make_tmp_paths to void
+  put g_toml 0 0
+  put g_tbinl 0 0
+  for i ulong len t_tmp_pre bound 32
+    c = get t_tmp_pre i
+    tmp_om_b c
+    tmp_bin_b c
+  end
+  pid = ulong getpid
+  tmp_both_u64 pid
+  tmp_om_b 45
+  tmp_bin_b 45
+  s = add get g_st 11 1
+  put g_st 11 s
+  tmp_both_u64 s
+  for i ulong len t_ext_om bound 16
+    tmp_om_b get t_ext_om i
+  end
+  for i ulong len t_ext_bin bound 16
+    tmp_bin_b get t_ext_bin i
+  end
+end
+
+fn cleanup_tmp to void
+  if gt get g_toml 0 0
+    x = unlink g_tom 0 get g_toml 0
+  end
+  if gt get g_tbinl 0 0
+    x = unlink g_tbin 0 get g_tbinl 0
+  end
+end
+
+fn read_u32_le a view uchar * off ulong to int
+  v = or ulong get a off shl ulong get a add off 1 8
+  v = or v shl ulong get a add off 2 16
+  v = or v shl ulong get a add off 3 24
+  ret int v
+end
+
+fn set_rlim res int lim ulong to void
+  b = new uchar 32 0
+  for i ulong 8
+    v = uchar and shr lim mul i 8 255
+    put b i v
+    put b add i 8 v
+  end
+  x = prlimit 0 res b 0 32
+end
+
+fn reap_child pid int dl long to ulong
+  st = new uchar 4 0
+  for it ulong 2000000 bound 2000000
+    w = waitpid pid st 0 4 1
+    if eq w long pid
+      s = or ulong get st 0 shl ulong get st 1 8
+      if eq and s 127 0
+        ret and shr s 8 255
+      end
+      ret add 1000 and s 127
+    end
+    if lt w 0
+      if ne w -4
+        ret 998
+      end
+      continue
+    end
+    if gt long monons dl
+      x = killpid pid 9
+      w2 = waitpid pid st 0 4 0
+      ret 999
+    end
+    x = sleepns 200000
+  end
+  x = killpid pid 9
+  w3 = waitpid pid st 0 4 0
+  ret 999
+end
+
+fn drain_cerr fd int dl long to bool
+  put g_cerrl 0 0
+  for it ulong 1000000 bound 1000000
+    left = sub dl long monons
+    if le left 0
+      ret false
+    end
+    w = waitio fd 1 left
+    if lt w 0
+      if ne w -4
+        ret false
+      end
+      continue
+    end
+    if eq w 0
+      continue
+    end
+    n = get g_cerrl 0
+    if ge n 8192
+      r = read fd g_junk 0 4096
+      if eq r 0
+        ret true
+      end
+      if lt r 0
+        if and ne r -4 ne r -11
+          ret false
+        end
+      end
+      continue
+    end
+    r = read fd g_cerr n sub 8192 n
+    if eq r 0
+      ret true
+    end
+    if lt r 0
+      if and ne r -4 ne r -11
+        ret false
+      end
+      continue
+    end
+    put g_cerrl 0 add n ulong r
+  end
+  ret false
+end
+
+fn put_pfd p edit uchar * off ulong fd int to void
+  if lt fd 0
+    put p off 255
+    put p add off 1 255
+    put p add off 2 255
+    put p add off 3 255
+  else
+    u = ulong fd
+    put p off uchar and u 255
+    put p add off 1 uchar and shr u 8 255
+    put p add off 2 uchar and shr u 16 255
+    put p add off 3 uchar and shr u 24 255
+  end
+  put p add off 4 1
+  put p add off 5 0
+  put p add off 6 0
+  put p add off 7 0
+end
+
+fn drain_one_out fd int to bool
+  n = get g_routl 0
+  if ge n CM_MAX_CAP
+    put g_st 12 1
+    r = read fd g_junk 0 4096
+    if eq r 0
+      ret false
+    end
+    if lt r 0
+      if and ne r -4 ne r -11
+        ret false
+      end
+    end
+    ret true
+  end
+  r = read fd g_rout n sub CM_MAX_CAP n
+  if eq r 0
+    ret false
+  end
+  if gt r 0
+    put g_routl 0 add n ulong r
+    ret true
+  end
+  if and ne r -4 ne r -11
+    ret false
+  end
+  ret true
+end
+
+fn drain_one_err fd int to bool
+  n = get g_rerrl 0
+  if ge n CM_MAX_CAP
+    put g_st 13 1
+    r = read fd g_junk 0 4096
+    if eq r 0
+      ret false
+    end
+    if lt r 0
+      if and ne r -4 ne r -11
+        ret false
+      end
+    end
+    ret true
+  end
+  r = read fd g_rerr n sub CM_MAX_CAP n
+  if eq r 0
+    ret false
+  end
+  if gt r 0
+    put g_rerrl 0 add n ulong r
+    ret true
+  end
+  if and ne r -4 ne r -11
+    ret false
+  end
+  ret true
+end
+
+fn drain_two outfd int errfd int dl long to bool
+  put g_routl 0 0
+  put g_rerrl 0 0
+  put g_st 12 0
+  put g_st 13 0
+  p = new uchar 16 0
+  o_open = true
+  e_open = true
+  for it ulong 1000000 bound 1000000
+    if and not o_open not e_open
+      ret true
+    end
+    left = sub dl long monons
+    if le left 0
+      ret false
+    end
+    if o_open
+      put_pfd p 0 outfd
+    else
+      put_pfd p 0 -1
+    end
+    if e_open
+      put_pfd p 8 errfd
+    else
+      put_pfd p 8 -1
+    end
+    w = pollfds p 0 16 left
+    if lt w 0
+      if ne w -4
+        ret false
+      end
+      continue
+    end
+    if eq w 0
+      continue
+    end
+    ro = or ulong get p 6 shl ulong get p 7 8
+    if and o_open ne ro 0
+      o_open = drain_one_out outfd
+    end
+    re = or ulong get p 14 shl ulong get p 15 8
+    if and e_open ne re 0
+      e_open = drain_one_err errfd
+    end
+  end
+  ret false
+end
+
+note ============================================================================
+note Compile & kernel-enforced execpure execution pipeline
+note ============================================================================
+
+fn write_src_tmp to bool
+  fd = fopen g_tom 0 get g_toml 0 577 384
+  if lt fd 0
+    ret false
+  end
+  n = get g_srcl 0
+  off = ulong 0
+  while lt off n bound 65536
+    w = write int fd g_src off sub n off
+    if le w 0
+      x = fclose int fd
+      ret false
+    end
+    off = add off ulong w
+  end
+  x = fclose int fd
+  ret true
+end
+
+fn child_compile infd int outfd int ewfd int to void
+  set_rlim 0 3
+  set_rlim 1 4194304
+  set_rlim 9 268435456
+  x = dupfd infd 0 0
+  x = dupfd outfd 1 0
+  x = dupfd ewfd 2 0
+  x = execprog g_pk 0 get g_pkl 0
+  exit 127
+end
+
+fn finish_compile pid int erfd int t0 long to void
+  tmo = mul long get g_st 6 1000000
+  dl = add t0 tmo
+  ok = drain_cerr erfd dl
+  x = fclose erfd
+  if not ok
+    x = killpid pid 9
+  end
+  rc = reap_child pid dl
+  dt = sub long monons t0
+  if lt dt 0
+    dt = 0
+  end
+  put g_st 1 div ulong dt 1000
+  if not ok
+    put g_st 0 999
+    ret
+  end
+  put g_st 0 rc
+  if eq rc 0
+    bfd = fopen g_tbin 0 get g_tbinl 0 0 0
+    if ge bfd 0
+      sz = fseek int bfd 0 2
+      if gt sz 0
+        put g_st 2 ulong sz
+      end
+      x = fclose int bfd
+    end
+  end
+end
+
+fn do_compile to void
+  put g_st 0 998
+  put g_st 1 0
+  put g_st 2 0
+  put g_cerrl 0 0
+  if not write_src_tmp
+    ret
+  end
+  infd = fopen g_tom 0 get g_toml 0 0 0
+  if lt infd 0
+    ret
+  end
+  outfd = fopen g_tbin 0 get g_tbinl 0 577 448
+  if lt outfd 0
+    x = fclose int infd
+    ret
+  end
+  ep = new uchar 8 0
+  if lt pipefds ep 0 8 524288 0
+    x = fclose int infd
+    x = fclose int outfd
+    ret
+  end
+  erfd = read_u32_le ep 0
+  ewfd = read_u32_le ep 4
+  pk_omc
+  t0 = long monons
+  pid = fork
+  if lt pid 0
+    x = fclose int infd
+    x = fclose int outfd
+    x = fclose erfd
+    x = fclose ewfd
+    ret
+  end
+  if eq pid 0
+    child_compile int infd int outfd ewfd
+  end
+  x = fclose int infd
+  x = fclose int outfd
+  x = fclose ewfd
+  finish_compile int pid erfd t0
+end
+
+fn child_execpure owfd int ewfd int to void
+  nul = fopen t_devnull 0 len t_devnull 0 0
+  if lt nul 0
+    exit 126
+  end
+  x = dupfd int nul 0 0
+  x = dupfd owfd 1 0
+  x = dupfd ewfd 2 0
+  x = execpure g_pk 0 get g_pkl 0
+  exit 127
+end
+
+fn finish_execpure pid int orfd int erfd int t0 long to void
+  tmo = mul long get g_st 7 1000000
+  dl = add t0 tmo
+  ok = drain_two orfd erfd dl
+  x = fclose orfd
+  x = fclose erfd
+  if not ok
+    x = killpid pid 9
+  end
+  rc = reap_child pid dl
+  dt = sub long monons t0
+  if lt dt 0
+    dt = 0
+  end
+  put g_st 4 div ulong dt 1000
+  if not ok
+    put g_st 3 999
+    ret
+  end
+  put g_st 3 rc
+end
+
+fn do_execpure to void
+  put g_st 3 998
+  put g_st 4 0
+  put g_routl 0 0
+  put g_rerrl 0 0
+  op = new uchar 8 0
+  ep = new uchar 8 0
+  if lt pipefds op 0 8 524288 0
+    ret
+  end
+  if lt pipefds ep 0 8 524288 0
+    x = fclose read_u32_le op 0
+    x = fclose read_u32_le op 4
+    ret
+  end
+  orfd = read_u32_le op 0
+  owfd = read_u32_le op 4
+  erfd = read_u32_le ep 0
+  ewfd = read_u32_le ep 4
+  pk_bin
+  t0 = long monons
+  pid = fork
+  if lt pid 0
+    x = fclose orfd
+    x = fclose owfd
+    x = fclose erfd
+    x = fclose ewfd
+    ret
+  end
+  if eq pid 0
+    child_execpure owfd ewfd
+  end
+  x = fclose owfd
+  x = fclose ewfd
+  finish_execpure int pid orfd erfd t0
+end
+
+note ============================================================================
+note CLI argument parsing & pin/snippet loading
+note ============================================================================
+
+fn arg_eq al ulong pat view uchar * to bool
+  if ne al len pat
+    ret false
+  end
+  for i ulong al bound 64
+    if ne get g_arg i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn parse_u64_arg al ulong to ulong
+  if eq al 0
+    ret 0
+  end
+  v = ulong 0
+  for i ulong al bound 16
+    c = get g_arg i
+    if or lt c 48 gt c 57
+      ret 0
+    end
+    v = add mul v 10 ulong sub c 48
+  end
+  ret v
+end
+
+fn is_low_hex c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if and ge c 97 le c 102
+    ret true
+  end
+  ret false
+end
+
+fn load_pin_file to bool
+  fd = fopen g_pinf 0 get g_pinfl 0 0 0
+  if lt fd 0
+    ret false
+  end
+  k = read int fd g_pin 0 127
+  x = fclose int fd
+  if lt k 64
+    ret false
+  end
+  for i ulong 64
+    if not is_low_hex get g_pin i
+      ret false
+    end
+  end
+  put g_pinl 0 64
+  ret true
+end
+
+fn pin_matches_omc to bool
+  if ne get g_pinl 0 64
+    ret false
+  end
+  for i ulong 64
+    if ne get g_pin i get g_omc_hex i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn load_snippet to int
+  put g_srcl 0 0
+  fd = int 0
+  if eq get g_st 15 0
+    r = fopen g_snip 0 get g_snipl 0 0 0
+    if lt r 0
+      ret 1
+    end
+    fd = int r
+  end
+  tot = ulong 0
+  while true bound 2048
+    if ge tot CM_MAX_SRC
+      k2 = read fd g_junk 0 16
+      if eq get g_st 15 0
+        x = fclose fd
+      end
+      if gt k2 0
+        ret 2
+      end
+      put g_srcl 0 tot
+      ret 0
+    end
+    k = read fd g_src tot sub CM_MAX_SRC tot
+    if lt k 0
+      if eq get g_st 15 0
+        x = fclose fd
+      end
+      ret 1
+    end
+    if eq k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  if eq get g_st 15 0
+    x = fclose fd
+  end
+  put g_srcl 0 tot
+  ret 0
+end
+
+note ============================================================================
+note Receipt printers
+note ============================================================================
+
+fn emit_refusal rsn view uchar * hasActual bool to int
+  ob_txt t_rcpt_pfx
+  ob_txt t_st_ref
+  ob_txt t_kv_sbx
+  ob_txt t_kv_rsn
+  ob_txt rsn
+  if hasActual
+    ob_txt t_kv_exp
+    ob_pin
+    ob_txt t_kv_omc
+    ob_hex_omc
+  end
+  ob_txt t_kv_rc
+  ob_u64 69
+  ob_txt t_kv_x64
+  ob_hex_bpf
+  ob_txt t_nl
+  ob_flush
+  ret 69
+end
+
+fn emit_compile_err rc ulong to int
+  note Redact compiler stderr just in case source snippet leaked a token into diagnostics
+  put g_rerrl 0 get g_cerrl 0
+  for i ulong get g_cerrl 0 bound 8192
+    put g_rerr i get g_cerr i
+  end
+  redact_stream 1
+  ob_txt t_rcpt_pfx
+  ob_txt t_st_cerr
+  ob_txt t_kv_sbx
+  ob_txt t_kv_omc
+  ob_hex_omc
+  ob_txt t_kv_snip
+  ob_hex_snip
+  ob_txt t_kv_cus
+  ob_u64 get g_st 1
+  ob_txt t_kv_omcerr
+  ob_u64 rc
+  ob_txt t_kv_rc
+  ob_u64 rc
+  ob_txt t_kv_red
+  ob_u64 get g_st 5
+  ob_txt t_kv_x64
+  ob_hex_bpf
+  ob_txt t_nl
+  ob_txt t_err_beg
+  ob_u64 get g_red_el 0
+  ob_txt t_nl
+  for i ulong get g_red_el 0 bound 65536
+    ob_byte get g_red_e i
+  end
+  ob_txt t_err_end
+  ob_flush
+  if eq rc 999
+    ret 124
+  end
+  if gt rc 255
+    ret 1
+  end
+  ret int rc
+end
+
+fn emit_run_receipt to int
+  rc = get g_st 3
+  retc = int 0
+  redact_stream 0
+  redact_stream 1
+  ob_txt t_rcpt_pfx
+  if eq rc 0
+    ob_txt t_st_ok
+    retc = int 0
+  else
+    if eq rc 999
+      ob_txt t_st_tmo
+      retc = int 124
+    else
+      if ge rc 1000
+        ob_txt t_st_sig
+        ob_txt t_kv_sig
+        ob_u64 sub rc 1000
+        retc = int add 128 sub rc 1000
+      else
+        if and ge rc 101 le rc 114
+          ob_txt t_st_trap
+          ob_txt t_kv_trap
+          ob_u64 sub rc 100
+          retc = int rc
+        else
+          ob_txt t_st_nz
+          if gt rc 255
+            retc = int 1
+          else
+            retc = int rc
+          end
+        end
+      end
+    end
+  end
+  ob_txt t_kv_sbx
+  ob_txt t_kv_omc
+  ob_hex_omc
+  ob_txt t_kv_snip
+  ob_hex_snip
+  ob_txt t_kv_bin
+  ob_u64 get g_st 2
+  ob_txt t_kv_cus
+  ob_u64 get g_st 1
+  ob_txt t_kv_rus
+  ob_u64 get g_st 4
+  ob_txt t_kv_rc
+  ob_u64 ulong retc
+  ob_txt t_kv_red
+  ob_u64 get g_st 5
+  ob_txt t_kv_x64
+  ob_hex_bpf
+  ob_txt t_nl
+  ob_txt t_out_beg
+  ob_u64 get g_red_ol 0
+  ob_txt t_nl
+  for i ulong get g_red_ol 0 bound 65536
+    ob_byte get g_red_o i
+  end
+  ob_txt t_out_end
+  ob_txt t_err_beg
+  ob_u64 get g_red_el 0
+  ob_txt t_nl
+  for i ulong get g_red_el 0 bound 65536
+    ob_byte get g_red_e i
+  end
+  ob_txt t_err_end
+  ob_flush
+  ret retc
+end
+
+note ============================================================================
+note `run` subcommand driver & CLI entry point
+note ============================================================================
+
+fn parse_run_args argc ulong to bool
+  put g_st 6 CM_DEF_CTMO_MS
+  put g_st 7 CM_DEF_RTMO_MS
+  i = ulong 2
+  while lt i argc bound 32
+    al = argread i g_arg 0 511
+    if le al 0
+      ret false
+    end
+    ul = ulong al
+    if arg_eq ul t_flg_omc
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_omc 0 511
+      if le vl 0
+        ret false
+      end
+      put g_omcl 0 ulong vl
+      put g_st 8 1
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_pin
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_pin 0 127
+      if le vl 0
+        ret false
+      end
+      put g_pinl 0 ulong vl
+      put g_st 9 1
+      put g_st 14 0
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_pinf
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_pinf 0 511
+      if le vl 0
+        ret false
+      end
+      put g_pinfl 0 ulong vl
+      put g_st 9 1
+      put g_st 14 1
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_tmo
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_arg 0 511
+      if le vl 0
+        ret false
+      end
+      ms = parse_u64_arg ulong vl
+      if or lt ms 10 gt ms 10000
+        ret false
+      end
+      put g_st 7 ms
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_ctmo
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_arg 0 511
+      if le vl 0
+        ret false
+      end
+      ms = parse_u64_arg ulong vl
+      if or lt ms 50 gt ms 10000
+        ret false
+      end
+      put g_st 6 ms
+      i = add i 1
+      continue
+    end
+    if eq get g_st 10 0
+      if arg_eq ul t_dash
+        put g_st 15 1
+      else
+        for k ulong ul bound 512
+          put g_snip k get g_arg k
+        end
+        put g_snipl 0 ul
+        put g_st 15 0
+      end
+      put g_st 10 1
+      i = add i 1
+      continue
+    end
+    ret false
+  end
+  if or eq get g_st 8 0 or eq get g_st 9 0 eq get g_st 10 0
+    ret false
+  end
+  ret true
+end
+
+fn cmd_run argc ulong to int
+  bpf_build_x64
+  if not parse_run_args argc
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  if eq get g_st 14 1
+    if not load_pin_file
+      ret emit_refusal t_rsn_pinf false
+    end
+  else
+    if ne get g_pinl 0 64
+      ret emit_refusal t_rsn_pinf false
+    end
+    for i ulong 64
+      if not is_low_hex get g_pin i
+        ret emit_refusal t_rsn_pinf false
+      end
+    end
+  end
+  if not sha_hash_omc_file
+    ret emit_refusal t_rsn_omcio false
+  end
+  if not pin_matches_omc
+    ret emit_refusal t_rsn_pin true
+  end
+  sr = load_snippet
+  if eq sr 1
+    ret emit_refusal t_rsn_srcio false
+  end
+  if eq sr 2
+    ret emit_refusal t_rsn_srcbig false
+  end
+  sha_hash_src
+  make_tmp_paths
+  do_compile
+  crc = get g_st 0
+  if ne crc 0
+    cleanup_tmp
+    ret emit_compile_err crc
+  end
+  do_execpure
+  cleanup_tmp
+  ret emit_run_receipt
+end
+
+fn main to int
+  ac = argcnt
+  if lt ac 2
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  al = argread 1 g_arg 0 511
+  if le al 0
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  ul = ulong al
+  if arg_eq ul t_cmd_ver
+    ob_txt t_ver
+    ob_flush
+    ret 0
+  end
+  if arg_eq ul t_cmd_bpf
+    ret cmd_x64_bpf_spec
+  end
+  if arg_eq ul t_cmd_run
+    ret cmd_run ulong ac
+  end
+  w = write 2 t_usage 0 len t_usage
+  ret 2
+end
