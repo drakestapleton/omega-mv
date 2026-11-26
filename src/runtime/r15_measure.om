@@ -1,0 +1,609 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/runtime/r15_measure.om -- Pure seeded OM-2 SPBM hwmon energy/power reader,
+note machine snapshot (/proc/stat, /proc/loadavg, cpufreq, thermal), and JSONL
+note writer for R15 / TY-5 energy measurement. Observation only; never touches NVML.
+
+const R15M_SPBM_ENERGY ulong 5
+const R15M_SPBM_POWER ulong 5
+const R15M_NCPU ulong 20
+const R15M_NZONE ulong 16
+const R15M_O_RDONLY int 0
+const R15M_O_EXCL_CREATE int 193
+
+note Canonical 5+5 SPBM channel label tables (read by tools/r15_machine_state.sh
+note and tests/r15_energy_preflight_test.sh so preflight and reader cannot drift).
+text r15m_k_elabel "pkg,cpu_e,cpu_p,gpc_unverified,gpm"
+text r15m_k_plabel "sys_total,soc_pkg,cpu_e,cpu_p,gpu"
+
+text r15m_el0 "pkg"
+text r15m_el1 "cpu_e"
+text r15m_el2 "cpu_p"
+text r15m_el3 "gpc_unverified"
+text r15m_el4 "gpm"
+
+text r15m_pl0 "sys_total"
+text r15m_pl1 "soc_pkg"
+text r15m_pl2 "cpu_e"
+text r15m_pl3 "cpu_p"
+text r15m_pl4 "gpu"
+
+text r15m_hwmon_pfx "/sys/class/hwmon/hwmon"
+text r15m_spbm_name "aien_spbm"
+text r15m_s_name "/name"
+text r15m_s_en "/energy"
+text r15m_s_pw "/power"
+text r15m_s_lab "_label"
+text r15m_s_inp "_input"
+text r15m_s_ovf "_overflow_raw"
+text r15m_p_stat "/proc/stat"
+text r15m_p_load "/proc/loadavg"
+text r15m_p_cpuf0 "/sys/devices/system/cpu/cpu"
+text r15m_p_cpuf1 "/cpufreq/scaling_cur_freq"
+text r15m_p_tz0 "/sys/class/thermal/thermal_zone"
+text r15m_p_tz1 "/temp"
+text r15m_why_no_spbm "no aien_spbm hwmon"
+text r15m_why_bad_elab "energy label mismatch"
+text r15m_why_bad_plab "power label mismatch"
+
+global g_r15_hwmon uchar 256
+global g_r15_hwmon_len ulong 1
+global g_r15_why uchar 256
+global g_r15_why_len ulong 1
+global g_r15_pbuf uchar 512
+global g_r15_lbuf uchar 4096
+global g_r15_sbuf uchar 16384
+
+note Energy sample slots (slot 0 = e0, slot 1 = e1, slot 2..2049 = telemetry):
+note Each sample: t_ns, spbm_ok, 5x energy_uj, 5x ovf, 5x power_uw (17 ulongs)
+note Stored in parallel arrays for fast bounded access.
+global g_r15_et ulong 2052
+global g_r15_eok ulong 2052
+global g_r15_euj ulong 10260
+global g_r15_eovf ulong 10260
+global g_r15_epw ulong 10260
+
+note Machine snapshots (slot 0 = s0, slot 1 = s1)
+global g_r15_busy ulong 40
+global g_r15_tot ulong 40
+global g_r15_freq ulong 40
+global g_r15_temp long 32
+global g_r15_nzone ulong 2
+global g_r15_load uchar 192
+global g_r15_load_len ulong 2
+
+note Buffered output writer
+global g_r15_obuf uchar 65536
+global g_r15_olen ulong 1
+global g_r15_ofd int 1
+
+fn r15m_set_why s view uchar * to void
+  n = len s
+  if gt n 255
+    n = ulong 255
+  end
+  for i ulong n bound 256
+    put g_r15_why i get s i
+  end
+  put g_r15_why_len 0 n
+end
+
+fn r15m_pbuf_reset to ulong
+  ret ulong 0
+end
+
+fn r15m_pbuf_txt pos ulong s view uchar * to ulong
+  n = len s
+  p = pos
+  for i ulong n bound 256
+    if lt p 511
+      put g_r15_pbuf p get s i
+      p = add p 1
+    end
+  end
+  ret p
+end
+
+fn r15m_pbuf_hwmon pos ulong to ulong
+  n = get g_r15_hwmon_len 0
+  p = pos
+  for i ulong n bound 256
+    if lt p 511
+      put g_r15_pbuf p get g_r15_hwmon i
+      p = add p 1
+    end
+  end
+  ret p
+end
+
+fn r15m_pbuf_u64 pos ulong v ulong to ulong
+  p = pos
+  if eq v 0
+    if lt p 511
+      put g_r15_pbuf p 48
+      p = add p 1
+    end
+    ret p
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig nd uchar add 48 rem x 10
+    x = div x 10
+    nd = add nd 1
+  end
+  k = nd
+  while gt k 0 bound 24
+    k = sub k 1
+    if lt p 511
+      put g_r15_pbuf p get dig k
+      p = add p 1
+    end
+  end
+  ret p
+end
+
+fn r15m_read_line_pbuf plen ulong to long
+  fd = fopen g_r15_pbuf 0 plen R15M_O_RDONLY 0
+  if lt fd 0
+    ret -1
+  end
+  got = ulong 0
+  while lt got 4095 bound 64
+    r = read int fd g_r15_lbuf got sub 4095 got
+    if eq r neg long 4
+      continue
+    end
+    if le r 0
+      break
+    end
+    got = add got ulong r
+  end
+  cl = fclose int fd
+  if eq got 0
+    ret -1
+  end
+  eol = got
+  for i ulong got bound 4096
+    c = get g_r15_lbuf i
+    if or eq c 10 eq c 13
+      eol = i
+      break
+    end
+  end
+  ret long eol
+end
+
+fn r15m_lbuf_eq n ulong s view uchar * to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 256
+    if ne get g_r15_lbuf i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn r15m_lbuf_parse_u64 n ulong outv edit ulong 1 to bool
+  if eq n 0
+    ret false
+  end
+  v = ulong 0
+  for i ulong n bound 32
+    c = ulong get g_r15_lbuf i
+    if or lt c 48 gt c 57
+      ret false
+    end
+    v = add mul v 10 sub c 48
+  end
+  put outv 0 v
+  ret true
+end
+
+fn r15m_lbuf_parse_i64 n ulong outv edit long 1 to bool
+  if eq n 0
+    ret false
+  end
+  isneg = false
+  i = ulong 0
+  if eq get g_r15_lbuf 0 45
+    isneg = true
+    i = ulong 1
+  end
+  if ge i n
+    ret false
+  end
+  v = long 0
+  while lt i n bound 32
+    c = ulong get g_r15_lbuf i
+    if or lt c 48 gt c 57
+      ret false
+    end
+    v = add mul v 10 long sub c 48
+    i = add i 1
+  end
+  if isneg
+    v = neg v
+  end
+  put outv 0 v
+  ret true
+end
+
+fn r15m_elab_ok idx ulong n ulong to bool
+  if eq idx 0
+    ret r15m_lbuf_eq n r15m_el0
+  end
+  if eq idx 1
+    ret r15m_lbuf_eq n r15m_el1
+  end
+  if eq idx 2
+    ret r15m_lbuf_eq n r15m_el2
+  end
+  if eq idx 3
+    ret r15m_lbuf_eq n r15m_el3
+  end
+  if eq idx 4
+    ret r15m_lbuf_eq n r15m_el4
+  end
+  ret false
+end
+
+fn r15m_plab_ok idx ulong n ulong to bool
+  if eq idx 0
+    ret r15m_lbuf_eq n r15m_pl0
+  end
+  if eq idx 1
+    ret r15m_lbuf_eq n r15m_pl1
+  end
+  if eq idx 2
+    ret r15m_lbuf_eq n r15m_pl2
+  end
+  if eq idx 3
+    ret r15m_lbuf_eq n r15m_pl3
+  end
+  if eq idx 4
+    ret r15m_lbuf_eq n r15m_pl4
+  end
+  ret false
+end
+
+fn r15m_spbm_attach to int
+  put g_r15_hwmon_len 0 0
+  put g_r15_why_len 0 0
+  found = false
+  for h ulong 32
+    p = r15m_pbuf_txt 0 r15m_hwmon_pfx
+    p = r15m_pbuf_u64 p h
+    dlen = p
+    p = r15m_pbuf_txt p r15m_s_name
+    nl = r15m_read_line_pbuf p
+    if ge nl 0
+      if r15m_lbuf_eq ulong nl r15m_spbm_name
+        for j ulong dlen bound 256
+          put g_r15_hwmon j get g_r15_pbuf j
+        end
+        put g_r15_hwmon_len 0 dlen
+        found = true
+        break
+      end
+    end
+  end
+  if not found
+    r15m_set_why r15m_why_no_spbm
+    ret -1
+  end
+  for i ulong R15M_SPBM_ENERGY
+    p = r15m_pbuf_hwmon 0
+    p = r15m_pbuf_txt p r15m_s_en
+    p = r15m_pbuf_u64 p add i 1
+    p = r15m_pbuf_txt p r15m_s_lab
+    nl = r15m_read_line_pbuf p
+    if lt nl 0
+      r15m_set_why r15m_why_bad_elab
+      put g_r15_hwmon_len 0 0
+      ret -1
+    end
+    if not r15m_elab_ok i ulong nl
+      r15m_set_why r15m_why_bad_elab
+      put g_r15_hwmon_len 0 0
+      ret -1
+    end
+  end
+  for i ulong R15M_SPBM_POWER
+    p = r15m_pbuf_hwmon 0
+    p = r15m_pbuf_txt p r15m_s_pw
+    p = r15m_pbuf_u64 p add i 1
+    p = r15m_pbuf_txt p r15m_s_lab
+    nl = r15m_read_line_pbuf p
+    if lt nl 0
+      r15m_set_why r15m_why_bad_plab
+      put g_r15_hwmon_len 0 0
+      ret -1
+    end
+    if not r15m_plab_ok i ulong nl
+      r15m_set_why r15m_why_bad_plab
+      put g_r15_hwmon_len 0 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn r15m_energy_read slot ulong to void
+  put g_r15_et slot ulong monons
+  put g_r15_eok slot 0
+  base = mul slot 5
+  for i ulong 5
+    put g_r15_euj add base i 0
+    put g_r15_eovf add base i 0
+    put g_r15_epw add base i 0
+  end
+  if eq get g_r15_hwmon_len 0 0
+    ret
+  end
+  val = new ulong 1 0
+  ok = ulong 1
+  for i ulong 5
+    p = r15m_pbuf_hwmon 0
+    p = r15m_pbuf_txt p r15m_s_en
+    p = r15m_pbuf_u64 p add i 1
+    p = r15m_pbuf_txt p r15m_s_inp
+    nl = r15m_read_line_pbuf p
+    if lt nl 0
+      ok = ulong 0
+    else
+      if r15m_lbuf_parse_u64 ulong nl val
+        put g_r15_euj add base i get val 0
+      else
+        ok = ulong 0
+      end
+    end
+    p2 = r15m_pbuf_hwmon 0
+    p2 = r15m_pbuf_txt p2 r15m_s_en
+    p2 = r15m_pbuf_u64 p2 add i 1
+    p2 = r15m_pbuf_txt p2 r15m_s_ovf
+    nl2 = r15m_read_line_pbuf p2
+    if lt nl2 0
+      ok = ulong 0
+    else
+      if r15m_lbuf_parse_u64 ulong nl2 val
+        put g_r15_eovf add base i get val 0
+      else
+        ok = ulong 0
+      end
+    end
+    p3 = r15m_pbuf_hwmon 0
+    p3 = r15m_pbuf_txt p3 r15m_s_pw
+    p3 = r15m_pbuf_u64 p3 add i 1
+    p3 = r15m_pbuf_txt p3 r15m_s_inp
+    nl3 = r15m_read_line_pbuf p3
+    if lt nl3 0
+      ok = ulong 0
+    else
+      if r15m_lbuf_parse_u64 ulong nl3 val
+        put g_r15_epw add base i get val 0
+      else
+        ok = ulong 0
+      end
+    end
+  end
+  put g_r15_eok slot ok
+end
+
+fn r15m_parse_stat_num pos ulong endp ulong outv edit ulong 1 to ulong
+  p = pos
+  while lt p endp bound 64
+    if ne get g_r15_sbuf p 32
+      break
+    end
+    p = add p 1
+  end
+  v = ulong 0
+  while lt p endp bound 32
+    c = ulong get g_r15_sbuf p
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 sub c 48
+    p = add p 1
+  end
+  put outv 0 v
+  ret p
+end
+
+fn r15m_parse_stat_line slot ulong ls ulong lend ulong to void
+  if lt sub lend ls 5
+    ret
+  end
+  if or ne get g_r15_sbuf ls 99 ne get g_r15_sbuf add ls 1 112
+    ret
+  end
+  if ne get g_r15_sbuf add ls 2 117
+    ret
+  end
+  c3 = ulong get g_r15_sbuf add ls 3
+  if or lt c3 48 gt c3 57
+    ret
+  end
+  val = new ulong 1 0
+  p = r15m_parse_stat_num add ls 3 lend val
+  cpu = get val 0
+  if ge cpu R15M_NCPU
+    ret
+  end
+  cols = new ulong 8 0
+  for k ulong 8
+    p = r15m_parse_stat_num p lend val
+    put cols k get val 0
+  end
+  busy = add get cols 0 get cols 1
+  busy = add busy get cols 2
+  busy = add busy get cols 5
+  busy = add busy get cols 6
+  busy = add busy get cols 7
+  tot = add busy get cols 3
+  tot = add tot get cols 4
+  idx = add mul slot R15M_NCPU cpu
+  put g_r15_busy idx busy
+  put g_r15_tot idx tot
+end
+
+fn r15m_take_snap slot ulong to void
+  cbase = mul slot R15M_NCPU
+  for c ulong R15M_NCPU
+    put g_r15_busy add cbase c 0
+    put g_r15_tot add cbase c 0
+    put g_r15_freq add cbase c 0
+  end
+  zbase = mul slot R15M_NZONE
+  for z ulong R15M_NZONE
+    put g_r15_temp add zbase z 0
+  end
+  put g_r15_nzone slot 0
+  put g_r15_load_len slot 0
+
+  p = r15m_pbuf_txt 0 r15m_p_stat
+  fd = fopen g_r15_pbuf 0 p R15M_O_RDONLY 0
+  if ge fd 0
+    got = ulong 0
+    while lt got 16383 bound 64
+      r = read int fd g_r15_sbuf got sub 16383 got
+      if eq r neg long 4
+        continue
+      end
+      if le r 0
+        break
+      end
+      got = add got ulong r
+    end
+    cl = fclose int fd
+    ls = ulong 0
+    for i ulong got bound 16384
+      if eq get g_r15_sbuf i 10
+        r15m_parse_stat_line slot ls i
+        ls = add i 1
+      end
+    end
+  end
+
+  p2 = r15m_pbuf_txt 0 r15m_p_load
+  nl = r15m_read_line_pbuf p2
+  if gt nl 0
+    un = ulong nl
+    if gt un 95
+      un = ulong 95
+    end
+    lbase = mul slot 96
+    for i ulong un bound 96
+      put g_r15_load add lbase i get g_r15_lbuf i
+    end
+    put g_r15_load_len slot un
+  end
+
+  uval = new ulong 1 0
+  for c ulong R15M_NCPU
+    pf = r15m_pbuf_txt 0 r15m_p_cpuf0
+    pf = r15m_pbuf_u64 pf c
+    pf = r15m_pbuf_txt pf r15m_p_cpuf1
+    fl = r15m_read_line_pbuf pf
+    if gt fl 0
+      if r15m_lbuf_parse_u64 ulong fl uval
+        put g_r15_freq add cbase c get uval 0
+      end
+    end
+  end
+
+  lval = new long 1 0
+  for z ulong R15M_NZONE
+    pz = r15m_pbuf_txt 0 r15m_p_tz0
+    pz = r15m_pbuf_u64 pz z
+    pz = r15m_pbuf_txt pz r15m_p_tz1
+    zl = r15m_read_line_pbuf pz
+    if le zl 0
+      break
+    end
+    if r15m_lbuf_parse_i64 ulong zl lval
+      put g_r15_temp add zbase z get lval 0
+      put g_r15_nzone slot add z 1
+    else
+      break
+    end
+  end
+end
+
+fn r15m_ob_init fd int to void
+  put g_r15_ofd 0 fd
+  put g_r15_olen 0 0
+end
+
+fn r15m_ob_flush to int
+  n = get g_r15_olen 0
+  if eq n 0
+    ret 0
+  end
+  fd = get g_r15_ofd 0
+  off = ulong 0
+  while lt off n bound 4096
+    w = write fd g_r15_obuf off sub n off
+    if eq w neg long 4
+      continue
+    end
+    if le w 0
+      put g_r15_olen 0 0
+      ret -1
+    end
+    off = add off ulong w
+  end
+  put g_r15_olen 0 0
+  ret 0
+end
+
+fn r15m_ob_ch c uchar to void
+  n = get g_r15_olen 0
+  if ge n 65535
+    ign = r15m_ob_flush
+    n = get g_r15_olen 0
+  end
+  put g_r15_obuf n c
+  put g_r15_olen 0 add n 1
+end
+
+fn r15m_ob_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    r15m_ob_ch get s i
+  end
+end
+
+fn r15m_ob_u64 v ulong to void
+  if eq v 0
+    r15m_ob_ch 48
+    ret
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig nd uchar add 48 rem x 10
+    x = div x 10
+    nd = add nd 1
+  end
+  k = nd
+  while gt k 0 bound 24
+    k = sub k 1
+    r15m_ob_ch get dig k
+  end
+end
+
+fn r15m_ob_i64 v long to void
+  if lt v 0
+    r15m_ob_ch 45
+    r15m_ob_u64 ulong neg v
+    ret
+  end
+  r15m_ob_u64 ulong v
+end

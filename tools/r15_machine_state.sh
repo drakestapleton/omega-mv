@@ -79,7 +79,7 @@ if [ "${1:-}" = preflight-parse ]; then preflight_ghz "${2:?perf csv}"; exit $?;
 # the R15 harness and reducer reject overflow flags and decreases (energy_ok).
 # This preflight adds the headroom check for R15_ENERGY_HEADROOM_SECONDS
 # (default 300 s, longer than any single measured process) at 600 W.
-R15_MEASURE_C=$(cd "$(dirname "$0")/.." && pwd)/tests/runtime/r15_measure.c
+R15_MEASURE_OM=$(cd "$(dirname "$0")/.." && pwd)/src/runtime/r15_measure.om
 energy_preflight() {
     local root=${R15_HWMON_ROOT:-/sys/class/hwmon} nap=${R15_ENERGY_PREFLIGHT_SLEEP:-0.1}
     local hs=${R15_ENERGY_HEADROOM_SECONDS:-300}
@@ -88,10 +88,10 @@ energy_preflight() {
     declare -a last=()
     local h="" d s v prev="" first="" n=0 i lab want
     local el pl
-    el=$(sed -n 's/^static const char \*const k_elabel\[[A-Z_0-9]*\] = {\(.*\)};/\1/p' "$R15_MEASURE_C" | tr -d '" ')
-    pl=$(sed -n 's/^static const char \*const k_plabel\[[A-Z_0-9]*\] = {\(.*\)};/\1/p' "$R15_MEASURE_C" | tr -d '" ')
+    el=$(sed -n 's/^text r15m_k_elabel "\([^"]*\)"$/\1/p' "$R15_MEASURE_OM")
+    pl=$(sed -n 's/^text r15m_k_plabel "\([^"]*\)"$/\1/p' "$R15_MEASURE_OM")
     if [ "$(printf "%s" "$el" | awk -F, "{print NF}")" != 5 ] || [ "$(printf "%s" "$pl" | awk -F, "{print NF}")" != 5 ]; then
-        echo "INSTRUMENT_UNAVAILABLE reason=invalid: cannot read the 5+5 label tables from $R15_MEASURE_C"
+        echo "INSTRUMENT_UNAVAILABLE reason=invalid: cannot read the 5+5 label tables from $R15_MEASURE_OM"
         return 5
     fi
     for d in "$root"/hwmon*; do
