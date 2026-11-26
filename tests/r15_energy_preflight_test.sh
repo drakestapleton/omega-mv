@@ -24,14 +24,14 @@
 # tables from r15_measure.c, and this test builds its fixtures from the same
 # tables, so the two cannot drift. Fixtures are fake hwmon trees in a temp dir.
 cd "$(dirname "$0")/.." || exit 1
-T=tools/r15_machine_state.sh; fail=0; C=tests/runtime/r15_measure.c
+T=tools/r15_machine_state.sh; fail=0; M=src/runtime/r15_measure.om
 W=$(mktemp -d) || exit 1; trap 'rm -rf "$W"' EXIT
 export R15_ENERGY_PREFLIGHT_SLEEP=0
 # fixture uptime: 100 s, so a 10 W floor is 1 kJ (1,000,000,000 uJ); fixtures hold 5 kJ unless a case says otherwise
 printf "100.00 90.00\n" > "$W/uptime"; export R15_UPTIME_FILE="$W/uptime"
-EL=$(sed -n 's/^static const char \*const k_elabel\[[A-Z_0-9]*\] = {\(.*\)};/\1/p' $C | tr -d '" ' | tr , ' ')
-PL=$(sed -n 's/^static const char \*const k_plabel\[[A-Z_0-9]*\] = {\(.*\)};/\1/p' $C | tr -d '" ' | tr , ' ')
-[ "$(echo $EL | wc -w)" = 5 ] && [ "$(echo $PL | wc -w)" = 5 ] || { echo "[-] cannot read label tables from $C"; exit 1; }
+EL=$(sed -n 's/^text r15m_k_elabel "\([^"]*\)"$/\1/p' "$M" | tr , ' ')
+PL=$(sed -n 's/^text r15m_k_plabel "\([^"]*\)"$/\1/p' "$M" | tr , ' ')
+[ "$(echo $EL | wc -w)" = 5 ] && [ "$(echo $PL | wc -w)" = 5 ] || { echo "[-] cannot read label tables from $M"; exit 1; }
 check() { # name expected-exit expected-text
     out=$(R15_HWMON_ROOT="$W/$1" "$T" energy-preflight 2>&1); rc=$?
     if [ "$rc" = "$2" ] && printf '%s\n' "$out" | grep -Fq -- "$3"; then echo "[+] $1: exit $rc"

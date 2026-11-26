@@ -1283,12 +1283,6 @@ test-algebra-asan: $(OMA_TEST)
 # check-mixed-algebra-evidence fails if a committed evidence/MIXED_ALGEBRA
 # file is modified or deleted, and runs before and after the bench.
 .PHONY: test-realize bench-mixed-algebra check-mixed-algebra-evidence
-OMA_RZ_ARCH = -march=armv8.6-a+dotprod+i8mm+sve
-OMA_RZ_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 $(OMA_RZ_ARCH) -Isrc
-OMA_RZ_SRCS = src/algebra/realize_common.c src/algebra/realize_binary.c \
-	src/algebra/realize_bitplane.c src/algebra/realize_sparse.c \
-	src/algebra/realize_rns.c src/algebra/realize_dense.c
-OMA_RZ_HDRS = src/algebra/realize_common.h
 OMA_SEL_OM = src/algebra/oma_select.om
 OMA_RZ_TEST = $(OUT_DIR)/tests-algebra/test_realize
 OMA_RZ_BENCH = $(OUT_DIR)/tests-algebra/bench_mixed_algebra
