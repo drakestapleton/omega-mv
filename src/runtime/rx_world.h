@@ -410,6 +410,7 @@ typedef struct {
     bool have_last;
     bool have_two;
     bool resident_seat;         /* handed to the graphics seat; fn is not called */
+    bool resident_crumb_reserved; /* holds 1 causal-log receipt slot until accept/loss/destroy */
     bool deferred;              /* fn returned RX_FN_DEFER; waits for rx_world_resume */
     bool resume_pending;        /* resumed before the deferring run returned */
     /* I11: popped while a running writer of one of its inputs had not yet
@@ -631,6 +632,7 @@ typedef struct RxWorld {
     RxCrumb *crumbs;
     uint64_t n_crumbs;
     uint64_t crumb_cap;
+    uint64_t reserved_crumbs;   /* receipt slots reserved for in-flight resident claims */
 
     pthread_t workers[RX_MAX_WORKERS];
     uint32_t n_workers;

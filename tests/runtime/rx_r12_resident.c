@@ -807,6 +807,200 @@ static void t_emergency_stop(void) {
     env_stop(&r.e);
 }
 
+static int last_slot_setup(Env *e, uint64_t crumb_cap, RxObjRef *a, RxObjRef *b,
+                           uint32_t *seat, RxCapRef *ext) {
+    memset(e, 0, sizeof(*e));
+    if (aienos_cap_start(&e->admin, &e->view) != 0) return -1;
+    if (rx_world_init_native(&e->w, e->view, 2, crumb_cap) != RX_OK) {
+        aienos_cap_stop(e->admin, e->view);
+        return -1;
+    }
+    e->w.external_subject = SUBJ_EXTERNAL;
+    *a = mkobj(e, RES_A);
+    *b = mkobj(e, RES_B);
+    if (rx_world_attach_physical(&e->w, *a) != RX_OK ||
+        rx_world_attach_physical(&e->w, *b) != RX_OK)
+        return -1;
+    RxCapRef in = mint(e, SUBJ_SEAT, RES_A, RX_RIGHT_READ);
+    RxCapRef out = mint(e, SUBJ_SEAT, RES_B, RX_RIGHT_READ | RX_RIGHT_WRITE);
+    if (rx_world_bind_capability(&e->w, *a, in) != RX_OK ||
+        rx_world_bind_capability(&e->w, *b, out) != RX_OK)
+        return -1;
+    *ext = mint(e, SUBJ_EXTERNAL, RES_A, RX_RIGHT_WRITE);
+    if (rx_world_enable_resident(&e->w) != RX_OK) return -1;
+    offer(&e->w, RX_ACCEL_BLACKWELL);
+    RxReactionDesc d;
+    seat_desc(&d, *a, *b, in, out);
+    if (rx_world_add_reaction(&e->w, &d, seat) != RX_OK) return -1;
+    return 0;
+}
+
+/* Regression for PR #17 security finding: admitting a resident claim reserves
+ * one causal-log receipt slot under w->mu so concurrent publishers cannot fill
+ * the remaining slot and strand rx_resident_accept / quiescence wait. */
+static void t_resident_last_slot(void) {
+    printf("[*] resident-seat last-slot reservation, completion, cancel, and teardown\n");
+    {
+        /* (1) One slot left: claim reserves it, blocks stealers, accept succeeds. */
+        Env e;
+        RxObjRef a, b;
+        uint32_t seat = UINT32_MAX;
+        RxCapRef ext;
+        CHECK(last_slot_setup(&e, 4, &a, &b, &seat, &ext) == 0, "last-slot setup cap=4");
+        RxMutation stim[2] = { { a, 0, X }, { a, 1, Y } };
+        CHECK(rx_world_publish_external(&e.w, ext, stim, 2) == 3, "last-slot stimulus crumb 3");
+        CHECK(wait_seat(&e.w, seat) == 0, "last-slot claim posted");
+        CHECK(e.w.n_crumbs == 3 && e.w.reactions[seat].resident_seat,
+              "last-slot claim unexpected pre-accept state (n=%llu)",
+              (unsigned long long)e.w.n_crumbs);
+
+        RxMutation steal = { a, 0, X + 99 };
+        CHECK(rx_world_publish_external(&e.w, ext, &steal, 1) == RX_ERR_FULL,
+              "external publish stole reserved resident slot");
+        CHECK(field_of(&e.w, a, 0) == X, "blocked external publish mutated A");
+        uint64_t init[RX_MAX_FIELDS] = { 0 };
+        RxObjRef extra;
+        CHECK(rx_world_create(&e.w, 1, RX_PERSIST_RESIDENT, RES_C, init, &extra) == RX_ERR_FULL,
+              "rx_world_create stole reserved resident slot");
+        CHECK(rx_world_retire(&e.w, a) == RX_ERR_FULL,
+              "rx_world_retire stole reserved resident slot");
+        CHECK(e.w.n_crumbs == 3, "stealers altered crumb count");
+        CHECK(rx_resident_accept(&e.w) == RX_ERR_NOT_FOUND,
+              "idle accept before step did not return RX_ERR_NOT_FOUND");
+
+        CHECK(rx_resident_seat_step(&e.w) == 1, "last-slot stand-in step");
+        CHECK(rx_resident_accept(&e.w) == RX_OK, "last-slot accept failed");
+        CHECK(rx_world_wait_quiescent(&e.w, 1000) == RX_OK, "last-slot quiescence timed out");
+        CHECK(field_of(&e.w, b, 0) == X + Y, "last-slot B=%llu",
+              (unsigned long long)field_of(&e.w, b, 0));
+        CHECK(e.w.n_crumbs == 4 && !e.w.reactions[seat].resident_seat &&
+              e.w.reactions[seat].commits == 1 && e.w.in_flight == 0,
+              "last-slot post-accept invariants failed (n=%llu in_flight=%u)",
+              (unsigned long long)e.w.n_crumbs, e.w.in_flight);
+        uint64_t checked = 0;
+        CHECK(rx_world_verify_crumbs(&e.w, &checked) == 0 && checked == 4,
+              "last-slot crumb verification failed (%llu)", (unsigned long long)checked);
+        env_stop(&e);
+    }
+
+    {
+        /* (2a) Seat-lost with retry=1 consumes reserved slot and settles cleanly. */
+        Env e;
+        RxObjRef a, b;
+        uint32_t seat = UINT32_MAX;
+        RxCapRef ext;
+        CHECK(last_slot_setup(&e, 4, &a, &b, &seat, &ext) == 0, "seat-lost setup cap=4");
+        RxMutation stim[2] = { { a, 0, X }, { a, 1, Y } };
+        CHECK(rx_world_publish_external(&e.w, ext, stim, 2) == 3, "seat-lost stimulus");
+        CHECK(wait_seat(&e.w, seat) == 0, "seat-lost claim posted");
+        RxMutation steal = { a, 0, X + 1 };
+        CHECK(rx_world_publish_external(&e.w, ext, &steal, 1) == RX_ERR_FULL,
+              "stealer blocked before seat loss");
+        CHECK(rx_resident_seat_lost(&e.w, 1) == 1, "seat loss did not close claim");
+        CHECK(rx_world_wait_quiescent(&e.w, 1000) == RX_OK, "seat-lost quiescence timed out");
+        CHECK(e.w.n_crumbs == 4 && !e.w.reactions[seat].resident_seat &&
+              e.w.stats.rejected >= 1 && e.w.in_flight == 0,
+              "seat-lost retry left dangling activation (n=%llu rej=%llu in_flight=%u)",
+              (unsigned long long)e.w.n_crumbs, (unsigned long long)e.w.stats.rejected,
+              e.w.in_flight);
+        env_stop(&e);
+    }
+
+    {
+        /* (2b) Seat-lost with retry=0 releases reservation back to normal capacity. */
+        Env e;
+        RxObjRef a, b;
+        uint32_t seat = UINT32_MAX;
+        RxCapRef ext;
+        CHECK(last_slot_setup(&e, 5, &a, &b, &seat, &ext) == 0, "seat-lost setup cap=5");
+        RxMutation stim[2] = { { a, 0, X }, { a, 1, Y } };
+        CHECK(rx_world_publish_external(&e.w, ext, stim, 2) == 3, "cap=5 stimulus");
+        CHECK(wait_seat(&e.w, seat) == 0, "cap=5 claim posted");
+        CHECK(rx_resident_seat_lost(&e.w, 0) == 1, "cap=5 seat loss");
+        CHECK(rx_world_wait_quiescent(&e.w, 1000) == RX_OK, "cap=5 settle");
+        CHECK(e.w.n_crumbs == 4 && !e.w.reactions[seat].resident_seat,
+              "cap=5 seat stayed open after seat loss");
+        RxMutation after = { a, 0, X + 5 };
+        CHECK(rx_world_publish_external(&e.w, ext, &after, 1) == 5,
+              "slot 5 was not usable after seat-loss release");
+        CHECK(rx_world_wait_quiescent(&e.w, 1000) == RX_OK, "cap=5 post-loss settle");
+        env_stop(&e);
+    }
+
+    {
+        /* (3) Operator emergency stop cannot steal reserved slot; cancel accept consumes it. */
+        Env e;
+        RxObjRef a, b;
+        uint32_t seat = UINT32_MAX;
+        RxCapRef ext;
+        CHECK(last_slot_setup(&e, 4, &a, &b, &seat, &ext) == 0, "halt setup cap=4");
+        RxCallerCred op;
+        CHECK(rx_world_enroll_caller(&e.w, SUBJ_OPERATOR, &op) == RX_OK, "halt enroll");
+        RxCapRef halt = mint(&e, SUBJ_OPERATOR, RX_WORLD_RES_CONTROL, RX_WORLD_RIGHT_HALT);
+        CHECK(halt.cap_id != UINT32_MAX, "halt cap");
+        RxMutation stim[2] = { { a, 0, X }, { a, 1, Y } };
+        CHECK(rx_world_publish_external(&e.w, ext, stim, 2) == 3, "halt stimulus");
+        CHECK(wait_seat(&e.w, seat) == 0, "halt claim posted");
+        CHECK(rx_resident_seat_step(&e.w) == 1, "halt step");
+
+        RxHaltStatus h;
+        CHECK(rx_world_emergency_stop(&e.w, SUBJ_OPERATOR, &op, halt, 17, &h) == RX_OK && h.halted,
+              "emergency stop on last slot");
+        CHECK(h.crumb == 0 && e.w.n_crumbs == 3,
+              "emergency stop stole reserved slot (crumb=%llu n=%llu)",
+              (unsigned long long)h.crumb, (unsigned long long)e.w.n_crumbs);
+        CHECK(rx_resident_accept(&e.w) == RX_ERR_HALTED,
+              "halted accept did not return RX_ERR_HALTED");
+        CHECK(e.w.n_crumbs == 4 && !e.w.reactions[seat].resident_seat &&
+              window_field(&e.w, b.id, 0) == 0 && field_of(&e.w, b, 0) == 0,
+              "halted last-slot cleanup failed");
+        CHECK(rx_world_emergency_resume(&e.w, SUBJ_OPERATOR, &op, halt, &h) == RX_OK && !h.halted,
+              "emergency resume on full log");
+        CHECK(rx_world_wait_quiescent(&e.w, 1000) == RX_OK, "halted quiescence timed out");
+        CHECK(e.w.n_crumbs == 4 && !e.w.reactions[seat].resident_seat &&
+              e.w.reactions[seat].commits == 0 && e.w.in_flight == 0,
+              "post-resume full-log invariants failed (n=%llu commits=%llu in_flight=%u)",
+              (unsigned long long)e.w.n_crumbs,
+              (unsigned long long)e.w.reactions[seat].commits, e.w.in_flight);
+        env_stop(&e);
+    }
+
+    {
+        /* (4) World teardown with an in-flight claim settles and tears down cleanly. */
+        Env e;
+        RxObjRef a, b;
+        uint32_t seat = UINT32_MAX;
+        RxCapRef ext;
+        CHECK(last_slot_setup(&e, 4, &a, &b, &seat, &ext) == 0, "teardown setup cap=4");
+        RxMutation stim[2] = { { a, 0, X }, { a, 1, Y } };
+        CHECK(rx_world_publish_external(&e.w, ext, stim, 2) == 3, "teardown stimulus");
+        CHECK(wait_seat(&e.w, seat) == 0, "teardown claim posted");
+        rx_world_destroy(&e.w);
+        CHECK(!e.w.reactions[seat].resident_seat, "teardown left resident_seat set");
+        aienos_cap_stop(e.admin, e.view);
+    }
+
+    {
+        /* (5) Zero slots remaining when woken: seat refuses cleanly without posting claim. */
+        Env e;
+        RxObjRef a, b;
+        uint32_t seat = UINT32_MAX;
+        RxCapRef ext;
+        CHECK(last_slot_setup(&e, 3, &a, &b, &seat, &ext) == 0, "zero-slot setup cap=3");
+        RxMutation stim[2] = { { a, 0, X }, { a, 1, Y } };
+        CHECK(rx_world_publish_external(&e.w, ext, stim, 2) == 3, "zero-slot stimulus crumb 3");
+        CHECK(rx_world_wait_quiescent(&e.w, 1000) == RX_OK, "zero-slot quiescence timed out");
+        CHECK(e.w.stats.resident_claims == 0 && !e.w.reactions[seat].resident_seat &&
+              e.w.stats.rejected >= 1 && e.w.stats.crumb_overflow >= 1 && e.w.n_crumbs == 3,
+              "zero-slot refusal invariant failed (claims=%llu rej=%llu ovf=%llu n=%llu)",
+              (unsigned long long)e.w.stats.resident_claims,
+              (unsigned long long)e.w.stats.rejected,
+              (unsigned long long)e.w.stats.crumb_overflow,
+              (unsigned long long)e.w.n_crumbs);
+        env_stop(&e);
+    }
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     t_shape();
@@ -823,6 +1017,7 @@ int main(void) {
     t_seat_lost_final();
     t_slot_renewal();
     t_emergency_stop();
+    t_resident_last_slot();
     printf("checks %d failures %d\n", g_checks, g_fail);
     write_receipt();
     return g_fail ? 1 : 0;

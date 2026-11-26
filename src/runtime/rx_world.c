@@ -185,7 +185,8 @@ static void add_parent(RxCrumb *k, uint64_t p) {
 /* Reserve room for one crumb. Caller holds mu through the matching append, so
  * no other publisher can consume the checked slot. */
 static int crumb_preflight(RxWorld *w) {
-    if (w->n_crumbs >= w->crumb_cap) {
+    if (w->reserved_crumbs >= w->crumb_cap ||
+        w->n_crumbs >= w->crumb_cap - w->reserved_crumbs) {
         w->stats.crumb_overflow++;
         return RX_ERR_FULL;
     }
@@ -226,6 +227,30 @@ static uint64_t crumb_append_preflighted(RxWorld *w, RxCrumb *k) {
     uint64_t id = crumb_append(w, k);
     if (id == 0) abort();
     return id;
+}
+
+/* Pin one causal-log receipt slot for a resident claim across the asynchronous
+ * seat window so concurrent publishers cannot starve completion or cancel. */
+static int crumb_reserve(RxWorld *w, RxReaction *r) {
+    if (!r || r->resident_crumb_reserved) abort();
+    if (crumb_preflight(w) != RX_OK) return RX_ERR_FULL;
+    w->reserved_crumbs++;
+    r->resident_crumb_reserved = true;
+    return RX_OK;
+}
+
+static void crumb_release_reservation(RxWorld *w, RxReaction *r) {
+    if (r && r->resident_crumb_reserved) {
+        r->resident_crumb_reserved = false;
+        if (w->reserved_crumbs > 0) w->reserved_crumbs--;
+    }
+}
+
+static uint64_t crumb_append_reserved(RxWorld *w, RxReaction *r, RxCrumb *k) {
+    if (!r || !r->resident_crumb_reserved || w->reserved_crumbs == 0) abort();
+    r->resident_crumb_reserved = false;
+    w->reserved_crumbs--;
+    return crumb_append_preflighted(w, k);
 }
 
 /* R6 containment engaged. The crumb names the reaction, the limit and the
@@ -1770,6 +1795,12 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
             if (d->caps[i].resource == w->objects[id].resource)
                 w->objects[id].cap = need_ref(w, d, i);
         }
+        if (crumb_reserve(w, r) != RX_OK) {
+            set_state(w, r, RX_REJECTED);
+            w->stats.rejected++;
+            end_activation(w, rid);
+            return;
+        }
         uint64_t seq = 0;
         int pr = rx_resident_post_claim(w, in, id, r->wake_cause, &seq);
         if (pr != RX_OK) {
@@ -1778,7 +1809,7 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
             k.kind = RX_CRUMB_FAILED;
             k.reason = pr;
             k.t_end_ns = now_ns();
-            crumb_append(w, &k);
+            crumb_append_reserved(w, r, &k);
             w->stats.failed++;
             end_activation(w, rid);
             return;
@@ -2191,6 +2222,12 @@ void rx_world_destroy(RxWorld *w) {
     pthread_cond_broadcast(&w->work_cv);
     pthread_mutex_unlock(&w->mu);
     for (uint32_t i = 0; i < w->n_workers; i++) pthread_join(w->workers[i], NULL);
+    for (uint32_t i = 0; i < w->n_reactions; i++) {
+        if (w->reactions[i].resident_crumb_reserved) {
+            crumb_release_reservation(w, &w->reactions[i]);
+            w->reactions[i].resident_seat = false;
+        }
+    }
     if (w->recorder_release) w->recorder_release(w->recorder_ctx);
     w->recorder = NULL;
     w->recorder_release = NULL;
@@ -2545,7 +2582,7 @@ static void seat_fail(RxWorld *w, uint32_t rid, RxCrumb *k, RxCrumbKind kind, in
     k->kind = kind;
     k->reason = reason;
     k->t_end_ns = now_ns();
-    crumb_append_preflighted(w, k);
+    crumb_append_reserved(w, r, k);
     r->resident_seat = false;
     w->stats.resident_closed++;
     if (kind == RX_CRUMB_INVALIDATED) w->stats.invalidations++;
@@ -2570,12 +2607,6 @@ int rx_resident_accept(RxWorld *w) {
         w->stats.gpu_polls_empty++;
         pthread_mutex_unlock(&w->mu);
         return RX_ERR_NOT_FOUND;
-    }
-    /* Leave the result ring and activation untouched when no causal record can
-     * be committed; the caller receives an explicit retry refusal. */
-    if (crumb_preflight(w) != RX_OK) {
-        pthread_mutex_unlock(&w->mu);
-        return RX_ERR_FULL;
     }
     OmegaSharedWorldDesc d;
     int tr = rx_resident_take_result(w, &d);
@@ -2629,7 +2660,7 @@ int rx_resident_accept(RxWorld *w) {
         k.kind = RX_CRUMB_CANCELLED;
         k.reason = RX_ERR_HALTED;
         k.t_end_ns = now_ns();
-        crumb_append_preflighted(w, &k);
+        crumb_append_reserved(w, r, &k);
         r->resident_seat = false;
         w->stats.resident_closed++;
         w->stats.resident_halted++;
@@ -2729,7 +2760,7 @@ int rx_resident_accept(RxWorld *w) {
     k.kind = RX_CRUMB_COMMIT;
     k.t_end_ns = now_ns();
     note_value(w, r, 1, f1);
-    uint64_t cid = crumb_append_preflighted(w, &k);
+    uint64_t cid = crumb_append_reserved(w, r, &k);
     set_state(w, r, RX_COMMITTED);
     w->stats.commits++;
     r->commits++;
@@ -2784,7 +2815,8 @@ int rx_resident_seat_lost(RxWorld *w, int retry) {
         k.kind = RX_CRUMB_FAILED;
         k.reason = RX_ERR_SEAT_LOST;
         k.t_end_ns = now_ns();
-        uint64_t fid = crumb_append(w, &k);
+        uint64_t fid = r->resident_crumb_reserved ? crumb_append_reserved(w, r, &k)
+                                                  : crumb_append(w, &k);
         r->resident_seat = false;
         w->stats.resident_closed++;
         w->stats.failed++;
