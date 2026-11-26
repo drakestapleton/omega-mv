@@ -1,0 +1,3067 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/infix/infix_front.om: Omega 1.0 Dual Surface Syntax Infix Frontend (pure seeded OM-2).
+note Library unit (no om2 header, no fn main; all symbols prefixed ix_ / IX_).
+note Parses clean human-readable infix Omega syntax and lowers deterministically to canonical
+note prefix OM-2 source that compiles with seed/out/omc and lowers via @ng front-ir to the exact
+note same canonical OIR and SHA-256 SEMANTIC_ID as hand-written prefix .om.
+note
+note Usage (linked with om_fmt.om or gate_infix.om):
+note   Fill ix_src[0..n), set ix_slen[0] = n, call ix_lower().
+note   Returns 0 (IX_OK) on success with canonical prefix OM-2 in ix_out[0..ix_olen[0]).
+note   Returns nonzero IX_ERR_* on any lexical, precedence, brace, operator, or reserved-word error
+note   (fail-closed, with line number in ix_st[1]).
+
+const IX_SRC_CAP ulong 262144
+const IX_OUT_CAP ulong 524288
+const IX_TOK_CAP ulong 65536
+const IX_NODE_CAP ulong 65536
+const IX_ARG_CAP ulong 65536
+const IX_MAX_DEPTH ulong 256
+
+note Error codes (0 = OK, nonzero = fail-closed refusal)
+const IX_OK ulong 0
+const IX_ERR_CAP ulong 1
+const IX_ERR_INVALID_OP ulong 2
+const IX_ERR_BAD_STR ulong 3
+const IX_ERR_BAD_NUM ulong 4
+const IX_ERR_UNCLOSED_BRACE ulong 5
+const IX_ERR_UNEXPECTED_BRACE ulong 6
+const IX_ERR_UNCLOSED_PAREN ulong 7
+const IX_ERR_PRECEDENCE ulong 8
+const IX_ERR_RESERVED ulong 9
+const IX_ERR_SYNTAX ulong 10
+const IX_ERR_DEPTH ulong 11
+const IX_ERR_RANGE ulong 12
+
+note Token kinds
+const IX_TK_EOF ulong 0
+const IX_TK_IDENT ulong 1
+const IX_TK_NUM ulong 2
+const IX_TK_STR ulong 3
+const IX_TK_COMMENT ulong 4
+const IX_TK_NL ulong 5
+const IX_TK_BLANK ulong 6
+const IX_TK_LPAREN ulong 10
+const IX_TK_RPAREN ulong 11
+const IX_TK_LBRACE ulong 12
+const IX_TK_RBRACE ulong 13
+const IX_TK_LBRACK ulong 14
+const IX_TK_RBRACK ulong 15
+const IX_TK_COMMA ulong 16
+const IX_TK_COLON ulong 17
+const IX_TK_SEMI ulong 18
+const IX_TK_DOT ulong 19
+const IX_TK_DOTDOT ulong 20
+const IX_TK_ARROW ulong 21
+const IX_TK_ASSIGN ulong 22
+const IX_TK_PLUS ulong 23
+const IX_TK_MINUS ulong 24
+const IX_TK_STAR ulong 25
+const IX_TK_SLASH ulong 26
+const IX_TK_PERCENT ulong 27
+const IX_TK_AMP ulong 28
+const IX_TK_PIPE ulong 29
+const IX_TK_CARET ulong 30
+const IX_TK_SHL ulong 31
+const IX_TK_SHR ulong 32
+const IX_TK_EQ ulong 33
+const IX_TK_NE ulong 34
+const IX_TK_LT ulong 35
+const IX_TK_LE ulong 36
+const IX_TK_GT ulong 37
+const IX_TK_GE ulong 38
+const IX_TK_ANDAND ulong 39
+const IX_TK_OROR ulong 40
+const IX_TK_BANG ulong 41
+const IX_TK_TILDE ulong 42
+const IX_TK_PLUSEQ ulong 43
+const IX_TK_MINUSEQ ulong 44
+const IX_TK_STAREQ ulong 45
+const IX_TK_AMPEQ ulong 46
+const IX_TK_PIPEEQ ulong 47
+const IX_TK_CARETEQ ulong 48
+const IX_TK_SHLEQ ulong 49
+const IX_TK_SHREQ ulong 50
+
+note AST node kinds
+const IX_N_ATOM ulong 1
+const IX_N_NEG_LIT ulong 2
+const IX_N_UNOP ulong 3
+const IX_N_BINOP ulong 4
+const IX_N_CAST ulong 5
+const IX_N_INDEX ulong 6
+const IX_N_FIELD ulong 7
+const IX_N_FINDEX ulong 8
+const IX_N_CALL ulong 9
+const IX_N_PART ulong 10
+const IX_N_BORROW ulong 11
+const IX_N_LEN ulong 12
+const IX_N_SIZEOF ulong 13
+const IX_N_OFFSETOF ulong 14
+const IX_N_NEW_ARR ulong 15
+const IX_N_NEW_STR ulong 16
+const IX_N_BITCAST ulong 17
+const IX_N_SEAL ulong 18
+
+note Binary op IDs (1..16)
+const IX_OP_ADD ulong 1
+const IX_OP_SUB ulong 2
+const IX_OP_MUL ulong 3
+const IX_OP_DIV ulong 4
+const IX_OP_REM ulong 5
+const IX_OP_AND ulong 6
+const IX_OP_OR ulong 7
+const IX_OP_XOR ulong 8
+const IX_OP_SHL ulong 9
+const IX_OP_SHR ulong 10
+const IX_OP_EQ ulong 11
+const IX_OP_NE ulong 12
+const IX_OP_LT ulong 13
+const IX_OP_LE ulong 14
+const IX_OP_GT ulong 15
+const IX_OP_GE ulong 16
+
+note Buffers and parser state
+global ix_src uchar 262144
+global ix_slen ulong 1
+global ix_out uchar 524288
+global ix_olen ulong 1
+
+global ix_tkind uchar 65536
+global ix_tpos uint 65536
+global ix_tlen uint 65536
+global ix_tline uint 65536
+global ix_tcnt ulong 1
+global ix_tcur ulong 1
+
+global ix_nkind uchar 65536
+global ix_na uint 65536
+global ix_nb uint 65536
+global ix_nc uint 65536
+global ix_args uint 65536
+global ix_ncnt ulong 1
+global ix_acnt ulong 1
+
+note ix_st: 0=err, 1=err_line, 2=om2_mode, 3=depth, 4=err_tok
+global ix_st ulong 8
+global ix_numbuf uchar 32
+
+note Keyword and reserved-word lookup tables
+text ix_tb_types "|bool|uchar|ushort|uint|ulong|byte|short|int|long|u8|u16|u32|u64|i8|i16|i32|i64|f32|f64|qty|"
+text ix_tb_kw_all "|fn|to|end|if|else|while|bound|for|in|unroll|break|continue|ret|return|let|put|get|len|new|global|text|const|struct|layout|field|at|little|big|abstract|ops|holds|view|edit|part|inline|export|requires|ensures|invariant|exit|trap|note|free|own|true|false|void|sizeof|offsetof|enlarge|add|sub|mul|div|rem|and|or|xor|shl|shr|eq|ne|lt|le|gt|ge|neg|not|rotr|rotl|bitcast|fsqrt|fabs|fmin|fmax|fma|"
+text ix_tb_kw_om2 "|out|fresh|seal|open|"
+text ix_tb_host "|read|write|fopen|fclose|fsync|fdsync|memfd|fchmod|chmod|faccess|syncfs|flock|umask|fseek|ftrunc|truncate|unlink|fstat|stat|lstat|pread|pwrite|chown|fchdir|makedir|rmdir|cwd|chdir|readlnk|getdnts|renames|link|symlnk|getuid|geteuid|getgid|getegid|getppid|setsid|getpgid|getsid|setpgid|fork|getpid|killpid|waitpid|pipefds|dupfd|execprog|argcnt|argread|envcnt|envread|execenv|prlimit|cpuset|cpuget|cpunow|setprio|getprio|execpure|shutdown|socknew|bind|connect|listen|accept|sockname|sockopt|recv|send|waitio|peercred|pollfds|sendmsg|peername|monons|realns|sleepns|random|dit|scrub|cpufence|cpurelax|devctl|mapnew|mapdrop|mapread|mapwrite|devcall|uvmctl|mapaddr|mapget|mapset|maphold|vfioctl|vfiomap|vfiomapw|eventfd|vfioirq|mapbind|kfdres|kfdmap|kfdctl|libfn|libptr|libcall|"
+text ix_tb_valfn "|rotr|rotl|fsqrt|fabs|fmin|fmax|fma|open|enlarge|"
+text ix_tb_voidhost "|cpufence|cpurelax|"
+
+note Keyword text literals for exact matching and prefix emission
+text ix_s_om2 "om2"
+text ix_s_target "target"
+text ix_s_usage "usage"
+text ix_s_note "note"
+text ix_s_const "const"
+text ix_s_global "global"
+text ix_s_text "text"
+text ix_s_struct "struct"
+text ix_s_layout "layout"
+text ix_s_field "field"
+text ix_s_at "at"
+text ix_s_little "little"
+text ix_s_big "big"
+text ix_s_abstract "abstract"
+text ix_s_ops "ops"
+text ix_s_holds "holds"
+text ix_s_export "export"
+text ix_s_inline "inline"
+text ix_s_fn "fn"
+text ix_s_to "to"
+text ix_s_void "void"
+text ix_s_end "end"
+text ix_s_if "if"
+text ix_s_else "else"
+text ix_s_while "while"
+text ix_s_bound "bound"
+text ix_s_for "for"
+text ix_s_in "in"
+text ix_s_unroll "unroll"
+text ix_s_ulong "ulong"
+text ix_s_return "return"
+text ix_s_ret "ret"
+text ix_s_break "break"
+text ix_s_continue "continue"
+text ix_s_exit "exit"
+text ix_s_trap "trap"
+text ix_s_requires "requires"
+text ix_s_ensures "ensures"
+text ix_s_invariant "invariant"
+text ix_s_let "let"
+text ix_s_put "put"
+text ix_s_get "get"
+text ix_s_new "new"
+text ix_s_len "len"
+text ix_s_sizeof "sizeof"
+text ix_s_offsetof "offsetof"
+text ix_s_part "part"
+text ix_s_view "view"
+text ix_s_edit "edit"
+text ix_s_out "out"
+text ix_s_fresh "fresh"
+text ix_s_bitcast "bitcast"
+text ix_s_seal "seal"
+text ix_s_true "true"
+text ix_s_false "false"
+text ix_s_neg "neg"
+text ix_s_not "not"
+text ix_s_debug "debug"
+text ix_s_release "release"
+text ix_s_diag "diag"
+text ix_s_fmt "fmt"
+text ix_s_zero "0"
+text ix_s_ops_p "add|sub|mul|div|rem|and|or|xor|shl|shr|eq|ne|lt|le|gt|ge|"
+text ix_s_errs "ok|capacity exceeded|invalid operator or character|malformed string literal|malformed number literal|unclosed brace|unexpected closing brace|unclosed parenthesis or bracket|malformed precedence|reserved word used as identifier|syntax error|nesting depth exceeded|invalid range or bound|"
+text ix_e_pfx "infix: line "
+text ix_e_sep ": error "
+text ix_e_col ": "
+text ix_e_nl "\n"
+
+note ---- Low-level byte, output, and error helpers ---------------------------------------------
+fn ix_byte p ulong to ulong
+if ge p get ix_slen 0
+ret 0
+end
+ret ulong get ix_src p
+end
+
+fn ix_fail code ulong line ulong to void
+if eq get ix_st 0 0
+put ix_st 0 code
+put ix_st 1 line
+end
+end
+
+fn ix_fail_cur code ulong to void
+idx = get ix_tcur 0
+line = ulong 1
+if lt idx get ix_tcnt 0
+line = ulong get ix_tline idx
+else
+if gt get ix_tcnt 0 0
+line = ulong get ix_tline sub get ix_tcnt 0 1
+end
+end
+ix_fail code line
+end
+
+fn ix_ok to bool
+ret eq get ix_st 0 0
+end
+
+fn ix_oc c ulong to void
+n = get ix_olen 0
+if ge n IX_OUT_CAP
+ix_fail IX_ERR_CAP 0
+ret
+end
+put ix_out n uchar c
+put ix_olen 0 add n 1
+end
+
+fn ix_os s view uchar * to void
+for i ulong len s bound 65536
+ix_oc ulong get s i
+end
+end
+
+fn ix_osp to void
+ix_oc 32
+end
+
+fn ix_onl to void
+ix_oc 10
+end
+
+fn ix_osrc pos ulong n ulong to void
+for i ulong n bound 65536
+ix_oc ix_byte add pos i
+end
+end
+
+fn ix_otok idx ulong to void
+ix_osrc ulong get ix_tpos idx ulong get ix_tlen idx
+end
+
+fn ix_is_alpha c ulong to bool
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 97 le c 122
+ret true
+end
+ret eq c 95
+end
+
+fn ix_is_digit c ulong to bool
+ret and ge c 48 le c 57
+end
+
+fn ix_is_hex c ulong to bool
+if ix_is_digit c
+ret true
+end
+ret and ge c 97 le c 102
+end
+
+fn ix_is_alnum c ulong to bool
+if ix_is_alpha c
+ret true
+end
+ret ix_is_digit c
+end
+
+note Exact match of ix_src[pos..pos+n) against literal s
+fn ix_span_eq pos ulong n ulong s view uchar * to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 256
+if ne ix_byte add pos i ulong get s i
+ret false
+end
+end
+ret true
+end
+
+note Membership of ix_src[pos..pos+n) in |word|word| table tbl
+fn ix_in_tbl tbl view uchar * pos ulong n ulong to bool
+if eq n 0
+ret false
+end
+tl = len tbl
+i = ulong 0
+while lt i tl bound 4096
+if eq get tbl i 124
+j = add i 1
+if le add j n tl
+if lt add j n tl
+if eq get tbl add j n 124
+m = true
+for k ulong n bound 64
+if ne ulong get tbl add j k ix_byte add pos k
+m = false
+break
+end
+end
+if m
+ret true
+end
+end
+end
+end
+end
+i = add i 1
+end
+ret false
+end
+
+fn ix_tok_eq idx ulong s view uchar * to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+if ne ulong get ix_tkind idx IX_TK_IDENT
+ret false
+end
+ret ix_span_eq ulong get ix_tpos idx ulong get ix_tlen idx s
+end
+
+fn ix_tok_num_eq idx ulong s view uchar * to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+if ne ulong get ix_tkind idx IX_TK_NUM
+ret false
+end
+ret ix_span_eq ulong get ix_tpos idx ulong get ix_tlen idx s
+end
+
+fn ix_is_type idx ulong to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+if ne ulong get ix_tkind idx IX_TK_IDENT
+ret false
+end
+ret ix_in_tbl ix_tb_types ulong get ix_tpos idx ulong get ix_tlen idx
+end
+
+fn ix_is_host idx ulong to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+if ne ulong get ix_tkind idx IX_TK_IDENT
+ret false
+end
+ret ix_in_tbl ix_tb_host ulong get ix_tpos idx ulong get ix_tlen idx
+end
+
+fn ix_is_valfn idx ulong to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+if ne ulong get ix_tkind idx IX_TK_IDENT
+ret false
+end
+ret ix_in_tbl ix_tb_valfn ulong get ix_tpos idx ulong get ix_tlen idx
+end
+
+fn ix_is_voidhost idx ulong to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+if ne ulong get ix_tkind idx IX_TK_IDENT
+ret false
+end
+ret ix_in_tbl ix_tb_voidhost ulong get ix_tpos idx ulong get ix_tlen idx
+end
+
+fn ix_is_reserved idx ulong to bool
+if ge idx get ix_tcnt 0
+ret true
+end
+if ne ulong get ix_tkind idx IX_TK_IDENT
+ret true
+end
+p = ulong get ix_tpos idx
+n = ulong get ix_tlen idx
+if ix_in_tbl ix_tb_types p n
+ret true
+end
+if ix_in_tbl ix_tb_kw_all p n
+ret true
+end
+if ix_in_tbl ix_tb_host p n
+ret true
+end
+if ne get ix_st 2 0
+if ix_in_tbl ix_tb_kw_om2 p n
+ret true
+end
+end
+ret false
+end
+
+note ---- Lexer ---------------------------------------------------------------------------------
+fn ix_push_tok kind ulong pos ulong n ulong line ulong to void
+cnt = get ix_tcnt 0
+if ge cnt IX_TOK_CAP
+ix_fail IX_ERR_CAP line
+ret
+end
+put ix_tkind cnt uchar kind
+put ix_tpos cnt uint pos
+put ix_tlen cnt uint n
+put ix_tline cnt uint line
+put ix_tcnt 0 add cnt 1
+end
+
+fn ix_lex_str p ulong line ulong to ulong
+n = get ix_slen 0
+q = add p 1
+while lt q n bound 262144
+c = ix_byte q
+if eq c 34
+ix_push_tok IX_TK_STR p sub add q 1 p line
+ret add q 1
+end
+if eq c 10
+ix_fail IX_ERR_BAD_STR line
+ret q
+end
+if eq c 92
+q = add q 1
+if ge q n
+ix_fail IX_ERR_BAD_STR line
+ret q
+end
+e = ix_byte q
+ok = false
+if eq e 110
+ok = true
+end
+if eq e 116
+ok = true
+end
+if eq e 92
+ok = true
+end
+if eq e 34
+ok = true
+end
+if not ok
+ix_fail IX_ERR_BAD_STR line
+ret q
+end
+end
+q = add q 1
+end
+ix_fail IX_ERR_BAD_STR line
+ret q
+end
+
+fn ix_lex_num p ulong line ulong to ulong
+n = get ix_slen 0
+q = p
+c0 = ix_byte q
+c1 = ix_byte add q 1
+note Hex literal: 0x[0-9a-f]+ (OM-2 lowercase hex only; uppercase refused)
+if and eq c0 48 or eq c1 120 eq c1 88
+if eq c1 88
+ix_fail IX_ERR_BAD_NUM line
+ret q
+end
+q = add q 2
+d = ulong 0
+while lt q n bound 64
+ch = ix_byte q
+if ix_is_hex ch
+q = add q 1
+d = add d 1
+else
+if and ge ch 65 le ch 70
+ix_fail IX_ERR_BAD_NUM line
+ret q
+end
+break
+end
+end
+if eq d 0
+ix_fail IX_ERR_BAD_NUM line
+ret q
+end
+ix_push_tok IX_TK_NUM p sub q p line
+ret q
+end
+note Decimal integer or float (careful: 0..n is integer 0 followed by .. range token)
+while lt q n bound 64
+if ix_is_digit ix_byte q
+q = add q 1
+else
+break
+end
+end
+if and eq ix_byte q 46 ix_is_digit ix_byte add q 1
+q = add q 1
+while lt q n bound 64
+if ix_is_digit ix_byte q
+q = add q 1
+else
+break
+end
+end
+ch = ix_byte q
+if or eq ch 101 eq ch 69
+q = add q 1
+sc = ix_byte q
+if or eq sc 43 eq sc 45
+q = add q 1
+end
+ed = ulong 0
+while lt q n bound 32
+if ix_is_digit ix_byte q
+q = add q 1
+ed = add ed 1
+else
+break
+end
+end
+if eq ed 0
+ix_fail IX_ERR_BAD_NUM line
+ret q
+end
+end
+if eq ix_byte q 102
+a1 = ix_byte add q 1
+a2 = ix_byte add q 2
+if or and eq a1 51 eq a2 50 and eq a1 54 eq a2 52
+q = add q 3
+else
+ix_fail IX_ERR_BAD_NUM line
+ret q
+end
+end
+end
+if ix_is_alpha ix_byte q
+ix_fail IX_ERR_BAD_NUM line
+ret q
+end
+ix_push_tok IX_TK_NUM p sub q p line
+ret q
+end
+
+fn ix_lex_op p ulong line ulong to ulong
+c = ix_byte p
+c2 = ix_byte add p 1
+c3 = ix_byte add p 2
+if eq c 40
+ix_push_tok IX_TK_LPAREN p 1 line
+ret add p 1
+end
+if eq c 41
+ix_push_tok IX_TK_RPAREN p 1 line
+ret add p 1
+end
+if eq c 123
+ix_push_tok IX_TK_LBRACE p 1 line
+ret add p 1
+end
+if eq c 125
+ix_push_tok IX_TK_RBRACE p 1 line
+ret add p 1
+end
+if eq c 91
+ix_push_tok IX_TK_LBRACK p 1 line
+ret add p 1
+end
+if eq c 93
+ix_push_tok IX_TK_RBRACK p 1 line
+ret add p 1
+end
+if eq c 44
+ix_push_tok IX_TK_COMMA p 1 line
+ret add p 1
+end
+if eq c 59
+ix_push_tok IX_TK_SEMI p 1 line
+ret add p 1
+end
+if eq c 58
+if or eq c2 58 eq c2 61
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+ix_push_tok IX_TK_COLON p 1 line
+ret add p 1
+end
+if eq c 46
+if eq c2 46
+if eq c3 46
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+ix_push_tok IX_TK_DOTDOT p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_DOT p 1 line
+ret add p 1
+end
+if eq c 43
+if eq c2 43
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_PLUSEQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_PLUS p 1 line
+ret add p 1
+end
+if eq c 45
+if eq c2 45
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+if eq c2 62
+ix_push_tok IX_TK_ARROW p 2 line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_MINUSEQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_MINUS p 1 line
+ret add p 1
+end
+if eq c 42
+if eq c2 42
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_STAREQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_STAR p 1 line
+ret add p 1
+end
+if eq c 47
+if or eq c2 42 eq c2 61
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+ix_push_tok IX_TK_SLASH p 1 line
+ret add p 1
+end
+if eq c 37
+if eq c2 61
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+ix_push_tok IX_TK_PERCENT p 1 line
+ret add p 1
+end
+if eq c 38
+if eq c2 38
+if eq c3 38
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+ix_push_tok IX_TK_ANDAND p 2 line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_AMPEQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_AMP p 1 line
+ret add p 1
+end
+if eq c 124
+if eq c2 124
+if eq c3 124
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+ix_push_tok IX_TK_OROR p 2 line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_PIPEEQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_PIPE p 1 line
+ret add p 1
+end
+if eq c 94
+if eq c2 61
+ix_push_tok IX_TK_CARETEQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_CARET p 1 line
+ret add p 1
+end
+if eq c 126
+if eq c2 61
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+ix_push_tok IX_TK_TILDE p 1 line
+ret add p 1
+end
+if eq c 61
+if eq c2 61
+if eq c3 61
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+ix_push_tok IX_TK_EQ p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_ASSIGN p 1 line
+ret add p 1
+end
+if eq c 33
+if eq c2 61
+if eq c3 61
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+ix_push_tok IX_TK_NE p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_BANG p 1 line
+ret add p 1
+end
+if eq c 60
+if eq c2 62
+ix_fail IX_ERR_INVALID_OP line
+ret add p 2
+end
+if eq c2 60
+if eq c3 60
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+if eq c3 61
+ix_push_tok IX_TK_SHLEQ p 3 line
+ret add p 3
+end
+ix_push_tok IX_TK_SHL p 2 line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_LE p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_LT p 1 line
+ret add p 1
+end
+if eq c 62
+if eq c2 62
+if eq c3 62
+ix_fail IX_ERR_INVALID_OP line
+ret add p 3
+end
+if eq c3 61
+ix_push_tok IX_TK_SHREQ p 3 line
+ret add p 3
+end
+ix_push_tok IX_TK_SHR p 2 line
+ret add p 2
+end
+if eq c2 61
+ix_push_tok IX_TK_GE p 2 line
+ret add p 2
+end
+ix_push_tok IX_TK_GT p 1 line
+ret add p 1
+end
+ix_fail IX_ERR_INVALID_OP line
+ret add p 1
+end
+
+fn ix_lex to void
+put ix_tcnt 0 0
+put ix_tcur 0 0
+n = get ix_slen 0
+p = ulong 0
+line = ulong 1
+bol = true
+while and lt p n ix_ok bound 524288
+c = ix_byte p
+if or eq c 32 or eq c 9 eq c 13
+p = add p 1
+continue
+end
+if eq c 10
+if bol
+ix_push_tok IX_TK_BLANK p 1 line
+else
+ix_push_tok IX_TK_NL p 1 line
+end
+p = add p 1
+line = add line 1
+bol = true
+continue
+end
+if and eq c 47 eq ix_byte add p 1 47
+q = add p 2
+while and lt q n ne ix_byte q 10 bound 262144
+q = add q 1
+end
+if bol
+clen = sub q add p 2
+if and gt clen 0 eq ix_byte add p 2 32
+ix_push_tok IX_TK_COMMENT add p 3 sub clen 1 line
+else
+ix_push_tok IX_TK_COMMENT add p 2 clen line
+end
+end
+p = q
+bol = false
+continue
+end
+if eq c 34
+p = ix_lex_str p line
+bol = false
+continue
+end
+if ix_is_digit c
+p = ix_lex_num p line
+bol = false
+continue
+end
+if ix_is_alpha c
+q = add p 1
+while and lt q n ix_is_alnum ix_byte q bound 128
+q = add q 1
+end
+ix_push_tok IX_TK_IDENT p sub q p line
+p = q
+bol = false
+continue
+end
+p = ix_lex_op p line
+bol = false
+end
+if ix_ok
+ix_push_tok IX_TK_EOF n 0 line
+end
+end
+
+note ---- Token cursor and AST builder helpers --------------------------------------------------
+fn ix_peek to ulong
+i = get ix_tcur 0
+if ge i get ix_tcnt 0
+ret IX_TK_EOF
+end
+ret ulong get ix_tkind i
+end
+
+fn ix_peek_n off ulong to ulong
+i = add get ix_tcur 0 off
+if ge i get ix_tcnt 0
+ret IX_TK_EOF
+end
+ret ulong get ix_tkind i
+end
+
+fn ix_take to ulong
+i = get ix_tcur 0
+if lt i get ix_tcnt 0
+put ix_tcur 0 add i 1
+end
+ret i
+end
+
+fn ix_skip_nl to void
+while or eq ix_peek IX_TK_NL eq ix_peek IX_TK_BLANK bound 65536
+ig = ix_take
+end
+end
+
+fn ix_expect kind ulong err_code ulong to bool
+if eq ix_peek kind
+ig = ix_take
+ret true
+end
+ix_fail_cur err_code
+ret false
+end
+
+fn ix_node kind ulong a ulong b ulong c ulong to ulong
+id = get ix_ncnt 0
+if ge id IX_NODE_CAP
+ix_fail_cur IX_ERR_CAP
+ret 0
+end
+put ix_nkind id uchar kind
+put ix_na id uint a
+put ix_nb id uint b
+put ix_nc id uint c
+put ix_ncnt 0 add id 1
+ret id
+end
+
+fn ix_arg_push v ulong to void
+id = get ix_acnt 0
+if ge id IX_ARG_CAP
+ix_fail_cur IX_ERR_CAP
+ret
+end
+put ix_args id uint v
+put ix_acnt 0 add id 1
+end
+
+fn ix_enter_depth to bool
+d = add get ix_st 3 1
+if gt d IX_MAX_DEPTH
+ix_fail_cur IX_ERR_DEPTH
+ret false
+end
+put ix_st 3 d
+ret true
+end
+
+fn ix_leave_depth to void
+d = get ix_st 3
+if gt d 0
+put ix_st 3 sub d 1
+end
+end
+
+note ---- Expression parser (precedence climbing / recursive descent) ---------------------------
+fn ix_parse_arglist to ulong
+note Returns packed (start << 32) | count; parses comma-separated exprs until RPAREN
+tmp = new uint 64 0
+ix_skip_nl
+if eq ix_peek IX_TK_RPAREN
+ig = ix_take
+ret shl get ix_acnt 0 32
+end
+cnt = ulong 0
+while ix_ok bound 65
+ix_skip_nl
+e = ix_parse_expr
+if not ix_ok
+ret 0
+end
+if ge cnt 64
+ix_fail_cur IX_ERR_CAP
+ret 0
+end
+put tmp cnt uint e
+cnt = add cnt 1
+ix_skip_nl
+if eq ix_peek IX_TK_COMMA
+ig = ix_take
+ix_skip_nl
+if eq ix_peek IX_TK_RPAREN
+ig = ix_take
+break
+end
+continue
+end
+if eq ix_peek IX_TK_RPAREN
+ig = ix_take
+break
+end
+ix_fail_cur IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+st = get ix_acnt 0
+for j ulong cnt bound 64
+ix_arg_push ulong get tmp j
+end
+ret or shl st 32 cnt
+end
+
+fn ix_parse_new to ulong
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+if not ix_expect IX_TK_SEMI IX_ERR_SYNTAX
+ret 0
+end
+sz = ix_take
+sk = ulong get ix_tkind sz
+if and ne sk IX_TK_NUM ne sk IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+ix_skip_nl
+init = ix_parse_expr
+ix_skip_nl
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_NEW_ARR ty sz init
+end
+nm = ix_take
+if ne ulong get ix_tkind nm IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+sz = ix_take
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+ix_skip_nl
+init = ix_parse_expr
+ix_skip_nl
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_NEW_ARR nm sz init
+end
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+pk = ix_parse_arglist
+ret ix_node IX_N_NEW_STR nm shr pk 32 and pk 0xffffffff
+end
+
+fn ix_parse_special id ulong to ulong
+if ix_tok_eq id ix_s_new
+ret ix_parse_new
+end
+if ix_tok_eq id ix_s_len
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+a = ix_take
+if ix_is_reserved a
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_LEN a 0 0
+end
+if ix_tok_eq id ix_s_sizeof
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+a = ix_take
+if ne ulong get ix_tkind a IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_SIZEOF a 0 0
+end
+if ix_tok_eq id ix_s_offsetof
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+s = ix_take
+if not ix_expect IX_TK_COMMA IX_ERR_SYNTAX
+ret 0
+end
+f = ix_take
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_OFFSETOF s f 0
+end
+if ix_tok_eq id ix_s_part
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+a = ix_take
+if ix_is_reserved a
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+if not ix_expect IX_TK_COMMA IX_ERR_SYNTAX
+ret 0
+end
+off = ix_parse_expr
+if not ix_expect IX_TK_COMMA IX_ERR_SYNTAX
+ret 0
+end
+cnt = ix_parse_expr
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_PART a off cnt
+end
+if or ix_tok_eq id ix_s_view ix_tok_eq id ix_s_edit
+md = ulong 0
+if ix_tok_eq id ix_s_edit
+md = 1
+end
+hp = false
+if eq ix_peek IX_TK_LPAREN
+ig = ix_take
+hp = true
+end
+a = ix_take
+if ix_is_reserved a
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+if hp
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+end
+ret ix_node IX_N_BORROW md a 0
+end
+if ix_tok_eq id ix_s_bitcast
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+if not ix_expect IX_TK_COMMA IX_ERR_SYNTAX
+ret 0
+end
+v = ix_parse_expr
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_BITCAST ty v 0
+end
+if ix_tok_eq id ix_s_seal
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret 0
+end
+ty = ix_take
+if not ix_expect IX_TK_COMMA IX_ERR_SYNTAX
+ret 0
+end
+v = ix_parse_expr
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_SEAL ty v 0
+end
+if or ix_tok_eq id ix_s_neg ix_tok_eq id ix_s_not
+if ne ix_peek IX_TK_LPAREN
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+ig = ix_take
+v = ix_parse_expr
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+op = ulong 1
+if ix_tok_eq id ix_s_not
+op = 2
+end
+ret ix_node IX_N_UNOP op v 0
+end
+ret 0
+end
+
+fn ix_is_special_kw id ulong to bool
+if ix_tok_eq id ix_s_new
+ret true
+end
+if ix_tok_eq id ix_s_len
+ret true
+end
+if ix_tok_eq id ix_s_sizeof
+ret true
+end
+if ix_tok_eq id ix_s_offsetof
+ret true
+end
+if ix_tok_eq id ix_s_part
+ret true
+end
+if ix_tok_eq id ix_s_view
+ret true
+end
+if ix_tok_eq id ix_s_edit
+ret true
+end
+if ix_tok_eq id ix_s_bitcast
+ret true
+end
+if ix_tok_eq id ix_s_seal
+ret true
+end
+if ix_tok_eq id ix_s_neg
+ret true
+end
+if ix_tok_eq id ix_s_not
+ret true
+end
+ret false
+end
+
+fn ix_parse_ident_expr id ulong to ulong
+if or ix_tok_eq id ix_s_true ix_tok_eq id ix_s_false
+ret ix_node IX_N_ATOM id 0 0
+end
+if ix_is_special_kw id
+ret ix_parse_special id
+end
+if ix_is_type id
+if ne ix_peek IX_TK_LPAREN
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+ig = ix_take
+ix_skip_nl
+e = ix_parse_expr
+ix_skip_nl
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_CAST id e 0
+end
+if or ix_is_valfn id ix_is_host id
+if ne ix_peek IX_TK_LPAREN
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+ig = ix_take
+pk = ix_parse_arglist
+ret ix_node IX_N_CALL id shr pk 32 and pk 0xffffffff
+end
+if ix_is_reserved id
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+if eq ix_peek IX_TK_LPAREN
+ig = ix_take
+pk = ix_parse_arglist
+ret ix_node IX_N_CALL id shr pk 32 and pk 0xffffffff
+end
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+idx = ix_parse_expr
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_INDEX id idx 0
+end
+if eq ix_peek IX_TK_DOT
+ig = ix_take
+fld = ix_take
+if ix_is_reserved fld
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+idx = ix_parse_expr
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret ix_node IX_N_FINDEX id fld idx
+end
+ret ix_node IX_N_FIELD id fld 0
+end
+ret ix_node IX_N_ATOM id 0 0
+end
+
+fn ix_parse_primary to ulong
+k = ix_peek
+if eq k IX_TK_LPAREN
+ig = ix_take
+ix_skip_nl
+if eq ix_peek IX_TK_RPAREN
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+e = ix_parse_expr
+ix_skip_nl
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret 0
+end
+ret e
+end
+if eq k IX_TK_NUM
+t = ix_take
+ret ix_node IX_N_ATOM t 0 0
+end
+if eq k IX_TK_IDENT
+id = ix_take
+ret ix_parse_ident_expr id
+end
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+
+fn ix_parse_unary to ulong
+if not ix_enter_depth
+ret 0
+end
+k = ix_peek
+res = ulong 0
+if or eq k IX_TK_BANG eq k IX_TK_TILDE
+ig = ix_take
+sub_e = ix_parse_unary
+res = ix_node IX_N_UNOP 2 sub_e 0
+else
+if eq k IX_TK_MINUS
+ig = ix_take
+if eq ix_peek IX_TK_NUM
+nt = ix_take
+res = ix_node IX_N_NEG_LIT nt 0 0
+else
+sub_e = ix_parse_unary
+res = ix_node IX_N_UNOP 1 sub_e 0
+end
+else
+res = ix_parse_primary
+end
+end
+ix_leave_depth
+ret res
+end
+
+fn ix_parse_mul to ulong
+lhs = ix_parse_unary
+while ix_ok bound 4096
+k = ix_peek
+op = ulong 0
+if eq k IX_TK_STAR
+op = IX_OP_MUL
+end
+if eq k IX_TK_SLASH
+op = IX_OP_DIV
+end
+if eq k IX_TK_PERCENT
+op = IX_OP_REM
+end
+if eq op 0
+break
+end
+ig = ix_take
+rhs = ix_parse_unary
+lhs = ix_node IX_N_BINOP op lhs rhs
+end
+ret lhs
+end
+
+fn ix_parse_add to ulong
+lhs = ix_parse_mul
+while ix_ok bound 4096
+k = ix_peek
+op = ulong 0
+if eq k IX_TK_PLUS
+op = IX_OP_ADD
+end
+if eq k IX_TK_MINUS
+op = IX_OP_SUB
+end
+if eq op 0
+break
+end
+ig = ix_take
+rhs = ix_parse_mul
+lhs = ix_node IX_N_BINOP op lhs rhs
+end
+ret lhs
+end
+
+fn ix_parse_shift to ulong
+lhs = ix_parse_add
+while ix_ok bound 4096
+k = ix_peek
+op = ulong 0
+if eq k IX_TK_SHL
+op = IX_OP_SHL
+end
+if eq k IX_TK_SHR
+op = IX_OP_SHR
+end
+if eq op 0
+break
+end
+ig = ix_take
+rhs = ix_parse_add
+lhs = ix_node IX_N_BINOP op lhs rhs
+end
+ret lhs
+end
+
+fn ix_parse_band to ulong
+lhs = ix_parse_shift
+while and ix_ok eq ix_peek IX_TK_AMP bound 4096
+ig = ix_take
+rhs = ix_parse_shift
+lhs = ix_node IX_N_BINOP IX_OP_AND lhs rhs
+end
+ret lhs
+end
+
+fn ix_parse_bxor to ulong
+lhs = ix_parse_band
+while and ix_ok eq ix_peek IX_TK_CARET bound 4096
+ig = ix_take
+rhs = ix_parse_band
+lhs = ix_node IX_N_BINOP IX_OP_XOR lhs rhs
+end
+ret lhs
+end
+
+fn ix_parse_bor to ulong
+lhs = ix_parse_bxor
+while and ix_ok eq ix_peek IX_TK_PIPE bound 4096
+ig = ix_take
+rhs = ix_parse_bxor
+lhs = ix_node IX_N_BINOP IX_OP_OR lhs rhs
+end
+ret lhs
+end
+
+fn ix_cmp_op k ulong to ulong
+if eq k IX_TK_EQ
+ret IX_OP_EQ
+end
+if eq k IX_TK_NE
+ret IX_OP_NE
+end
+if eq k IX_TK_LT
+ret IX_OP_LT
+end
+if eq k IX_TK_LE
+ret IX_OP_LE
+end
+if eq k IX_TK_GT
+ret IX_OP_GT
+end
+if eq k IX_TK_GE
+ret IX_OP_GE
+end
+ret 0
+end
+
+fn ix_parse_cmp to ulong
+lhs = ix_parse_bor
+op = ix_cmp_op ix_peek
+if eq op 0
+ret lhs
+end
+ig = ix_take
+rhs = ix_parse_bor
+if ne ix_cmp_op ix_peek 0
+note Chained non-associative comparison like a < b < c or x == y == z is refused fail-closed
+ix_fail_cur IX_ERR_PRECEDENCE
+ret 0
+end
+ret ix_node IX_N_BINOP op lhs rhs
+end
+
+fn ix_parse_land to ulong
+lhs = ix_parse_cmp
+while and ix_ok eq ix_peek IX_TK_ANDAND bound 4096
+ig = ix_take
+rhs = ix_parse_cmp
+lhs = ix_node IX_N_BINOP IX_OP_AND lhs rhs
+end
+ret lhs
+end
+
+fn ix_parse_expr to ulong
+if not ix_enter_depth
+ret 0
+end
+lhs = ix_parse_land
+while and ix_ok eq ix_peek IX_TK_OROR bound 4096
+ig = ix_take
+rhs = ix_parse_land
+lhs = ix_node IX_N_BINOP IX_OP_OR lhs rhs
+end
+ix_leave_depth
+ret lhs
+end
+
+note ---- Canonical Prefix Emitter for AST ------------------------------------------------------
+fn ix_emit_opname op ulong to void
+c = ulong 1
+s = ulong 0
+for i ulong len ix_s_ops_p bound 256
+if eq get ix_s_ops_p i 124
+if eq c op
+for j ulong sub i s bound 16
+ix_oc ulong get ix_s_ops_p add s j
+end
+ret
+end
+c = add c 1
+s = add i 1
+end
+end
+end
+
+fn ix_emit_expr nd ulong to void
+if not ix_ok
+ret
+end
+k = ulong get ix_nkind nd
+a = ulong get ix_na nd
+b = ulong get ix_nb nd
+c = ulong get ix_nc nd
+if eq k IX_N_ATOM
+ix_otok a
+ret
+end
+if eq k IX_N_NEG_LIT
+ix_oc 45
+ix_otok a
+ret
+end
+if eq k IX_N_UNOP
+if eq a 1
+ix_os ix_s_neg
+else
+ix_os ix_s_not
+end
+ix_osp
+ix_emit_expr b
+ret
+end
+if eq k IX_N_BINOP
+ix_emit_opname a
+ix_osp
+ix_emit_expr b
+ix_osp
+ix_emit_expr c
+ret
+end
+if eq k IX_N_CAST
+ix_otok a
+ix_osp
+ix_emit_expr b
+ret
+end
+if eq k IX_N_INDEX
+ix_os ix_s_get
+ix_osp
+ix_otok a
+ix_osp
+ix_emit_expr b
+ret
+end
+if eq k IX_N_FIELD
+ix_os ix_s_get
+ix_osp
+ix_otok a
+ix_osp
+ix_otok b
+ret
+end
+if eq k IX_N_FINDEX
+ix_os ix_s_get
+ix_osp
+ix_otok a
+ix_osp
+ix_otok b
+ix_osp
+ix_emit_expr c
+ret
+end
+if eq k IX_N_CALL
+ix_otok a
+for j ulong c bound 64
+ix_osp
+ix_emit_expr ulong get ix_args add b j
+end
+ret
+end
+if eq k IX_N_PART
+ix_os ix_s_part
+ix_osp
+ix_otok a
+ix_osp
+ix_emit_expr b
+ix_osp
+ix_emit_expr c
+ret
+end
+if eq k IX_N_BORROW
+if eq a 0
+ix_os ix_s_view
+else
+ix_os ix_s_edit
+end
+ix_osp
+ix_otok b
+ret
+end
+if eq k IX_N_LEN
+ix_os ix_s_len
+ix_osp
+ix_otok a
+ret
+end
+if eq k IX_N_SIZEOF
+ix_os ix_s_sizeof
+ix_osp
+ix_otok a
+ret
+end
+if eq k IX_N_OFFSETOF
+ix_os ix_s_offsetof
+ix_osp
+ix_otok a
+ix_osp
+ix_otok b
+ret
+end
+if eq k IX_N_NEW_ARR
+ix_os ix_s_new
+ix_osp
+ix_otok a
+ix_osp
+ix_otok b
+ix_osp
+ix_emit_expr c
+ret
+end
+if eq k IX_N_NEW_STR
+ix_os ix_s_new
+ix_osp
+ix_otok a
+for j ulong c bound 64
+ix_osp
+ix_emit_expr ulong get ix_args add b j
+end
+ret
+end
+if eq k IX_N_BITCAST
+ix_os ix_s_bitcast
+ix_osp
+ix_otok a
+ix_osp
+ix_emit_expr b
+ret
+end
+if eq k IX_N_SEAL
+ix_os ix_s_seal
+ix_osp
+ix_otok a
+ix_osp
+ix_emit_expr b
+ret
+end
+end
+
+note ---- Statement and Block Parser ------------------------------------------------------------
+fn ix_req_stmt_end to bool
+k = ix_peek
+if or eq k IX_TK_NL eq k IX_TK_SEMI
+ig = ix_take
+ret true
+end
+if or eq k IX_TK_RBRACE or eq k IX_TK_COMMENT eq k IX_TK_EOF
+ret true
+end
+ix_fail_cur IX_ERR_SYNTAX
+ret false
+end
+
+fn ix_compound_op k ulong to ulong
+if eq k IX_TK_PLUSEQ
+ret IX_OP_ADD
+end
+if eq k IX_TK_MINUSEQ
+ret IX_OP_SUB
+end
+if eq k IX_TK_STAREQ
+ret IX_OP_MUL
+end
+if eq k IX_TK_AMPEQ
+ret IX_OP_AND
+end
+if eq k IX_TK_PIPEEQ
+ret IX_OP_OR
+end
+if eq k IX_TK_CARETEQ
+ret IX_OP_XOR
+end
+if eq k IX_TK_SHLEQ
+ret IX_OP_SHL
+end
+if eq k IX_TK_SHREQ
+ret IX_OP_SHR
+end
+ret 0
+end
+
+fn ix_parse_bound_val to ulong
+if eq ix_peek IX_TK_NUM
+bt = ix_take
+if ix_tok_num_eq bt ix_s_zero
+ix_fail_cur IX_ERR_RANGE
+ret 0
+end
+ret bt
+end
+if eq ix_peek IX_TK_IDENT
+bt = ix_take
+if ix_is_reserved bt
+ix_fail_cur IX_ERR_RESERVED
+ret 0
+end
+ret bt
+end
+ix_fail_cur IX_ERR_SYNTAX
+ret 0
+end
+
+fn ix_emit_comment t ulong to void
+ix_os ix_s_note
+n = ulong get ix_tlen t
+if gt n 0
+ix_osp
+ix_otok t
+end
+ix_onl
+end
+
+fn ix_peek_non_nl to ulong
+i = get ix_tcur 0
+cnt = get ix_tcnt 0
+while lt i cnt bound 65536
+tk = ulong get ix_tkind i
+if and ne tk IX_TK_NL ne tk IX_TK_BLANK
+ret i
+end
+i = add i 1
+end
+ret cnt
+end
+
+fn ix_parse_if to void
+cond = ix_parse_expr
+if not ix_ok
+ret
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_if
+ix_osp
+ix_emit_expr cond
+ix_onl
+ix_parse_block
+if not ix_ok
+ret
+end
+extra = ulong 0
+while ix_ok bound 256
+nxt = ix_peek_non_nl
+if not ix_tok_eq nxt ix_s_else
+break
+end
+put ix_tcur 0 add nxt 1
+ix_os ix_s_else
+ix_onl
+if ix_tok_eq get ix_tcur 0 ix_s_if
+ig = ix_take
+c2 = ix_parse_expr
+if not ix_ok
+ret
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_if
+ix_osp
+ix_emit_expr c2
+ix_onl
+ix_parse_block
+extra = add extra 1
+continue
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_parse_block
+break
+end
+ix_os ix_s_end
+ix_onl
+for j ulong extra bound 256
+ix_os ix_s_end
+ix_onl
+end
+end
+
+fn ix_parse_while to void
+cond = ix_parse_expr
+if not ix_ok
+ret
+end
+has_b = false
+bt = ulong 0
+if ix_tok_eq get ix_tcur 0 ix_s_bound
+ig = ix_take
+bt = ix_parse_bound_val
+has_b = true
+end
+if not ix_ok
+ret
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_while
+ix_osp
+ix_emit_expr cond
+if has_b
+ix_osp
+ix_os ix_s_bound
+ix_osp
+ix_otok bt
+end
+ix_onl
+ix_parse_block
+if ix_ok
+ix_os ix_s_end
+ix_onl
+end
+end
+
+fn ix_parse_for to void
+v = ix_take
+if ix_is_reserved v
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+has_ty = false
+ty = ulong 0
+if eq ix_peek IX_TK_COLON
+ig = ix_take
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+has_ty = true
+end
+if not ix_tok_eq get ix_tcur 0 ix_s_in
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ig = ix_take
+z = ix_take
+if not ix_tok_num_eq z ix_s_zero
+ix_fail_cur IX_ERR_RANGE
+ret
+end
+if not ix_expect IX_TK_DOTDOT IX_ERR_SYNTAX
+ret
+end
+cnt = ix_parse_expr
+if not ix_ok
+ret
+end
+has_b = false
+bt = ulong 0
+has_u = false
+if ix_tok_eq get ix_tcur 0 ix_s_bound
+ig = ix_take
+bt = ix_parse_bound_val
+has_b = true
+else
+if ix_tok_eq get ix_tcur 0 ix_s_unroll
+ig = ix_take
+has_u = true
+end
+end
+if not ix_ok
+ret
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_for
+ix_osp
+ix_otok v
+ix_osp
+if has_ty
+ix_otok ty
+else
+ix_os ix_s_ulong
+end
+ix_osp
+ix_emit_expr cnt
+if has_b
+ix_osp
+ix_os ix_s_bound
+ix_osp
+ix_otok bt
+end
+if has_u
+ix_osp
+ix_os ix_s_unroll
+end
+ix_onl
+ix_parse_block
+if ix_ok
+ix_os ix_s_end
+ix_onl
+end
+end
+
+fn ix_parse_ident_stmt id ulong to void
+k = ix_peek
+if eq k IX_TK_ASSIGN
+if ix_is_reserved id
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+ig = ix_take
+e = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_otok id
+ix_osp
+ix_oc 61
+ix_osp
+ix_emit_expr e
+ix_onl
+ret
+end
+cop = ix_compound_op k
+if ne cop 0
+if ix_is_reserved id
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+ig = ix_take
+e = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_otok id
+ix_osp
+ix_oc 61
+ix_osp
+ix_emit_opname cop
+ix_osp
+ix_otok id
+ix_osp
+ix_emit_expr e
+ix_onl
+ret
+end
+if eq k IX_TK_LBRACK
+if ix_is_reserved id
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+ig = ix_take
+idx = ix_parse_expr
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+if not ix_expect IX_TK_ASSIGN IX_ERR_SYNTAX
+ret
+end
+val = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_put
+ix_osp
+ix_otok id
+ix_osp
+ix_emit_expr idx
+ix_osp
+ix_emit_expr val
+ix_onl
+ret
+end
+if eq k IX_TK_DOT
+if ix_is_reserved id
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+ig = ix_take
+fld = ix_take
+if ix_is_reserved fld
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+idx = ix_parse_expr
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+if not ix_expect IX_TK_ASSIGN IX_ERR_SYNTAX
+ret
+end
+val = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_put
+ix_osp
+ix_otok id
+ix_osp
+ix_otok fld
+ix_osp
+ix_emit_expr idx
+ix_osp
+ix_emit_expr val
+ix_onl
+ret
+end
+if not ix_expect IX_TK_ASSIGN IX_ERR_SYNTAX
+ret
+end
+val = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_put
+ix_osp
+ix_otok id
+ix_osp
+ix_otok fld
+ix_osp
+ix_emit_expr val
+ix_onl
+ret
+end
+if eq k IX_TK_LPAREN
+if and ix_is_reserved id not ix_is_voidhost id
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+ig = ix_take
+pk = ix_parse_arglist
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+st = shr pk 32
+cnt = and pk 0xffffffff
+ix_otok id
+for j ulong cnt bound 64
+ix_osp
+ix_emit_expr ulong get ix_args add st j
+end
+ix_onl
+ret
+end
+ix_fail_cur IX_ERR_SYNTAX
+end
+
+fn ix_is_end_tok nk ulong to bool
+if eq nk IX_TK_NL
+ret true
+end
+if eq nk IX_TK_SEMI
+ret true
+end
+if eq nk IX_TK_RBRACE
+ret true
+end
+if eq nk IX_TK_COMMENT
+ret true
+end
+ret eq nk IX_TK_EOF
+end
+
+fn ix_parse_stmt to void
+k = ix_peek
+if ne k IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+id = ix_take
+if ix_tok_eq id ix_s_if
+ix_parse_if
+ret
+end
+if ix_tok_eq id ix_s_while
+ix_parse_while
+ret
+end
+if ix_tok_eq id ix_s_for
+ix_parse_for
+ret
+end
+if or ix_tok_eq id ix_s_return ix_tok_eq id ix_s_ret
+nk = ix_peek
+if ix_is_end_tok nk
+if or eq nk IX_TK_NL eq nk IX_TK_SEMI
+ig = ix_take
+end
+ix_os ix_s_ret
+ix_onl
+ret
+end
+e = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_ret
+ix_osp
+ix_emit_expr e
+ix_onl
+ret
+end
+if ix_tok_eq id ix_s_break
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_break
+ix_onl
+ret
+end
+if ix_tok_eq id ix_s_continue
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_continue
+ix_onl
+ret
+end
+if ix_tok_eq id ix_s_exit
+hp = false
+if eq ix_peek IX_TK_LPAREN
+ig = ix_take
+hp = true
+end
+e = ix_parse_expr
+if hp
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret
+end
+end
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_exit
+ix_osp
+ix_emit_expr e
+ix_onl
+ret
+end
+if ix_tok_eq id ix_s_trap
+hp = false
+if eq ix_peek IX_TK_LPAREN
+ig = ix_take
+hp = true
+end
+nt = ix_take
+if ne ulong get ix_tkind nt IX_TK_NUM
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if hp
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret
+end
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_trap
+ix_osp
+ix_otok nt
+ix_onl
+ret
+end
+if or ix_tok_eq id ix_s_requires or ix_tok_eq id ix_s_ensures ix_tok_eq id ix_s_invariant
+e = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_otok id
+ix_osp
+ix_emit_expr e
+ix_onl
+ret
+end
+if ix_tok_eq id ix_s_let
+v = ix_take
+if ix_is_reserved v
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if not ix_expect IX_TK_ASSIGN IX_ERR_SYNTAX
+ret
+end
+e = ix_parse_expr
+if not ix_ok
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_otok v
+ix_osp
+ix_oc 61
+ix_osp
+ix_emit_expr e
+ix_onl
+ret
+end
+ix_parse_ident_stmt id
+end
+
+fn ix_parse_block to void
+if not ix_enter_depth
+ret
+end
+while ix_ok bound 262144
+k = ix_peek
+if or eq k IX_TK_NL eq k IX_TK_SEMI
+ig = ix_take
+continue
+end
+if eq k IX_TK_BLANK
+ig = ix_take
+ix_onl
+continue
+end
+if eq k IX_TK_COMMENT
+t = ix_take
+ix_emit_comment t
+continue
+end
+if eq k IX_TK_RBRACE
+ig = ix_take
+ix_leave_depth
+ret
+end
+if eq k IX_TK_EOF
+ix_fail_cur IX_ERR_UNCLOSED_BRACE
+ix_leave_depth
+ret
+end
+ix_parse_stmt
+end
+ix_leave_depth
+end
+
+note ---- Top-level Declaration Parsers ---------------------------------------------------------
+fn ix_parse_slice_type mode ulong to void
+note Emits " <type> <size>" or " <type> *" or " <struct>" + optional " fresh"
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok ty
+if eq ix_peek IX_TK_SEMI
+ig = ix_take
+if eq ix_peek IX_TK_STAR
+ig = ix_take
+ix_osp
+ix_oc 42
+else
+sz = ix_take
+sk = ulong get ix_tkind sz
+if and ne sk IX_TK_NUM ne sk IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok sz
+end
+else
+ix_osp
+ix_oc 42
+end
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+else
+ty = ix_take
+if ne ulong get ix_tkind ty IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok ty
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+if eq ix_peek IX_TK_RBRACK
+ig = ix_take
+ix_osp
+ix_oc 42
+else
+if eq ix_peek IX_TK_STAR
+ig = ix_take
+ix_osp
+ix_oc 42
+else
+sz = ix_take
+ix_osp
+ix_otok sz
+end
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+end
+else
+if eq ix_peek IX_TK_STAR
+ig = ix_take
+ix_osp
+ix_oc 42
+else
+if eq ix_peek IX_TK_NUM
+sz = ix_take
+ix_osp
+ix_otok sz
+end
+end
+end
+end
+if and eq mode 1 ix_tok_eq get ix_tcur 0 ix_s_fresh
+ig = ix_take
+ix_osp
+ix_os ix_s_fresh
+end
+end
+
+fn ix_parse_param to void
+pn = ix_take
+if ix_is_reserved pn
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if not ix_expect IX_TK_COLON IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok pn
+cur = get ix_tcur 0
+if ix_tok_eq cur ix_s_view
+ig = ix_take
+ix_osp
+ix_os ix_s_view
+ix_parse_slice_type 0
+ret
+end
+if ix_tok_eq cur ix_s_edit
+ig = ix_take
+ix_osp
+ix_os ix_s_edit
+ix_parse_slice_type 1
+ret
+end
+if ix_tok_eq cur ix_s_out
+ig = ix_take
+ix_osp
+ix_os ix_s_out
+ix_parse_slice_type 2
+ret
+end
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok ty
+end
+
+fn ix_parse_fn has_exp bool has_inl bool to void
+fname = ix_take
+if ix_is_reserved fname
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if has_exp
+ix_os ix_s_export
+ix_osp
+end
+ix_os ix_s_fn
+ix_osp
+ix_otok fname
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret
+end
+ix_skip_nl
+if ne ix_peek IX_TK_RPAREN
+while ix_ok bound 32
+ix_skip_nl
+ix_parse_param
+if not ix_ok
+ret
+end
+ix_skip_nl
+if eq ix_peek IX_TK_COMMA
+ig = ix_take
+ix_skip_nl
+if eq ix_peek IX_TK_RPAREN
+break
+end
+continue
+end
+break
+end
+end
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret
+end
+ix_osp
+ix_os ix_s_to
+ix_osp
+if eq ix_peek IX_TK_ARROW
+ig = ix_take
+rt = ix_take
+if and not ix_is_type rt not ix_tok_eq rt ix_s_void
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_otok rt
+else
+if or eq ix_peek IX_TK_LBRACE or eq ix_peek IX_TK_NL ix_tok_eq get ix_tcur 0 ix_s_inline
+ix_os ix_s_void
+else
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+end
+inl = has_inl
+if ix_tok_eq get ix_tcur 0 ix_s_inline
+ig = ix_take
+inl = true
+end
+if inl
+ix_osp
+ix_os ix_s_inline
+end
+ix_onl
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_parse_block
+if ix_ok
+ix_os ix_s_end
+ix_onl
+end
+end
+
+fn ix_parse_const to void
+nm = ix_take
+if ix_is_reserved nm
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if not ix_expect IX_TK_COLON IX_ERR_SYNTAX
+ret
+end
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_expect IX_TK_ASSIGN IX_ERR_SYNTAX
+ret
+end
+negf = false
+if eq ix_peek IX_TK_MINUS
+ig = ix_take
+negf = true
+end
+lit = ix_take
+lk = ulong get ix_tkind lit
+ok = eq lk IX_TK_NUM
+if and not negf or ix_tok_eq lit ix_s_true ix_tok_eq lit ix_s_false
+ok = true
+end
+if not ok
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_const
+ix_osp
+ix_otok nm
+ix_osp
+ix_otok ty
+ix_osp
+if negf
+ix_oc 45
+end
+ix_otok lit
+ix_onl
+end
+
+fn ix_parse_global to void
+nm = ix_take
+if ix_is_reserved nm
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if not ix_expect IX_TK_COLON IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_global
+ix_osp
+ix_otok nm
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_expect IX_TK_SEMI IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok ty
+ix_osp
+if eq ix_peek IX_TK_STAR
+ig = ix_take
+ix_oc 42
+else
+sz = ix_take
+sk = ulong get ix_tkind sz
+if and ne sk IX_TK_NUM ne sk IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_otok sz
+end
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+else
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_expect IX_TK_LBRACK IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok ty
+ix_osp
+if eq ix_peek IX_TK_STAR
+ig = ix_take
+ix_oc 42
+else
+sz = ix_take
+ix_otok sz
+end
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+end
+if not ix_req_stmt_end
+ret
+end
+ix_onl
+end
+
+fn ix_parse_text to void
+nm = ix_take
+if ix_is_reserved nm
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if eq ix_peek IX_TK_ASSIGN
+ig = ix_take
+end
+st = ix_take
+if ne ulong get ix_tkind st IX_TK_STR
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_req_stmt_end
+ret
+end
+ix_os ix_s_text
+ix_osp
+ix_otok nm
+ix_osp
+ix_otok st
+ix_onl
+end
+
+fn ix_parse_struct to void
+nm = ix_take
+if ix_is_reserved nm
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_struct
+ix_osp
+ix_otok nm
+while ix_ok bound 512
+k = ix_peek
+if or eq k IX_TK_NL or eq k IX_TK_COMMA eq k IX_TK_SEMI
+ig = ix_take
+continue
+end
+if eq k IX_TK_RBRACE
+ig = ix_take
+break
+end
+if eq k IX_TK_EOF
+ix_fail_cur IX_ERR_UNCLOSED_BRACE
+ret
+end
+fnm = ix_take
+if ix_is_reserved fnm
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if not ix_expect IX_TK_COLON IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok fnm
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_expect IX_TK_SEMI IX_ERR_SYNTAX
+ret
+end
+sz = ix_take
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+ix_osp
+ix_otok ty
+ix_osp
+ix_otok sz
+else
+ty = ix_take
+if not ix_is_type ty
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_otok ty
+end
+end
+ix_osp
+ix_os ix_s_end
+ix_onl
+end
+
+fn ix_parse_layout to void
+nm = ix_take
+if ix_is_reserved nm
+ix_fail_cur IX_ERR_RESERVED
+ret
+end
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret
+end
+sz = ix_take
+if ne ulong get ix_tkind sz IX_TK_NUM
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+if not ix_expect IX_TK_RPAREN IX_ERR_UNCLOSED_PAREN
+ret
+end
+ix_skip_nl
+if not ix_expect IX_TK_LBRACE IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_layout
+ix_osp
+ix_otok nm
+ix_osp
+ix_otok sz
+ix_onl
+while ix_ok bound 512
+k = ix_peek
+if or eq k IX_TK_NL or eq k IX_TK_COMMA eq k IX_TK_SEMI
+ig = ix_take
+continue
+end
+if eq k IX_TK_RBRACE
+ig = ix_take
+break
+end
+if eq k IX_TK_EOF
+ix_fail_cur IX_ERR_UNCLOSED_BRACE
+ret
+end
+if not ix_tok_eq get ix_tcur 0 ix_s_field
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ig = ix_take
+fnm = ix_take
+if not ix_expect IX_TK_COLON IX_ERR_SYNTAX
+ret
+end
+ix_os ix_s_field
+ix_osp
+ix_otok fnm
+if eq ix_peek IX_TK_LBRACK
+ig = ix_take
+ty = ix_take
+if not ix_expect IX_TK_SEMI IX_ERR_SYNTAX
+ret
+end
+cnt = ix_take
+if not ix_expect IX_TK_RBRACK IX_ERR_UNCLOSED_PAREN
+ret
+end
+ix_osp
+ix_otok ty
+ix_osp
+ix_otok cnt
+else
+ty = ix_take
+ix_osp
+ix_otok ty
+end
+if not ix_tok_eq get ix_tcur 0 ix_s_at
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ig = ix_take
+off = ix_take
+en = ix_take
+if and not ix_tok_eq en ix_s_little not ix_tok_eq en ix_s_big
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_os ix_s_at
+ix_osp
+ix_otok off
+ix_osp
+ix_otok en
+ix_onl
+end
+ix_os ix_s_end
+ix_onl
+end
+
+fn ix_parse_abstract to void
+nm = ix_take
+if not ix_expect IX_TK_COLON IX_ERR_SYNTAX
+ret
+end
+ty = ix_take
+ix_os ix_s_abstract
+ix_osp
+ix_otok nm
+ix_osp
+ix_otok ty
+if ix_tok_eq get ix_tcur 0 ix_s_ops
+ig = ix_take
+if not ix_expect IX_TK_LPAREN IX_ERR_SYNTAX
+ret
+end
+ix_osp
+ix_os ix_s_ops
+while ix_ok bound 16
+if eq ix_peek IX_TK_RPAREN
+ig = ix_take
+break
+end
+op = ix_take
+ix_osp
+ix_otok op
+if eq ix_peek IX_TK_COMMA
+ig = ix_take
+end
+end
+end
+ix_onl
+end
+
+fn ix_parse_holds to void
+nm = ix_take
+pr = ix_take
+ix_os ix_s_holds
+ix_osp
+ix_otok nm
+ix_osp
+ix_otok pr
+ix_onl
+end
+
+fn ix_parse_top to void
+while ix_ok bound 65536
+k = ix_peek
+if or eq k IX_TK_NL eq k IX_TK_SEMI
+ig = ix_take
+continue
+end
+if eq k IX_TK_BLANK
+ig = ix_take
+ix_onl
+continue
+end
+if eq k IX_TK_COMMENT
+t = ix_take
+ix_emit_comment t
+continue
+end
+if eq k IX_TK_EOF
+ret
+end
+if eq k IX_TK_RBRACE
+ix_fail_cur IX_ERR_UNEXPECTED_BRACE
+ret
+end
+if ne k IX_TK_IDENT
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+id = ix_take
+if ix_tok_eq id ix_s_om2
+put ix_st 2 1
+ix_os ix_s_om2
+while and ix_ok eq ix_peek IX_TK_IDENT bound 8
+md = ix_take
+ix_osp
+ix_otok md
+end
+ix_onl
+continue
+end
+if ix_tok_eq id ix_s_target
+tg = ix_take
+ix_os ix_s_target
+ix_osp
+ix_otok tg
+ix_onl
+continue
+end
+if ix_tok_eq id ix_s_usage
+ix_os ix_s_usage
+ix_onl
+continue
+end
+if ix_tok_eq id ix_s_const
+ix_parse_const
+continue
+end
+if ix_tok_eq id ix_s_global
+ix_parse_global
+continue
+end
+if ix_tok_eq id ix_s_text
+ix_parse_text
+continue
+end
+if ix_tok_eq id ix_s_struct
+ix_parse_struct
+continue
+end
+if ix_tok_eq id ix_s_layout
+ix_parse_layout
+continue
+end
+if ix_tok_eq id ix_s_abstract
+ix_parse_abstract
+continue
+end
+if ix_tok_eq id ix_s_holds
+ix_parse_holds
+continue
+end
+if ix_tok_eq id ix_s_fn
+ix_parse_fn false false
+continue
+end
+if ix_tok_eq id ix_s_export
+inl = false
+if ix_tok_eq get ix_tcur 0 ix_s_inline
+ig = ix_take
+inl = true
+end
+if not ix_tok_eq get ix_tcur 0 ix_s_fn
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ig = ix_take
+ix_parse_fn true inl
+continue
+end
+if ix_tok_eq id ix_s_inline
+if not ix_tok_eq get ix_tcur 0 ix_s_fn
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+ig = ix_take
+ix_parse_fn false true
+continue
+end
+ix_fail_cur IX_ERR_SYNTAX
+ret
+end
+end
+
+note ---- Public Entrypoint and Diagnostic Writer -----------------------------------------------
+fn ix_lower to ulong
+put ix_olen 0 0
+put ix_ncnt 0 0
+put ix_acnt 0 0
+put ix_st 0 0
+put ix_st 1 0
+put ix_st 2 0
+put ix_st 3 0
+put ix_st 4 0
+ix_lex
+if not ix_ok
+ret get ix_st 0
+end
+ix_parse_top
+ret get ix_st 0
+end
+
+fn ix_write_u fd int v ulong to void
+x = v
+i = ulong 32
+for j ulong 21
+i = sub i 1
+put ix_numbuf i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd ix_numbuf i sub 32 i
+ret
+end
+end
+end
+
+fn ix_write_err fd int to void
+r1 = write fd ix_e_pfx 0 len ix_e_pfx
+ix_write_u fd get ix_st 1
+r2 = write fd ix_e_sep 0 len ix_e_sep
+code = get ix_st 0
+ix_write_u fd code
+r3 = write fd ix_e_col 0 len ix_e_col
+c = ulong 0
+s = ulong 0
+for i ulong len ix_s_errs bound 512
+if eq get ix_s_errs i 124
+if eq c code
+r4 = write fd ix_s_errs s sub i s
+break
+end
+c = add c 1
+s = add i 1
+end
+end
+r5 = write fd ix_e_nl 0 len ix_e_nl
+end

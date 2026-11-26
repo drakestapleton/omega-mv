@@ -1,0 +1,2042 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/infix/om_fmt.om: Omega 1.0 Bidirectional Surface Formatter (pure seeded OM-2).
+note Program-mode CLI linked after seed/ng/infix/infix_front.om:
+note   (printf 'om2\n'; cat seed/ng/infix/infix_front.om seed/ng/infix/om_fmt.om) \
+note     | seed/out/omc > om-fmt
+note
+note CLI modes:
+note   om-fmt --to-infix   reads canonical prefix .om on stdin, prints clean readable infix on stdout
+note   om-fmt --to-prefix  reads clean infix Omega on stdin, prints canonical prefix OM-2 on stdout
+note Exit 0 on success; nonzero with diagnostic on stderr on malformed input or invalid usage.
+
+const FM_MAX_FNS ulong 4096
+const FM_MAX_STRS ulong 512
+const FM_MAX_FLDS ulong 4096
+const FM_MAX_LOCS ulong 512
+const FM_MAX_BLKS ulong 256
+
+note Block stack tags for --to-infix
+const FM_BLK_FN ulong 1
+const FM_BLK_IF ulong 2
+const FM_BLK_ELSE ulong 3
+const FM_BLK_WHILE ulong 4
+const FM_BLK_FOR ulong 5
+const FM_BLK_LAYOUT ulong 6
+
+note Symbol tables populated by Pass 1 (functions, structs, layouts)
+global fm_fn_p uint 4096
+global fm_fn_l uint 4096
+global fm_fn_ar uchar 4096
+global fm_fn_rk uchar 4096
+global fm_fn_cnt ulong 1
+
+global fm_st_p uint 512
+global fm_st_l uint 512
+global fm_st_f0 uint 512
+global fm_st_fc uint 512
+global fm_st_cnt ulong 1
+
+global fm_fl_p uint 4096
+global fm_fl_l uint 4096
+global fm_fl_arr uchar 4096
+global fm_fl_bool uchar 4096
+global fm_fl_cnt ulong 1
+
+note Per-function local/param table: kind 0=scalar, 1=bool, 2=array, 3+sidx=struct/layout
+global fm_loc_p uint 512
+global fm_loc_l uint 512
+global fm_loc_k uint 512
+global fm_loc_cnt ulong 1
+
+note Block stack and per-node bool flag (parallel to ix_nkind[0..65535])
+global fm_blk uchar 256
+global fm_btop ulong 1
+global fm_nbool uchar 65536
+global fm_ind ulong 1
+global fm_line ulong 1
+global fm_in_lay ulong 1
+global fm_argb uchar 256
+
+note Complete built-in + host-word arity table (name:arity)
+text fm_tb_arity "|read:4|write:4|fclose:1|fsync:1|fchmod:2|fseek:3|socknew:3|listen:2|accept:2|fork:0|dupfd:3|monons:0|fopen:5|unlink:3|makedir:4|getdnts:4|connect:4|bind:4|waitpid:5|fstat:4|recv:5|send:5|sleepns:1|argcnt:0|argread:4|waitio:3|execprog:3|renames:4|rmdir:3|killpid:2|pipefds:4|getpid:0|realns:0|sockname:4|cwd:3|readlnk:6|sockopt:6|random:4|envcnt:0|envread:4|chdir:3|ftrunc:2|stat:6|link:3|symlnk:3|chmod:4|faccess:4|getuid:0|geteuid:0|getgid:0|getegid:0|lstat:6|truncate:4|chown:5|fchdir:1|getppid:0|umask:1|fdsync:1|memfd:4|setsid:0|getpgid:1|setpgid:2|pread:5|pwrite:5|getsid:1|syncfs:1|shutdown:2|devctl:5|mapnew:5|mapdrop:1|mapread:5|mapwrite:5|devcall:8|uvmctl:5|mapaddr:1|mapget:3|mapset:4|maphold:2|mapbind:4|flock:2|execpure:3|cpufence:0|cpurelax:0|peercred:4|pollfds:4|sendmsg:5|peername:4|vfioctl:5|vfiomap:4|vfiomapw:4|eventfd:1|vfioirq:5|execenv:6|prlimit:5|cpuset:4|cpuget:4|cpunow:0|setprio:3|getprio:2|libfn:1|libptr:3|libcall:4|dit:1|scrub:1|kfdres:1|kfdmap:3|fsqrt:1|fabs:1|rotr:2|rotl:2|fmin:2|fmax:2|fma:3|open:1|enlarge:2|"
+
+text fm_s_to_infix "--to-infix"
+text fm_s_to_prefix "--to-prefix"
+text fm_s_usage "usage: om-fmt --to-infix | --to-prefix\n"
+text fm_s_err_pfx "om-fmt: line "
+text fm_s_err_mid ": prefix syntax error\n"
+text fm_s_err_io "om-fmt: I/O error\n"
+text fm_s_bool "bool"
+text fm_s_arrow " -> "
+text fm_s_eq_sp " = "
+text fm_s_col_sp ": "
+text fm_s_com_sp ", "
+text fm_s_semi_sp "; "
+text fm_s_else_br "} else {"
+text fm_s_in_rng " in 0.."
+text fm_s_sl_sl "//"
+text fm_s_add "add"
+text fm_s_sub "sub"
+text fm_s_mul "mul"
+text fm_s_div "div"
+text fm_s_rem "rem"
+text fm_s_and "and"
+text fm_s_or "or"
+text fm_s_xor "xor"
+text fm_s_shl "shl"
+text fm_s_shr "shr"
+text fm_s_eq "eq"
+text fm_s_ne "ne"
+text fm_s_lt "lt"
+text fm_s_le "le"
+text fm_s_gt "gt"
+text fm_s_ge "ge"
+text fm_s_bin_sym "+|-|*|/|%|&|||^^|<<|>>|==|!=|<|<=|>|>=|"
+
+note ---- Prefix line tokenizer (reuses ix_tkind/ix_tpos/ix_tlen/ix_tcnt/ix_tcur per line) -----
+fn fm_span_eq_span p1 ulong l1 ulong p2 ulong l2 ulong to bool
+if ne l1 l2
+ret false
+end
+for i ulong l1 bound 128
+if ne ix_byte add p1 i ix_byte add p2 i
+ret false
+end
+end
+ret true
+end
+
+fn fm_w_eq idx ulong s view uchar * to bool
+if ge idx get ix_tcnt 0
+ret false
+end
+ret ix_span_eq ulong get ix_tpos idx ulong get ix_tlen idx s
+end
+
+fn fm_w_kind idx ulong to ulong
+if ge idx get ix_tcnt 0
+ret 0
+end
+ret ulong get ix_tkind idx
+end
+
+fn fm_is_wsep ch ulong to bool
+if eq ch 32
+ret true
+end
+if eq ch 9
+ret true
+end
+if eq ch 13
+ret true
+end
+if eq ch 40
+ret true
+end
+ret eq ch 41
+end
+
+note Tokenize ix_src[ls..lend) into ix_t* (kinds: 1=word, 3=string, 10=LPAREN, 11=RPAREN, 22=ASSIGN)
+fn fm_lex_line ls ulong lend ulong to void
+put ix_tcnt 0 0
+put ix_tcur 0 0
+p = ls
+while lt p lend bound 16384
+c = ix_byte p
+if or eq c 32 or eq c 9 eq c 13
+p = add p 1
+continue
+end
+if eq c 40
+ix_push_tok IX_TK_LPAREN p 1 get fm_line 0
+p = add p 1
+continue
+end
+if eq c 41
+ix_push_tok IX_TK_RPAREN p 1 get fm_line 0
+p = add p 1
+continue
+end
+if eq c 34
+q = add p 1
+while lt q lend bound 16384
+ch = ix_byte q
+if eq ch 92
+q = add q 2
+continue
+end
+if eq ch 34
+q = add q 1
+break
+end
+q = add q 1
+end
+ix_push_tok IX_TK_STR p sub q p get fm_line 0
+p = q
+continue
+end
+q = p
+while lt q lend bound 16384
+ch = ix_byte q
+if fm_is_wsep ch
+break
+end
+q = add q 1
+end
+if and eq sub q p 1 eq c 61
+ix_push_tok IX_TK_ASSIGN p 1 get fm_line 0
+else
+ix_push_tok IX_TK_IDENT p sub q p get fm_line 0
+end
+p = q
+end
+end
+
+fn fm_indent to void
+n = get fm_ind 0
+for i ulong n bound 64
+ix_osp
+ix_osp
+end
+end
+
+note ---- Symbol table helpers -----------------------------------------------------------------
+fn fm_find_fn p ulong l ulong to ulong
+cnt = get fm_fn_cnt 0
+for i ulong cnt bound 4096
+if fm_span_eq_span ulong get fm_fn_p i ulong get fm_fn_l i p l
+ret i
+end
+end
+ret 999999
+end
+
+fn fm_find_st p ulong l ulong to ulong
+cnt = get fm_st_cnt 0
+for i ulong cnt bound 512
+if fm_span_eq_span ulong get fm_st_p i ulong get fm_st_l i p l
+ret i
+end
+end
+ret 999999
+end
+
+fn fm_find_fld sidx ulong p ulong l ulong to ulong
+f0 = ulong get fm_st_f0 sidx
+fc = ulong get fm_st_fc sidx
+for i ulong fc bound 256
+fi = add f0 i
+if fm_span_eq_span ulong get fm_fl_p fi ulong get fm_fl_l fi p l
+ret fi
+end
+end
+ret 999999
+end
+
+fn fm_add_loc p ulong l ulong k ulong to void
+cnt = get fm_loc_cnt 0
+for i ulong cnt bound 512
+if fm_span_eq_span ulong get fm_loc_p i ulong get fm_loc_l i p l
+put fm_loc_k i uint k
+ret
+end
+end
+if lt cnt FM_MAX_LOCS
+put fm_loc_p cnt uint p
+put fm_loc_l cnt uint l
+put fm_loc_k cnt uint k
+put fm_loc_cnt 0 add cnt 1
+end
+end
+
+fn fm_find_loc p ulong l ulong to ulong
+cnt = get fm_loc_cnt 0
+for i ulong cnt bound 512
+if fm_span_eq_span ulong get fm_loc_p i ulong get fm_loc_l i p l
+ret ulong get fm_loc_k i
+end
+end
+ret 0
+end
+
+note Look up built-in / host word arity from fm_tb_arity; returns 99 if not found
+fn fm_builtin_arity p ulong l ulong to ulong
+if eq l 0
+ret 99
+end
+tl = len fm_tb_arity
+i = ulong 0
+while lt i tl bound 2048
+if eq get fm_tb_arity i 124
+j = add i 1
+if lt add j add l 1 tl
+if eq get fm_tb_arity add j l 58
+m = true
+for k ulong l bound 32
+if ne ulong get fm_tb_arity add j k ix_byte add p k
+m = false
+break
+end
+end
+if m
+ret ulong sub get fm_tb_arity add add j l 1 48
+end
+end
+end
+end
+i = add i 1
+end
+ret 99
+end
+
+fn fm_binop_id idx ulong to ulong
+if fm_w_eq idx fm_s_add
+ret IX_OP_ADD
+end
+if fm_w_eq idx fm_s_sub
+ret IX_OP_SUB
+end
+if fm_w_eq idx fm_s_mul
+ret IX_OP_MUL
+end
+if fm_w_eq idx fm_s_div
+ret IX_OP_DIV
+end
+if fm_w_eq idx fm_s_rem
+ret IX_OP_REM
+end
+if fm_w_eq idx fm_s_and
+ret IX_OP_AND
+end
+if fm_w_eq idx fm_s_or
+ret IX_OP_OR
+end
+if fm_w_eq idx fm_s_xor
+ret IX_OP_XOR
+end
+if fm_w_eq idx fm_s_shl
+ret IX_OP_SHL
+end
+if fm_w_eq idx fm_s_shr
+ret IX_OP_SHR
+end
+if fm_w_eq idx fm_s_eq
+ret IX_OP_EQ
+end
+if fm_w_eq idx fm_s_ne
+ret IX_OP_NE
+end
+if fm_w_eq idx fm_s_lt
+ret IX_OP_LT
+end
+if fm_w_eq idx fm_s_le
+ret IX_OP_LE
+end
+if fm_w_eq idx fm_s_gt
+ret IX_OP_GT
+end
+if fm_w_eq idx fm_s_ge
+ret IX_OP_GE
+end
+ret 0
+end
+
+note ---- Pass 1: discover all functions, structs, and layouts ---------------------------------
+fn fm_p1_fn wi0 ulong to void
+wc = get ix_tcnt 0
+if ge wi0 wc
+ret
+end
+nm = wi0
+i = add wi0 1
+ar = ulong 0
+rk = ulong 2
+while lt i wc bound 128
+if fm_w_eq i ix_s_to
+if lt add i 1 wc
+rt = add i 1
+if fm_w_eq rt ix_s_void
+rk = 0
+else
+if fm_w_eq rt fm_s_bool
+rk = 1
+else
+rk = 2
+end
+end
+end
+break
+end
+ar = add ar 1
+i = add i 1
+if ge i wc
+break
+end
+if or fm_w_eq i ix_s_view or fm_w_eq i ix_s_edit fm_w_eq i ix_s_out
+is_ed = fm_w_eq i ix_s_edit
+i = add i 1
+if lt i wc
+ty = i
+i = add i 1
+if ix_is_type ty
+note array slice has explicit size or *
+if lt i wc
+i = add i 1
+end
+if and is_ed lt i wc
+if fm_w_eq i ix_s_fresh
+i = add i 1
+end
+end
+end
+end
+else
+i = add i 1
+end
+end
+fc = get fm_fn_cnt 0
+if lt fc FM_MAX_FNS
+put fm_fn_p fc uint ulong get ix_tpos nm
+put fm_fn_l fc uint ulong get ix_tlen nm
+put fm_fn_ar fc uchar ar
+put fm_fn_rk fc uchar rk
+put fm_fn_cnt 0 add fc 1
+end
+end
+
+fn fm_p1_add_field fnm ulong is_a bool is_b bool to ulong
+fi = get fm_fl_cnt 0
+if ge fi FM_MAX_FLDS
+ret 0
+end
+put fm_fl_p fi uint ulong get ix_tpos fnm
+put fm_fl_l fi uint ulong get ix_tlen fnm
+if is_a
+put fm_fl_arr fi uchar 1
+else
+put fm_fl_arr fi uchar 0
+end
+if is_b
+put fm_fl_bool fi uchar 1
+else
+put fm_fl_bool fi uchar 0
+end
+put fm_fl_cnt 0 add fi 1
+ret 1
+end
+
+fn fm_is_arr_cnt i ulong wc ulong to bool
+if ge i wc
+ret false
+end
+if fm_w_eq i ix_s_end
+ret false
+end
+if ix_is_digit ix_byte ulong get ix_tpos i
+ret true
+end
+if lt add i 1 wc
+if not ix_is_type add i 1
+ret true
+end
+end
+ret false
+end
+
+fn fm_p1_struct to void
+wc = get ix_tcnt 0
+if lt wc 3
+ret
+end
+sc = get fm_st_cnt 0
+if ge sc FM_MAX_STRS
+ret
+end
+put fm_st_p sc uint ulong get ix_tpos 1
+put fm_st_l sc uint ulong get ix_tlen 1
+put fm_st_f0 sc uint get fm_fl_cnt 0
+i = ulong 2
+fc = ulong 0
+while lt i wc bound 256
+if fm_w_eq i ix_s_end
+break
+end
+fnm = i
+i = add i 1
+if ge i wc
+break
+end
+is_b = fm_w_eq i fm_s_bool
+i = add i 1
+is_a = fm_is_arr_cnt i wc
+if is_a
+i = add i 1
+end
+fc = add fc fm_p1_add_field fnm is_a is_b
+end
+put fm_st_fc sc uint fc
+put fm_st_cnt 0 add sc 1
+end
+
+fn fm_pass1 to void
+put fm_fn_cnt 0 0
+put fm_st_cnt 0 0
+put fm_fl_cnt 0 0
+put fm_in_lay 0 0
+n = get ix_slen 0
+p = ulong 0
+in_l = false
+cur_s = ulong 0
+while lt p n bound 262144
+lend = p
+while and lt lend n ne ix_byte lend 10 bound 16384
+lend = add lend 1
+end
+fm_lex_line p lend
+wc = get ix_tcnt 0
+if gt wc 0
+if in_l
+if fm_w_eq 0 ix_s_end
+in_l = false
+else
+if and fm_w_eq 0 ix_s_field ge wc 4
+fi = get fm_fl_cnt 0
+if lt fi FM_MAX_FLDS
+put fm_fl_p fi uint ulong get ix_tpos 1
+put fm_fl_l fi uint ulong get ix_tlen 1
+if fm_w_eq 3 ix_s_at
+put fm_fl_arr fi uchar 0
+else
+put fm_fl_arr fi uchar 1
+end
+if fm_w_eq 2 fm_s_bool
+put fm_fl_bool fi uchar 1
+else
+put fm_fl_bool fi uchar 0
+end
+put fm_fl_cnt 0 add fi 1
+put fm_st_fc cur_s uint add ulong get fm_st_fc cur_s 1
+end
+end
+end
+else
+if fm_w_eq 0 ix_s_fn
+fm_p1_fn 1
+else
+if and fm_w_eq 0 ix_s_export and gt wc 2 fm_w_eq 1 ix_s_fn
+fm_p1_fn 2
+else
+if fm_w_eq 0 ix_s_struct
+fm_p1_struct
+else
+if and fm_w_eq 0 ix_s_layout ge wc 3
+sc = get fm_st_cnt 0
+if lt sc FM_MAX_STRS
+put fm_st_p sc uint ulong get ix_tpos 1
+put fm_st_l sc uint ulong get ix_tlen 1
+put fm_st_f0 sc uint get fm_fl_cnt 0
+put fm_st_fc sc uint 0
+put fm_st_cnt 0 add sc 1
+cur_s = sc
+in_l = true
+end
+end
+end
+end
+end
+end
+end
+if lt lend n
+p = add lend 1
+else
+p = lend
+end
+end
+end
+
+note ---- Pass 2: Prefix Expression Parser -> AST ----------------------------------------------
+fn fm_mknode kind ulong a ulong b ulong c ulong isb ulong to ulong
+id = ix_node kind a b c
+if ix_ok
+put fm_nbool id uchar isb
+end
+ret id
+end
+
+fn fm_parse_pget wc ulong to ulong
+arr = ix_take
+if ge arr wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret 0
+end
+lk = fm_find_loc ulong get ix_tpos arr ulong get ix_tlen arr
+if ge lk 3
+sidx = sub lk 3
+fld = ix_take
+if ge fld wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret 0
+end
+fi = fm_find_fld sidx ulong get ix_tpos fld ulong get ix_tlen fld
+is_af = false
+is_bf = ulong 0
+if lt fi FM_MAX_FLDS
+if ne get fm_fl_arr fi 0
+is_af = true
+end
+if ne get fm_fl_bool fi 0
+is_bf = 1
+end
+end
+if is_af
+idx = fm_parse_pexpr
+ret fm_mknode IX_N_FINDEX arr fld idx is_bf
+end
+ret fm_mknode IX_N_FIELD arr fld 0 is_bf
+end
+idx = fm_parse_pexpr
+ret fm_mknode IX_N_INDEX arr idx 0 0
+end
+
+fn fm_parse_pexpr to ulong
+if not ix_enter_depth
+ret 0
+end
+wi = get ix_tcur 0
+wc = get ix_tcnt 0
+if ge wi wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ix_leave_depth
+ret 0
+end
+note Optional grouping parens in prefix Omega: ( expr )
+if eq fm_w_kind wi IX_TK_LPAREN
+put ix_tcur 0 add wi 1
+e = fm_parse_pexpr
+c2 = get ix_tcur 0
+if or ge c2 wc ne fm_w_kind c2 IX_TK_RPAREN
+ix_fail IX_ERR_UNCLOSED_PAREN get fm_line 0
+ix_leave_depth
+ret 0
+end
+put ix_tcur 0 add c2 1
+ix_leave_depth
+ret e
+end
+if ne fm_w_kind wi IX_TK_IDENT
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ix_leave_depth
+ret 0
+end
+put ix_tcur 0 add wi 1
+bop = fm_binop_id wi
+if ne bop 0
+lhs = fm_parse_pexpr
+rhs = fm_parse_pexpr
+isb = ulong 0
+if ge bop IX_OP_EQ
+isb = 1
+else
+if or eq bop IX_OP_AND eq bop IX_OP_OR
+if or ne get fm_nbool lhs 0 ne get fm_nbool rhs 0
+isb = 1
+end
+end
+end
+res = fm_mknode IX_N_BINOP bop lhs rhs isb
+ix_leave_depth
+ret res
+end
+if or fm_w_eq wi ix_s_neg fm_w_eq wi ix_s_not
+uop = ulong 1
+if fm_w_eq wi ix_s_not
+uop = 2
+end
+ch = fm_parse_pexpr
+isb = ulong 0
+if and eq uop 2 ne get fm_nbool ch 0
+isb = 1
+end
+res = fm_mknode IX_N_UNOP uop ch 0 isb
+ix_leave_depth
+ret res
+end
+if ix_is_type wi
+ch = fm_parse_pexpr
+isb = ulong 0
+if fm_w_eq wi fm_s_bool
+isb = 1
+end
+res = fm_mknode IX_N_CAST wi ch 0 isb
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_get
+res = fm_parse_pget wc
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_len
+a = ix_take
+if ge a wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ix_leave_depth
+ret 0
+end
+res = fm_mknode IX_N_LEN a 0 0 0
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_sizeof
+a = ix_take
+res = fm_mknode IX_N_SIZEOF a 0 0 0
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_offsetof
+s = ix_take
+f = ix_take
+res = fm_mknode IX_N_OFFSETOF s f 0 0
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_part
+a = ix_take
+off = fm_parse_pexpr
+cnt = fm_parse_pexpr
+res = fm_mknode IX_N_PART a off cnt 0
+ix_leave_depth
+ret res
+end
+if or fm_w_eq wi ix_s_view fm_w_eq wi ix_s_edit
+md = ulong 0
+if fm_w_eq wi ix_s_edit
+md = 1
+end
+a = ix_take
+res = fm_mknode IX_N_BORROW md a 0 0
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_bitcast
+ty = ix_take
+v = fm_parse_pexpr
+res = fm_mknode IX_N_BITCAST ty v 0 0
+ix_leave_depth
+ret res
+end
+if fm_w_eq wi ix_s_seal
+ty = ix_take
+v = fm_parse_pexpr
+res = fm_mknode IX_N_SEAL ty v 0 0
+ix_leave_depth
+ret res
+end
+p0 = ulong get ix_tpos wi
+l0 = ulong get ix_tlen wi
+ba = fm_builtin_arity p0 l0
+if ne ba 99
+res = fm_parse_pcall wi ba 0
+ix_leave_depth
+ret res
+end
+fi = fm_find_fn p0 l0
+if lt fi FM_MAX_FNS
+ar = ulong get fm_fn_ar fi
+isb = ulong 0
+if eq get fm_fn_rk fi 1
+isb = 1
+end
+res = fm_parse_pcall wi ar isb
+ix_leave_depth
+ret res
+end
+isb = ulong 0
+if or fm_w_eq wi ix_s_true fm_w_eq wi ix_s_false
+isb = 1
+else
+if eq fm_find_loc p0 l0 1
+isb = 1
+end
+end
+res = fm_mknode IX_N_ATOM wi 0 0 isb
+ix_leave_depth
+ret res
+end
+
+fn fm_parse_pcall fnw ulong ar ulong isb ulong to ulong
+tmp = new uint 16 0
+for j ulong ar bound 16
+e = fm_parse_pexpr
+if not ix_ok
+ret 0
+end
+put tmp j uint e
+end
+st = get ix_acnt 0
+for j ulong ar bound 16
+ix_arg_push ulong get tmp j
+end
+ret fm_mknode IX_N_CALL fnw st ar isb
+end
+
+note ---- Infix Expression Pretty-Printer ------------------------------------------------------
+fn fm_op_prec op ulong isb ulong to ulong
+if eq op IX_OP_OR
+if ne isb 0
+ret 1
+end
+ret 4
+end
+if eq op IX_OP_AND
+if ne isb 0
+ret 2
+end
+ret 6
+end
+if ge op IX_OP_EQ
+ret 3
+end
+if eq op IX_OP_XOR
+ret 5
+end
+if or eq op IX_OP_SHL eq op IX_OP_SHR
+ret 7
+end
+if or eq op IX_OP_ADD eq op IX_OP_SUB
+ret 8
+end
+ret 9
+end
+
+fn fm_emit_binsym op ulong isb ulong to void
+if and eq op IX_OP_AND ne isb 0
+ix_oc 38
+ix_oc 38
+ret
+end
+if and eq op IX_OP_OR ne isb 0
+ix_oc 124
+ix_oc 124
+ret
+end
+if eq op IX_OP_ADD
+ix_oc 43
+ret
+end
+if eq op IX_OP_SUB
+ix_oc 45
+ret
+end
+if eq op IX_OP_MUL
+ix_oc 42
+ret
+end
+if eq op IX_OP_DIV
+ix_oc 47
+ret
+end
+if eq op IX_OP_REM
+ix_oc 37
+ret
+end
+if eq op IX_OP_AND
+ix_oc 38
+ret
+end
+if eq op IX_OP_OR
+ix_oc 124
+ret
+end
+if eq op IX_OP_XOR
+ix_oc 94
+ret
+end
+if eq op IX_OP_SHL
+ix_oc 60
+ix_oc 60
+ret
+end
+if eq op IX_OP_SHR
+ix_oc 62
+ix_oc 62
+ret
+end
+if eq op IX_OP_EQ
+ix_oc 61
+ix_oc 61
+ret
+end
+if eq op IX_OP_NE
+ix_oc 33
+ix_oc 61
+ret
+end
+if eq op IX_OP_LT
+ix_oc 60
+ret
+end
+if eq op IX_OP_LE
+ix_oc 60
+ix_oc 61
+ret
+end
+if eq op IX_OP_GT
+ix_oc 62
+ret
+end
+if eq op IX_OP_GE
+ix_oc 62
+ix_oc 61
+ret
+end
+end
+
+fn fm_need_parens myp ulong parp ulong is_r ulong to bool
+if eq parp 0
+ret false
+end
+if lt myp parp
+ret true
+end
+if and eq myp parp ne is_r 0
+ret true
+end
+note Parenthesize mixed bitwise/shift/arith/cmp for crystal clarity: e.g. (v >> 16) & 255
+if and ge parp 4 le parp 6
+if ne myp parp
+ret true
+end
+end
+if eq parp 7
+if eq myp 8
+ret true
+end
+end
+if and ge myp 4 le myp 7
+if or eq parp 3 or eq parp 8 eq parp 9
+ret true
+end
+end
+ret false
+end
+
+fn fm_is_num_tok tid ulong to bool
+p = ulong get ix_tpos tid
+c = ix_byte p
+if ix_is_digit c
+ret true
+end
+if and eq c 45 ix_is_digit ix_byte add p 1
+ret true
+end
+ret false
+end
+
+fn fm_emit_infix nd ulong parp ulong is_r ulong to void
+k = ulong get ix_nkind nd
+a = ulong get ix_na nd
+b = ulong get ix_nb nd
+c = ulong get ix_nc nd
+isb = ulong get fm_nbool nd
+if eq k IX_N_ATOM
+ix_otok a
+ret
+end
+if eq k IX_N_BINOP
+myp = fm_op_prec a isb
+wrap = fm_need_parens myp parp is_r
+if wrap
+ix_oc 40
+end
+fm_emit_infix b myp 0
+ix_osp
+fm_emit_binsym a isb
+ix_osp
+fm_emit_infix c myp 1
+if wrap
+ix_oc 41
+end
+ret
+end
+if eq k IX_N_UNOP
+if eq a 1
+ix_oc 45
+ck = ulong get ix_nkind b
+wrap_u = eq ck IX_N_BINOP
+if eq ck IX_N_ATOM
+if fm_is_num_tok ulong get ix_na b
+wrap_u = true
+end
+end
+if wrap_u
+ix_oc 40
+fm_emit_infix b 0 0
+ix_oc 41
+else
+fm_emit_infix b 10 0
+end
+ret
+end
+if ne isb 0
+ix_oc 33
+else
+ix_oc 126
+end
+ck = ulong get ix_nkind b
+if eq ck IX_N_BINOP
+ix_oc 40
+fm_emit_infix b 0 0
+ix_oc 41
+else
+fm_emit_infix b 10 0
+end
+ret
+end
+if eq k IX_N_CAST
+ix_otok a
+ix_oc 40
+fm_emit_infix b 0 0
+ix_oc 41
+ret
+end
+if eq k IX_N_INDEX
+ix_otok a
+ix_oc 91
+fm_emit_infix b 0 0
+ix_oc 93
+ret
+end
+if eq k IX_N_FIELD
+ix_otok a
+ix_oc 46
+ix_otok b
+ret
+end
+if eq k IX_N_FINDEX
+ix_otok a
+ix_oc 46
+ix_otok b
+ix_oc 91
+fm_emit_infix c 0 0
+ix_oc 93
+ret
+end
+if eq k IX_N_CALL
+ix_otok a
+ix_oc 40
+for j ulong c bound 64
+if gt j 0
+ix_os fm_s_com_sp
+end
+fm_emit_infix ulong get ix_args add b j 0 0
+end
+ix_oc 41
+ret
+end
+if eq k IX_N_PART
+ix_os ix_s_part
+ix_oc 40
+ix_otok a
+ix_os fm_s_com_sp
+fm_emit_infix b 0 0
+ix_os fm_s_com_sp
+fm_emit_infix c 0 0
+ix_oc 41
+ret
+end
+if eq k IX_N_BORROW
+if eq a 0
+ix_os ix_s_view
+else
+ix_os ix_s_edit
+end
+ix_oc 40
+ix_otok b
+ix_oc 41
+ret
+end
+if eq k IX_N_LEN
+ix_os ix_s_len
+ix_oc 40
+ix_otok a
+ix_oc 41
+ret
+end
+if eq k IX_N_SIZEOF
+ix_os ix_s_sizeof
+ix_oc 40
+ix_otok a
+ix_oc 41
+ret
+end
+if eq k IX_N_OFFSETOF
+ix_os ix_s_offsetof
+ix_oc 40
+ix_otok a
+ix_os fm_s_com_sp
+ix_otok b
+ix_oc 41
+ret
+end
+if eq k IX_N_BITCAST
+ix_os ix_s_bitcast
+ix_oc 40
+ix_otok a
+ix_os fm_s_com_sp
+fm_emit_infix b 0 0
+ix_oc 41
+ret
+end
+if eq k IX_N_SEAL
+ix_os ix_s_seal
+ix_oc 40
+ix_otok a
+ix_os fm_s_com_sp
+fm_emit_infix b 0 0
+ix_oc 41
+ret
+end
+end
+
+note ---- Pass 2: Statement and Top-Level Prefix -> Infix Renderer -----------------------------
+fn fm_push_blk tag ulong to void
+bt = get fm_btop 0
+if ge bt FM_MAX_BLKS
+ix_fail IX_ERR_DEPTH get fm_line 0
+ret
+end
+put fm_blk bt uchar tag
+put fm_btop 0 add bt 1
+end
+
+fn fm_emit_fn_param i ulong wc ulong to ulong
+pn = i
+ix_otok pn
+ix_os fm_s_col_sp
+j = add i 1
+if ge j wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret wc
+end
+if or fm_w_eq j ix_s_view or fm_w_eq j ix_s_edit fm_w_eq j ix_s_out
+is_ed = fm_w_eq j ix_s_edit
+ix_otok j
+ix_osp
+j = add j 1
+ty = j
+j = add j 1
+if ix_is_type ty
+ix_oc 91
+ix_otok ty
+ix_os fm_s_semi_sp
+ix_otok j
+ix_oc 93
+j = add j 1
+fm_add_loc ulong get ix_tpos pn ulong get ix_tlen pn 2
+if and is_ed lt j wc
+if fm_w_eq j ix_s_fresh
+ix_osp
+ix_os ix_s_fresh
+j = add j 1
+end
+end
+else
+ix_otok ty
+si = fm_find_st ulong get ix_tpos ty ulong get ix_tlen ty
+if lt si FM_MAX_STRS
+fm_add_loc ulong get ix_tpos pn ulong get ix_tlen pn add 3 si
+end
+end
+ret j
+end
+ix_otok j
+if fm_w_eq j fm_s_bool
+fm_add_loc ulong get ix_tpos pn ulong get ix_tlen pn 1
+else
+fm_add_loc ulong get ix_tpos pn ulong get ix_tlen pn 0
+end
+ret add j 1
+end
+
+fn fm_emit_fn_line is_exp bool wi0 ulong to void
+wc = get ix_tcnt 0
+if ge wi0 wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+put fm_loc_cnt 0 0
+if is_exp
+ix_os ix_s_export
+ix_osp
+end
+ix_os ix_s_fn
+ix_osp
+ix_otok wi0
+ix_oc 40
+i = add wi0 1
+pno = ulong 0
+while and lt i wc ix_ok bound 128
+if fm_w_eq i ix_s_to
+break
+end
+if gt pno 0
+ix_os fm_s_com_sp
+end
+i = fm_emit_fn_param i wc
+pno = add pno 1
+end
+if not ix_ok
+ret
+end
+if or ge i wc not fm_w_eq i ix_s_to
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_oc 41
+ix_os fm_s_arrow
+i = add i 1
+if ge i wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_otok i
+i = add i 1
+if lt i wc
+if fm_w_eq i ix_s_inline
+ix_osp
+ix_os ix_s_inline
+i = add i 1
+end
+end
+if ne i wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_osp
+ix_oc 123
+ix_onl
+fm_push_blk FM_BLK_FN
+put fm_ind 0 add get fm_ind 0 1
+end
+
+fn fm_emit_sfield fnm ulong ty ulong is_a bool cnt ulong to void
+ix_osp
+ix_osp
+ix_otok fnm
+ix_os fm_s_col_sp
+if is_a
+ix_oc 91
+ix_otok ty
+ix_os fm_s_semi_sp
+ix_otok cnt
+ix_oc 93
+else
+ix_otok ty
+end
+ix_oc 44
+ix_onl
+end
+
+fn fm_emit_struct_line to void
+wc = get ix_tcnt 0
+if lt wc 3
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_struct
+ix_osp
+ix_otok 1
+ix_osp
+ix_oc 123
+ix_onl
+i = ulong 2
+while lt i wc bound 256
+if fm_w_eq i ix_s_end
+break
+end
+fnm = i
+i = add i 1
+if ge i wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ty = i
+i = add i 1
+is_a = fm_is_arr_cnt i wc
+cnt = ulong 0
+if is_a
+cnt = i
+i = add i 1
+end
+fm_emit_sfield fnm ty is_a cnt
+end
+ix_oc 125
+ix_onl
+end
+
+fn fm_req_eol to void
+if ne get ix_tcur 0 get ix_tcnt 0
+ix_fail IX_ERR_SYNTAX get fm_line 0
+end
+end
+
+fn fm_emit_new_struct lhs ulong ty ulong si ulong vi ulong to void
+tmp = new uint 64 0
+fc = ulong get fm_st_fc si
+put ix_tcur 0 add vi 2
+for j ulong fc bound 64
+e = fm_parse_pexpr
+if not ix_ok
+ret
+end
+put tmp j uint e
+end
+fm_req_eol
+fm_add_loc ulong get ix_tpos lhs ulong get ix_tlen lhs add 3 si
+fm_indent
+ix_otok lhs
+ix_os fm_s_eq_sp
+ix_os ix_s_new
+ix_osp
+ix_otok ty
+ix_oc 40
+for j ulong fc bound 64
+if gt j 0
+ix_os fm_s_com_sp
+end
+fm_emit_infix ulong get tmp j 0 0
+end
+ix_oc 41
+ix_onl
+end
+
+fn fm_emit_stmt_line to void
+wc = get ix_tcnt 0
+put ix_ncnt 0 0
+put ix_acnt 0 0
+if fm_w_eq 0 ix_s_end
+if ne wc 1
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+bt = get fm_btop 0
+if eq bt 0
+ix_fail IX_ERR_UNEXPECTED_BRACE get fm_line 0
+ret
+end
+put fm_btop 0 sub bt 1
+if gt get fm_ind 0 0
+put fm_ind 0 sub get fm_ind 0 1
+end
+fm_indent
+ix_oc 125
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_else
+if ne wc 1
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+bt = get fm_btop 0
+if eq bt 0
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+if ne ulong get fm_blk sub bt 1 FM_BLK_IF
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+put fm_blk sub bt 1 uchar FM_BLK_ELSE
+put fm_ind 0 sub get fm_ind 0 1
+fm_indent
+ix_os fm_s_else_br
+ix_onl
+put fm_ind 0 add get fm_ind 0 1
+ret
+end
+if fm_w_eq 0 ix_s_if
+put ix_tcur 0 1
+c = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+ix_os ix_s_if
+ix_osp
+fm_emit_infix c 0 0
+ix_osp
+ix_oc 123
+ix_onl
+fm_push_blk FM_BLK_IF
+put fm_ind 0 add get fm_ind 0 1
+ret
+end
+if fm_w_eq 0 ix_s_while
+put ix_tcur 0 1
+c = fm_parse_pexpr
+if not ix_ok
+ret
+end
+has_b = false
+bt = ulong 0
+cur = get ix_tcur 0
+if and lt cur wc fm_w_eq cur ix_s_bound
+put ix_tcur 0 add cur 1
+bt = ix_take
+if ge bt wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+has_b = true
+end
+fm_req_eol
+fm_indent
+ix_os ix_s_while
+ix_osp
+fm_emit_infix c 0 0
+if has_b
+ix_osp
+ix_os ix_s_bound
+ix_osp
+ix_otok bt
+end
+ix_osp
+ix_oc 123
+ix_onl
+fm_push_blk FM_BLK_WHILE
+put fm_ind 0 add get fm_ind 0 1
+ret
+end
+if fm_w_eq 0 ix_s_for
+if lt wc 4
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+fm_add_loc ulong get ix_tpos 1 ulong get ix_tlen 1 0
+put ix_tcur 0 3
+cnt = fm_parse_pexpr
+if not ix_ok
+ret
+end
+has_b = false
+bt = ulong 0
+has_u = false
+cur = get ix_tcur 0
+if and lt cur wc fm_w_eq cur ix_s_bound
+put ix_tcur 0 add cur 1
+bt = ix_take
+if ge bt wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+has_b = true
+else
+if and lt cur wc fm_w_eq cur ix_s_unroll
+put ix_tcur 0 add cur 1
+has_u = true
+end
+end
+fm_req_eol
+fm_indent
+ix_os ix_s_for
+ix_osp
+ix_otok 1
+if not fm_w_eq 2 ix_s_ulong
+ix_os fm_s_col_sp
+ix_otok 2
+end
+ix_os fm_s_in_rng
+fm_emit_infix cnt 0 0
+if has_b
+ix_osp
+ix_os ix_s_bound
+ix_osp
+ix_otok bt
+end
+if has_u
+ix_osp
+ix_os ix_s_unroll
+end
+ix_osp
+ix_oc 123
+ix_onl
+fm_push_blk FM_BLK_FOR
+put fm_ind 0 add get fm_ind 0 1
+ret
+end
+if fm_w_eq 0 ix_s_ret
+fm_indent
+ix_os ix_s_return
+if gt wc 1
+put ix_tcur 0 1
+e = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+ix_osp
+fm_emit_infix e 0 0
+end
+ix_onl
+ret
+end
+if or fm_w_eq 0 ix_s_break fm_w_eq 0 ix_s_continue
+if ne wc 1
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+fm_indent
+ix_otok 0
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_exit
+put ix_tcur 0 1
+e = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+ix_os ix_s_exit
+ix_oc 40
+fm_emit_infix e 0 0
+ix_oc 41
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_trap
+if ne wc 2
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+fm_indent
+ix_os ix_s_trap
+ix_oc 40
+ix_otok 1
+ix_oc 41
+ix_onl
+ret
+end
+if or fm_w_eq 0 ix_s_requires or fm_w_eq 0 ix_s_ensures fm_w_eq 0 ix_s_invariant
+put ix_tcur 0 1
+e = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+ix_otok 0
+ix_osp
+fm_emit_infix e 0 0
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_put
+if lt wc 4
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+arr = ulong 1
+lk = fm_find_loc ulong get ix_tpos arr ulong get ix_tlen arr
+if ge lk 3
+sidx = sub lk 3
+fld = ulong 2
+fi = fm_find_fld sidx ulong get ix_tpos fld ulong get ix_tlen fld
+is_af = false
+if lt fi FM_MAX_FLDS
+if ne get fm_fl_arr fi 0
+is_af = true
+end
+end
+put ix_tcur 0 3
+if is_af
+idx = fm_parse_pexpr
+val = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+ix_otok arr
+ix_oc 46
+ix_otok fld
+ix_oc 91
+fm_emit_infix idx 0 0
+ix_oc 93
+ix_os fm_s_eq_sp
+fm_emit_infix val 0 0
+ix_onl
+ret
+end
+val = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+ix_otok arr
+ix_oc 46
+ix_otok fld
+ix_os fm_s_eq_sp
+fm_emit_infix val 0 0
+ix_onl
+ret
+end
+put ix_tcur 0 2
+idx = fm_parse_pexpr
+val = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+ix_otok arr
+ix_oc 91
+fm_emit_infix idx 0 0
+ix_oc 93
+ix_os fm_s_eq_sp
+fm_emit_infix val 0 0
+ix_onl
+ret
+end
+note Void user function call or void host word (cpufence/cpurelax)
+p0 = ulong get ix_tpos 0
+l0 = ulong get ix_tlen 0
+fidx = fm_find_fn p0 l0
+if lt fidx FM_MAX_FNS
+if eq get fm_fn_rk fidx 0
+ar = ulong get fm_fn_ar fidx
+put ix_tcur 0 1
+nd = fm_parse_pcall 0 ar 0
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_indent
+fm_emit_infix nd 0 0
+ix_onl
+ret
+end
+end
+if ix_is_voidhost 0
+if ne wc 1
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+fm_indent
+ix_otok 0
+ix_oc 40
+ix_oc 41
+ix_onl
+ret
+end
+note Assignment: name = expr  (or short form: name expr)
+if lt wc 2
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+vi = ulong 1
+if eq fm_w_kind 1 IX_TK_ASSIGN
+vi = 2
+end
+if ge vi wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+note Special RHS: new T N init  or  new Struct v1 ... vn
+if fm_w_eq vi ix_s_new
+if ge add vi 1 wc
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ty = add vi 1
+if ix_is_type ty
+if lt wc add vi 4
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+sz = add vi 2
+put ix_tcur 0 add vi 3
+init = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+fm_add_loc p0 l0 2
+fm_indent
+ix_otok 0
+ix_os fm_s_eq_sp
+ix_os ix_s_new
+ix_osp
+ix_oc 91
+ix_otok ty
+ix_os fm_s_semi_sp
+ix_otok sz
+ix_oc 93
+ix_oc 40
+fm_emit_infix init 0 0
+ix_oc 41
+ix_onl
+ret
+end
+si = fm_find_st ulong get ix_tpos ty ulong get ix_tlen ty
+if ge si FM_MAX_STRS
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+fm_emit_new_struct 0 ty si vi
+ret
+end
+put ix_tcur 0 vi
+e = fm_parse_pexpr
+if not ix_ok
+ret
+end
+fm_req_eol
+if ne get fm_nbool e 0
+fm_add_loc p0 l0 1
+else
+fm_add_loc p0 l0 0
+end
+fm_indent
+ix_otok 0
+ix_os fm_s_eq_sp
+fm_emit_infix e 0 0
+ix_onl
+end
+
+fn fm_emit_top_line ls ulong lend ulong to void
+wc = get ix_tcnt 0
+if fm_w_eq 0 ix_s_om2
+ix_osrc ls sub lend ls
+ix_onl
+ret
+end
+if or fm_w_eq 0 ix_s_target fm_w_eq 0 ix_s_usage
+ix_osrc ls sub lend ls
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_const
+if ne wc 4
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_const
+ix_osp
+ix_otok 1
+ix_os fm_s_col_sp
+ix_otok 2
+ix_os fm_s_eq_sp
+ix_otok 3
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_global
+if ne wc 4
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_global
+ix_osp
+ix_otok 1
+ix_os fm_s_col_sp
+ix_oc 91
+ix_otok 2
+ix_os fm_s_semi_sp
+ix_otok 3
+ix_oc 93
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_text
+if ne wc 3
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_text
+ix_osp
+ix_otok 1
+ix_os fm_s_eq_sp
+ix_otok 2
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_struct
+fm_emit_struct_line
+ret
+end
+if fm_w_eq 0 ix_s_layout
+if ne wc 3
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_layout
+ix_osp
+ix_otok 1
+ix_oc 40
+ix_otok 2
+ix_oc 41
+ix_osp
+ix_oc 123
+ix_onl
+fm_push_blk FM_BLK_LAYOUT
+put fm_ind 0 add get fm_ind 0 1
+ret
+end
+if fm_w_eq 0 ix_s_abstract
+if lt wc 3
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_abstract
+ix_osp
+ix_otok 1
+ix_os fm_s_col_sp
+ix_otok 2
+if and gt wc 3 fm_w_eq 3 ix_s_ops
+ix_osp
+ix_os ix_s_ops
+ix_oc 40
+for j ulong sub wc 4 bound 16
+if gt j 0
+ix_os fm_s_com_sp
+end
+ix_otok add 4 j
+end
+ix_oc 41
+end
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_holds
+if ne wc 3
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_os ix_s_holds
+ix_osp
+ix_otok 1
+ix_osp
+ix_otok 2
+ix_onl
+ret
+end
+if fm_w_eq 0 ix_s_fn
+fm_emit_fn_line false 1
+ret
+end
+if and fm_w_eq 0 ix_s_export and gt wc 2 fm_w_eq 1 ix_s_fn
+fm_emit_fn_line true 2
+ret
+end
+ix_fail IX_ERR_SYNTAX get fm_line 0
+end
+
+fn fm_emit_layout_line to void
+wc = get ix_tcnt 0
+if fm_w_eq 0 ix_s_end
+if ne wc 1
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+put fm_btop 0 sub get fm_btop 0 1
+put fm_ind 0 sub get fm_ind 0 1
+fm_indent
+ix_oc 125
+ix_onl
+ret
+end
+if and fm_w_eq 0 ix_s_field ge wc 6
+fm_indent
+ix_os ix_s_field
+ix_osp
+ix_otok 1
+ix_os fm_s_col_sp
+if fm_w_eq 3 ix_s_at
+ix_otok 2
+ix_osp
+ix_os ix_s_at
+ix_osp
+ix_otok 4
+ix_osp
+ix_otok 5
+else
+if lt wc 7
+ix_fail IX_ERR_SYNTAX get fm_line 0
+ret
+end
+ix_oc 91
+ix_otok 2
+ix_os fm_s_semi_sp
+ix_otok 3
+ix_oc 93
+ix_osp
+ix_os ix_s_at
+ix_osp
+ix_otok 5
+ix_osp
+ix_otok 6
+end
+ix_oc 44
+ix_onl
+ret
+end
+ix_fail IX_ERR_SYNTAX get fm_line 0
+end
+
+fn fm_to_infix to ulong
+put ix_olen 0 0
+put ix_st 0 0
+put ix_st 1 0
+put ix_st 3 0
+put fm_btop 0 0
+put fm_ind 0 0
+put fm_line 0 1
+fm_pass1
+n = get ix_slen 0
+p = ulong 0
+ln = ulong 1
+while and lt p n ix_ok bound 262144
+put fm_line 0 ln
+lend = p
+while and lt lend n ne ix_byte lend 10 bound 16384
+lend = add lend 1
+end
+tr = lend
+if and gt tr p eq ix_byte sub tr 1 13
+tr = sub tr 1
+end
+fm_lex_line p tr
+wc = get ix_tcnt 0
+if eq wc 0
+ix_onl
+else
+if fm_w_eq 0 ix_s_note
+fm_indent
+ix_os fm_s_sl_sl
+nend = add ulong get ix_tpos 0 ulong get ix_tlen 0
+if lt nend tr
+ix_osrc nend sub tr nend
+end
+ix_onl
+else
+bt = get fm_btop 0
+if eq bt 0
+fm_emit_top_line p tr
+else
+if eq ulong get fm_blk sub bt 1 FM_BLK_LAYOUT
+fm_emit_layout_line
+else
+fm_emit_stmt_line
+end
+end
+end
+end
+if lt lend n
+p = add lend 1
+else
+p = lend
+end
+ln = add ln 1
+end
+if and ix_ok ne get fm_btop 0 0
+ix_fail IX_ERR_UNCLOSED_BRACE ln
+end
+ret get ix_st 0
+end
+
+note ---- CLI Driver (stdin -> stdout) ---------------------------------------------------------
+fn fm_arg_eq n ulong s view uchar * to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get fm_argb i get s i
+ret false
+end
+end
+ret true
+end
+
+fn fm_read_stdin to bool
+n = ulong 0
+while lt n IX_SRC_CAP bound 262145
+k = read 0 ix_src n sub IX_SRC_CAP n
+if lt k 0
+ret false
+end
+if eq k 0
+put ix_slen 0 n
+ret true
+end
+n = add n ulong k
+end
+ret false
+end
+
+fn fm_write_stdout to bool
+n = get ix_olen 0
+o = ulong 0
+while lt o n bound 524289
+k = write 1 ix_out o sub n o
+if le k 0
+ret false
+end
+o = add o ulong k
+end
+ret true
+end
+
+fn main to int
+ac = argcnt
+if ne ac 2
+r = write 2 fm_s_usage 0 len fm_s_usage
+ret 2
+end
+al = argread 1 fm_argb 0 len fm_argb
+if lt al 0
+r = write 2 fm_s_usage 0 len fm_s_usage
+ret 2
+end
+md = ulong 0
+if fm_arg_eq ulong al fm_s_to_infix
+md = 1
+end
+if fm_arg_eq ulong al fm_s_to_prefix
+md = 2
+end
+if eq md 0
+r = write 2 fm_s_usage 0 len fm_s_usage
+ret 2
+end
+if not fm_read_stdin
+r = write 2 fm_s_err_io 0 len fm_s_err_io
+ret 3
+end
+rc = ulong 0
+if eq md 1
+rc = fm_to_infix
+if ne rc 0
+r1 = write 2 fm_s_err_pfx 0 len fm_s_err_pfx
+ix_write_u 2 get ix_st 1
+r2 = write 2 fm_s_err_mid 0 len fm_s_err_mid
+ret int rc
+end
+else
+rc = ix_lower
+if ne rc 0
+ix_write_err 2
+ret int rc
+end
+end
+if not fm_write_stdout
+r = write 2 fm_s_err_io 0 len fm_s_err_io
+ret 3
+end
+ret 0
+end
