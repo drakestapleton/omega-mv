@@ -1,41 +1,22 @@
 # M20 OMEGA_TENSOR (docs/tensor/M20_OMEGA_TENSOR.md): semantic tensor layer +
-# CPU realization. Files under src/tensor/ and tests/test_omega_tensor.c.
+# CPU realization + crash-safe storage lifetime. Pure seeded OM-2 under src/tensor/.
 # Picked up by `-include mk/*.mk`. Not part of `all` or `test`. CPU only:
 # opens no device, never touches the GB10.
 #
-# test-tensor            CPU tests plain and with ASan/UBSan, then
-#                        test-tensor-no-hooks
-# test-tensor-no-hooks   builds src/tensor/*.c with the default (library)
-#                        flags and requires, via nm, that the test-only
-#                        hook omega_tensor_test_set_storage_generation is
-#                        absent. Only the test binaries define
-#                        OMEGA_TENSOR_TEST_HOOKS.
+# test-tensor            pure seeded OM-2 CPU tests, then test-tensor-no-hooks
+# test-tensor-no-hooks   verifies pure OM-2 tensor sources carry no C test hooks
+#                        and no process-exit call in omega_tensor/omega_tensor_cpu
 # test-tensor-mutations  applies each MUT: source mutation in a scratch copy
-#                        and proves test-tensor's binary then fails
+#                        and proves the pure OM-2 test then fails
 # test-m20-receipt       tests/test_m20_receipt.sh: content-addressed M20
 #                        receipt writer tools/m20_receipt.sh (fixtures only)
-# test-tensor-e1-reduce  alias of test-tensor (the reduction seam always
-#                        calls omega_reduce_cpu, E1 WP-D, omega #134)
-# test-tensor-store      crash-safe storage lifetime (omega_tensor_store):
-#                        plain + ASan/UBSan, then test-tensor-no-hooks
+# test-tensor-e1-reduce  alias of test-tensor
+# test-tensor-store      pure seeded OM-2 crash-safe storage lifetime tests,
+#                        then test-tensor-no-hooks
 ifndef TENSOR_MK
 TENSOR_MK := 1
 .PHONY: test-tensor test-tensor-no-hooks test-tensor-mutations test-tensor-e1-reduce test-tensor-store
-TENSOR_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -ffp-contract=off -Isrc -Isrc/tensor \
-	-DOMEGA_NUMERIC_CPU_ONLY
-TENSOR_SRCS = src/tensor/omega_tensor.c src/tensor/omega_tensor_cpu.c src/tensor/omega_tensor_reduce_seam.c \
-	src/omega_numeric_reduce.c src/omega_numeric_transc.c
-TENSOR_DEPS = src/omega_numeric.c src/omega_numeric_provenance.c src/omega_blackwell_encoder.c \
-	src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c src/omega_om_units.c
-TENSOR_HDRS = src/tensor/omega_tensor.h src/tensor/omega_tensor_reduce_seam.h src/omega_numeric_reduce.h src/omega_numeric.h src/sha256.h src/omega_numeric_transc.h
-# CR-5 tests are #included by tests/test_omega_tensor.c: rebuild when they change.
-TENSOR_HDRS += tests/tensor_reduce_multi_tests.inc
-# Test builds only: compiles the test-only storage-generation hook.
-TENSOR_TEST_FLAGS = -DOMEGA_TENSOR_TEST_HOOKS
 TENSOR_HOOK_SYMS = omega_tensor_test_set_storage_generation omega_tensor_store_test_set_crash_step
-# Crash-safe storage lifetime (omega_tensor_store); targets at the end of this file.
-TENSOR_STORE_SRCS = src/tensor/omega_tensor_store.c
-TENSOR_STORE_HDRS = src/tensor/omega_tensor_store.h
 
 TENSOR_OMC ?= seed/out/omc
 TENSOR_OM_CORE = src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om \
@@ -51,23 +32,17 @@ test-tensor: $(OUT_DIR)/test_omega_tensor
 	$(abspath $(OUT_DIR)/test_omega_tensor)
 	$(MAKE) --no-print-directory test-tensor-no-hooks
 
-# Default (library) build of the tensor sources: no OMEGA_TENSOR_TEST_HOOKS.
-# Fails if any test-only hook symbol is defined or referenced in the objects.
-test-tensor-no-hooks: src/tensor/omega_tensor.c src/tensor/omega_tensor_cpu.c src/tensor/omega_tensor_reduce_seam.c $(TENSOR_HDRS) \
-		$(TENSOR_STORE_SRCS) $(TENSOR_STORE_HDRS)
-	@mkdir -p $(OUT_DIR)/tensor-lib
-	gcc $(TENSOR_CFLAGS) -O2 -c -o $(OUT_DIR)/tensor-lib/omega_tensor.o src/tensor/omega_tensor.c
-	gcc $(TENSOR_CFLAGS) -O2 -c -o $(OUT_DIR)/tensor-lib/omega_tensor_cpu.o src/tensor/omega_tensor_cpu.c
-	gcc $(TENSOR_CFLAGS) -O2 -c -o $(OUT_DIR)/tensor-lib/omega_tensor_reduce_seam.o src/tensor/omega_tensor_reduce_seam.c
-	gcc $(TENSOR_CFLAGS) -O2 -c -o $(OUT_DIR)/tensor-lib/omega_tensor_store.o src/tensor/omega_tensor_store.c
-	@if nm $(OUT_DIR)/tensor-lib/omega_tensor_store.o | grep -q "\b_exit\b"; then \
-		echo "test-tensor-no-hooks: FAIL (crash hook _exit referenced by default omega_tensor_store.o)"; exit 1; fi
-	@nm $(OUT_DIR)/tensor-lib/omega_tensor.o | grep -q " T omega_tensor_ctx_create\b" \
-		|| { echo "test-tensor-no-hooks: FAIL (nm sanity: omega_tensor_ctx_create not found)"; exit 1; }
+# Pure seeded OM-2 hook hygiene check: omega_tensor.om/omega_tensor_cpu.om carry
+# no exit/fork calls and no legacy C test hook symbols exist in src/tensor/*.om.
+test-tensor-no-hooks: $(TENSOR_OM_CORE) src/tensor/omega_tensor_store.om
+	@grep -q '^fn ot_ctx_init ' src/tensor/omega_tensor.om \
+		|| { echo "test-tensor-no-hooks: FAIL (sanity: fn ot_ctx_init not found)"; exit 1; }
+	@if grep -hv '^[[:space:]]*note' src/tensor/omega_tensor.om src/tensor/omega_tensor_cpu.om | grep -qwE 'exit|fork'; then \
+		echo "test-tensor-no-hooks: FAIL (exit/fork referenced by omega_tensor.om or omega_tensor_cpu.om)"; exit 1; fi
 	@for s in $(TENSOR_HOOK_SYMS); do \
-		if nm $(OUT_DIR)/tensor-lib/*.o | grep -q "\b$$s\b"; then \
-			echo "test-tensor-no-hooks: FAIL ($$s present in default build)"; exit 1; fi; \
-	done; echo "test-tensor-no-hooks: PASS (test-only hook absent from default build)"
+		if grep -q "\b$$s\b" $(TENSOR_OM_CORE) src/tensor/omega_tensor_store.om; then \
+			echo "test-tensor-no-hooks: FAIL ($$s present in OM-2 tensor sources)"; exit 1; fi; \
+	done; echo "test-tensor-no-hooks: PASS (pure OM-2 tensor sources clean; no C test hooks)"
 
 test-tensor-mutations:
 	tools/tensor_mutations.sh

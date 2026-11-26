@@ -88,48 +88,47 @@ GB10_ROWS_MAX_N|s/if (n > OMEGA_REDUCE_GB10_MAX_N) return OMEGA_NUMERIC_ERR_OPER
     echo "tensor gb10 mutation sweep: PASS ($gtotal of $gtotal mutations caught)"
     exit 0
 fi
-DEPS="src/omega_numeric_reduce.c src/omega_numeric_transc.c src/omega_numeric.c src/omega_numeric_provenance.c src/omega_blackwell_encoder.c \
-src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c src/omega_om_units.c"
-FLAGS="-std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -ffp-contract=off -O2 -DOMEGA_NUMERIC_CPU_ONLY -DOMEGA_TENSOR_TEST_HOOKS"
+OMC=${TENSOR_OMC:-seed/out/omc}
+OM_CORE="src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om src/tensor/omega_tensor_cpu.om src/tensor/omega_tensor_gb10.om src/tensor/omega_tensor.om"
+OM_STORE="src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om src/tensor/omega_tensor_cpu.om src/tensor/omega_tensor.om src/tensor/omega_tensor_store.om"
 
 # name|file|sed expression (applied only to the line carrying MUT:<name>)
 # Reduction order and padding mutations live in the E1 WP-D suite
 # (test-numeric-reduce-cpu, RED_DIFFERENT_ORDER_CAUGHT): the seam calls it.
-MUTATIONS='RELEASE_BUMP|omega_tensor.c|s/(\*gen)++/(void)0/
-STORAGE_GEN_CHECK|omega_tensor.c|s/ || s->gen != h.generation//
-BCAST_ZERO_STRIDE|omega_tensor.c|s/o.strides\[d\] = 0;/o.strides[d] = in->strides[sd];/
-PERMUTE_STRIDES|omega_tensor.c|s/in->strides\[perm\[d\]\]/in->strides[d]/
-SLICE_OFFSET|omega_tensor.c|s/start\[d\], in->strides\[d\]/start[d], 1/
-TRANSC_EXP2_LOG2_SWAP|omega_tensor_cpu.c|s/= omega_math_exp2, \(.*\)= omega_math_log2,/= omega_math_log2, \1= omega_math_exp2,/
-UNARY_VIEW_STRIDE|omega_tensor.c|s/gather(s, .in, src);/dense_strides(in.rank, in.shape, in.strides); gather(s, \&in, src);/
-TRANSC_EXP_LOG_SWAP|omega_tensor_cpu.c|s/= omega_math_exp, \(.*\)= omega_math_log,/= omega_math_log, \1= omega_math_exp,/
-RELU_NEG_ZERO|omega_tensor.c|s/if (u >> 31) return 0U;/if (u >> 31) return u == 0x80000000U ? u : 0U;/
-RELU_NAN_PAYLOAD|omega_tensor.c|s/return OMEGA_QNAN_BITS;/return u;/
-TRANSC_RSQRT_ERF_SWAP|omega_tensor_cpu.c|s/= omega_math_rsqrt, \(.*\)= omega_math_erf,/= omega_math_erf, \1= omega_math_rsqrt,/
-GELU_VIEW_STRIDE|omega_tensor.c|s/gather(s, .in, src);/if (op == OMEGA_TU_GELU) { dense_strides(in.rank, in.shape, in.strides); } gather(s, \&in, src);/
-TRIG_SIN_COS_SWAP|omega_tensor_cpu.c|s/= omega_math_sin, \(.*\)= omega_math_cos,/= omega_math_cos, \1= omega_math_sin,/
-TRIG_DOMAIN_NUMBER|omega_tensor_cpu.c|s/out\[i\] = f(a\[i\]);/{ out[i] = f(a[i]); if ((op == OMEGA_TU_SIN || op == OMEGA_TU_COS) \&\& out[i] != out[i]) out[i] = 0.0f; }/
-ZEROS_NEG0|omega_tensor.c|s/shape, 0.0f, out)/shape, -0.0f, out)/
-NEG_SUB|omega_tensor.c|s/return u ^ 0x80000000U;/return omega_float_to_bits(0.0f - omega_bits_to_float(u));/
-NEG_NAN|omega_tensor.c|s/return 0x7fc00000U;/return u ^ 0x80000000U;/
-FULL_CANON|omega_tensor.c|s/uint32_t u = omega_float_to_bits(value);/uint32_t u = canon_bits(OMEGA_DT_F32, (const uint8_t *)\&value);/
-EMBED_START|omega_tensor.c|s/start\[d\], ds\[d\]/start[d] + 1, ds[d]/
-EMBED_STEP|omega_tensor.c|s/ds\[d\], st, /ds[d], 1, /
-CONCAT_AXIS_OFFSET|omega_tensor.c|s/aoff \* ds\[axis\]/aoff/
-CMP_FALSE_NEG_ZERO|omega_tensor_cpu.c|s/zero = 0.0f;/zero = -0.0f;/
-CMP_EQ_NAN_TRUE|omega_tensor.c|s/OMEGA_NOP_FSETP_EQ_SEL,/OMEGA_NOP_FSETP_EQU_SEL,/
-WHERE_ACCEPTS_HALF|omega_tensor.c|s/u != OMEGA_TENSOR_MASK_FALSE_BITS)/u != OMEGA_TENSOR_MASK_FALSE_BITS \&\& u != 0x3f000000U)/
-REDUCE_AXES_DESCENDING|omega_tensor.c|s/for (uint32_t d = in.rank; d-- > 0;)/for (uint32_t d = 0; d < in.rank; d++)/
-REDUCE_AXES_KEEPDIMS|omega_tensor.c|s/keep\[n\] = keepdims;/keep[n] = keepdims \&\& false;/
-SUM_TO_SHAPE_SIZE1|omega_tensor.c|s/ax\[n\] = d; keep\[n\] = true; n++;/(void)0;/'
+MUTATIONS='RELEASE_BUMP|omega_tensor.om|{n;s/add cur 1/cur/;}
+STORAGE_GEN_CHECK|omega_tensor.om|{n;s/ret eq get ot_st_gen s g/ret true/;}
+BCAST_ZERO_STRIDE|omega_tensor.om|{n;s/put ot_tmp_st d 0/put ot_tmp_st d get ot_ts_strides idx/;}
+PERMUTE_STRIDES|omega_tensor.om|{n;s/put ot_tmp_st d get ot_ts_strides idx/put ot_tmp_st d get ot_ts_strides add s8 d/;}
+SLICE_OFFSET|omega_tensor.om|{n;s/mul a istr/a/;}
+TRANSC_EXP2_LOG2_SWAP|omega_tensor_cpu.om|{n;s/ret ot_math_exp2 x/ret ot_math_log2 x/;}
+UNARY_VIEW_STRIDE|omega_tensor.om|{n;s/ot_load_ts_desc s/ot_load_ts_desc s\n  put ot_tmp_st 0 16/;}
+TRANSC_EXP_LOG_SWAP|omega_tensor_cpu.om|{n;s/ret ot_math_exp x/ret ot_math_log x/;}
+RELU_NEG_ZERO|omega_tensor_cpu.om|{n;s/ret uint 0/if eq u OT_NEG0_BITS\n      ret u\n    end\n    ret uint 0/;}
+RELU_NAN_PAYLOAD|omega_tensor_cpu.om|{n;s/ret OT_QNAN_BITS/ret u/;}
+TRANSC_RSQRT_ERF_SWAP|omega_tensor_cpu.om|{n;s/ret ot_math_erf x/ret div 1.0f32 fsqrt x/;}
+GELU_VIEW_STRIDE|omega_tensor.om|{n;s/ot_load_ts_desc s/ot_load_ts_desc s\n  if eq op OT_TU_GELU\n    put ot_tmp_st 0 16\n  end/;}
+TRIG_SIN_COS_SWAP|omega_tensor_cpu.om|{n;s/ret ot_math_sin x/ret ot_math_cos x/;}
+TRIG_DOMAIN_NUMBER|omega_tensor_cpu.om|{n;s/ret bitcast f32 OT_QNAN_BITS/ret 0.0f32/;}
+ZEROS_NEG0|omega_tensor.om|{n;s/0\.0f32/-0.0f32/;}
+NEG_SUB|omega_tensor_cpu.om|{n;s/ret xor u OT_NEG0_BITS/ret bitcast uint sub 0.0f32 bitcast f32 u/;}
+NEG_NAN|omega_tensor_cpu.om|{n;s/ret OT_QNAN_BITS/ret xor u OT_NEG0_BITS/;}
+FULL_CANON|omega_tensor.om|{n;s/ot_arena_put_f32 dbase i val/if ot_is_nan bitcast uint val\n      ot_arena_put_f32 dbase i bitcast f32 OT_QNAN_BITS\n    else\n      ot_arena_put_f32 dbase i val\n    end/;}
+EMBED_START|omega_tensor.om|{n;s/ret long mul a ds_d/ret long mul add a 1 ds_d/;}
+EMBED_STEP|omega_tensor.om|{n;s/put ot_tmp_st d mul ds_d st/put ot_tmp_st d ds_d/;}
+CONCAT_AXIS_OFFSET|omega_tensor.om|{n;s/mul aoff get ds axis/aoff/;}
+CMP_FALSE_NEG_ZERO|omega_tensor_cpu.om|{n;s/ret 0\.0f32/ret bitcast f32 OT_NEG0_BITS/;}
+CMP_EQ_NAN_TRUE|omega_tensor_cpu.om|{n;s/ret false/ret true/;}
+WHERE_ACCEPTS_HALF|omega_tensor.om|{n;s/if and ne u OT_ONE_BITS ne u uint 0/if eq u uint 0x3f000000\n      continue\n    end\n    if and ne u OT_ONE_BITS ne u uint 0/;}
+REDUCE_AXES_DESCENDING|omega_tensor.om|{n;s/d = sub sub rank 1 di/d = di/;}
+REDUCE_AXES_KEEPDIMS|omega_tensor.om|{n;s/keepdims = get keep_and_out 2/keepdims = ulong 0/;}
+SUM_TO_SHAPE_SIZE1|omega_tensor.om|{n;s/n = add n 1/n = n/;}'
 
-STORE_MUTATIONS='TSTORE_HASH_VERIFY|s/memcmp(dig, sl->payload_sha, 32) != 0 || memcmp(vid, sl->value_id, 32) != 0/0/
-TSTORE_SHORT_RECORD|s/len != HDR_BYTES + count \* REC_BYTES/0/
-TSTORE_GEN_RESET|s/sl->gen = r->gen + 1;/sl->gen = 1;/
-TSTORE_RENAME_BEFORE_WRITE|s/const char \*wpath = tmp;/const char *wpath = final;/
-TSTORE_RECORD_SUM|s/memcmp(sum, in + REC_SUM, 32) != 0/0/
-TSTORE_HEADER_SUM|s/memcmp(sum, st->jbuf + HDR_SUM, 32) != 0/0/'
-STORE_SRCS="src/tensor/omega_tensor.c src/tensor/omega_tensor_cpu.c src/tensor/omega_tensor_reduce_seam.c"
+STORE_MUTATIONS='TSTORE_HASH_VERIFY|{n;s/if ne get dig i get ots_sl_psha add mul sl 32 i/if false/;}
+TSTORE_SHORT_RECORD|{n;s/if ne jlen add OTS_HDR_BYTES mul cnt OTS_REC_BYTES/if false/;}
+TSTORE_GEN_RESET|{n;s/put ots_sl_meta add sb 1 add gen 1/put ots_sl_meta add sb 1 1/;}
+TSTORE_RENAME_BEFORE_WRITE|{n;s/fopen ots_pa 0 get ots_plen 0/fopen ots_pb 0 get ots_plen 1/;}
+TSTORE_RECORD_SUM|{n;s/if ne get sum k get ots_jbuf add add off 168 k/if false/;}
+TSTORE_HEADER_SUM|{n;s/if ne get sum i get ots_jbuf add 24 i/if false/;}'
 # The runner reads its own env var ONLY; the legacy sweep never did.
 unset ONLY
 fail=0
@@ -139,14 +138,9 @@ total=0
 # baseline check on) and print one legacy "MUTATION <name>: ..." line per
 # mutant, in row order. Returns 3 if the unmutated baseline does not pass.
 # Sets fail=1 if the runner reported fewer or more verdict lines than rows.
-# Legacy notes that need no mapping beyond the verdict: KILLED note
-# "<N> failing case(s), first: ..." becomes "caught (<N> failing checks)",
-# "harness exit" (nonzero exit, no FAIL line) becomes "caught (0 failing
-# checks)". The 5-line build-log head the old script printed on a build error
-# is replaced by the runner's one-line build error note.
 run_block() {
     rb_rows=$1
-    "tools/mutation_runner.sh" -k marker -m "$rb_rows" -t "$3" -b "$2" -c "src tests" -f FAIL -B \
+    "tools/mutation_runner.sh" -k marker -m "$rb_rows" -t "$3" -b "$2" -c "src/tensor src/train/tg_sha256.om $OMC" -f FAIL -B \
         > "$SCRATCH/rb.out" 2> "$SCRATCH/rb.err"
     if grep -q 'unmutated baseline does not pass' "$SCRATCH/rb.out"; then
         cat "$SCRATCH/rb.err"; return 3
@@ -169,9 +163,6 @@ run_block() {
                 fail=1 ;;
         esac
     done < "$SCRATCH/rb.err"
-    # The legacy sweep walked the rows itself, so a row could not be skipped.
-    # A runner that died, was killed or reported nothing must not pass silently:
-    # one verdict line per row is required.
     rb_want=$(grep -c '|' "$rb_rows")
     if [ "$rb_seen" -ne "$rb_want" ]; then
         echo "MUTATION $rb_rows: runner reported $rb_seen verdicts for $rb_want rows (runner died or reported nothing)"
@@ -179,27 +170,21 @@ run_block() {
     fi
 }
 
-# Main block. Rows are name|file|sed expression; the file column is relative
-# to src/tensor, the runner wants it relative to the tree root.
+# Main block (pure seeded OM-2).
 printf '%s\n' "$MUTATIONS" | sed 's#^\([A-Z0-9_]*\)|#\1|src/tensor/#' > "$SCRATCH/main.rows"
-# Baseline: the unmutated build must PASS, otherwise every mutant would
-# look "caught" (e.g. the test refusing an unsuitable FP environment).
 if ! run_block "$SCRATCH/main.rows" \
-    "gcc $FLAGS -Isrc -Isrc/tensor -o .tensor_t tests/test_omega_tensor.c src/tensor/omega_tensor.c src/tensor/omega_tensor_cpu.c src/tensor/omega_tensor_reduce_seam.c $DEPS" \
+    "(printf 'om2\n'; sed -e '/^om2$/d' -e 's/^export fn /fn /' $OM_CORE src/tensor/test_tensor.om) | $OMC > .tensor_t && chmod +x .tensor_t" \
     ./.tensor_t; then
     echo "tensor mutation sweep: FAIL (unmutated baseline does not pass)"; exit 1
 fi
 # M20 receipt writer mutants (MUT: markers in tools/m20_receipt.sh), own sweep.
 tools/m20_receipt_mutations.sh || fail=1
 
-# Crash-safe storage lifetime (omega_tensor_store.c): each mutant rebuilds
-# tests/test_omega_tensor_store.c against the mutated copy and must FAIL it.
-# (Skipping the fsync before rename is not observable without power loss, so
-# it is not a mutant here.) Rows are name|expr, the file is implied.
-printf '%s\n' "$STORE_MUTATIONS" | sed 's#^\([A-Z0-9_]*\)|#\1|src/tensor/omega_tensor_store.c|#' > "$SCRATCH/store.rows"
+# Crash-safe storage lifetime (src/tensor/omega_tensor_store.om): pure seeded OM-2.
+printf '%s\n' "$STORE_MUTATIONS" | sed 's#^\([A-Z0-9_]*\)|#\1|src/tensor/omega_tensor_store.om|#' > "$SCRATCH/store.rows"
 if ! run_block "$SCRATCH/store.rows" \
-    "gcc $FLAGS -Isrc -Isrc/tensor -o .tstore_t tests/test_omega_tensor_store.c src/tensor/omega_tensor_store.c $STORE_SRCS $DEPS" \
-    ./.tstore_t; then
+    "(printf 'om2\n'; sed -e '/^om2$/d' -e 's/^export fn /fn /' $OM_STORE src/tensor/test_tensor_store.om) | $OMC > .tstore_t && chmod +x .tstore_t" \
+    "rm -rf .tstore_d && mkdir -p .tstore_d && ./.tstore_t .tstore_d"; then
     echo "MUTATION store baseline: unmutated store test does not pass"; fail=1
 fi
 
