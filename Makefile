@@ -430,10 +430,8 @@ aienos_source = if [ "$(AIENOS_R7_DIR)" = "$(AIENOS_R7_DEFAULT)" ]; then \
 	fi || { echo 'error: the aienos authority source is not the aienos.lock commit $(AIENOS_LOCK) (see above).'; \
 		echo "  pass AIENOS_LOCK_REPO=<an aienos clone holding that commit>, or AIENOS_R7_DIR=<a clean tree of it inside such a clone>;"; \
 		echo "  a modified default cache under $(OUT_DIR)/aienos-authority must be deleted, not reused."; exit 1; }
-RX_R7_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_r7_native.c
-RX_R7_TEST = $(OUT_DIR)/rx_r7_native_test
+# R7 native authority, pure seeded OM-2 (mk/tests-rt-2-om.mk).
+RX_R7_TEST = $(TRT2_R7_BIN)
 
 .PHONY: aienos-authority-capability
 aienos-authority-capability:
@@ -464,10 +462,6 @@ test-effect-cap64: test-effect-cap64-om
 test-aienos-cap-abi: aienos-authority-capability
 	CC="$(CC)" CFLAGS="$(CFLAGS)" bash tests/runtime/aienos_cap_abi.sh "$(EFFECT_CAP64_CAP_INC)"
 
-$(RX_R7_TEST): $(RX_R7_SRCS) src/runtime/rx_caproot.h src/runtime/rx_world.h \
-	src/runtime/aienos_cap.h src/runtime/omega_shared_world_abi.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R7_SRCS) $(AIENOS_CAP_LIB) -lm
-
 test-r7: $(RX_R7_TEST)
 	./$(RX_R7_TEST)
 
@@ -478,16 +472,8 @@ RX_OP_AUTH_MISUSE_TEST = $(TRT1_OAM_BIN)
 test-r16-operator-authority-misuse: $(RX_OP_AUTH_MISUSE_TEST)
 	./$(RX_OP_AUTH_MISUSE_TEST)
 
-# R9: generation barrier. The candidate is prepared beside the live world.
-# A stop after each persistence step must recover one whole generation.
-RX_R9_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_generation.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_r9_barrier.c
-RX_R9_TEST = $(OUT_DIR)/rx_r9_barrier_test
-
-$(RX_R9_TEST): $(RX_R9_SRCS) src/runtime/rx_generation.h src/runtime/rx_caproot.h \
-	src/runtime/rx_world.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R9_SRCS) $(AIENOS_CAP_LIB) -lm
+# R9: generation barrier, pure seeded OM-2 (mk/tests-rt-2-om.mk).
+RX_R9_TEST = $(TRT2_R9_BIN)
 
 test-r9: $(RX_R9_TEST)
 	./$(RX_R9_TEST)
@@ -512,16 +498,8 @@ RX_R10_TEST = $(TRT2_R10_BIN)
 test-r10: $(RX_R10_TEST)
 	./$(RX_R10_TEST)
 
-# R8: AEGIS resident authority. Capability slots in the world; AEGIS decides,
-# only root.install mints, through the native Aienux authority.
-RX_R8_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	tests/runtime/rx_r8_aegis.c
-RX_R8_TEST = $(OUT_DIR)/rx_r8_aegis_test
-
-$(RX_R8_TEST): $(RX_R8_SRCS) src/runtime/rx_aegis.h src/runtime/rx_caproot.h \
-	src/runtime/rx_world.h src/runtime/aienos_cap.h $(AIENOS_CAP_LIB) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $@ $(RX_R8_SRCS) $(AIENOS_CAP_LIB) -lm
+# R8: AEGIS resident authority, pure seeded OM-2 (mk/tests-rt-2-om.mk).
+RX_R8_TEST = $(TRT2_R8_BIN)
 
 test-r8: $(RX_R8_TEST)
 	./$(RX_R8_TEST)
@@ -1229,26 +1207,17 @@ test-r16-operator-mutants: $(RX_R13_HOST) $(RX_OPERATOR_CLI)
 		RX_R13_SRCS="$(RX_R13_SRCS)" RX_PROD_ARGUS_SRCS="$(RX_PROD_ARGUS_SRCS)" \
 		AIENOS_CAP_LIB="$(AIENOS_CAP_LIB)" bash tests/runtime/rx_operator_mutants.sh $(RX_OPERATOR_CLI)
 
-ARGUS_R7 = $(ARGUS_OUT)/rx_r7_native_test
-ARGUS_R8 = $(ARGUS_OUT)/rx_r8_aegis_test
-ARGUS_R9 = $(ARGUS_OUT)/rx_r9_barrier_test
+ARGUS_R7 = $(TRT2_R7_BIN)
+ARGUS_R8 = $(TRT2_R8_BIN)
+ARGUS_R9 = $(TRT2_R9_BIN)
 ARGUS_BENCH = $(TR2_BENCH_ARGUS_BIN)
 
 $(ARGUS_OUT):
 	mkdir -p $@
 
-$(ARGUS_R7): $(RX_R7_SRCS) src/runtime/rx_argus.h $(ARGUS_RX) $(ARGUS_STAMP) $(ARGUS_CAP_LIB) | $(ARGUS_OUT)
-	$(CC) $(ARGUS_CFLAGS) $(ARGUS_LINK_FLAGS) -pthread -o $@ $(RX_R7_SRCS) $(ARGUS_RX) $(ARGUS_CAP_LIB) -lm
-$(ARGUS_R8): $(RX_R8_SRCS) src/runtime/rx_argus.h $(ARGUS_RX) $(ARGUS_STAMP) $(ARGUS_CAP_LIB) | $(ARGUS_OUT)
-	$(CC) $(ARGUS_CFLAGS) $(ARGUS_LINK_FLAGS) -pthread -o $@ $(RX_R8_SRCS) $(ARGUS_RX) $(ARGUS_CAP_LIB) -lm
-$(ARGUS_R9): $(RX_R9_SRCS) src/runtime/rx_argus.h $(ARGUS_RX) $(ARGUS_STAMP) $(ARGUS_CAP_LIB) | $(ARGUS_OUT)
-	$(CC) $(ARGUS_CFLAGS) $(ARGUS_LINK_FLAGS) -pthread -o $@ $(RX_R9_SRCS) $(ARGUS_RX) $(ARGUS_CAP_LIB) -lm
-
-# ARGUS_RUNTIME_INTEGRATION: run each suite with the consumer ingesting into
-# the real argus_core; keep the raw 128-byte stream (consumer ingest order)
-# and a JSON summary: $(ARGUS_STREAMS)/<argus>-<suite>-v11.bin/.json
+# ARGUS_RUNTIME_INTEGRATION: pure seeded OM-2 suites emit ARGUS v1.1 summary & stream records.
 .PHONY: test-argus-runtime bench-rx-argus
-test-argus-runtime: $(ARGUS_R7) $(ARGUS_R8) $(ARGUS_R9)
+test-argus-runtime: $(ARGUS_R7) $(ARGUS_R8) $(ARGUS_R9) | $(ARGUS_OUT)
 	mkdir -p $(ARGUS_STREAMS)
 	@set -e; for s in r7:$(ARGUS_R7) r8:$(ARGUS_R8) r9:$(ARGUS_R9); do \
 		n=$${s%%:*}; b=$${s#*:}; \
