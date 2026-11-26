@@ -1,0 +1,918 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ddc/gate_ddc.om: RM10 #650 Wheeler Diverse Double Compilation (DDC) Gate in pure seeded OM-2.
+note Zero C, Python, or shell on the verification path. Links after seed/ng/sha256.om:
+note   { printf 'om2\n'; cat seed/ng/sha256.om seed/ddc/gate_ddc.om; } | seed/out/omc > gate_ddc
+note Usage:
+note   gate_ddc REPO_ROOT NG_BIN SCRATCH [wrong]
+note
+note Executes three genuinely diverse compiler paths on REPO_ROOT/seed/omc/omc.om:
+note   Path A  (cold seed chain): seed0.hex -> seed0 -> hex1 -> asm2 -> om4 -> omc_stage1 -> omc_A -> omc_A2
+note   Path B1 (independent ng):  ng (@ng front-ir | @ng a64) -> omc_by_ng -> omc_B1
+note   Path B2 (independent ng):  ng (@ng front-ir | @ng opt | @ng a64 split) -> omc_by_ng_opt -> omc_B2
+note Asserts:
+note   1. Stage-1 compiler binaries are genuinely distinct (omc_stage1 != omc_by_ng != omc_by_ng_opt)
+note   2. Final compilers are byte-for-byte identical: omc_A == omc_A2 == omc_B1 == omc_B2 == seed/out/omc.sha256
+note   3. NC1 (Planted Trusting-Trust Miscompile): temp copy of omc.om with 1-line EI_ABIVERSION=1 implant
+note      compiled via ng -> omc_trojan -> omc_trojan(clean omc.om) -> omc_B_trojan (exit 0, valid ELF)
+note      MUST diverge from omc_A and be caught fail-closed!
+note   4. NC2 (1-bit tamper): 1-bit flip in omc_B1 copy MUST be caught fail-closed!
+note   5. Optional `wrong` argument substitutes omc_B_trojan for omc_B1; gate MUST print DDC-GATE FAIL (exit 1).
+
+global dd_root uchar 2048
+global dd_rl ulong 1
+global dd_ng uchar 2048
+global dd_nl ulong 1
+global dd_scr uchar 2048
+global dd_sl ulong 1
+global dd_pa uchar 4096
+global dd_pl ulong 1
+global dd_pb uchar 4096
+global dd_pbl ulong 1
+global dd_pc uchar 4096
+global dd_pcl ulong 1
+global dd_av uchar 8192
+global dd_an ulong 1
+global dd_st uchar 4
+global dd_dig uchar 24
+global dd_hx uchar 66
+global dd_pin uchar 64
+global dd_h_s1 uchar 64
+global dd_h_ng1 uchar 64
+global dd_h_ng2 uchar 64
+global dd_h_a uchar 64
+global dd_h_a2 uchar 64
+global dd_h_b1 uchar 64
+global dd_h_b2 uchar 64
+global dd_h_tr uchar 64
+global dd_b2 uchar 4194304
+global dd_b2n ulong 1
+global dd_wrong ulong 1
+
+text dd_t_seed0 "/seed/rung0/seed0.hex"
+text dd_t_hex1 "/seed/rung1/hex1.hex"
+text dd_t_asm2 "/seed/rung2/asm2.hex1"
+text dd_t_t2 "/seed/rung2/table.s2"
+text dd_t_t3 "/seed/rung3/table3.s2"
+text dd_t_t4 "/seed/rung4/table4.s2"
+text dd_t_om4s "/seed/rung4/om4.s"
+text dd_t_omc "/seed/omc/omc.om"
+text dd_t_pin "/seed/out/omc.sha256"
+
+text dd_s_seed0 "/seed0.bin"
+text dd_s_hex1 "/hex1.bin"
+text dd_s_asm2 "/asm2.bin"
+text dd_s_om4in "/om4.in"
+text dd_s_om4 "/om4.bin"
+text dd_s_s1 "/omc_stage1"
+text dd_s_a "/omc_A"
+text dd_s_a2 "/omc_A2"
+text dd_s_fi "/ng_fi.in"
+text dd_s_ir "/omc.ir"
+text dd_s_a64 "/ng_a64.in"
+text dd_s_ng1 "/omc_by_ng"
+text dd_s_b1 "/omc_B1"
+text dd_s_opt "/ng_opt.in"
+text dd_s_iro "/omc_opt.ir"
+text dd_s_spl "/ng_spl.in"
+text dd_s_ng2 "/omc_by_ng_opt"
+text dd_s_b2 "/omc_B2"
+text dd_s_plsrc "/omc_planted.om"
+text dd_s_plfi "/ng_plfi.in"
+text dd_s_plir "/omc_pl.ir"
+text dd_s_pla6 "/ng_pla6.in"
+text dd_s_trbin "/omc_trojan"
+text dd_s_btr "/omc_B_trojan"
+text dd_s_err "/child.err"
+text dd_s_nul "/empty.in"
+
+text dd_hdr_fi "@ng front-ir\n"
+text dd_hdr_a6 "@ng a64\n"
+text dd_hdr_op "@ng opt\n"
+text dd_hdr_sp "@ng a64 split\n"
+text dd_pat_elf "wrword 4 65794\n"
+text dd_pat_imp "wrword 8 1\n"
+text dd_w_wrong "wrong"
+
+text dd_m_usage "usage: gate_ddc REPO_ROOT NG_BIN SCRATCH [wrong]\n"
+text dd_m_fail "DDC-GATE FAIL step="
+text dd_m_pass "DDC-GATE PASS paths=3 diverse_bins=3 neg_controls=2 sha256="
+text dd_m_nl "\n"
+text dd_m_p1 "DDC stage1(om4)="
+text dd_m_p2 "DDC stage1(ng_a64)="
+text dd_m_p3 "DDC stage1(ng_opt_split)="
+text dd_m_p4 "DDC final(omc_A==omc_B1==omc_B2==pin)="
+text dd_m_p5 "DDC nc1_trojan_caught(omc_B_trojan)="
+text dd_m_p6 "DDC nc2_bitflip_caught=OK\n"
+
+fn dd_wrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn dd_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put dd_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 dd_dig p sub 24 p
+ret
+end
+end
+end
+
+fn dd_fail code ulong to int
+dd_wrt dd_m_fail
+dd_num code
+dd_wrt dd_m_nl
+ret int code
+end
+
+fn dd_p_root suf view uchar * to void
+n = get dd_rl 0
+for i ulong n bound 2048
+put dd_pa i get dd_root i
+end
+m = len suf
+for j ulong m bound 256
+put dd_pa add n j get suf j
+end
+put dd_pl 0 add n m
+end
+
+fn dd_p_scr suf view uchar * to void
+n = get dd_sl 0
+for i ulong n bound 2048
+put dd_pa i get dd_scr i
+end
+m = len suf
+for j ulong m bound 256
+put dd_pa add n j get suf j
+end
+put dd_pl 0 add n m
+end
+
+fn dd_pa_to_pb to void
+n = get dd_pl 0
+for i ulong n bound 4096
+put dd_pb i get dd_pa i
+end
+put dd_pbl 0 n
+end
+
+fn dd_pa_to_pc to void
+n = get dd_pl 0
+for i ulong n bound 4096
+put dd_pc i get dd_pa i
+end
+put dd_pcl 0 n
+end
+
+fn dd_ng_to_pc to void
+n = get dd_nl 0
+for i ulong n bound 2048
+put dd_pc i get dd_ng i
+end
+put dd_pcl 0 n
+end
+
+note Load file at dd_pa into sh_dat[0..); returns length or 99999999 on error
+fn dd_load_sh to ulong
+fd = fopen dd_pa 0 get dd_pl 0 0 0
+if lt fd 0
+ret 99999999
+end
+n = ulong 0
+while lt n len sh_dat bound 4096
+chunk = sub len sh_dat n
+if gt chunk 65536
+chunk = ulong 65536
+end
+k = read int fd sh_dat n chunk
+if lt k 0
+r = fclose int fd
+ret 99999999
+end
+if eq k 0
+r = fclose int fd
+ret n
+end
+n = add n ulong k
+end
+r = fclose int fd
+ret 99999999
+end
+
+note Load file at dd_pa into dd_b2[0..); returns length or 99999999 on error
+fn dd_load_b2 to ulong
+fd = fopen dd_pa 0 get dd_pl 0 0 0
+if lt fd 0
+ret 99999999
+end
+n = ulong 0
+while lt n len dd_b2 bound 2048
+chunk = sub len dd_b2 n
+if gt chunk 65536
+chunk = ulong 65536
+end
+k = read int fd dd_b2 n chunk
+if lt k 0
+r = fclose int fd
+ret 99999999
+end
+if eq k 0
+r = fclose int fd
+ret n
+end
+n = add n ulong k
+end
+r = fclose int fd
+ret 99999999
+end
+
+note Write dd_b2[0..n) to dd_pa with mode
+fn dd_save_b2 n ulong mode int to bool
+fd = fopen dd_pa 0 get dd_pl 0 577 mode
+if lt fd 0
+ret false
+end
+o = ulong 0
+while lt o n bound 4096
+chunk = sub n o
+if gt chunk 65536
+chunk = ulong 65536
+end
+k = write int fd dd_b2 o chunk
+if le k 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k
+end
+r = fclose int fd
+ret true
+end
+
+note Hash file at dd_pa into dd_hx[0..64); returns file size or 99999999 on error
+fn dd_hash_file to ulong
+n = dd_load_sh
+if eq n 99999999
+ret 99999999
+end
+sh_all n
+for j ulong 32
+b = uint get sh_dig j
+put dd_hx mul j 2 sh_hexd shr b 4
+put dd_hx add mul j 2 1 sh_hexd and b 15
+end
+ret n
+end
+
+fn dd_hex_eq_pin to bool
+for i ulong 64
+if ne get dd_hx i get dd_pin i
+ret false
+end
+end
+ret true
+end
+
+fn dd_hx_eq_a to bool
+for i ulong 64
+if ne get dd_hx i get dd_h_a i
+ret false
+end
+end
+ret true
+end
+
+note Byte-for-byte comparison of two files: dd_pa (loaded in sh_dat) vs dd_pb (loaded in dd_b2)
+fn dd_files_eq to bool
+na = dd_load_sh
+if eq na 99999999
+ret false
+end
+n = get dd_pbl 0
+for i ulong n bound 4096
+put dd_pa i get dd_pb i
+end
+put dd_pl 0 n
+nb = dd_load_b2
+if ne na nb
+ret false
+end
+for i ulong na bound 4194304
+if ne get sh_dat i get dd_b2 i
+ret false
+end
+end
+ret true
+end
+
+note Run program at dd_pc with stdin=dd_pb, stdout=dd_pa (mode outMode), stderr=SCRATCH/child.err
+fn dd_exec outMode int to ulong
+n = get dd_pcl 0
+put dd_av 0 1
+put dd_av 1 0
+put dd_av 2 uchar and n 255
+put dd_av 3 uchar shr n 8
+for i ulong n bound 4096
+put dd_av add 4 i get dd_pc i
+end
+put dd_an 0 add 4 n
+fi = fopen dd_pb 0 get dd_pbl 0 0 0
+fo = fopen dd_pa 0 get dd_pl 0 577 outMode
+sn = get dd_sl 0
+em = len dd_s_err
+for i ulong sn bound 2048
+put dd_av add 4096 i get dd_scr i
+end
+for j ulong em bound 64
+put dd_av add add 4096 sn j get dd_s_err j
+end
+fe = fopen dd_av 4096 add sn em 577 420
+if or lt fi 0 or lt fo 0 lt fe 0
+ret 255
+end
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fe 2 0
+r = execprog dd_av 0 get dd_an 0
+exit 127
+end
+r = fclose int fi
+r = fclose int fo
+r = fclose int fe
+w = waitpid int pid dd_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get dd_st 0 0
+ret add 256 ulong get dd_st 0
+end
+ret ulong get dd_st 1
+end
+
+note Pure-Omega seed0.hex decoder (mirrors seed/rung0/load0.sh, zero shell!)
+fn dd_hexval c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
+end
+if and ge c 97 le c 102
+ret add 10 ulong sub c 97
+end
+if and ge c 65 le c 70
+ret add 10 ulong sub c 65
+end
+ret 99
+end
+
+fn dd_load0 to bool
+dd_p_root dd_t_seed0
+n = dd_load_sh
+if eq n 99999999
+ret false
+end
+outp = ulong 0
+pos = ulong 0
+while lt pos n bound 65536
+val = ulong 0
+nd = ulong 0
+incom = false
+while lt pos n bound 1024
+c = get sh_dat pos
+pos = add pos 1
+if eq c 10
+break
+end
+if eq c 35
+incom = true
+end
+if not incom
+if and ne c 32 and ne c 9 ne c 13
+hv = dd_hexval c
+if eq hv 99
+ret false
+end
+val = or shl val 4 hv
+nd = add nd 1
+end
+end
+end
+if gt nd 0
+if ne nd 8
+ret false
+end
+put dd_b2 outp uchar and val 255
+put dd_b2 add outp 1 uchar and shr val 8 255
+put dd_b2 add outp 2 uchar and shr val 16 255
+put dd_b2 add outp 3 uchar and shr val 24 255
+outp = add outp 4
+end
+end
+if ne outp 408
+ret false
+end
+dd_p_scr dd_s_seed0
+ret dd_save_b2 outp 493
+end
+
+note Write header text + file at dd_pb into scratch file at dd_pa
+fn dd_prepend hdr view uchar * to bool
+fd = fopen dd_pa 0 get dd_pl 0 577 420
+if lt fd 0
+ret false
+end
+k = write int fd hdr 0 len hdr
+if ne k long len hdr
+r = fclose int fd
+ret false
+end
+fi = fopen dd_pb 0 get dd_pbl 0 0 0
+if lt fi 0
+r = fclose int fd
+ret false
+end
+while true bound 4096
+nr = read int fi sh_dat 0 65536
+if lt nr 0
+r1 = fclose int fi
+r2 = fclose int fd
+ret false
+end
+if eq nr 0
+break
+end
+o = ulong 0
+while lt o ulong nr bound 1024
+nw = write int fd sh_dat o sub ulong nr o
+if le nw 0
+r1 = fclose int fi
+r2 = fclose int fd
+ret false
+end
+o = add o ulong nw
+end
+end
+r1 = fclose int fi
+r2 = fclose int fd
+ret true
+end
+
+note Concatenate the 4 om4 assembly inputs into SCRATCH/om4.in
+fn dd_append_to fd int to bool
+n = dd_load_sh
+if eq n 99999999
+ret false
+end
+o = ulong 0
+while lt o n bound 4096
+chunk = sub n o
+if gt chunk 65536
+chunk = ulong 65536
+end
+k = write fd sh_dat o chunk
+if le k 0
+ret false
+end
+o = add o ulong k
+end
+ret true
+end
+
+fn dd_cat_om4 to bool
+dd_p_scr dd_s_om4in
+fd = fopen dd_pa 0 get dd_pl 0 577 420
+if lt fd 0
+ret false
+end
+dd_p_root dd_t_t2
+if not dd_append_to int fd
+r = fclose int fd
+ret false
+end
+dd_p_root dd_t_t3
+if not dd_append_to int fd
+r = fclose int fd
+ret false
+end
+dd_p_root dd_t_t4
+if not dd_append_to int fd
+r = fclose int fd
+ret false
+end
+dd_p_root dd_t_om4s
+if not dd_append_to int fd
+r = fclose int fd
+ret false
+end
+r = fclose int fd
+ret true
+end
+
+note ---- Path A: Cold seed chain seed0 -> hex1 -> asm2 -> om4 -> omc_stage1 -> omc_A -> omc_A2 ----
+
+fn dd_path_a to int
+if not dd_load0
+ret dd_fail 10
+end
+note seed0 -> hex1
+dd_p_scr dd_s_seed0
+dd_pa_to_pc
+dd_p_root dd_t_hex1
+dd_pa_to_pb
+dd_p_scr dd_s_hex1
+if ne dd_exec 493 0
+ret dd_fail 11
+end
+note hex1 -> asm2
+dd_p_scr dd_s_hex1
+dd_pa_to_pc
+dd_p_root dd_t_asm2
+dd_pa_to_pb
+dd_p_scr dd_s_asm2
+if ne dd_exec 493 0
+ret dd_fail 12
+end
+note asm2 -> om4
+if not dd_cat_om4
+ret dd_fail 13
+end
+dd_p_scr dd_s_asm2
+dd_pa_to_pc
+dd_p_scr dd_s_om4in
+dd_pa_to_pb
+dd_p_scr dd_s_om4
+if ne dd_exec 493 0
+ret dd_fail 14
+end
+note om4 -> omc_stage1
+dd_p_scr dd_s_om4
+dd_pa_to_pc
+dd_p_root dd_t_omc
+dd_pa_to_pb
+dd_p_scr dd_s_s1
+if ne dd_exec 493 0
+ret dd_fail 15
+end
+if eq dd_hash_file 99999999
+ret dd_fail 16
+end
+for i ulong 64
+put dd_h_s1 i get dd_hx i
+end
+note omc_stage1 -> omc_A
+dd_p_scr dd_s_s1
+dd_pa_to_pc
+dd_p_root dd_t_omc
+dd_pa_to_pb
+dd_p_scr dd_s_a
+if ne dd_exec 493 0
+ret dd_fail 17
+end
+if eq dd_hash_file 99999999
+ret dd_fail 18
+end
+for i ulong 64
+put dd_h_a i get dd_hx i
+end
+if not dd_hex_eq_pin
+ret dd_fail 19
+end
+note Fixpoint check: omc_A -> omc_A2 must equal omc_A byte-for-byte
+dd_p_scr dd_s_a
+dd_pa_to_pc
+dd_p_root dd_t_omc
+dd_pa_to_pb
+dd_p_scr dd_s_a2
+if ne dd_exec 493 0
+ret dd_fail 20
+end
+dd_p_scr dd_s_a
+dd_pa_to_pb
+dd_p_scr dd_s_a2
+if not dd_files_eq
+ret dd_fail 21
+end
+ret 0
+end
+
+note ---- Path B1 & B2: Independent seed/ng compiler (default a64 + opt/a64-split) ----
+
+note Prepend hdr onto path in dd_pb -> SCRATCH/ng_fi.in, run NG_BIN -> SCRATCH/outScr (mode)
+fn dd_ng_step hdr view uchar * outScr view uchar * mode int to bool
+dd_p_scr dd_s_fi
+if not dd_prepend hdr
+ret false
+end
+dd_ng_to_pc
+dd_p_scr dd_s_fi
+dd_pa_to_pb
+dd_p_scr outScr
+ret eq dd_exec mode 0
+end
+
+fn dd_path_b to int
+note Lower clean seed/omc/omc.om to ΩIR via independent ng front-ir
+dd_p_root dd_t_omc
+dd_pa_to_pb
+if not dd_ng_step dd_hdr_fi dd_s_ir 420
+ret dd_fail 31
+end
+note Path B1: @ng a64 -> omc_by_ng
+dd_p_scr dd_s_ir
+dd_pa_to_pb
+if not dd_ng_step dd_hdr_a6 dd_s_ng1 493
+ret dd_fail 32
+end
+dd_p_scr dd_s_ng1
+if eq dd_hash_file 99999999
+ret dd_fail 33
+end
+same = true
+for i ulong 64
+put dd_h_ng1 i get dd_hx i
+if ne get dd_hx i get dd_h_s1 i
+same = false
+end
+end
+if same
+ret dd_fail 34
+end
+note Compile clean omc.om with diverse compiler omc_by_ng -> omc_B1
+dd_p_scr dd_s_ng1
+dd_pa_to_pc
+dd_p_root dd_t_omc
+dd_pa_to_pb
+dd_p_scr dd_s_b1
+if ne dd_exec 493 0
+ret dd_fail 35
+end
+dd_p_scr dd_s_b1
+if eq dd_hash_file 99999999
+ret dd_fail 36
+end
+for i ulong 64
+put dd_h_b1 i get dd_hx i
+end
+
+note Path B2: @ng opt -> @ng a64 split -> omc_by_ng_opt -> omc_B2
+dd_p_scr dd_s_ir
+dd_pa_to_pb
+if not dd_ng_step dd_hdr_op dd_s_iro 420
+ret dd_fail 37
+end
+dd_p_scr dd_s_iro
+dd_pa_to_pb
+if not dd_ng_step dd_hdr_sp dd_s_ng2 493
+ret dd_fail 38
+end
+dd_p_scr dd_s_ng2
+if eq dd_hash_file 99999999
+ret dd_fail 39
+end
+same1 = true
+same2 = true
+for i ulong 64
+put dd_h_ng2 i get dd_hx i
+if ne get dd_hx i get dd_h_s1 i
+same1 = false
+end
+if ne get dd_hx i get dd_h_ng1 i
+same2 = false
+end
+end
+if or same1 same2
+ret dd_fail 40
+end
+dd_p_scr dd_s_ng2
+dd_pa_to_pc
+dd_p_root dd_t_omc
+dd_pa_to_pb
+dd_p_scr dd_s_b2
+if ne dd_exec 493 0
+ret dd_fail 41
+end
+dd_p_scr dd_s_b2
+if eq dd_hash_file 99999999
+ret dd_fail 42
+end
+for i ulong 64
+put dd_h_b2 i get dd_hx i
+end
+ret 0
+end
+
+note ---- Planted Trusting-Trust Miscompile Negative Controls (temp scratch copy only!) ----
+
+fn dd_match_pat pos ulong n ulong to bool
+m = len dd_pat_elf
+if gt add pos m n
+ret false
+end
+for j ulong m bound 32
+if ne get sh_dat add pos j get dd_pat_elf j
+ret false
+end
+end
+ret true
+end
+
+note Splice 1-line EI_ABIVERSION=1 implant right after `wrword 4 65794\n` in SCRATCH/omc_planted.om
+fn dd_plant_trojan_src to bool
+dd_p_root dd_t_omc
+n = dd_load_sh
+if or eq n 99999999 gt add n 64 len dd_b2
+ret false
+end
+hits = ulong 0
+ins = ulong 0
+for i ulong n bound 4194304
+if eq get sh_dat i 119
+if dd_match_pat i n
+hits = add hits 1
+ins = add i len dd_pat_elf
+end
+end
+end
+if ne hits 1
+ret false
+end
+for i ulong ins bound 4194304
+put dd_b2 i get sh_dat i
+end
+im = len dd_pat_imp
+for j ulong im bound 32
+put dd_b2 add ins j get dd_pat_imp j
+end
+remn = sub n ins
+for k ulong remn bound 4194304
+put dd_b2 add add ins im k get sh_dat add ins k
+end
+dd_p_scr dd_s_plsrc
+ret dd_save_b2 add n im 420
+end
+
+fn dd_neg_controls to int
+note NC1: Compile planted trojan omc through ng -> omc_trojan -> omc_trojan(clean omc.om) -> omc_B_trojan
+if not dd_plant_trojan_src
+ret dd_fail 50
+end
+dd_p_scr dd_s_plsrc
+dd_pa_to_pb
+if not dd_ng_step dd_hdr_fi dd_s_plir 420
+ret dd_fail 51
+end
+dd_p_scr dd_s_plir
+dd_pa_to_pb
+if not dd_ng_step dd_hdr_a6 dd_s_trbin 493
+ret dd_fail 52
+end
+dd_p_scr dd_s_trbin
+dd_pa_to_pc
+dd_p_root dd_t_omc
+dd_pa_to_pb
+dd_p_scr dd_s_btr
+if ne dd_exec 493 0
+ret dd_fail 53
+end
+dd_p_scr dd_s_btr
+if eq dd_hash_file 99999999
+ret dd_fail 54
+end
+for i ulong 64
+put dd_h_tr i get dd_hx i
+end
+note Trojan output MUST diverge from omc_A (caught fail-closed!)
+if dd_hx_eq_a
+ret dd_fail 55
+end
+dd_p_scr dd_s_a
+dd_pa_to_pb
+dd_p_scr dd_s_btr
+if dd_files_eq
+ret dd_fail 56
+end
+
+note NC2: 1-bit flip in omc_B1 MUST diverge from omc_A!
+dd_p_scr dd_s_b1
+n = dd_load_sh
+if or eq n 99999999 lt n 256
+ret dd_fail 57
+end
+put sh_dat 200 xor get sh_dat 200 uchar 1
+sh_all n
+for j ulong 32
+b = uint get sh_dig j
+put dd_hx mul j 2 sh_hexd shr b 4
+put dd_hx add mul j 2 1 sh_hexd and b 15
+end
+if dd_hx_eq_a
+ret dd_fail 58
+end
+ret 0
+end
+
+fn dd_check_wrong to void
+if lt argcnt 5
+ret
+end
+k = argread 4 dd_pa 0 64
+if ne k long len dd_w_wrong
+ret
+end
+for i ulong len dd_w_wrong
+if ne get dd_pa i get dd_w_wrong i
+ret
+end
+end
+put dd_wrong 0 1
+end
+
+fn main to int
+if or lt argcnt 4 gt argcnt 5
+dd_wrt dd_m_usage
+ret 2
+end
+rl = argread 1 dd_root 0 2047
+nl = argread 2 dd_ng 0 2047
+sl = argread 3 dd_scr 0 2047
+if or lt rl 1 or lt nl 1 lt sl 1
+dd_wrt dd_m_usage
+ret 2
+end
+put dd_rl 0 ulong rl
+put dd_nl 0 ulong nl
+put dd_sl 0 ulong sl
+put dd_wrong 0 0
+dd_check_wrong
+r = makedir dd_scr 0 ulong sl 493
+
+note Read pinned expected sha256 from REPO_ROOT/seed/out/omc.sha256
+dd_p_root dd_t_pin
+pn = dd_load_sh
+if or eq pn 99999999 lt pn 64
+ret dd_fail 1
+end
+for i ulong 64
+put dd_pin i get sh_dat i
+end
+
+rc = dd_path_a
+if ne rc 0
+ret rc
+end
+rc = dd_path_b
+if ne rc 0
+ret rc
+end
+rc = dd_neg_controls
+if ne rc 0
+ret rc
+end
+
+note Primary Wheeler DDC equality assertions (if `wrong` flag is set, compare trojan instead -> must fail!)
+dd_p_scr dd_s_a
+dd_pa_to_pb
+if ne get dd_wrong 0 0
+dd_p_scr dd_s_btr
+else
+dd_p_scr dd_s_b1
+end
+if not dd_files_eq
+ret dd_fail 60
+end
+dd_p_scr dd_s_a
+dd_pa_to_pb
+dd_p_scr dd_s_b2
+if not dd_files_eq
+ret dd_fail 61
+end
+
+dd_wrt dd_m_p1
+w1 = write 1 dd_h_s1 0 64
+dd_wrt dd_m_nl
+dd_wrt dd_m_p2
+w2 = write 1 dd_h_ng1 0 64
+dd_wrt dd_m_nl
+dd_wrt dd_m_p3
+w3 = write 1 dd_h_ng2 0 64
+dd_wrt dd_m_nl
+dd_wrt dd_m_p4
+w4 = write 1 dd_h_a 0 64
+dd_wrt dd_m_nl
+dd_wrt dd_m_p5
+w5 = write 1 dd_h_tr 0 64
+dd_wrt dd_m_nl
+dd_wrt dd_m_p6
+dd_wrt dd_m_pass
+w6 = write 1 dd_h_a 0 64
+dd_wrt dd_m_nl
+ret 0
+end
