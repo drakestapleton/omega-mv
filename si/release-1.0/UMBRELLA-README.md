@@ -85,7 +85,7 @@ For sharing and exchanging custom `OLLMSP01` Helix specialist strands between so
 
 ## Quickstart by Platform
 
-Never pipe remote scripts directly into a shell. Always verify `SHA256SUMS.txt` fail-closed before installing or executing any binary.
+Never pipe remote scripts directly into a shell. Always verify `SHA256SUMS-1.0.txt` (or `launch-kit/SHA256SUMS.txt` for bundle verification) fail-closed before installing or executing any binary.
 
 ### 1. Linux AArch64 & DGX Spark GB10 (Primary)
 ```sh
@@ -93,17 +93,17 @@ Never pipe remote scripts directly into a shell. Always verify `SHA256SUMS.txt` 
 sh seed/omega-from-seed.sh
 sha256sum -c seed/out/omc.sha256
 
-# Preview topology & profile plan without modifying the filesystem
+# Preview topology & profile plan without modifying the filesystem (or --json for AI agents)
 sh si/release-1.0/install-si-1.0.sh --profile full --dry-run
 
-# Verify a downloaded release bundle fail-closed before installing
-sh si/release-1.0/install-si-1.0.sh --verify-bundle ./si-1.0-bundle --install --prefix "$HOME/.local"
+# Verify the release launch-kit bundle fail-closed before installing
+sh si/release-1.0/install-si-1.0.sh --verify-bundle si/release-1.0/launch-kit --install --prefix "$HOME/.local"
 ```
 
 ### 2. Linux x86_64
 ```sh
 sh si/release-1.0/install-si-1.0.sh --profile core --dry-run
-sh si/release-1.0/install-si-1.0.sh --verify-bundle ./si-1.0-x86linux-bundle --install --prefix "$HOME/.local"
+sh si/release-1.0/install-si-1.0.sh --verify-bundle si/release-1.0/launch-kit --install --prefix "$HOME/.local"
 ```
 
 ### 3. macOS Apple Silicon (`arm64`)
