@@ -4,7 +4,7 @@ TRT5_OM_OMC ?= seed/out/omc
 OUT_DIR ?= build
 
 TRT5_CG_SRCS   = seed/ng/sha256.om src/runtime/rx_compose.om tests/runtime/rx_composition_gate.om
-TRT5_HB_SRCS   = seed/ng/sha256.om src/runtime/rx_world.om tests/runtime/rx_heartbeat_test.om
+TRT5_HB_SRCS   = seed/ng/sha256.om src/omega_evidence.om src/runtime/aien_machine_id.om tests/runtime/rx_argus_env.om src/runtime/rx_world.om tests/runtime/rx_heartbeat_test.om
 TRT5_PR_SRCS   = seed/ng/sha256.om src/runtime/rx_graph.om src/runtime/rx_plan.om src/runtime/rx_plan_arrange.om tests/runtime/rx_plan_reuse.om
 TRT5_R12_SRCS  = src/runtime/rx_coherent.om tests/runtime/rx_r12_resident.om
 TRT5_R13E_SRCS = seed/ng/sha256.om src/runtime/rx_cortex.om src/runtime/rx_cortex_record.om tests/runtime/rx_r13_cortex_episode.om

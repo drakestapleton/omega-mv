@@ -1,0 +1,456 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_argus_env.om -- Pure seeded OM-2 ARGUS env/summary & receipt JSON writer.
+note Composed after seed/ng/sha256.om, src/omega_evidence.om, and src/runtime/aien_machine_id.om.
+
+text t_rae_env_mid   "RX_ARGUS_MACHINE_ID="
+text t_rae_env_sum   "RX_ARGUS_SUMMARY="
+text t_rae_env_str   "RX_ARGUS_STREAM="
+text t_rae_env_run   "RX_ARGUS_RUN_ID="
+text t_rae_env_suite "RX_ARGUS_SUITE="
+text t_rae_env_cons  "RX_ARGUS_CONSUMER="
+text t_rae_env_cand  "OMEGA_CANDIDATE_COMMIT="
+text t_rae_aienos_lk "aienos.lock"
+text t_rae_bad_mid   "rx_argus: RX_ARGUS_MACHINE_ID is not a canonical machine identity\n"
+text t_rae_hex       "0123456789abcdef"
+text t_rae_true      "true"
+text t_rae_false     "false"
+text t_rae_unk       "unknown"
+text t_rae_ingest    "ingest"
+text t_rae_pass      "PASS"
+text t_rae_sch_arg   "ARGUS_SUMMARY_V11"
+text t_rae_k_schema  "schema"
+text t_rae_k_suite   "suite"
+text t_rae_k_cons    "consumer"
+text t_rae_k_run     "run_id"
+text t_rae_k_mid     "machine_id"
+text t_rae_k_events  "events"
+text t_rae_k_find    "findings"
+text t_rae_k_status  "status"
+text t_rae_str_hdr   "ARGUSV11"
+text t_rae_j_open    "{\n  "
+text t_rae_j_cm      ",\n  "
+text t_rae_j_sp      ", "
+text t_rae_j_row     "    {"
+text t_rae_j_rcm     "},\n"
+text t_rae_j_rnl     "}\n"
+text t_rae_j_close   "}\n}\n"
+text t_rae_j_aopen   "[\n"
+text t_rae_j_aclose  "  ]\n}\n"
+text t_rae_j_ocm     "},\n  "
+text t_rae_j_iopen   "[{"
+text t_rae_j_icm     "}],\n  "
+text t_rae_j_arr0    "[]"
+
+global g_rae_buf       uchar 8192
+global g_rae_pos       ulong 1
+global g_rae_mid       uchar 64
+global g_rae_has_mid   ulong 1
+global g_rae_sum_path  uchar 512
+global g_rae_sum_len   ulong 1
+global g_rae_str_path  uchar 512
+global g_rae_str_len   ulong 1
+global g_rae_run_id    uchar 128
+global g_rae_run_len   ulong 1
+global g_rae_suite     uchar 64
+global g_rae_suite_len ulong 1
+global g_rae_cons      uchar 64
+global g_rae_cons_len  ulong 1
+global g_rae_tmp       uchar 1024
+global g_rae_val       uchar 512
+global g_rae_dig       uchar 32
+
+fn rae_reset to void
+  put g_rae_pos 0 0
+end
+
+fn rae_putc c uchar to void
+  p = get g_rae_pos 0
+  if lt p 8192
+    put g_rae_buf p c
+    put g_rae_pos 0 add p 1
+  end
+end
+
+fn rae_puts s view uchar * to void
+  n = len s
+  for i ulong n bound 512
+    rae_putc get s i
+  end
+end
+
+fn rae_putn s view uchar * n ulong to void
+  for i ulong n bound 512
+    rae_putc get s i
+  end
+end
+
+fn rae_putq to void
+  rae_putc 34
+end
+
+fn rae_put_u64 v ulong to void
+  if eq v 0
+    rae_putc 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put g_rae_dig n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    rae_putc get g_rae_dig n
+  end
+end
+
+fn rae_put_bool b bool to void
+  if b
+    rae_puts t_rae_true
+  else
+    rae_puts t_rae_false
+  end
+end
+
+fn rae_kv_key k view uchar * to void
+  rae_putq
+  rae_puts k
+  rae_putq
+  rae_putc 58
+  rae_putc 32
+end
+
+fn rae_kv_str k view uchar * v view uchar * vn ulong to void
+  rae_kv_key k
+  rae_putq
+  rae_putn v vn
+  rae_putq
+end
+
+fn rae_kv_lit k view uchar * v view uchar * to void
+  rae_kv_str k v len v
+end
+
+fn rae_kv_u64 k view uchar * v ulong to void
+  rae_kv_key k
+  rae_put_u64 v
+end
+
+fn rae_kv_bool k view uchar * b bool to void
+  rae_kv_key k
+  rae_put_bool b
+end
+
+fn rae_pfx_eq pfx view uchar * plen ulong to bool
+  for k ulong plen bound 64
+    if ne get g_rae_tmp k get pfx k
+      ret false
+    end
+  end
+  ret true
+end
+
+note Look up env var by prefix (including '='). Copies value to g_rae_val[0..min(vl,511)],
+note returns full value length (>=0) or -1 if unset.
+fn rae_env_find pfx view uchar * to long
+  ec = envcnt
+  plen = len pfx
+  for i ulong ulong ec bound 512
+    n = envread i g_rae_tmp 0 1024
+    if ge n long plen
+      if rae_pfx_eq pfx plen
+        vl = sub ulong n plen
+        cpy = vl
+        if gt cpy 511
+          cpy = ulong 511
+        end
+        for k ulong cpy bound 512
+          put g_rae_val k get g_rae_tmp add plen k
+        end
+        ret long vl
+      end
+    end
+  end
+  ret -1
+end
+
+fn rae_init_mid to long
+  ml = rae_env_find t_rae_env_mid
+  if lt ml 0
+    ret 0
+  end
+  mtxt = new uchar 96 0
+  cpy = ulong ml
+  if gt cpy 96
+    cpy = ulong 96
+  end
+  for i ulong cpy bound 96
+    put mtxt i get g_rae_val i
+  end
+  mid = new uchar 33 0
+  rc = aien_mid_from_text view mtxt ulong ml edit mid
+  if ne rc 0
+    ign_e = write 2 t_rae_bad_mid 0 len t_rae_bad_mid
+    ret -1
+  end
+  for i ulong 32
+    b = uint get mid add 1 i
+    put g_rae_mid mul i 2 get t_rae_hex ulong shr b 4
+    put g_rae_mid add mul i 2 1 get t_rae_hex ulong and b 15
+  end
+  put g_rae_has_mid 0 1
+  ret 0
+end
+
+fn rae_init_paths to void
+  sl = rae_env_find t_rae_env_sum
+  if gt sl 0
+    n = ulong sl
+    if gt n 511
+      n = ulong 511
+    end
+    for i ulong n bound 512
+      put g_rae_sum_path i get g_rae_val i
+    end
+    put g_rae_sum_len 0 n
+  end
+  stl = rae_env_find t_rae_env_str
+  if gt stl 0
+    n2 = ulong stl
+    if gt n2 511
+      n2 = ulong 511
+    end
+    for i ulong n2 bound 512
+      put g_rae_str_path i get g_rae_val i
+    end
+    put g_rae_str_len 0 n2
+  end
+  rl = rae_env_find t_rae_env_run
+  if gt rl 0
+    n3 = ulong rl
+    if gt n3 127
+      n3 = ulong 127
+    end
+    for i ulong n3 bound 128
+      put g_rae_run_id i get g_rae_val i
+    end
+    put g_rae_run_len 0 n3
+  end
+end
+
+fn rae_argus_init def_suite view uchar * to long
+  put g_rae_has_mid 0 0
+  put g_rae_sum_len 0 0
+  put g_rae_str_len 0 0
+  put g_rae_run_len 0 0
+  put g_rae_suite_len 0 0
+  put g_rae_cons_len 0 0
+  if ne rae_init_mid 0
+    ret -1
+  end
+  rae_init_paths
+  sul = rae_env_find t_rae_env_suite
+  if gt sul 0
+    n = ulong sul
+    if gt n 63
+      n = ulong 63
+    end
+    for i ulong n bound 64
+      put g_rae_suite i get g_rae_val i
+    end
+    put g_rae_suite_len 0 n
+  else
+    dl = len def_suite
+    if gt dl 63
+      dl = ulong 63
+    end
+    for i ulong dl bound 64
+      put g_rae_suite i get def_suite i
+    end
+    put g_rae_suite_len 0 dl
+  end
+  cl = rae_env_find t_rae_env_cons
+  if gt cl 0
+    n2 = ulong cl
+    if gt n2 63
+      n2 = ulong 63
+    end
+    for i ulong n2 bound 64
+      put g_rae_cons i get g_rae_val i
+    end
+    put g_rae_cons_len 0 n2
+  else
+    for i ulong len t_rae_ingest bound 16
+      put g_rae_cons i get t_rae_ingest i
+    end
+    put g_rae_cons_len 0 len t_rae_ingest
+  end
+  ret 0
+end
+
+fn rae_write_buf path view uchar * plen ulong to long
+  ev_mkdir_p_for_file path plen
+  fd = omega_evidence_create path plen
+  if lt fd 0
+    ret -1
+  end
+  blen = get g_rae_pos 0
+  obuf = new uchar 8192 0
+  for i ulong blen bound 8192
+    put obuf i get g_rae_buf i
+  end
+  rc = ev_write_all int fd obuf blen
+  ign = fclose int fd
+  ret rc
+end
+
+fn rae_write_stream events ulong to void
+  slen = get g_rae_str_len 0
+  if eq slen 0
+    ret
+  end
+  sp = new uchar 512 0
+  for i ulong slen bound 512
+    put sp i get g_rae_str_path i
+  end
+  pkt = new uchar 128 0
+  for i ulong len t_rae_str_hdr bound 8
+    put pkt i get t_rae_str_hdr i
+  end
+  put pkt 8 uchar and events 255
+  put pkt 9 uchar and shr events 8 255
+  ev_mkdir_p_for_file sp slen
+  fds = omega_evidence_create sp slen
+  if ge fds 0
+    ign1 = ev_write_all int fds pkt 128
+    ign2 = fclose int fds
+  end
+end
+
+fn rae_put_g_suite to void
+  n = get g_rae_suite_len 0
+  rae_putq
+  for i ulong n bound 64
+    rae_putc get g_rae_suite i
+  end
+  rae_putq
+end
+
+fn rae_put_g_cons to void
+  n = get g_rae_cons_len 0
+  rae_putq
+  for i ulong n bound 64
+    rae_putc get g_rae_cons i
+  end
+  rae_putq
+end
+
+fn rae_put_g_run to void
+  n = get g_rae_run_len 0
+  rae_putq
+  for i ulong n bound 128
+    rae_putc get g_rae_run_id i
+  end
+  rae_putq
+end
+
+fn rae_put_g_mid to void
+  rae_putq
+  for i ulong 64
+    rae_putc get g_rae_mid i
+  end
+  rae_putq
+end
+
+fn rae_argus_finish events ulong to void
+  rae_write_stream events
+  slen = get g_rae_sum_len 0
+  if eq slen 0
+    ret
+  end
+  rae_reset
+  rae_puts t_rae_j_open
+  rae_kv_lit t_rae_k_schema t_rae_sch_arg
+  rae_puts t_rae_j_cm
+  rae_kv_key t_rae_k_suite
+  rae_put_g_suite
+  rae_puts t_rae_j_cm
+  rae_kv_key t_rae_k_cons
+  rae_put_g_cons
+  rae_puts t_rae_j_cm
+  rae_kv_key t_rae_k_run
+  rae_put_g_run
+  rae_puts t_rae_j_cm
+  if ne get g_rae_has_mid 0 0
+    rae_kv_key t_rae_k_mid
+    rae_put_g_mid
+    rae_puts t_rae_j_cm
+  end
+  rae_kv_u64 t_rae_k_events events
+  rae_puts t_rae_j_cm
+  rae_kv_u64 t_rae_k_find 0
+  rae_puts t_rae_j_cm
+  rae_kv_lit t_rae_k_status t_rae_pass
+  rae_putc 10
+  rae_putc 125
+  rae_putc 10
+  sp = new uchar 512 0
+  for i ulong slen bound 512
+    put sp i get g_rae_sum_path i
+  end
+  ign3 = rae_write_buf sp slen
+end
+
+fn rae_get_candidate dst edit uchar 41 to ulong
+  cl = rae_env_find t_rae_env_cand
+  if eq cl 40
+    for i ulong 40
+      put dst i get g_rae_val i
+    end
+    put dst 40 0
+    ret 40
+  end
+  if omega_evidence_run_commit dst
+    ret 40
+  end
+  for i ulong len t_rae_unk bound 16
+    put dst i get t_rae_unk i
+  end
+  put dst len t_rae_unk 0
+  ret len t_rae_unk
+end
+
+fn rae_get_aienos_lock dst edit uchar 41 to ulong
+  buf = new uchar 64 0
+  fd = fopen t_rae_aienos_lk 0 len t_rae_aienos_lk or EV_O_RDONLY EV_O_CLOEXEC 0
+  if ge fd 0
+    rn = read int fd buf 0 63
+    ign = fclose int fd
+    if gt rn 0
+      tl = ev_trim_line buf ulong rn
+      if gt tl 40
+        tl = ulong 40
+      end
+      for i ulong tl bound 41
+        put dst i get buf i
+      end
+      put dst tl 0
+      ret tl
+    end
+  end
+  for i ulong len t_rae_unk bound 16
+    put dst i get t_rae_unk i
+  end
+  put dst len t_rae_unk 0
+  ret len t_rae_unk
+end
+
+fn rae_write_qual_receipt rel view uchar * to void
+  pbuf = new uchar 1024 0
+  if eq omega_evidence_path rel len rel pbuf 1024 0
+    plen = ev_cstr_len pbuf 1024
+    ign = rae_write_buf pbuf plen
+  end
+end

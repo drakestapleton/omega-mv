@@ -5,9 +5,9 @@ TRT2_OM_OMC ?= seed/out/omc
 TRT2_I11_SRCS  = seed/ng/sha256.om src/runtime/rx_world.om tests/runtime/rx_i11_wake_merge.om
 TRT2_R15I_SRCS = seed/ng/sha256.om src/runtime/rx_world.om src/runtime/rx_generation.om tests/runtime/rx_r15_instr.om
 TRT2_CG_SRCS   = seed/ng/sha256.om om/runtime/rx_mid.om om/runtime/rx_capq_core.om om/runtime/rx_skillroute_core.om src/runtime/rx_graph.om src/runtime/rx_capq.om src/runtime/rx_skillroute.om tests/runtime/rx_capability_graph.om
-TRT2_R7_SRCS   = seed/authority/cap_table_om2.om src/runtime/rx_caproot.om tests/runtime/rx_r7_native.om
-TRT2_R8_SRCS   = seed/ng/sha256.om src/runtime/rx_world.om src/runtime/rx_aegis.om tests/runtime/rx_r8_aegis.om
-TRT2_R9_SRCS   = seed/ng/sha256.om seed/authority/cap_table_om2.om src/runtime/rx_caproot.om src/runtime/rx_generation.om tests/runtime/rx_r9_barrier.om
+TRT2_R7_SRCS   = seed/ng/sha256.om src/omega_evidence.om src/runtime/aien_machine_id.om tests/runtime/rx_argus_env.om seed/authority/cap_table_om2.om src/runtime/rx_caproot.om tests/runtime/rx_r7_native.om
+TRT2_R8_SRCS   = seed/ng/sha256.om src/omega_evidence.om src/runtime/aien_machine_id.om tests/runtime/rx_argus_env.om src/runtime/rx_world.om src/runtime/rx_aegis.om tests/runtime/rx_r8_aegis.om
+TRT2_R9_SRCS   = seed/ng/sha256.om src/omega_evidence.om src/runtime/aien_machine_id.om tests/runtime/rx_argus_env.om seed/authority/cap_table_om2.om src/runtime/rx_caproot.om src/runtime/rx_generation.om tests/runtime/rx_r9_barrier.om
 TRT2_R10_SRCS  = seed/ng/sha256.om src/runtime/rx_world.om src/runtime/rx_omega.om tests/runtime/rx_r10_omega.om
 TRT2_EM_SRCS   = seed/ng/sha256.om src/runtime/rx_world.om src/runtime/rx_generation.om tests/runtime/rx_emergency.om
 
