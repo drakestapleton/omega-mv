@@ -152,6 +152,60 @@ if [ "$NEG_RC" -ne 1 ] || ! grep -q "R MISMATCH fib38 mutant" "$OUT/neg/neg.out"
 fi
 echo "NEG_CONTROL_OK planted_wrong_output caught (rc=$NEG_RC)"
 
+echo "=== [4b/5] Optimization-breakage & semantic-corruption live compiler mutants ==="
+# Verify real ng strictly reduces chacha.ir -> chacha.opt under @ng opt
+CH_IR_SZ=$(wc -c < "$OUT/ir/chacha.ir")
+CH_OPT_SZ=$(wc -c < "$OUT/ir/chacha.opt")
+if [ "$CH_OPT_SZ" -ge "$CH_IR_SZ" ]; then
+  echo "run_rm3: real ng failed to reduce chacha IR ($CH_IR_SZ -> $CH_OPT_SZ)" >&2
+  exit 1
+fi
+
+# Mutant M1: disable single-block optimizer op_blk1 in a scratch copy of seed/ng/src/opt.om
+sed 's/^op_blk1 f$/note op_blk1 disabled/' \
+  "$REPO/seed/ng/src/opt.om" > "$OUT/neg/opt_noop.om"
+if cmp -s "$REPO/seed/ng/src/opt.om" "$OUT/neg/opt_noop.om"; then
+  echo "run_rm3: Mutant M1 pattern not matched in opt.om" >&2
+  exit 1
+fi
+cat "$REPO/seed/ng/src/ir.om" "$REPO/seed/ng/src/front.om" "$OUT/neg/opt_noop.om" \
+    "$REPO/seed/ng/src/a64.om" "$REPO/seed/ng/src/main.om" | "$OMC" > "$OUT/neg/ng_mut_noop"
+chmod +x "$OUT/neg/ng_mut_noop"
+(printf '@ng opt\n'; cat "$OUT/ir/chacha.ir") | "$OUT/neg/ng_mut_noop" > "$OUT/neg/chacha_noop.opt"
+CH_NOOP_SZ=$(wc -c < "$OUT/neg/chacha_noop.opt")
+if [ "$CH_NOOP_SZ" -le "$CH_OPT_SZ" ]; then
+  echo "run_rm3: NEGATIVE CONTROL FAILED: opt_disabled mutant still shrank ($CH_NOOP_SZ <= $CH_OPT_SZ)" >&2
+  exit 1
+fi
+echo "NEG_CONTROL_OK opt_disabled_mutant caught (real_opt=$CH_OPT_SZ < noop_opt=$CH_NOOP_SZ <= ir=$CH_IR_SZ)"
+
+# Mutant M2: corrupt front.om fe_lfold constant-fold add by +1 in a scratch copy, compile sha
+sed 's/fe_lval fe_lcst t fe_lcan t add av bv t/fe_lval fe_lcst t fe_lcan t add av add bv 1 t/' \
+  "$REPO/seed/ng/src/front.om" > "$OUT/neg/front_bad.om"
+if cmp -s "$REPO/seed/ng/src/front.om" "$OUT/neg/front_bad.om"; then
+  echo "run_rm3: Mutant M2 pattern not matched in front.om" >&2
+  exit 1
+fi
+cat "$REPO/seed/ng/src/ir.om" "$OUT/neg/front_bad.om" "$REPO/seed/ng/src/opt.om" \
+    "$REPO/seed/ng/src/a64.om" "$REPO/seed/ng/src/main.om" | "$OMC" > "$OUT/neg/ng_mut_sem"
+chmod +x "$OUT/neg/ng_mut_sem"
+(printf '@ng front-ir\n'; cat "$KDIR/sha.om") | "$OUT/neg/ng_mut_sem" > "$OUT/neg/sha_bad.ir"
+(printf '@ng opt\n'; cat "$OUT/neg/sha_bad.ir") | "$OUT/neg/ng_mut_sem" > "$OUT/neg/sha_bad.opt"
+(printf '@ng a64\n'; cat "$OUT/neg/sha_bad.opt") | "$OUT/neg/ng_mut_sem" > "$OUT/neg/sha_bad"
+chmod +x "$OUT/neg/sha_bad"
+WANT_SHA=$(cat "$KDIR/want/sha.sha256")
+set +e
+"$OUT/rm3_bench" run 1 2 "$OUT/scr" sha "$WANT_SHA" \
+  omc "$OUT/bin/omc/sha" mut_sem "$OUT/neg/sha_bad" > "$OUT/neg/neg_sem.out" 2>&1
+SEM_RC=$?
+set -e
+if [ "$SEM_RC" -ne 1 ] || ! grep -q "R MISMATCH sha mut_sem" "$OUT/neg/neg_sem.out"; then
+  echo "run_rm3: NEGATIVE CONTROL FAILED: opt_semantic_mutant not caught (rc=$SEM_RC)" >&2
+  cat "$OUT/neg/neg_sem.out" >&2
+  exit 1
+fi
+echo "NEG_CONTROL_OK opt_semantic_mutant caught (rc=$SEM_RC)"
+
 echo "=== [5/5] Interleaved paired timing (taskset -c $CPUS, warm=$WARM, reps=$REPS) ==="
 : > "$OUT/rows.txt"
 for k in $KERNELS; do
