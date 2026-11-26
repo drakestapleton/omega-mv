@@ -1167,3 +1167,64 @@ invariant `shfl` stays put).
 Its mutants hoist a load past the loop's stores and checks past their guard (both refused
 by ngcheck: the hoisted op keeps an in-loop token, s6.4), merge preheader ops of different imm
 (a run differs) and let BCE delete a check one element past its proof (a run differs).
+
+## 16. Additive `omega.ng.ir.v2` (version 10): Structural Purity, Physical Contracts, and Per-Function `SEMANTIC_ID`
+
+`omega.ng.ir.v2` is an additive wire revision (version byte `10`, 16-byte domain tag `omega.ng.ir.v2\0\0`)
+for Sovereign Intelligence 2.0 Stage 0. Version 9 (`omega.ng.ir.v1\0\0`) remains 100% unchanged and
+backward-compatible in every reader and writer; mismatches between version byte and domain tag are
+refused as `VERSION` (class 11).
+
+### 16.1 Per-Function Contract Record (28 bytes, v2 only)
+
+In a version 10 module, every function record carries a fixed 28-byte little-endian contract block
+immediately after `result` (and the 13-byte kernel header when `kind == 1`), before `nblocks`:
+
+| bytes | field | type | canonical rules |
+|---|---|---|---|
+| 1 | `purity_flag` | `u8` | `0` unspecified/impure, `1` `@pure` (above 1 -> `NONCANONICAL` 13) |
+| 1 | `precision_tier` | `u8` | `0` unspecified, `1` `@exact`, `2` `@tol` (above 2 -> `NONCANONICAL` 13) |
+| 1 | `hard_deadline` | `u8` | `0` soft/none, `1` `@hard_deadline` (above 1 -> `NONCANONICAL` 13) |
+| 1 | `reserved` | `u8` | MUST be `0` (nonzero -> `NONCANONICAL` 13) |
+| 8 | `err_bound` | `u64` | fixed-point/ulp error bound; MUST be `0` unless `precision_tier == 2` (`@tol`) (`NONCANONICAL` 13 otherwise) |
+| 8 | `deadline_us` | `u64` | latency deadline in microseconds (`0` = none); MUST be `> 0` when `hard_deadline == 1` (`NONCANONICAL` 13 otherwise) |
+| 8 | `power_mw` | `u64` | power ceiling in milliwatts (`0` = none) |
+
+In a version 9 (`omega.ng.ir.v1`) module, the 28-byte block is absent on the wire and all contract
+fields default to `0` in memory.
+
+### 16.2 Front-End Source Annotations (Omega NG only; frozen OM-2 `omc` untouched)
+
+Prefix Omega NG (`seed/ng/src/front.om`) and infix Omega NG (`seed/ng/infix/infix_front.om`) accept
+per-function contract annotations immediately preceding `fn` or `export fn`:
+
+- `@pure`: sets `purity_flag = 1`.
+- `@exact`: sets `precision_tier = 1` (contradiction with `@tol` or nonzero `@err` is refused).
+- `@tol` or `@tol N` / `@tol(N)`: sets `precision_tier = 2` (and `err_bound = N` when given).
+- `@err N` / `@err(N)`: sets `err_bound = N` and sets `precision_tier = 2` when unspecified (refused with `@exact` if `N > 0`).
+- `@deadline N` / `@deadline(N)`: sets `deadline_us = N` (`N > 0`).
+- `@hard_deadline` or `@hard_deadline N` / `@hard_deadline(N)`: sets `hard_deadline = 1` (and `deadline_us = N` when given; requires `deadline_us > 0`).
+- `@power N` / `@power(N)`: sets `power_mw = N` (`N > 0`).
+
+Units with no contract annotations lower to version 9 (`omega.ng.ir.v1`) byte-for-byte unchanged.
+Units with any contract annotation lower to version 10 (`omega.ng.ir.v2`).
+
+### 16.3 Structural Purity Verification (`seed/ng/ngcheck.om`)
+
+`ngcheck` NEVER trusts `purity_flag` as an unchecked hint. For every function with `purity_flag == 1`,
+`ngcheck` structurally verifies all of the following (refusing with `EFFECT`, exit 22, on any violation):
+
+1. Function is not a kernel (`kind != 1`) and accepts no mutable (`access == 1`, `edit`) `REF` or `SLICE` parameters.
+2. Every op in every block has zero `TK == 1` (`E`) effect ops (`store`, `fstore`, `vstore`, `fill`, `atom`, `atomcas`, `alloca`, `sync`, `launch`, `mmast`, `host`, `pool.grow`, `pool.store`, `pool.read`, `pool.write`, `chk.*`), with the sole structured exception of `call` (op 64) whose callee ALSO has `purity_flag == 1` (closed pure callees — because every `purity_flag == 1` function in the module is verified by the same pass, purity is transitively closed over the call graph).
+3. Zero mutable global access: `gaddr` (op 52) may reference only immutable class-1 globals (`class == 1`, never class-0 mutable globals), and mutable runtime pool readers (`pool.len` 112, `pool.load` 113) are refused.
+4. Zero process-termination or trap terminators (`trap` 65, `exit` 66).
+
+### 16.4 Canonical Per-Function `SEMANTIC_ID` (`@ng sem-id`) and OMPK v2
+
+`@ng sem-id` computes a canonical per-function FIPS 180-4 SHA-256 digest over:
+`omega.ng.sem.fn.v2\0 || canonical function signature (structural types) || 28-byte canonical v2 contract || canonical blocks & ops (structural types, SSA value ids, block ids, immutable class-1 global bytes for gaddr)`.
+Because source names, comments, whitespace, and surface syntax are erased before ΩIR lowering,
+hand-written prefix `.om` and infix Omega NG produce bit-identical `SEMANTIC_ID` digests for every
+function. `@ng pack` emits OMPK v1 (128-byte header) for v1 modules and OMPK v2 (160-byte header,
+carrying `purity_flag`, `precision_tier`, `hard_deadline`, `err_bound`, `deadline_us`, `power_mw`
+and binding `func_id` to the canonical per-function `SEMANTIC_ID`) for v2 modules.
