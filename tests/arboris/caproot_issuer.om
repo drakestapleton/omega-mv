@@ -1,9 +1,11 @@
 om2
 note SPDX-License-Identifier: AGPL-3.0-only
 note Pure seeded OM-2 port of tests/arboris/caproot_issuer.c.
-note Exercises seed/authority/caproot.om (caproot_validate) against the live
-note 22,560-byte RxCapTable serialized from seed/authority/cap_table_om2.om +
-note src/runtime/rx_caproot.om.
+note Supports:
+note   - no args: in-process caproot_validate self-test (test-arboris-caproot-issuer-om)
+note   - <prog>: exercises <prog> via fork/pipefds/dupfd(fd3)/execprog/waitpid
+note   - <prog> --arboris-silicon|--sparse-silicon|--arboris-signed-silicon|--arboris-benchmark:
+note     mints GPU_RESOURCE effect cap and invokes <prog> with mode 1/2/3 on stdin + RO table on fd 3.
 note Concatenate: cap_table_om2.om + rx_caproot.om + caproot.om + this file.
 
 const CI_GPU_RESOURCE ulong 0x4152425247423130
@@ -21,10 +23,20 @@ global g_ci_off   ulong 2
 global g_ci_par   ulong 2
 global g_ci_chd   ulong 2
 global g_ci_wref  ulong 2
+global g_ci_mode  ulong 1
+global g_ci_pkt   uchar 520
+global g_ci_plen  ulong 1
+global g_ci_path  uchar 64
+global g_ci_tlen  ulong 1
+global g_ci_reqb  uchar 48
 
-text t_ci_path "/tmp/om_caproot_tbl_tsub2.bin"
+text t_ci_pfx  "/tmp/om_caproot_tbl_"
 text t_ci_pass "PASS sealed capability root, delegated effect, scope, epoch, generation, expiry and revocation\n"
 text t_ci_fail "FAIL caproot_issuer check\n"
+text t_ci_f_as "--arboris-silicon"
+text t_ci_f_ss "--sparse-silicon"
+text t_ci_f_sg "--arboris-signed-silicon"
+text t_ci_f_bm "--arboris-benchmark"
 
 fn ci_put32 off ulong v ulong to void
   put g_ci_tbl off uchar and v 255
@@ -37,6 +49,69 @@ fn ci_put64 off ulong v ulong to void
   for b ulong 8
     put g_ci_tbl add off b uchar and shr v mul b 8 255
   end
+end
+
+fn ci_req_put64 idx ulong v ulong to void
+  base = mul idx 8
+  for b ulong 8
+    put g_ci_reqb add base b uchar and shr v mul b 8 255
+  end
+end
+
+fn ci_build_path to void
+  for i ulong 20
+    put g_ci_path i get t_ci_pfx i
+  end
+  pid = ulong getpid
+  db = new uchar 24 0
+  n = ulong 0
+  if eq pid 0
+    put db 0 48
+    n = 1
+  else
+    x = pid
+    while gt x 0 bound 24
+      put db n uchar add 48 rem x 10
+      x = div x 10
+      n = add n 1
+    end
+  end
+  for i ulong n bound 24
+    put g_ci_path add 20 i get db sub sub n 1 i
+  end
+  put g_ci_tlen 0 add 20 n
+end
+
+fn ci_arg_eq idx ulong lit view uchar * to bool
+  tmp = new uchar 64 0
+  got = argread idx tmp 0 64
+  if ne got long len lit
+    ret false
+  end
+  for i ulong len lit bound 64
+    if ne get tmp i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ci_load_prog_pkt to int
+  pb = new uchar 512 0
+  got = argread 1 pb 0 512
+  if le got 0
+    ret 1
+  end
+  n = ulong got
+  put g_ci_pkt 0 1
+  put g_ci_pkt 1 0
+  put g_ci_pkt 2 uchar and n 255
+  put g_ci_pkt 3 uchar and shr n 8 255
+  for i ulong n bound 512
+    put g_ci_pkt add 4 i get pb i
+  end
+  put g_ci_plen 0 add 4 n
+  ret 0
 end
 
 fn ci_serialize_table to void
@@ -69,40 +144,34 @@ fn ci_serialize_table to void
   end
 end
 
-fn ci_write_tbl_file to int
-  fd = fopen t_ci_path 0 29 577 384
-  if lt fd 0
-    ret 1
+fn ci_open_ro_tbl to long
+  tlen = get g_ci_tlen 0
+  wfd = fopen g_ci_path 0 tlen 577 384
+  if lt wfd 0
+    ret -1
   end
-  wr = write int fd g_ci_tbl 0 22560
-  ign = fclose int fd
+  wr = write int wfd g_ci_tbl 0 22560
+  ign = fclose int wfd
   if ne wr 22560
-    ret 1
+    ign_u = unlink g_ci_path 0 tlen
+    ret -1
   end
-  ret 0
+  rfd = fopen g_ci_path 0 tlen 0 0
+  ign_u2 = unlink g_ci_path 0 tlen
+  ret rfd
 end
 
 fn ci_write_fail to void
-  ign = write 2 t_ci_fail 0 26
+  ign = write 2 t_ci_fail 0 len t_ci_fail
 end
 
-fn ci_open_map to long
-  fd = fopen t_ci_path 0 29 0 0
-  if lt fd 0
-    ret -1
-  end
-  tbl = mapnew int fd 0 22560 1 1
-  ign = fclose int fd
-  ign = unlink t_ci_path 0 29
-  ret tbl
-end
-
-fn ci_check subject ulong cid ulong cgen ulong epoch ulong pgen ulong want bool to int
-  ci_serialize_table
-  if ne ci_write_tbl_file 0
+fn ci_check_inproc subject ulong cid ulong cgen ulong epoch ulong pgen ulong want bool to int
+  ro_fd = ci_open_ro_tbl
+  if lt ro_fd 0
     ret 1
   end
-  tbl = ci_open_map
+  tbl = mapnew int ro_fd 0 22560 1 1
+  ign = fclose int ro_fd
   if le tbl 0
     ret 1
   end
@@ -124,6 +193,87 @@ fn ci_check subject ulong cid ulong cgen ulong epoch ulong pgen ulong want bool 
   ret 0
 end
 
+fn ci_open_ro_bundle to long
+  tlen = get g_ci_tlen 0
+  wfd = fopen g_ci_path 0 tlen 577 384
+  if lt wfd 0
+    ret -1
+  end
+  wr0 = write int wfd g_ci_reqb 0 48
+  if ne wr0 48
+    ign0 = fclose int wfd
+    ign_u0 = unlink g_ci_path 0 tlen
+    ret -1
+  end
+  if lt fseek int wfd 65536 0 0
+    ign1 = fclose int wfd
+    ign_u1 = unlink g_ci_path 0 tlen
+    ret -1
+  end
+  wr = write int wfd g_ci_tbl 0 22560
+  ign = fclose int wfd
+  if ne wr 22560
+    ign_u = unlink g_ci_path 0 tlen
+    ret -1
+  end
+  rfd = fopen g_ci_path 0 tlen 0 0
+  ign_u2 = unlink g_ci_path 0 tlen
+  ret rfd
+end
+
+fn ci_spawn_prog ro_fd int to int
+  pid = fork
+  if lt pid 0
+    ign_3 = fclose ro_fd
+    ret 1
+  end
+  if eq pid 0
+    if eq ro_fd 0
+      if lt dupfd ro_fd 9 0 0
+        exit 126
+      end
+      ign_5a = fclose ro_fd
+      ro_fd = int 9
+    end
+    if lt dupfd ro_fd 0 0 0
+      exit 126
+    end
+    ign_6 = fclose ro_fd
+    ign_e = execprog g_ci_pkt 0 get g_ci_plen 0
+    exit 127
+  end
+  ign_8 = fclose ro_fd
+  wst = new uchar 4 0
+  wp = waitpid int pid wst 0 4 0
+  if ne wp pid
+    ret 1
+  end
+  code = or ulong get wst 0 shl ulong get wst 1 8
+  if ne code 0
+    ci_write_fail
+    ret 1
+  end
+  ret 0
+end
+
+fn ci_check_val subject ulong cid ulong cgen ulong epoch ulong pgen ulong allow_v ulong to int
+  ci_serialize_table
+  if eq get g_ci_mode 0 0
+    ret ci_check_inproc subject cid cgen epoch pgen ne allow_v 0
+  end
+  ci_req_put64 0 subject
+  ci_req_put64 1 cid
+  ci_req_put64 2 cgen
+  ci_req_put64 3 epoch
+  ci_req_put64 4 pgen
+  ci_req_put64 5 allow_v
+  ro_fd = ci_open_ro_bundle
+  if lt ro_fd 0
+    ret 1
+  end
+  ret ci_spawn_prog int ro_fd
+end
+
 fn ci_sync_globals hdr view ulong 4 slots view ulong 3328 to void
   for i ulong 4
     put g_ci_hdr i get hdr i
@@ -141,6 +291,26 @@ fn ci_mint_root hdr edit ulong 4 slots edit ulong 3328 deliv edit uchar 256 tok 
   put req 2 res
   put req 3 rights
   put req 4 2
+  put req 5 CAP_NONE
+  put req 6 0
+  put req 7 get g_ci_off 0
+  put req 8 get g_ci_off 1
+  if ne rx_capadmin_mint hdr slots deliv tok req out_r ERR_OK
+    ret 1
+  end
+  put g_ci_wref 0 get out_r 0
+  put g_ci_wref 1 get out_r 1
+  ret 0
+end
+
+fn ci_mint_device hdr edit ulong 4 slots edit ulong 3328 deliv edit uchar 256 tok view uchar 32 to int
+  req = new ulong 9 0
+  out_r = new ulong 2 0
+  put req 0 0
+  put req 1 42
+  put req 2 CI_GPU_RESOURCE
+  put req 3 CI_RIGHT_EFFECT
+  put req 4 0
   put req 5 CAP_NONE
   put req 6 0
   put req 7 get g_ci_off 0
@@ -182,10 +352,10 @@ fn ci_clock_and_revoke hdr edit ulong 4 slots edit ulong 3328 deliv edit uchar 2
     ret 1
   end
   ci_sync_globals hdr slots
-  if ne ci_check 42 get g_ci_chd 0 get g_ci_chd 1 1 get g_ci_chd 1 false 0
+  if ne ci_check_val 42 get g_ci_chd 0 get g_ci_chd 1 1 get g_ci_chd 1 0 0
     ret 1
   end
-  if ne ci_check 42 get g_ci_par 0 get g_ci_par 1 1 get g_ci_par 1 true 0
+  if ne ci_check_val 42 get g_ci_par 0 get g_ci_par 1 1 get g_ci_par 1 1 0
     ret 1
   end
   rargs = new ulong 4 0
@@ -198,25 +368,13 @@ fn ci_clock_and_revoke hdr edit ulong 4 slots edit ulong 3328 deliv edit uchar 2
     ret 1
   end
   ci_sync_globals hdr slots
-  if ne ci_check 42 get g_ci_par 0 get g_ci_par 1 1 get g_ci_par 1 false 0
+  if ne ci_check_val 42 get g_ci_par 0 get g_ci_par 1 1 get g_ci_par 1 0 0
     ret 1
   end
   ret 0
 end
 
-fn main to int
-  hdr = new ulong 4 0
-  slots = new ulong 3328 0
-  deliv = new uchar 256 0
-  tok = new uchar 32 0
-  office = new ulong 2 0
-  if ne rx_caproot_start hdr slots deliv tok ERR_OK
-    ret 1
-  end
-  rx_capadmin_office office
-  put g_ci_off 0 get office 0
-  put g_ci_off 1 get office 1
-
+fn ci_exercise hdr edit ulong 4 slots edit ulong 3328 deliv edit uchar 256 tok view uchar 32 to int
   if ne ci_mint_root hdr slots deliv tok CI_GPU_RESOURCE or CI_RIGHT_EFFECT CI_RIGHT_DELEG 0
     ret 1
   end
@@ -229,16 +387,16 @@ fn main to int
 
   cid = get g_ci_chd 0
   cgen = get g_ci_chd 1
-  if ne ci_check 42 cid cgen 1 cgen true 0
+  if ne ci_check_val 42 cid cgen 1 cgen 1 0
     ret 1
   end
-  if ne ci_check 43 cid cgen 1 cgen false 0
+  if ne ci_check_val 43 cid cgen 1 cgen 0 0
     ret 1
   end
-  if ne ci_check 42 cid cgen 2 cgen false 0
+  if ne ci_check_val 42 cid cgen 2 cgen 0 0
     ret 1
   end
-  if ne ci_check 42 cid cgen 1 add cgen 1 false 0
+  if ne ci_check_val 42 cid cgen 1 add cgen 1 0 0
     ret 1
   end
 
@@ -246,7 +404,7 @@ fn main to int
     ret 1
   end
   ci_sync_globals hdr slots
-  if ne ci_check 42 get g_ci_wref 0 get g_ci_wref 1 1 get g_ci_wref 1 false 0
+  if ne ci_check_val 42 get g_ci_wref 0 get g_ci_wref 1 1 get g_ci_wref 1 0 0
     ret 1
   end
 
@@ -254,17 +412,76 @@ fn main to int
     ret 1
   end
   ci_sync_globals hdr slots
-  if ne ci_check 42 get g_ci_wref 0 get g_ci_wref 1 1 get g_ci_wref 1 false 0
+  if ne ci_check_val 42 get g_ci_wref 0 get g_ci_wref 1 1 get g_ci_wref 1 0 0
     ret 1
   end
 
-  if ne ci_clock_and_revoke hdr slots deliv tok 0
+  ret ci_clock_and_revoke hdr slots deliv tok
+end
+
+fn ci_parse_cli to long
+  ac = ulong argcnt
+  if eq ac 1
+    put g_ci_mode 0 0
+    ret 0
+  end
+  if ne ci_load_prog_pkt 0
+    ret -1
+  end
+  if eq ac 2
+    put g_ci_mode 0 1
+    ret 0
+  end
+  if eq ac 3
+    if or ci_arg_eq 2 t_ci_f_as ci_arg_eq 2 t_ci_f_ss
+      put g_ci_mode 0 2
+      ret 1
+    end
+    if ci_arg_eq 2 t_ci_f_sg
+      put g_ci_mode 0 2
+      ret 2
+    end
+    if ci_arg_eq 2 t_ci_f_bm
+      put g_ci_mode 0 2
+      ret 3
+    end
+  end
+  ret -1
+end
+
+fn main to int
+  ci_build_path
+  dev_allow = ci_parse_cli
+  if lt dev_allow 0
     ret 1
+  end
+  hdr = new ulong 4 0
+  slots = new ulong 3328 0
+  deliv = new uchar 256 0
+  tok = new uchar 32 0
+  office = new ulong 2 0
+  if ne rx_caproot_start hdr slots deliv tok ERR_OK
+    ret 1
+  end
+  rx_capadmin_office office
+  put g_ci_off 0 get office 0
+  put g_ci_off 1 get office 1
+
+  res = int 0
+  if gt dev_allow 0
+    if ne ci_mint_device hdr slots deliv tok 0
+      res = int 1
+    else
+      ci_sync_globals hdr slots
+      res = ci_check_val 42 get g_ci_wref 0 get g_ci_wref 1 1 get g_ci_wref 1 ulong dev_allow
+    end
+  else
+    res = ci_exercise hdr slots deliv tok
   end
 
-  if ne rx_caproot_stop hdr slots deliv tok ERR_OK
-    ret 1
+  ign_s = rx_caproot_stop hdr slots deliv tok
+  if and eq res 0 eq dev_allow 0
+    ign_p = write 1 t_ci_pass 0 len t_ci_pass
   end
-  ign_p = write 1 t_ci_pass 0 95
-  ret 0
+  ret res
 end
