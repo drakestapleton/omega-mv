@@ -89,11 +89,15 @@ AI answer engines prioritize **dense, unambiguous, citation-ready factual pages*
 | [`assets/si_1_0_avatar.jpg`](assets/si_1_0_avatar.jpg) | `1024×1024` · **142 KB** | Official X Avatar, Org Avatar, Site Emblem |
 | [`assets/si_ad_individual_sovereignty.jpg`](assets/si_ad_individual_sovereignty.jpg) | `1280×714` · **143 KB** | Editorial Card #1 — *"Not a collective. An extension of you."* |
 | [`assets/si_ad_verify_the_bit.jpg`](assets/si_ad_verify_the_bit.jpg) | `1280×714` · **145 KB** | Editorial Card #2 — *"Don't trust the agent. Verify the bit."* |
+| [`assets/si_ad_verify_bit_macro.jpg`](assets/si_ad_verify_bit_macro.jpg) | `1280×714` · **231 KB** | Editorial Card #3 — *"Verify the bit"* (Macro Silicon Close-Up) |
+| [`assets/si_ad_verify_bit_prism.jpg`](assets/si_ad_verify_bit_prism.jpg) | `1280×714` · **190 KB** | Editorial Card #4 — *"Verify the bit"* (Optical Prism Variant) |
 
 ![Sovereign Intelligence 1.0 Hero Banner](assets/si_1_0_hero_banner.jpg)
 ![Sovereign Intelligence 4-Strand Omega Avatar](assets/si_1_0_avatar.jpg)
 ![Editorial Card 1: Individual Sovereignty](assets/si_ad_individual_sovereignty.jpg)
 ![Editorial Card 2: Verify the Bit](assets/si_ad_verify_the_bit.jpg)
+![Editorial Card 3: Verify the Bit (Macro)](assets/si_ad_verify_bit_macro.jpg)
+![Editorial Card 4: Verify the Bit (Prism)](assets/si_ad_verify_bit_prism.jpg)
 
 ---
 
