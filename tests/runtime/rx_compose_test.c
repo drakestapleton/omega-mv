@@ -669,6 +669,36 @@ static void t_refused_dir(void) {
     CHECK(access(bad, F_OK) != 0, "refused dir not created");
 }
 
+static void t_symlink_confinement(void) {
+    printf("[*] symlink confinement: roots and identity files are refused\n");
+    char real[240], link[240], identity[280], victim[280], got[5] = { 0 };
+    dir_for(real, sizeof real, "symlink_real");
+    dir_for(link, sizeof link, "symlink_root");
+    CHECK(mkdir(real, 0700) == 0 && symlink(real, link) == 0, "symlink root setup");
+    reset_c();
+    CHECK(fx_open(&g_fx, &g_c, link, 1) == RX_ERR_ARG, "symlink root was accepted");
+    snprintf(identity, sizeof identity, "%s/machine.id", real);
+    CHECK(access(identity, F_OK) != 0, "symlink root target was modified");
+    unlink(link);
+    rmtree(real);
+
+    dir_for(real, sizeof real, "symlink_identity");
+    CHECK(mkdir(real, 0700) == 0, "identity directory setup");
+    snprintf(victim, sizeof victim, "%s/victim", real);
+    FILE *f = fopen(victim, "wb");
+    CHECK(f && fwrite("SAFE", 1, 4, f) == 4, "identity victim setup");
+    if (f) fclose(f);
+    snprintf(identity, sizeof identity, "%s/machine.id", real);
+    CHECK(symlink(victim, identity) == 0, "identity symlink setup");
+    reset_c();
+    CHECK(fx_open(&g_fx, &g_c, real, 1) == RX_ERR_IDENTITY, "symlink identity was accepted");
+    f = fopen(victim, "rb");
+    CHECK(f && fread(got, 1, 4, f) == 4 && memcmp(got, "SAFE", 4) == 0,
+          "identity symlink target was modified");
+    if (f) fclose(f);
+    rmtree(real);
+}
+
 int main(void) {
     snprintf(g_base, sizeof g_base, "/tmp/rx_compose_test.XXXXXX");
     if (!mkdtemp(g_base)) { perror("mkdtemp"); return 1; }
@@ -680,6 +710,7 @@ int main(void) {
     t_cortex();
     t_pending();
     t_refused_dir();
+    t_symlink_confinement();
     fx_free(&g_fx);
     rmtree(g_base);
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);

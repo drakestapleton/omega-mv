@@ -686,6 +686,7 @@ typedef struct RxWorld {
     bool halted;
     RxHaltStatus halt;
     char halt_dir[384];              /* durable mark directory; "" = none */
+    int halt_fd;                     /* retained validated halt directory, or -1 */
 
     /* M20 durable recorder (rx_world_set_recorder); at most one. */
     RxRecordFn recorder;
@@ -836,8 +837,9 @@ int  rx_world_caller_check_fn(void *world, uint32_t subject, const RxCallerCred 
                                            capability may also pause the world */
 #define RX_HALT_ALREADY       1   /* stop: already stopped, nothing changed */
 #define RX_HALT_NOT_STOPPED   2   /* resume: not stopped, nothing changed */
-/* A dir that src/omega_path_check.h refuses (a ".." component, a byte outside
- * its set, too long) is RX_ERR_ARG, and the world's halt directory is unchanged. */
+/* A dir that src/omega_path_check.h refuses, has a symlink component, is not
+ * owned by this uid, or is group/other-writable is RX_ERR_ARG, and the world's
+ * halt directory is unchanged. A valid directory descriptor is retained. */
 int  rx_world_set_halt_dir(RxWorld *w, const char *dir);
 int  rx_world_emergency_stop(RxWorld *w, uint32_t subject, const RxCallerCred *cred,
                              RxCapRef cap, int32_t reason, RxHaltStatus *out);

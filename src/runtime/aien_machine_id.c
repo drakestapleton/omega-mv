@@ -19,7 +19,7 @@
  * canonical machine identity. The codec is in aien_machine_id.h.
  */
 #include "aien_machine_id.h"
-#include "omega_path_check.h"
+#include "omega_fs.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,41 +35,32 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
     return 0;
 }
 
-int aien_mid_store(const char *path, const AienMachineId *m) {
-    if (!path || !m) return AIEN_MID_E_ARG;
+int aien_mid_store_at(int dir_fd, const char *name, const AienMachineId *m) {
+    if (dir_fd < 0 || !name || !m || strchr(name, '/')) return AIEN_MID_E_ARG;
     uint8_t rec[AIEN_MID_RECORD_BYTES];
     int rc = aien_mid_encode(m, rec);
     if (rc != AIEN_MID_OK) return rc;
+    if (omega_fs_replace_ok_at(dir_fd, name) != 0) return AIEN_MID_E_IO;
 
-    /* The caller's path, checked (src/omega_path_check.h), is the only path opened or renamed. */
-    char p[4091];
-    if (omega_path_copy(p, sizeof p, path) != 0) return AIEN_MID_E_ARG;
-    char tmp[4096];
-    if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", p) >= sizeof tmp) return AIEN_MID_E_ARG;
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    char stem[OMEGA_FS_NAME_MAX + 1], tmp[OMEGA_FS_NAME_MAX + 1];
+    if ((size_t)snprintf(stem, sizeof stem, "%s.tmp", name) >= sizeof stem ||
+        omega_fs_temp_name(tmp, sizeof tmp, stem) != 0)
+        return AIEN_MID_E_ARG;
+    int fd = omega_fs_open_regular_at(dir_fd, tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return AIEN_MID_E_IO;
     if (write_all(fd, rec, sizeof rec) != 0 || fsync(fd) != 0) {
-        close(fd); unlink(tmp); return AIEN_MID_E_IO;
+        close(fd); omega_fs_unlink_at(dir_fd, tmp, 0); return AIEN_MID_E_IO;
     }
-    if (close(fd) != 0 || rename(tmp, p) != 0) { unlink(tmp); return AIEN_MID_E_IO; }
-
-    /* fsync the directory so the rename survives a crash */
-    char dir[4096];
-    snprintf(dir, sizeof dir, "%s", p);
-    char *slash = strrchr(dir, '/');
-    if (slash == dir) dir[1] = 0;
-    else if (slash) *slash = 0;
-    else { dir[0] = '.'; dir[1] = 0; }
-    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dfd >= 0) { fsync(dfd); close(dfd); }
+    if (close(fd) != 0 || omega_fs_rename_at(dir_fd, tmp, name) != 0 || fsync(dir_fd) != 0) {
+        omega_fs_unlink_at(dir_fd, tmp, 0);
+        return AIEN_MID_E_IO;
+    }
     return AIEN_MID_OK;
 }
 
-int aien_mid_load(const char *path, AienMachineId *out) {
-    if (!path || !out) return AIEN_MID_E_ARG;
-    char p[4096];
-    if (omega_path_copy(p, sizeof p, path) != 0) return AIEN_MID_E_ARG;
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
+int aien_mid_load_at(int dir_fd, const char *name, AienMachineId *out) {
+    if (dir_fd < 0 || !name || !out || strchr(name, '/')) return AIEN_MID_E_ARG;
+    int fd = omega_fs_open_regular_at(dir_fd, name, O_RDONLY, 0);
     if (fd < 0) return AIEN_MID_E_IO;
     uint8_t buf[AIEN_MID_RECORD_BYTES + 1];
     size_t got = 0;
@@ -82,6 +73,30 @@ int aien_mid_load(const char *path, AienMachineId *out) {
     }
     close(fd);
     return aien_mid_decode(buf, got, out);
+}
+
+int aien_mid_store(const char *path, const AienMachineId *m) {
+    if (!path || !m) return AIEN_MID_E_ARG;
+    char checked[OMEGA_FS_PATH_MAX];
+    if (omega_path_copy(checked, sizeof checked, path) != 0) return AIEN_MID_E_ARG;
+    char name[OMEGA_FS_NAME_MAX + 1];
+    int dir_fd = omega_fs_parent_open_at(AT_FDCWD, checked, name, sizeof name);
+    if (dir_fd < 0) return AIEN_MID_E_IO;
+    int rc = aien_mid_store_at(dir_fd, name, m);
+    close(dir_fd);
+    return rc;
+}
+
+int aien_mid_load(const char *path, AienMachineId *out) {
+    if (!path || !out) return AIEN_MID_E_ARG;
+    char checked[OMEGA_FS_PATH_MAX];
+    if (omega_path_copy(checked, sizeof checked, path) != 0) return AIEN_MID_E_ARG;
+    char name[OMEGA_FS_NAME_MAX + 1];
+    int dir_fd = omega_fs_parent_open_at(AT_FDCWD, checked, name, sizeof name);
+    if (dir_fd < 0) return AIEN_MID_E_IO;
+    int rc = aien_mid_load_at(dir_fd, name, out);
+    close(dir_fd);
+    return rc;
 }
 
 void aien_mid_index_init(AienMachineIndex *t, AienMachineId *slots, uint32_t capacity) {

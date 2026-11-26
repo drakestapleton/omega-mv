@@ -866,6 +866,39 @@ static void read_blob_checked(void) {
     rm_tree(dir);
 }
 
+static void symlink_persistence_refused(void) {
+    char dir[256], tmp[320], legacy[384], victim[320], got[5] = { 0 };
+    CHECK(fresh_dir(dir, sizeof dir) == 0, "symlink temp directory");
+    snprintf(tmp, sizeof tmp, "%s/tmp", dir);
+    snprintf(legacy, sizeof legacy, "%s/write.partial", tmp);
+    snprintf(victim, sizeof victim, "%s/victim", dir);
+    CHECK(mkdir(tmp, 0755) == 0, "symlink tmp setup");
+    FILE *f = fopen(victim, "wb");
+    CHECK(f && fwrite("SAFE", 1, 4, f) == 4, "symlink victim setup");
+    if (f) fclose(f);
+    CHECK(symlink(victim, legacy) == 0, "legacy write.partial symlink setup");
+    RxGenStore *s = NULL;
+    CHECK(rx_gen_open(dir, &s) == RX_GEN_OK && s,
+          "a planted predictable temporary redirected the exclusive temporary path");
+    if (s) rx_gen_close(s);
+    f = fopen(victim, "rb");
+    CHECK(f && fread(got, 1, 4, f) == 4 && memcmp(got, "SAFE", 4) == 0,
+          "generation temporary symlink target was modified");
+    if (f) fclose(f);
+    rm_tree(dir);
+
+    char real[256], link[256];
+    CHECK(fresh_dir(real, sizeof real) == 0 && fresh_dir(link, sizeof link) == 0,
+          "symlink root directories");
+    CHECK(rmdir(link) == 0 && symlink(real, link) == 0, "generation root symlink setup");
+    s = NULL;
+    CHECK(rx_gen_open(link, &s) != RX_GEN_OK && !s, "generation symlink root was accepted");
+    snprintf(victim, sizeof victim, "%s/active", real);
+    CHECK(access(victim, F_OK) != 0, "generation symlink root target was modified");
+    unlink(link);
+    rm_tree(real);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc >= 4 && strcmp(argv[1], "--crash") == 0) return child_crash(argv[2], atoi(argv[3]));
@@ -890,6 +923,7 @@ int main(int argc, char **argv) {
         check_crash(exe, steps[i], want[i], text[i], receipt_already[i]);
     negative_and_live();
     read_blob_checked();
+    symlink_persistence_refused();
     drafts_are_released();
     if (g_fail) {
         fprintf(stderr, "%d generation-barrier failures\n", g_fail);

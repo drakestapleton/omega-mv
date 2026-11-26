@@ -35,6 +35,8 @@ global g_mid_tmp_t    uchar 4096
 global g_mid_ren_pkt  uchar 8200
 global g_mid_io_buf   uchar 48
 global g_mid_rec_tmp  uchar 44
+global g_mid_st       uchar 128
+global g_mid_seq      ulong 1
 
 note Local index table (capacity up to 64 entries)
 global g_mid_idx_slots uchar 2112
@@ -402,6 +404,138 @@ fn mid_store_rename tlen ulong plen ulong to int
   ret 0
 end
 
+fn mid_st_u32 off ulong to ulong
+  b0 = ulong get g_mid_st off
+  b1 = ulong get g_mid_st add off 1
+  b2 = ulong get g_mid_st add off 2
+  b3 = ulong get g_mid_st add off 3
+  ret or b0 or shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn mid_stat_reg_ok to int
+  mode = mid_st_u32 16
+  if ne and mode ulong 61440 ulong 32768
+    ret sub int 0 1
+  end
+  if ne and mode ulong 18 ulong 0
+    ret sub int 0 1
+  end
+  if ne mid_st_u32 20 ulong 1
+    ret sub int 0 1
+  end
+  if ne mid_st_u32 24 ulong geteuid
+    ret sub int 0 1
+  end
+  ret 0
+end
+
+fn mid_no_symlink_ancestors plen ulong to int
+  if eq plen 0
+    ret sub int 0 1
+  end
+  if eq get g_mid_tmp_p sub plen 1 47
+    ret sub int 0 1
+  end
+  i = ulong 1
+  while lt i plen bound 4096
+    if eq get g_mid_tmp_p i 47
+      r = lstat g_mid_tmp_p 0 i g_mid_st 0 128
+      if ne r 0
+        ret sub int 0 1
+      end
+      mode = mid_st_u32 16
+      if ne and mode ulong 61440 ulong 16384
+        ret sub int 0 1
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn mid_replace_ok plen ulong to int
+  if ne mid_no_symlink_ancestors plen 0
+    ret sub int 0 1
+  end
+  r = lstat g_mid_tmp_p 0 plen g_mid_st 0 128
+  if eq r sub long 0 2
+    ret 0
+  end
+  if ne r 0
+    ret sub int 0 1
+  end
+  ret mid_stat_reg_ok
+end
+
+fn mid_append_dec off ulong val ulong to ulong
+  dig = new uchar 24 0
+  n = ulong 0
+  v = val
+  if eq v 0
+    put dig 0 uchar 48
+    n = ulong 1
+  else
+    while gt v 0 bound 24
+      put dig n uchar add rem v 10 48
+      v = div v 10
+      n = add n 1
+    end
+  end
+  if gt add off n 4095
+    ret 0
+  end
+  for i ulong n bound 24
+    put g_mid_tmp_t add off i get dig sub sub n 1 i
+  end
+  ret add off n
+end
+
+fn mid_build_tmp plen ulong to ulong
+  if gt add plen 36 4095
+    ret 0
+  end
+  for i ulong plen bound 4096
+    put g_mid_tmp_t i get g_mid_tmp_p i
+  end
+  put g_mid_tmp_t plen uchar 46
+  put g_mid_tmp_t add plen 1 uchar 116
+  put g_mid_tmp_t add plen 2 uchar 109
+  put g_mid_tmp_t add plen 3 uchar 112
+  put g_mid_tmp_t add plen 4 uchar 46
+  pos = mid_append_dec add plen 5 ulong getpid
+  if eq pos 0
+    ret 0
+  end
+  put g_mid_tmp_t pos uchar 46
+  seq = add get g_mid_seq 0 1
+  put g_mid_seq 0 seq
+  ret mid_append_dec add pos 1 seq
+end
+
+fn mid_fsync_parent plen ulong to void
+  last = ulong 0
+  found = int 0
+  for i ulong plen bound 4096
+    if eq get g_mid_tmp_p i 47
+      last = i
+      found = int 1
+    end
+  end
+  if eq found 0
+    ret
+  end
+  dlen = last
+  if eq dlen 0
+    dlen = ulong 1
+  end
+  note O_RDONLY | O_DIRECTORY | O_NOFOLLOW = 16384 + 32768 = 49152
+  dfd = fopen g_mid_tmp_p 0 dlen 49152 0
+  if ge dfd 0
+    ign_s = fsync int dfd
+    ign_c = fclose int dfd
+  end
+end
+
 fn aien_mid_store path view uchar 4096 plen ulong m view uchar 33 to int
   rec = new uchar 44 0
   rc = aien_mid_encode view m edit rec
@@ -411,22 +545,27 @@ fn aien_mid_store path view uchar 4096 plen ulong m view uchar 33 to int
   for i ulong 44
     put g_mid_rec_tmp i get rec i
   end
-  if ne mid_path_check_g view path plen 4091 0
+  if ne mid_path_check_g view path plen 4060 0
     ret sub int 0 1
   end
-  for i ulong plen
-    put g_mid_tmp_t i get g_mid_tmp_p i
+  if ne mid_replace_ok plen 0
+    ret sub int 0 5
   end
-  put g_mid_tmp_t plen uchar 46
-  put g_mid_tmp_t add plen 1 uchar 116
-  put g_mid_tmp_t add plen 2 uchar 109
-  put g_mid_tmp_t add plen 3 uchar 112
-  tlen = add plen 4
-  fd = fopen g_mid_tmp_t 0 tlen 577 420
+  tlen = mid_build_tmp plen
+  if eq tlen 0
+    ret sub int 0 1
+  end
+  note O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK = 1+64+128+32768+2048 = 35009
+  fd = fopen g_mid_tmp_t 0 tlen 35009 420
   if lt fd 0
     ret sub int 0 5
   end
   fdi = int fd
+  if or ne fstat fdi g_mid_st 0 128 0 ne mid_stat_reg_ok 0
+    ign = fclose fdi
+    ign = unlink g_mid_tmp_t 0 tlen
+    ret sub int 0 5
+  end
   w = write fdi g_mid_rec_tmp 0 44
   if ne w 44
     ign = fclose fdi
@@ -439,18 +578,30 @@ fn aien_mid_store path view uchar 4096 plen ulong m view uchar 33 to int
     ign = unlink g_mid_tmp_t 0 tlen
     ret sub int 0 5
   end
-  ret mid_store_rename tlen plen
+  rrc = mid_store_rename tlen plen
+  if eq rrc 0
+    mid_fsync_parent plen
+  end
+  ret rrc
 end
 
 fn aien_mid_load path view uchar 4096 plen ulong dst edit uchar 33 to int
   if ne mid_path_check_g view path plen 4096 0
     ret sub int 0 1
   end
-  fd = fopen g_mid_tmp_p 0 plen 0 0
+  if ne mid_no_symlink_ancestors plen 0
+    ret sub int 0 5
+  end
+  note O_RDONLY|O_NOFOLLOW|O_NONBLOCK = 32768+2048 = 34816
+  fd = fopen g_mid_tmp_p 0 plen 34816 0
   if lt fd 0
     ret sub int 0 5
   end
   fdi = int fd
+  if or ne fstat fdi g_mid_st 0 128 0 ne mid_stat_reg_ok 0
+    ign = fclose fdi
+    ret sub int 0 5
+  end
   got = ulong 0
   cont = int 1
   while ne cont 0

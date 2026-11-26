@@ -33,12 +33,12 @@ M4 caller check ignores the stop|src/runtime/rx_world.c|s/if \(w->halted\) \{\n 
 M5 a reaction subject may stop the world|src/runtime/rx_world.c|s/if \(w->reactions\[i\]\.desc\.subject == subject\) return RX_ERR_AUTHORITY;/(void)i;/
 M6 store ignores the durable mark|src/runtime/rx_generation.c|s/(static int halt_marked\(const RxGenStore \*store\) \{\n)/$1    if (store) return 0;\n/
 M7 a restarted world ignores the mark|src/runtime/rx_world.c|s/\} else if \(rc != 0 && !w->halted\) \{/} else if (0) {/
-M8 resume deletes the mark without keeping the record|src/runtime/rx_world.c|s/if \(rc == RX_OK && durable_write\(w->halt_dir, name, buf, \(size_t\)n, true\) != 0\)/if (0)/
+M8 resume deletes the mark without keeping the record|src/runtime/rx_world.c|s/if \(rc == RX_OK && durable_write\(w->halt_fd, name, buf, \(size_t\)n, true\) != 0\)/if (0)/
 M9 the stop is not in force until the disk write returns|src/runtime/rx_world.c|s/(        w->halted = true;               \/\* in force before any disk work \*\/\n)(        w->halt\.durable = halt_mark_write\(w\);\n)/$2        if (w->halt.durable != 1) w->halted = false; else w->halted = true;\n/
 M10 a refused activation spends the episode budget|src/runtime/rx_world.c|s/        if \(r->episode_activations\) r->episode_activations--;\n        r->rearm = true;\n        end_activation\(w, rid\);/        r->rearm = true;\n        end_activation(w, rid);/
 M11 object create under a stop|src/runtime/rx_world.c|s/(RxObjRef \*out\) \{\n    pthread_mutex_lock\(&w->mu\);\n    )if \(w->halted\)/${1}if (0)/
 M12 object retire under a stop|src/runtime/rx_world.c|s/(int rx_world_retire\(RxWorld \*w, RxObjRef ref\) \{\n    pthread_mutex_lock\(&w->mu\);\n    )if \(w->halted\)/${1}if (0)/
-M13 a symlink mark reads as absent|src/runtime/rx_world.c|s/errno == ELOOP \? RX_ERR_TORN : RX_ERR_IO/errno == ELOOP ? 0 : RX_ERR_IO/'
+M13 a symlink mark reads as absent|src/runtime/rx_world.c|s/if \(!S_ISREG\(st\.st_mode\)\) return RX_ERR_TORN;/if (!S_ISREG(st.st_mode)) return 0;/'
 
 build_run() { # dir -> exit status of the test
     (cd "$1" && $CC -std=gnu11 -Wall -Wextra -D_GNU_SOURCE -O2 -Isrc -pthread -o t $SRCS) >"$1/build.log" 2>&1 || { echo "build failed:"; tail -5 "$1/build.log"; return 99; }

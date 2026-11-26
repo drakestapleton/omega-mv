@@ -279,6 +279,8 @@ int  cx_open_with(CxStore *s, const CxJournalOps *ops, void *ctx, const char *na
  * together, nothing local detects it (an external anchor problem). */
 #ifndef CX_NO_POSIX
 int  cx_open(CxStore *s, const char *path, uint64_t n_subjects, uint32_t flags);
+/* Descriptor-relative form for a single journal name in a retained directory. */
+int  cx_open_at(CxStore *s, int dir_fd, const char *name, uint64_t n_subjects, uint32_t flags);
 #endif
 void cx_close(CxStore *s);   /* = cx_free */
 
