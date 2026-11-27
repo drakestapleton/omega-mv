@@ -1,0 +1,552 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/hive_shield/strand6_sentinel.om: Strand 6 (The Sentinel)
+note Pure Seeded OM-2 Language Purity, Rogue Kernel-Module Quarantine & UEFI/SPI Hardware Lock Guard.
+note
+note Modes:
+note   strand6_sentinel scan-dir <dir> <max_c_allowed>
+note   strand6_sentinel audit-file <path>
+note
+note Fail-closed refusal codes:
+note   141 HS_ERR_ROGUE_KMOD       live .ko binary, readable .QUARANTINED .ko (mode != 000), or insmod/modprobe
+note   142 HS_ERR_C_CONTAMINATION  C/H file count exceeds monotonic purity ratchet
+note   143 HS_ERR_UEFI_SPI_TOUCH   forbidden UEFI NVRAM / SPI flash / efibootmgr / efivars reference
+note   144 HS_ERR_IMPURE_OM        forbidden raw C/kernel pointer escape in source
+note   145 HS_ERR_SCAN_LIMIT       directory stack (>256) or path (>1023 B) overflow (fail-closed, never skip)
+
+const S6_O_DIR int 49152
+const S6_MAX_FILE ulong 262144
+const S6_MAX_STACK ulong 256
+const S6_PATH_STRIDE ulong 1024
+
+const S6_ERR_ROGUE_KMOD ulong 141
+const S6_ERR_C_CONTAM ulong 142
+const S6_ERR_UEFI_SPI ulong 143
+const S6_ERR_IMPURE_OM ulong 144
+const S6_ERR_SCAN_LIMIT ulong 145
+
+global s6_arg uchar 1024
+global s6_dir_stk uchar 262144
+global s6_dir_len ulong 256
+global s6_dents uchar 65536
+global s6_cur_path uchar 1024
+global s6_cur_len ulong 1
+global s6_fpath uchar 1024
+global s6_stbuf uchar 128
+global s6_buf uchar 262144
+global s6_buflen ulong 1
+global s6_dig uchar 24
+note Stats: [0]=files_scanned [1]=om_files [2]=c_h_files [3]=ko_found [4]=quarantined_ko [5]=scan_err
+global s6_stat ulong 8
+
+text s6_use "usage: strand6_sentinel scan-dir <dir> <max_c_allowed> | audit-file <path>\n"
+text s6_c_scan "scan-dir"
+text s6_c_aud "audit-file"
+text s6_p_scan1 "STRAND6_SENTINEL SCAN_DIR PASS files="
+text s6_p_om " om="
+text s6_p_ch " c_h="
+text s6_p_ko " live_ko="
+text s6_p_qko " quarantined_ko="
+text s6_p_aud1 "STRAND6_SENTINEL AUDIT_FILE PASS bytes="
+text s6_p_aud2 " uefi_clean=1 kmod_clean=1 purity_clean=1\n"
+text s6_f_pfx "STRAND6_SENTINEL REFUSED code="
+text s6_f_rsn " reason="
+text s6_nl "\n"
+
+text s6_r_141 "ROGUE_KERNEL_MODULE"
+text s6_r_142 "C_CONTAMINATION_EXCEEDS_RATCHET"
+text s6_r_143 "UEFI_SPI_NVRAM_FORBIDDEN"
+text s6_r_144 "IMPURE_RAW_POINTER_ESCAPE"
+text s6_r_145 "SCAN_STACK_OR_PATH_LIMIT"
+
+note UEFI / SPI / NVRAM forbidden patterns
+text s6_u0 "efibootmgr"
+text s6_u1 "/sys/firmware/efi/efivars"
+text s6_u2 "/boot/efi/EFI"
+text s6_u3 "flashrom"
+text s6_u4 "fwupdmgr"
+text s6_u5 "/dev/mtd"
+text s6_u6 "/dev/spidev"
+
+note Rogue kmod patterns
+text s6_k0 "insmod"
+text s6_k1 "aien_gpu.ko"
+text s6_k2 "modprobe aien_gpu"
+
+note Impure raw C/pointer patterns
+text s6_p0 "vm_insert_pages"
+text s6_p1 "dma_unmap_page"
+text s6_p2 "put_page("
+text s6_p3 "unsafe_ptr"
+text s6_p4 "__asm__"
+
+text s6_qtag ".QUARANTINED"
+
+fn s6_wrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn s6_num fd int v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put s6_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd s6_dig p sub 24 p
+ret
+end
+end
+end
+
+fn s6_refuse code ulong to int
+s6_wrt 2 s6_f_pfx
+s6_num 2 code
+s6_wrt 2 s6_f_rsn
+if eq code S6_ERR_ROGUE_KMOD
+s6_wrt 2 s6_r_141
+end
+if eq code S6_ERR_C_CONTAM
+s6_wrt 2 s6_r_142
+end
+if eq code S6_ERR_UEFI_SPI
+s6_wrt 2 s6_r_143
+end
+if eq code S6_ERR_IMPURE_OM
+s6_wrt 2 s6_r_144
+end
+if eq code S6_ERR_SCAN_LIMIT
+s6_wrt 2 s6_r_145
+end
+s6_wrt 2 s6_nl
+ret int code
+end
+
+fn s6_eq_arg s view uchar * n ulong to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get s6_arg i get s i
+ret false
+end
+end
+ret true
+end
+
+fn s6_parse_u n ulong to ulong
+if eq n 0
+ret not ulong 0
+end
+if gt n 20
+ret not ulong 0
+end
+v = ulong 0
+for i ulong n bound 20
+c = ulong get s6_arg i
+if lt c 48
+ret not ulong 0
+end
+if gt c 57
+ret not ulong 0
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+fn s6_buf_has pat view uchar * to bool
+bl = get s6_buflen 0
+pl = len pat
+if lt bl pl
+ret false
+end
+lim = add sub bl pl 1
+b0 = get pat 0
+for i ulong lim bound 262144
+if eq get s6_buf i b0
+ok = true
+for j ulong pl bound 64
+if ne get s6_buf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+end
+ret false
+end
+
+fn s6_check_uefi to bool
+if s6_buf_has s6_u0
+ret true
+end
+if s6_buf_has s6_u1
+ret true
+end
+if s6_buf_has s6_u2
+ret true
+end
+if s6_buf_has s6_u3
+ret true
+end
+if s6_buf_has s6_u4
+ret true
+end
+if s6_buf_has s6_u5
+ret true
+end
+if s6_buf_has s6_u6
+ret true
+end
+ret false
+end
+
+fn s6_check_kmod_txt to bool
+if s6_buf_has s6_k0
+ret true
+end
+if s6_buf_has s6_k1
+ret true
+end
+if s6_buf_has s6_k2
+ret true
+end
+ret false
+end
+
+fn s6_check_impure_txt to bool
+if s6_buf_has s6_p0
+ret true
+end
+if s6_buf_has s6_p1
+ret true
+end
+if s6_buf_has s6_p2
+ret true
+end
+if s6_buf_has s6_p3
+ret true
+end
+if s6_buf_has s6_p4
+ret true
+end
+ret false
+end
+
+fn s6_ends2 base ulong nlen ulong c0 uchar c1 uchar to bool
+if lt nlen 3
+ret false
+end
+if ne get s6_dents add base sub nlen 2 c0
+ret false
+end
+ret eq get s6_dents add base sub nlen 1 c1
+end
+
+fn s6_ends3 base ulong nlen ulong c0 uchar c1 uchar c2 uchar to bool
+if lt nlen 4
+ret false
+end
+if ne get s6_dents add base sub nlen 3 c0
+ret false
+end
+if ne get s6_dents add base sub nlen 2 c1
+ret false
+end
+ret eq get s6_dents add base sub nlen 1 c2
+end
+
+fn s6_name_has_q base ulong nlen ulong to bool
+pl = len s6_qtag
+if lt nlen pl
+ret false
+end
+lim = add sub nlen pl 1
+for i ulong lim bound 256
+ok = true
+for j ulong pl bound 16
+if ne get s6_dents add add base i j get s6_qtag j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn s6_is_dot base ulong nlen ulong to bool
+if eq nlen 1
+ret eq get s6_dents base 46
+end
+if eq nlen 2
+if eq get s6_dents base 46
+ret eq get s6_dents add base 1 46
+end
+end
+ret false
+end
+
+fn s6_recl o ulong to ulong
+b0 = ulong get s6_dents add o 16
+b1 = shl ulong get s6_dents add o 17 8
+ret or b0 b1
+end
+
+fn s6_nlen o ulong lim ulong to ulong
+base = add o 19
+n = ulong 0
+while lt add base n lim bound 256
+if eq get s6_dents add base n 0
+break
+end
+n = add n 1
+end
+ret n
+end
+
+note Verify that a .QUARANTINED file actually has mode 0000 (not readable/executable!)
+fn s6_quarantine_is_locked clen ulong base ulong nl ulong to bool
+tot = add add clen 1 nl
+if ge tot S6_PATH_STRIDE
+ret false
+end
+for i ulong clen bound 1024
+put s6_fpath i get s6_cur_path i
+end
+put s6_fpath clen 47
+for j ulong nl bound 256
+put s6_fpath add add clen 1 j get s6_dents add base j
+end
+sr = stat s6_fpath 0 tot s6_stbuf 0 128
+if ne sr 0
+ret false
+end
+note Linux AArch64 struct stat: st_mode is u32 LE at offset 16
+b0 = ulong get s6_stbuf 16
+b1 = shl ulong get s6_stbuf 17 8
+mode = or b0 b1
+perms = and mode 511
+ret eq perms 0
+end
+
+fn s6_push_dir parent_len ulong base ulong nlen ulong sp ulong to ulong
+if ge sp S6_MAX_STACK
+put s6_stat 5 S6_ERR_SCAN_LIMIT
+ret sp
+end
+tot = add add parent_len 1 nlen
+if ge tot S6_PATH_STRIDE
+put s6_stat 5 S6_ERR_SCAN_LIMIT
+ret sp
+end
+dst = mul sp S6_PATH_STRIDE
+for i ulong parent_len bound 1024
+put s6_dir_stk add dst i get s6_cur_path i
+end
+put s6_dir_stk add dst parent_len 47
+for j ulong nlen bound 256
+put s6_dir_stk add add add dst parent_len 1 j get s6_dents add base j
+end
+put s6_dir_len sp tot
+ret add sp 1
+end
+
+fn s6_pop_dir sp ulong to ulong
+ns = sub sp 1
+dl = get s6_dir_len ns
+src = mul ns S6_PATH_STRIDE
+for i ulong dl bound 1024
+put s6_cur_path i get s6_dir_stk add src i
+end
+put s6_cur_len 0 dl
+ret ns
+end
+
+fn s6_classify_file clen ulong base ulong nl ulong to void
+put s6_stat 0 add get s6_stat 0 1
+if s6_name_has_q base nl
+if s6_quarantine_is_locked clen base nl
+put s6_stat 4 add get s6_stat 4 1
+else
+put s6_stat 3 add get s6_stat 3 1
+end
+ret
+end
+if s6_ends3 base nl 46 107 111
+put s6_stat 3 add get s6_stat 3 1
+end
+if s6_ends3 base nl 46 111 109
+put s6_stat 1 add get s6_stat 1 1
+end
+if s6_ends2 base nl 46 99
+put s6_stat 2 add get s6_stat 2 1
+end
+if s6_ends2 base nl 46 104
+put s6_stat 2 add get s6_stat 2 1
+end
+end
+
+fn s6_scan_buf lim ulong clen ulong sp ulong to ulong
+o = ulong 0
+nsp = sp
+while lt o lim bound 65536
+rl = s6_recl o
+if eq rl 0
+break
+end
+nl = s6_nlen o lim
+base = add o 19
+dtype = ulong get s6_dents add o 18
+if not s6_is_dot base nl
+if eq dtype 4
+nsp = s6_push_dir clen base nl nsp
+else
+s6_classify_file clen base nl
+end
+end
+o = add o rl
+end
+ret nsp
+end
+
+fn s6_scan_one_dir sp ulong to ulong
+nsp = s6_pop_dir sp
+clen = get s6_cur_len 0
+dfd = fopen s6_cur_path 0 clen S6_O_DIR 0
+if lt dfd 0
+ret nsp
+end
+going = true
+while going bound 4096
+nr = getdnts int dfd s6_dents 0 65536
+if le nr 0
+going = false
+else
+nsp = s6_scan_buf ulong nr clen nsp
+end
+end
+ign = fclose int dfd
+ret nsp
+end
+
+fn s6_cmd_scan_dir to int
+if ne argcnt 4
+s6_wrt 2 s6_use
+ret 2
+end
+dl = argread 2 s6_dir_stk 0 1000
+if lt dl 1
+s6_wrt 2 s6_use
+ret 2
+end
+put s6_dir_len 0 ulong dl
+ml = argread 3 s6_arg 0 32
+if lt ml 1
+s6_wrt 2 s6_use
+ret 2
+end
+max_c = s6_parse_u ulong ml
+if eq max_c not ulong 0
+s6_wrt 2 s6_use
+ret 2
+end
+for k ulong 8
+put s6_stat k 0
+end
+sp = ulong 1
+while gt sp 0 bound 4096
+sp = s6_scan_one_dir sp
+if ne get s6_stat 5 0
+ret s6_refuse S6_ERR_SCAN_LIMIT
+end
+end
+if gt get s6_stat 3 0
+ret s6_refuse S6_ERR_ROGUE_KMOD
+end
+if gt get s6_stat 2 max_c
+ret s6_refuse S6_ERR_C_CONTAM
+end
+s6_wrt 1 s6_p_scan1
+s6_num 1 get s6_stat 0
+s6_wrt 1 s6_p_om
+s6_num 1 get s6_stat 1
+s6_wrt 1 s6_p_ch
+s6_num 1 get s6_stat 2
+s6_wrt 1 s6_p_ko
+s6_num 1 get s6_stat 3
+s6_wrt 1 s6_p_qko
+s6_num 1 get s6_stat 4
+s6_wrt 1 s6_nl
+ret 0
+end
+
+fn s6_cmd_audit_file to int
+if ne argcnt 3
+s6_wrt 2 s6_use
+ret 2
+end
+pl = argread 2 s6_arg 0 1000
+if lt pl 1
+s6_wrt 2 s6_use
+ret 2
+end
+fd = fopen s6_arg 0 ulong pl 0 0
+if lt fd 0
+ret 2
+end
+n = ulong 0
+while lt n S6_MAX_FILE bound 4096
+k = read int fd s6_buf n sub S6_MAX_FILE n
+if lt k 0
+c1 = fclose int fd
+ret 2
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+c2 = fclose int fd
+put s6_buflen 0 n
+if s6_check_uefi
+ret s6_refuse S6_ERR_UEFI_SPI
+end
+if s6_check_kmod_txt
+ret s6_refuse S6_ERR_ROGUE_KMOD
+end
+if s6_check_impure_txt
+ret s6_refuse S6_ERR_IMPURE_OM
+end
+s6_wrt 1 s6_p_aud1
+s6_num 1 n
+s6_wrt 1 s6_p_aud2
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+s6_wrt 2 s6_use
+ret 2
+end
+cl = argread 1 s6_arg 0 64
+if lt cl 1
+s6_wrt 2 s6_use
+ret 2
+end
+if s6_eq_arg s6_c_scan ulong cl
+ret s6_cmd_scan_dir
+end
+if s6_eq_arg s6_c_aud ulong cl
+ret s6_cmd_audit_file
+end
+s6_wrt 2 s6_use
+ret 2
+end

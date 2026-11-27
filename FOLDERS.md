@@ -331,7 +331,7 @@ Seeded Omega exhaustive u8/u16 equivalence checker for OSC IR v1 scalar function
 
 ## `seed/helix/`
 
-Proof-Carrying Evolutionary Helix, 4-Strand BFT Stem-Cell Braid (`1,612 B` independent AArch64 seeds: Monk `408 B`, Predator `396 B`, Trickster `404 B`, Ascetic `404 B`), Four-Wall Loop-1 Helical RSI Containment Gate (`rsi-loop1.sh --lean`), in-process zero-CUDA SM121 Evolutionary JIT (`helix_jit.om`, `helix-build-jit.sh`), Arboris nervous system benchmarks, pure-Omega RFC 8032 Ed25519 DDC receipt signer, `EGP2` structural e-graph + dual-checker, 15 SM121/`uor-gpu` antibodies, 29 Lean 4.36.0 theorems under `seed/helix/proofs/`, and the 5-stage Omega LLM closed-loop verified RLVR & SM121 training JIT factory under `seed/helix/ollm_factory/`
+Proof-Carrying Evolutionary Helix, 4-Strand BFT Stem-Cell Braid (`1,612 B` independent AArch64 seeds: Monk `408 B`, Predator `396 B`, Trickster `404 B`, Ascetic `404 B`), Four-Wall Loop-1 Helical RSI Containment Gate (`rsi-loop1.sh --lean`), in-process zero-CUDA SM121 Evolutionary JIT (`helix_jit.om`, `helix-build-jit.sh`), Arboris nervous system benchmarks, pure-Omega RFC 8032 Ed25519 DDC receipt signer, `EGP2` structural e-graph + dual-checker, 15 SM121/`uor-gpu` antibodies, Strand 5 Aegis (`seed/helix/strand5_aegis/`, OM-3 Zero-Pointer Linear Silicon Capabilities + ΩIR v2 + OMEGA-MEMO + `om2` DDC fixpoint), Multi-Strand Hive Shield (`seed/helix/hive_shield/`, Strands 6–9 Sentinel/Warden/Notary/Arbiter), Lean 4.36.0 proofs under `seed/helix/proofs/` (including `Om3MemorySafety.lean` & `HiveShield.lean`), and the 5-stage Omega LLM closed-loop verified RLVR & SM121 training JIT factory under `seed/helix/ollm_factory/`
 
 ## `seed/json/`
 

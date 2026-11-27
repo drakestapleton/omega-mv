@@ -1,0 +1,426 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/hive_shield/strand9_arbiter.om: Strand 9 (The Arbiter)
+note Pure Seeded OM-2 Zero-Trust Personal Silicon Mesh, Network Endpoint & Remote-Command Guard.
+note
+note Modes:
+note   strand9_arbiter check-bind <endpoint_addr>
+note   strand9_arbiter check-cmd <cmd_file> <concurrent_ssh> <signed_cap>
+note
+note Fail-closed refusal codes:
+note   171 HS_ERR_WILDCARD_BIND    wildcard 0.0.0.0 or :: listener refused (matches omega-mesh rc=12)
+note   172 HS_ERR_UNOWNED_HOST     address outside owned Hive prefixes (127., 192.168.1., 100.64..127., ::1, l2:0x88b5)
+note   173 HS_ERR_UNSAFE_CMD       dangerous remote command (pkill -f, rm -rf /, UEFI/SPI, rogue insmod)
+note   174 HS_ERR_SSH_STORM        concurrent SSH sessions > 4 (prevents Spark sshd MaxStartups storm)
+note   175 HS_ERR_UNSIGNED_RPC     cross-node command lacks Ed25519 / capability signature
+
+const S9_MAX_CMD ulong 65536
+const S9_MAX_SSH ulong 4
+
+const S9_ERR_WILDCARD ulong 171
+const S9_ERR_UNOWNED ulong 172
+const S9_ERR_UNSAFE ulong 173
+const S9_ERR_STORM ulong 174
+const S9_ERR_UNSIGNED ulong 175
+
+global s9_arg uchar 1024
+global s9_addr uchar 256
+global s9_alen ulong 1
+global s9_buf uchar 65536
+global s9_blen ulong 1
+global s9_dig uchar 24
+global s9_oct ulong 4
+
+text s9_use "usage: strand9_arbiter check-bind <addr> | check-cmd <cmd_file> <concurrent_ssh> <signed_cap>\n"
+text s9_c_bind "check-bind"
+text s9_c_cmd "check-cmd"
+
+text s9_p_b1 "STRAND9_ARBITER CHECK_BIND PASS endpoint="
+text s9_p_c1 "STRAND9_ARBITER CHECK_CMD PASS bytes="
+text s9_p_c2 " ssh_conc="
+text s9_p_c3 " signed_cap=1\n"
+text s9_f_pfx "STRAND9_ARBITER REFUSED code="
+text s9_f_rsn " reason="
+text s9_nl "\n"
+
+text s9_r_171 "WILDCARD_BIND_FORBIDDEN"
+text s9_r_172 "UNOWNED_HOST_OUTSIDE_HIVE"
+text s9_r_173 "UNSAFE_REMOTE_COMMAND"
+text s9_r_174 "SSH_CONCURRENCY_STORM"
+text s9_r_175 "UNSIGNED_CROSS_NODE_RPC"
+
+text s9_w_v4 "0.0.0.0"
+text s9_w_v6 "::"
+text s9_ok_lo "127."
+text s9_ok_lan "192.168.1."
+text s9_ok_ts "100."
+text s9_ok_v6 "::1"
+text s9_ok_l2 "l2:0x88b5"
+
+note Dangerous remote command signatures
+text s9_d0 "pkill -f"
+text s9_d1 "rm -rf /"
+text s9_d2 "efibootmgr"
+text s9_d3 "efivars"
+text s9_d4 "flashrom"
+text s9_d5 "fwupdmgr"
+text s9_d6 "/dev/mtd"
+text s9_d7 "/dev/spidev"
+text s9_d8 "insmod"
+text s9_d9 "mkfs."
+
+fn s9_wrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn s9_num fd int v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put s9_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd s9_dig p sub 24 p
+ret
+end
+end
+end
+
+fn s9_refuse code ulong to int
+s9_wrt 2 s9_f_pfx
+s9_num 2 code
+s9_wrt 2 s9_f_rsn
+if eq code S9_ERR_WILDCARD
+s9_wrt 2 s9_r_171
+end
+if eq code S9_ERR_UNOWNED
+s9_wrt 2 s9_r_172
+end
+if eq code S9_ERR_UNSAFE
+s9_wrt 2 s9_r_173
+end
+if eq code S9_ERR_STORM
+s9_wrt 2 s9_r_174
+end
+if eq code S9_ERR_UNSIGNED
+s9_wrt 2 s9_r_175
+end
+s9_wrt 2 s9_nl
+ret int code
+end
+
+fn s9_eq_arg s view uchar * n ulong to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get s9_arg i get s i
+ret false
+end
+end
+ret true
+end
+
+fn s9_parse_arg_u idx ulong to ulong
+al = argread idx s9_arg 0 64
+if lt al 1
+ret not ulong 0
+end
+n = ulong al
+if gt n 20
+ret not ulong 0
+end
+v = ulong 0
+for i ulong n bound 20
+c = ulong get s9_arg i
+if lt c 48
+ret not ulong 0
+end
+if gt c 57
+ret not ulong 0
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+fn s9_addr_eq s view uchar * to bool
+n = get s9_alen 0
+if ne n len s
+ret false
+end
+for i ulong n bound 256
+if ne get s9_addr i get s i
+ret false
+end
+end
+ret true
+end
+
+fn s9_addr_pfx s view uchar * to bool
+n = get s9_alen 0
+pl = len s
+if lt n pl
+ret false
+end
+for i ulong pl bound 64
+if ne get s9_addr i get s i
+ret false
+end
+end
+ret true
+end
+
+note Strictly parse s9_addr[0..s9_alen) as a.b.c.d with 4 decimal octets in 0..255 and zero trailing chars
+fn s9_parse_ipv4 to bool
+n = get s9_alen 0
+if lt n 7
+ret false
+end
+if gt n 15
+ret false
+end
+p = ulong 0
+for oi ulong 4
+if ge p n
+ret false
+end
+v = ulong 0
+d = ulong 0
+while lt p n bound 4
+c = ulong get s9_addr p
+if eq c 46
+break
+end
+if lt c 48
+ret false
+end
+if gt c 57
+ret false
+end
+v = add mul v 10 sub c 48
+d = add d 1
+p = add p 1
+end
+if eq d 0
+ret false
+end
+if gt v 255
+ret false
+end
+put s9_oct oi v
+if lt oi 3
+if ge p n
+ret false
+end
+if ne get s9_addr p 46
+ret false
+end
+p = add p 1
+end
+end
+ret eq p n
+end
+
+fn s9_ipv4_is_owned to bool
+if not s9_parse_ipv4
+ret false
+end
+o0 = get s9_oct 0
+o1 = get s9_oct 1
+o2 = get s9_oct 2
+if eq o0 127
+ret true
+end
+if eq o0 192
+if eq o1 168
+if eq o2 1
+ret true
+end
+end
+end
+if eq o0 100
+if ge o1 64
+if le o1 127
+ret true
+end
+end
+end
+ret false
+end
+
+fn s9_cmd_check_bind to int
+if ne argcnt 3
+s9_wrt 2 s9_use
+ret 2
+end
+al = argread 2 s9_addr 0 250
+if lt al 1
+s9_wrt 2 s9_use
+ret 2
+end
+put s9_alen 0 ulong al
+if s9_addr_eq s9_w_v4
+ret s9_refuse S9_ERR_WILDCARD
+end
+if s9_addr_eq s9_w_v6
+ret s9_refuse S9_ERR_WILDCARD
+end
+allowed = false
+if s9_ipv4_is_owned
+allowed = true
+end
+if s9_addr_eq s9_ok_v6
+allowed = true
+end
+if s9_addr_eq s9_ok_l2
+allowed = true
+end
+if not allowed
+ret s9_refuse S9_ERR_UNOWNED
+end
+s9_wrt 1 s9_p_b1
+r = write 1 s9_addr 0 get s9_alen 0
+s9_wrt 1 s9_nl
+ret 0
+end
+
+fn s9_buf_has pat view uchar * to bool
+bl = get s9_blen 0
+pl = len pat
+if lt bl pl
+ret false
+end
+lim = add sub bl pl 1
+b0 = get pat 0
+for i ulong lim bound 65536
+if eq get s9_buf i b0
+ok = true
+for j ulong pl bound 32
+if ne get s9_buf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+end
+ret false
+end
+
+fn s9_check_bad_cmd_a to bool
+if s9_buf_has s9_d0
+ret true
+end
+if s9_buf_has s9_d1
+ret true
+end
+if s9_buf_has s9_d2
+ret true
+end
+if s9_buf_has s9_d3
+ret true
+end
+if s9_buf_has s9_d4
+ret true
+end
+ret false
+end
+
+fn s9_check_bad_cmd to bool
+if s9_check_bad_cmd_a
+ret true
+end
+if s9_buf_has s9_d5
+ret true
+end
+if s9_buf_has s9_d6
+ret true
+end
+if s9_buf_has s9_d7
+ret true
+end
+if s9_buf_has s9_d8
+ret true
+end
+if s9_buf_has s9_d9
+ret true
+end
+ret false
+end
+
+fn s9_cmd_check_cmd to int
+bad = not ulong 0
+if ne argcnt 5
+s9_wrt 2 s9_use
+ret 2
+end
+conc = s9_parse_arg_u 3
+scap = s9_parse_arg_u 4
+if eq conc bad
+ret 2
+end
+if eq scap bad
+ret 2
+end
+if gt conc S9_MAX_SSH
+ret s9_refuse S9_ERR_STORM
+end
+if ne scap 1
+ret s9_refuse S9_ERR_UNSIGNED
+end
+pl = argread 2 s9_arg 0 1000
+if lt pl 1
+ret 2
+end
+fd = fopen s9_arg 0 ulong pl 0 0
+if lt fd 0
+ret 2
+end
+n = ulong 0
+while lt n S9_MAX_CMD bound 1024
+k = read int fd s9_buf n sub S9_MAX_CMD n
+if lt k 0
+c1 = fclose int fd
+ret 2
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+c2 = fclose int fd
+put s9_blen 0 n
+if s9_check_bad_cmd
+ret s9_refuse S9_ERR_UNSAFE
+end
+s9_wrt 1 s9_p_c1
+s9_num 1 n
+s9_wrt 1 s9_p_c2
+s9_num 1 conc
+s9_wrt 1 s9_p_c3
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+s9_wrt 2 s9_use
+ret 2
+end
+cl = argread 1 s9_arg 0 64
+if lt cl 1
+s9_wrt 2 s9_use
+ret 2
+end
+if s9_eq_arg s9_c_bind ulong cl
+ret s9_cmd_check_bind
+end
+if s9_eq_arg s9_c_cmd ulong cl
+ret s9_cmd_check_cmd
+end
+s9_wrt 2 s9_use
+ret 2
+end

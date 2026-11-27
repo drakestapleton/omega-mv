@@ -1,0 +1,1515 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/strand5_aegis/om3_aegis.om: Strand 5 (The Aegis) — Pure Seeded OM-2
+note OM-3 Zero-Pointer Linear Silicon Capability Verifier, ΩIR v2 Contract Bridge,
+note Zero-Runtime-Overhead Lowerer, and OMEGA-MEMO Content-Addressed Proof Memoizer.
+note
+note Link order (program mode; prefix om2\n at line 1):
+note   (printf 'om2\n'; cat seed/ng/sha256.om seed/ng/memo/memo_policy.om \
+note    seed/ng/memo/memo_store.om seed/helix/strand5_aegis/om3_aegis.om) | seed/out/omc > om3_aegis
+note
+note Usage:
+note   om3_aegis verify-om3 <src.om3> <memo_root> [out_om2.om]
+note   om3_aegis memo-ddc <src_sha64> <bin_sha64> <pin_sha64> <memo_root>
+note
+note Refusal codes (fail-closed):
+note   101 OM3_ERR_RAW_PTR           raw pointer / fwld / fwst / fwadr / mapaddr / dma_addr / put_page escape
+note   102 OM3_ERR_VA_OVERLAP        overlapping GPU VA mapping (user vs kernel VA aliasing)
+note   103 OM3_ERR_OOB_STATIC        static bounds proof failed (off + len > size or u64 wrap)
+note   104 OM3_ERR_MISSING_UNMAP     reclaim/tlbinval/submit/access without valid PTE mapping state
+note   105 OM3_ERR_MISSING_TLB       reclaim/fence_drain without TLB invalidation
+note   106 OM3_ERR_UNFENCED_DMA      reclaim or unit exit with in-flight GPU DMA (epoch > drained_epoch)
+note   107 OM3_ERR_VMA_LEAK          reclaim or unit exit with active user VMA pins > 0
+note   108 OM3_ERR_USE_AFTER_RECLAIM use/map/submit/access after region was reclaimed (UAF)
+note   109 OM3_ERR_DOUBLE_RECLAIM    double reclaim / double free
+note   110 OM3_ERR_DOMAIN_ALIEN      cross-domain violation (GPU targeting KERNEL_SLAB, phys overlap)
+note   111 OM3_ERR_SYNTAX            malformed om3 header, overlong line (>=510 B), or directive
+note   120 OM3_ERR_MEMO_TAMPER       OMEGA-MEMO proof certificate tamper / corruption detected
+note   130 OM3_ERR_DDC_MISMATCH      Strand 5 @ng DDC binary SHA-256 != pinned om2 omc SHA-256
+
+const AE_MAX_SRC ulong 262144
+const AE_MAX_LINE ulong 510
+const AE_MAX_REG ulong 128
+const AE_NAME_STRIDE ulong 32
+const AE_ENV_HDR ulong 48
+
+note Hardware memory domains
+const AE_DOM_CPU_HOST ulong 1
+const AE_DOM_CPU_KERNEL_SLAB ulong 2
+const AE_DOM_GPU_DEVICE_DMA ulong 3
+const AE_DOM_GPU_PT_GMMU ulong 4
+const AE_DOM_MMIO_BAR0 ulong 5
+const AE_DOM_SHARED_UNCACHED ulong 6
+
+note Map states
+const AE_MAP_NONE ulong 0
+const AE_MAP_MAPPED ulong 1
+const AE_MAP_PTE_CLEARED ulong 2
+const AE_MAP_TLB_FLUSHED ulong 3
+
+note Region lifetime states
+const AE_ST_LIVE ulong 1
+const AE_ST_RECLAIMED ulong 2
+
+note Error codes
+const AE_ERR_RAW_PTR ulong 101
+const AE_ERR_VA_OVERLAP ulong 102
+const AE_ERR_OOB_STATIC ulong 103
+const AE_ERR_MISSING_UNMAP ulong 104
+const AE_ERR_MISSING_TLB ulong 105
+const AE_ERR_UNFENCED_DMA ulong 106
+const AE_ERR_VMA_LEAK ulong 107
+const AE_ERR_USE_AFTER_RECLAIM ulong 108
+const AE_ERR_DOUBLE_RECLAIM ulong 109
+const AE_ERR_DOMAIN_ALIEN ulong 110
+const AE_ERR_SYNTAX ulong 111
+const AE_ERR_MEMO_TAMPER ulong 120
+const AE_ERR_DDC_MISMATCH ulong 130
+
+global ae_src uchar 262144
+global ae_srclen ulong 1
+global ae_emit uchar 262144
+global ae_emitlen ulong 1
+
+global ae_rname uchar 4096
+global ae_rnlen ulong 128
+global ae_rdom ulong 128
+global ae_rbase ulong 128
+global ae_rsize ulong 128
+global ae_rva ulong 128
+global ae_rvlen ulong 128
+global ae_rmap ulong 128
+global ae_repoch ulong 128
+global ae_rdrain ulong 128
+global ae_rvma ulong 128
+global ae_rstate ulong 128
+global ae_rcnt ulong 1
+
+note Telemetry: [0]=maps [1]=bounds_erased [2]=fences [3]=reclaims [4]=line [5]=ng_contracts
+global ae_stat ulong 8
+global ae_src_sha uchar 32
+global ae_om2_sha uchar 32
+global ae_fid uchar 32
+
+global ae_arg uchar 1024
+global ae_line uchar 512
+global ae_tok0 uchar 64
+global ae_tok1 uchar 64
+global ae_tok2 uchar 64
+global ae_tok3 uchar 64
+global ae_tok4 uchar 64
+global ae_tlen ulong 8
+global ae_dig uchar 24
+global ae_hex uchar 64
+
+text ae_use "usage: om3_aegis verify-om3 <src.om3> <memo_root> [out_om2.om] | memo-ddc <src_sha> <bin_sha> <pin_sha> <memo_root>\n"
+text ae_tag_fid "omega.om3.aegis.v2"
+text ae_tag_ddc "omega.strand5.aegis.ddc.v1"
+text ae_s_pass1 "OM3_AEGIS PASS mode="
+text ae_s_cold "COLD_PROVED"
+text ae_s_hit "MEMO_HIT"
+text ae_s_reg " regions="
+text ae_s_map " maps="
+text ae_s_bnd " bounds_erased="
+text ae_s_fnc " fences="
+text ae_s_rcl " reclaims="
+text ae_s_ctr " contracts="
+text ae_s_osh " om3_sha256="
+text ae_s_2sh " om2_sha256="
+text ae_s_ref1 "OM3_AEGIS REFUSED code="
+text ae_s_line " line="
+text ae_s_rsn " reason="
+text ae_s_nl "\n"
+text ae_s_om2 "om2\n"
+text ae_s_ddc_ok "STRAND5_MEMO_DDC PASS mode="
+text ae_s_ddc_pin " omc_sha256="
+text ae_s_ddc_bad "STRAND5_MEMO_DDC FAIL code=130 reason=omc_sha256_mismatch\n"
+
+text ae_kw_om3 "om3"
+text ae_kw_note "note"
+text ae_kw_reg "@region"
+text ae_kw_map "@map"
+text ae_kw_pin "@vma_pin"
+text ae_kw_sub "@gpu_submit"
+text ae_kw_acc "@access"
+text ae_kw_unm "@unmap"
+text ae_kw_tlb "@tlbinval"
+text ae_kw_fnc "@fence_drain"
+text ae_kw_rev "@vma_revoke"
+text ae_kw_rcl "@reclaim"
+
+note ΩIR v2 contract pass-through directives (forwarded verbatim for @ng front-ir + ngcheck)
+text ae_ng_0 "@pure"
+text ae_ng_1 "@exact"
+text ae_ng_2 "@tol"
+text ae_ng_3 "@err"
+text ae_ng_4 "@deadline"
+text ae_ng_5 "@hard_deadline"
+text ae_ng_6 "@power"
+
+note Forbidden raw pointer / kernel escape hatches in OM-3
+text ae_ban_0 "fwld"
+text ae_ban_1 "fwst"
+text ae_ban_2 "fwadr"
+text ae_ban_3 "fwcall"
+text ae_ban_4 "rawptr"
+text ae_ban_5 "unsafe_ptr"
+text ae_ban_6 "ptr_cast"
+text ae_ban_7 "dma_addr"
+text ae_ban_8 "put_page"
+text ae_ban_9 "mapaddr"
+text ae_ban_10 "devctl"
+text ae_ban_11 "uvmctl"
+text ae_ban_12 "vm_insert_pages"
+text ae_ban_13 "kfree"
+
+text ae_r_101 "NO_RAW_PTR"
+text ae_r_102 "DISJOINT_VA_OVERLAP"
+text ae_r_103 "OOB_STATIC"
+text ae_r_104 "MISSING_PTE_UNMAP"
+text ae_r_105 "MISSING_TLB_INVAL"
+text ae_r_106 "UNFENCED_GPU_DMA_UAF"
+text ae_r_107 "UNREVOKED_VMA_PIN_LEAK"
+text ae_r_108 "USE_AFTER_RECLAIM_UAF"
+text ae_r_109 "DOUBLE_RECLAIM"
+text ae_r_110 "CROSS_DOMAIN_VIOLATION"
+text ae_r_111 "MALFORMED_OM3_SYNTAX"
+text ae_r_120 "OMEGA_MEMO_PROOF_TAMPER"
+
+text ae_c_ver "verify-om3"
+text ae_c_ddc "memo-ddc"
+
+fn ae_bad_u to ulong
+ret not ulong 0
+end
+
+fn ae_wrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn ae_num fd int v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put ae_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd ae_dig p sub 24 p
+ret
+end
+end
+end
+
+fn ae_hexch v ulong to uchar
+if lt v 10
+ret uchar add 48 v
+end
+ret uchar add 87 v
+end
+
+fn ae_wrhex fd int which ulong to void
+for i ulong 32
+b = ulong 0
+if eq which 0
+b = ulong get ae_src_sha i
+else
+b = ulong get ae_om2_sha i
+end
+put ae_hex mul i 2 ae_hexch shr b 4
+put ae_hex add mul i 2 1 ae_hexch and b 15
+end
+r = write fd ae_hex 0 64
+end
+
+fn ae_refuse code ulong ln ulong to int
+ae_wrt 2 ae_s_ref1
+ae_num 2 code
+ae_wrt 2 ae_s_line
+ae_num 2 ln
+ae_wrt 2 ae_s_rsn
+if eq code AE_ERR_RAW_PTR
+ae_wrt 2 ae_r_101
+end
+if eq code AE_ERR_VA_OVERLAP
+ae_wrt 2 ae_r_102
+end
+if eq code AE_ERR_OOB_STATIC
+ae_wrt 2 ae_r_103
+end
+if eq code AE_ERR_MISSING_UNMAP
+ae_wrt 2 ae_r_104
+end
+if eq code AE_ERR_MISSING_TLB
+ae_wrt 2 ae_r_105
+end
+if eq code AE_ERR_UNFENCED_DMA
+ae_wrt 2 ae_r_106
+end
+if eq code AE_ERR_VMA_LEAK
+ae_wrt 2 ae_r_107
+end
+if eq code AE_ERR_USE_AFTER_RECLAIM
+ae_wrt 2 ae_r_108
+end
+if eq code AE_ERR_DOUBLE_RECLAIM
+ae_wrt 2 ae_r_109
+end
+if eq code AE_ERR_DOMAIN_ALIEN
+ae_wrt 2 ae_r_110
+end
+if eq code AE_ERR_SYNTAX
+ae_wrt 2 ae_r_111
+end
+if eq code AE_ERR_MEMO_TAMPER
+ae_wrt 2 ae_r_120
+end
+ae_wrt 2 ae_s_nl
+ret int code
+end
+
+fn ae_eq_arg s view uchar * n ulong to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get ae_arg i get s i
+ret false
+end
+end
+ret true
+end
+
+fn ae_eq_t0 s view uchar * to bool
+n = get ae_tlen 0
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get ae_tok0 i get s i
+ret false
+end
+end
+ret true
+end
+
+fn ae_tok_put ti ulong pos ulong ch uchar to void
+if ge pos 64
+ret
+end
+if eq ti 0
+put ae_tok0 pos ch
+end
+if eq ti 1
+put ae_tok1 pos ch
+end
+if eq ti 2
+put ae_tok2 pos ch
+end
+if eq ti 3
+put ae_tok3 pos ch
+end
+if eq ti 4
+put ae_tok4 pos ch
+end
+end
+
+fn ae_tok_get ti ulong pos ulong to uchar
+if eq ti 0
+ret get ae_tok0 pos
+end
+if eq ti 1
+ret get ae_tok1 pos
+end
+if eq ti 2
+ret get ae_tok2 pos
+end
+if eq ti 3
+ret get ae_tok3 pos
+end
+ret get ae_tok4 pos
+end
+
+fn ae_is_ws c ulong to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+if eq c 13
+ret true
+end
+ret false
+end
+
+note Split ae_line[0..llen) into up to 5 whitespace tokens; returns token count
+fn ae_split llen ulong to ulong
+for k ulong 8
+put ae_tlen k 0
+end
+nt = ulong 0
+p = ulong 0
+while lt p llen bound 512
+c = ulong get ae_line p
+if ae_is_ws c
+p = add p 1
+continue
+end
+if ge nt 5
+break
+end
+tl = ulong 0
+while lt p llen bound 512
+ch = get ae_line p
+if ae_is_ws ulong ch
+break
+end
+ae_tok_put nt tl ch
+tl = add tl 1
+p = add p 1
+end
+put ae_tlen nt tl
+nt = add nt 1
+end
+ret nt
+end
+
+fn ae_is_hex_pfx ti ulong n ulong to bool
+if lt n 3
+ret false
+end
+c0 = ulong ae_tok_get ti 0
+if ne c0 48
+ret false
+end
+c1 = ulong ae_tok_get ti 1
+if eq c1 120
+ret true
+end
+if eq c1 88
+ret true
+end
+ret false
+end
+
+note Parse unsigned decimal or 0x hex token ti; returns ae_bad_u on invalid or u64 overflow
+fn ae_parse_u ti ulong to ulong
+bad = ae_bad_u
+n = get ae_tlen ti
+if eq n 0
+ret bad
+end
+if ae_is_hex_pfx ti n
+hlen = sub n 2
+if gt hlen 16
+ret bad
+end
+v = ulong 0
+for i ulong hlen bound 16
+ch = ulong ae_tok_get ti add i 2
+d = ulong 99
+if and ge ch 48 le ch 57
+d = sub ch 48
+end
+if and ge ch 97 le ch 102
+d = add 10 sub ch 97
+end
+if and ge ch 65 le ch 70
+d = add 10 sub ch 65
+end
+if ge d 16
+ret bad
+end
+v = add mul v 16 d
+end
+ret v
+end
+if gt n 20
+ret bad
+end
+v2 = ulong 0
+for i ulong n bound 20
+c2 = ulong ae_tok_get ti i
+if lt c2 48
+ret bad
+end
+if gt c2 57
+ret bad
+end
+if gt v2 1844674407370955161
+ret bad
+end
+p10 = mul v2 10
+d2 = sub c2 48
+nxt = add p10 d2
+if lt nxt p10
+ret bad
+end
+v2 = nxt
+end
+ret v2
+end
+
+fn ae_is_idch c ulong to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 97 le c 122
+ret true
+end
+if eq c 95
+ret true
+end
+ret false
+end
+
+fn ae_has_word llen ulong pat view uchar * to bool
+pl = len pat
+if lt llen pl
+ret false
+end
+lim = add sub llen pl 1
+for i ulong lim bound 512
+ok = true
+for j ulong pl bound 32
+if ne get ae_line add i j get pat j
+ok = false
+break
+end
+end
+if ok
+preOk = true
+if gt i 0
+if ae_is_idch ulong get ae_line sub i 1
+preOk = false
+end
+end
+postOk = true
+ep = add i pl
+if lt ep llen
+if ae_is_idch ulong get ae_line ep
+postOk = false
+end
+end
+if and preOk postOk
+ret true
+end
+end
+end
+ret false
+end
+
+fn ae_check_raw_ptr_a llen ulong to bool
+if ae_has_word llen ae_ban_0
+ret true
+end
+if ae_has_word llen ae_ban_1
+ret true
+end
+if ae_has_word llen ae_ban_2
+ret true
+end
+if ae_has_word llen ae_ban_3
+ret true
+end
+if ae_has_word llen ae_ban_4
+ret true
+end
+if ae_has_word llen ae_ban_5
+ret true
+end
+if ae_has_word llen ae_ban_6
+ret true
+end
+ret false
+end
+
+fn ae_check_raw_ptr llen ulong to bool
+if ae_check_raw_ptr_a llen
+ret true
+end
+if ae_has_word llen ae_ban_7
+ret true
+end
+if ae_has_word llen ae_ban_8
+ret true
+end
+if ae_has_word llen ae_ban_9
+ret true
+end
+if ae_has_word llen ae_ban_10
+ret true
+end
+if ae_has_word llen ae_ban_11
+ret true
+end
+if ae_has_word llen ae_ban_12
+ret true
+end
+if ae_has_word llen ae_ban_13
+ret true
+end
+ret false
+end
+
+fn ae_is_ng_contract to bool
+if ae_eq_t0 ae_ng_0
+ret true
+end
+if ae_eq_t0 ae_ng_1
+ret true
+end
+if ae_eq_t0 ae_ng_2
+ret true
+end
+if ae_eq_t0 ae_ng_3
+ret true
+end
+if ae_eq_t0 ae_ng_4
+ret true
+end
+if ae_eq_t0 ae_ng_5
+ret true
+end
+if ae_eq_t0 ae_ng_6
+ret true
+end
+ret false
+end
+
+note Region lookup by tok1; returns AE_MAX_REG if not found
+fn ae_find_reg to ulong
+nl = get ae_tlen 1
+if eq nl 0
+ret AE_MAX_REG
+end
+if gt nl AE_NAME_STRIDE
+ret AE_MAX_REG
+end
+rc = get ae_rcnt 0
+for r ulong rc bound 128
+if eq get ae_rnlen r nl
+o = mul r AE_NAME_STRIDE
+eqv = true
+for j ulong nl bound 32
+if ne get ae_rname add o j get ae_tok1 j
+eqv = false
+break
+end
+end
+if eqv
+ret r
+end
+end
+end
+ret AE_MAX_REG
+end
+
+note Interval overlap check: [a0, a0+al) overlaps [b0, b0+bl) (callers verify non-wrapping)
+fn ae_ovl a0 ulong al ulong b0 ulong bl ulong to bool
+if eq al 0
+ret false
+end
+if eq bl 0
+ret false
+end
+aend = add a0 al
+bend = add b0 bl
+if lt a0 bend
+if lt b0 aend
+ret true
+end
+end
+ret false
+end
+
+fn ae_add_overflow a ulong b ulong to bool
+s = add a b
+ret lt s a
+end
+
+fn ae_emit_push b uchar to bool
+p = get ae_emitlen 0
+if ge p AE_MAX_SRC
+ret false
+end
+put ae_emit p b
+put ae_emitlen 0 add p 1
+ret true
+end
+
+fn ae_emit_str s view uchar * to bool
+n = len s
+for i ulong n bound 64
+if not ae_emit_push get s i
+ret false
+end
+end
+ret true
+end
+
+fn ae_emit_line llen ulong to bool
+for i ulong llen bound 512
+if not ae_emit_push get ae_line i
+ret false
+end
+end
+ret ae_emit_push 10
+end
+
+note ---- OM-3 Linear Capability Handlers ----
+
+fn ae_do_region nt ulong to ulong
+bad = ae_bad_u
+if ne nt 5
+ret AE_ERR_SYNTAX
+end
+nl = get ae_tlen 1
+if eq nl 0
+ret AE_ERR_SYNTAX
+end
+if gt nl AE_NAME_STRIDE
+ret AE_ERR_SYNTAX
+end
+if ne ae_find_reg AE_MAX_REG
+ret AE_ERR_DOMAIN_ALIEN
+end
+dom = ae_parse_u 2
+base = ae_parse_u 3
+sz = ae_parse_u 4
+if lt dom 1
+ret AE_ERR_SYNTAX
+end
+if gt dom 6
+ret AE_ERR_SYNTAX
+end
+if eq base bad
+ret AE_ERR_SYNTAX
+end
+if eq sz bad
+ret AE_ERR_SYNTAX
+end
+if eq sz 0
+ret AE_ERR_SYNTAX
+end
+if ae_add_overflow base sz
+ret AE_ERR_OOB_STATIC
+end
+rc = get ae_rcnt 0
+if ge rc AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+note Law 2: Physical range must be strictly disjoint from any live region
+for i ulong rc bound 128
+if eq get ae_rstate i AE_ST_LIVE
+if ae_ovl base sz get ae_rbase i get ae_rsize i
+ret AE_ERR_DOMAIN_ALIEN
+end
+end
+end
+o = mul rc AE_NAME_STRIDE
+for j ulong nl bound 32
+put ae_rname add o j get ae_tok1 j
+end
+put ae_rnlen rc nl
+put ae_rdom rc dom
+put ae_rbase rc base
+put ae_rsize rc sz
+put ae_rva rc 0
+put ae_rvlen rc 0
+put ae_rmap rc AE_MAP_NONE
+put ae_repoch rc 0
+put ae_rdrain rc 0
+put ae_rvma rc 0
+put ae_rstate rc AE_ST_LIVE
+put ae_rcnt 0 add rc 1
+ret 0
+end
+
+fn ae_do_map nt ulong to ulong
+bad = ae_bad_u
+if ne nt 4
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if eq get ae_rdom r AE_DOM_CPU_KERNEL_SLAB
+ret AE_ERR_DOMAIN_ALIEN
+end
+if ne get ae_rmap r AE_MAP_NONE
+ret AE_ERR_VA_OVERLAP
+end
+va = ae_parse_u 2
+vlen = ae_parse_u 3
+if eq va bad
+ret AE_ERR_SYNTAX
+end
+if eq va 0
+ret AE_ERR_SYNTAX
+end
+if eq vlen bad
+ret AE_ERR_SYNTAX
+end
+if eq vlen 0
+ret AE_ERR_SYNTAX
+end
+if ae_add_overflow va vlen
+ret AE_ERR_OOB_STATIC
+end
+if gt vlen get ae_rsize r
+ret AE_ERR_OOB_STATIC
+end
+note Law 2: Global GPU VA disjointness across ALL live regions (user + kernel; VA stays reserved until full reclaim)
+rc = get ae_rcnt 0
+for i ulong rc bound 128
+if eq get ae_rstate i AE_ST_LIVE
+if gt get ae_rvlen i 0
+if ae_ovl va vlen get ae_rva i get ae_rvlen i
+ret AE_ERR_VA_OVERLAP
+end
+end
+end
+end
+put ae_rva r va
+put ae_rvlen r vlen
+put ae_rmap r AE_MAP_MAPPED
+put ae_stat 0 add get ae_stat 0 1
+ret 0
+end
+
+fn ae_do_vma_pin nt ulong to ulong
+if ne nt 2
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if eq get ae_rdom r AE_DOM_CPU_KERNEL_SLAB
+ret AE_ERR_DOMAIN_ALIEN
+end
+put ae_rvma r add get ae_rvma r 1
+ret 0
+end
+
+fn ae_do_gpu_submit nt ulong to ulong
+bad = ae_bad_u
+if ne nt 3
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if eq get ae_rdom r AE_DOM_CPU_KERNEL_SLAB
+ret AE_ERR_DOMAIN_ALIEN
+end
+if ne get ae_rmap r AE_MAP_MAPPED
+ret AE_ERR_MISSING_UNMAP
+end
+ep = ae_parse_u 2
+if eq ep bad
+ret AE_ERR_SYNTAX
+end
+if le ep get ae_repoch r
+ret AE_ERR_SYNTAX
+end
+put ae_repoch r ep
+ret 0
+end
+
+fn ae_do_access nt ulong to ulong
+bad = ae_bad_u
+if ne nt 4
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+dom = get ae_rdom r
+if eq dom AE_DOM_GPU_DEVICE_DMA
+if ne get ae_rmap r AE_MAP_MAPPED
+ret AE_ERR_MISSING_UNMAP
+end
+end
+if eq dom AE_DOM_GPU_PT_GMMU
+if ne get ae_rmap r AE_MAP_MAPPED
+ret AE_ERR_MISSING_UNMAP
+end
+end
+off = ae_parse_u 2
+alen = ae_parse_u 3
+if eq off bad
+ret AE_ERR_SYNTAX
+end
+if eq alen bad
+ret AE_ERR_SYNTAX
+end
+if eq alen 0
+ret AE_ERR_SYNTAX
+end
+if ae_add_overflow off alen
+ret AE_ERR_OOB_STATIC
+end
+if gt add off alen get ae_rsize r
+ret AE_ERR_OOB_STATIC
+end
+put ae_stat 1 add get ae_stat 1 1
+ret 0
+end
+
+fn ae_do_unmap nt ulong to ulong
+if ne nt 2
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if ne get ae_rmap r AE_MAP_MAPPED
+ret AE_ERR_MISSING_UNMAP
+end
+put ae_rmap r AE_MAP_PTE_CLEARED
+ret 0
+end
+
+fn ae_do_tlbinval nt ulong to ulong
+if ne nt 2
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if ne get ae_rmap r AE_MAP_PTE_CLEARED
+ret AE_ERR_MISSING_UNMAP
+end
+put ae_rmap r AE_MAP_TLB_FLUSHED
+ret 0
+end
+
+fn ae_do_fence_drain nt ulong to ulong
+bad = ae_bad_u
+if ne nt 3
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if ne get ae_rmap r AE_MAP_TLB_FLUSHED
+ret AE_ERR_MISSING_TLB
+end
+ep = ae_parse_u 2
+if eq ep bad
+ret AE_ERR_SYNTAX
+end
+if lt ep get ae_repoch r
+ret AE_ERR_UNFENCED_DMA
+end
+put ae_rdrain r ep
+put ae_stat 2 add get ae_stat 2 1
+ret 0
+end
+
+fn ae_do_vma_revoke nt ulong to ulong
+if ne nt 2
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if ne get ae_rstate r AE_ST_LIVE
+ret AE_ERR_USE_AFTER_RECLAIM
+end
+if eq get ae_rvma r 0
+ret AE_ERR_VMA_LEAK
+end
+put ae_rvma r sub get ae_rvma r 1
+ret 0
+end
+
+fn ae_do_reclaim nt ulong to ulong
+if ne nt 2
+ret AE_ERR_SYNTAX
+end
+r = ae_find_reg
+if ge r AE_MAX_REG
+ret AE_ERR_SYNTAX
+end
+if eq get ae_rstate r AE_ST_RECLAIMED
+ret AE_ERR_DOUBLE_RECLAIM
+end
+mp = get ae_rmap r
+if eq mp AE_MAP_MAPPED
+ret AE_ERR_MISSING_UNMAP
+end
+if eq mp AE_MAP_PTE_CLEARED
+ret AE_ERR_MISSING_TLB
+end
+if gt get ae_repoch r get ae_rdrain r
+ret AE_ERR_UNFENCED_DMA
+end
+if gt get ae_rvma r 0
+ret AE_ERR_VMA_LEAK
+end
+put ae_rstate r AE_ST_RECLAIMED
+put ae_rva r 0
+put ae_rvlen r 0
+put ae_stat 3 add get ae_stat 3 1
+ret 0
+end
+
+fn ae_dispatch_at nt ulong to ulong
+if ae_eq_t0 ae_kw_reg
+ret ae_do_region nt
+end
+if ae_eq_t0 ae_kw_map
+ret ae_do_map nt
+end
+if ae_eq_t0 ae_kw_pin
+ret ae_do_vma_pin nt
+end
+if ae_eq_t0 ae_kw_sub
+ret ae_do_gpu_submit nt
+end
+if ae_eq_t0 ae_kw_acc
+ret ae_do_access nt
+end
+if ae_eq_t0 ae_kw_unm
+ret ae_do_unmap nt
+end
+if ae_eq_t0 ae_kw_tlb
+ret ae_do_tlbinval nt
+end
+if ae_eq_t0 ae_kw_fnc
+ret ae_do_fence_drain nt
+end
+if ae_eq_t0 ae_kw_rev
+ret ae_do_vma_revoke nt
+end
+if ae_eq_t0 ae_kw_rcl
+ret ae_do_reclaim nt
+end
+ret AE_ERR_SYNTAX
+end
+
+note End-of-unit leak check across ALL live regions in ALL domains
+fn ae_check_leaks to ulong
+rcnt = get ae_rcnt 0
+for r ulong rcnt bound 128
+if eq get ae_rstate r AE_ST_LIVE
+mp = get ae_rmap r
+if eq mp AE_MAP_MAPPED
+ret AE_ERR_MISSING_UNMAP
+end
+if eq mp AE_MAP_PTE_CLEARED
+ret AE_ERR_MISSING_TLB
+end
+if gt get ae_repoch r get ae_rdrain r
+ret AE_ERR_UNFENCED_DMA
+end
+if gt get ae_rvma r 0
+ret AE_ERR_VMA_LEAK
+end
+end
+end
+ret 0
+end
+
+note Verify entire ae_src[0..ae_srclen) as OM-3 and emit zero-overhead OM-2 into ae_emit
+note Returns 0 on PASS, or error code (line number stored in ae_stat[4])
+fn ae_verify_and_lower to ulong
+put ae_rcnt 0 0
+put ae_emitlen 0 0
+for i ulong 8
+put ae_stat i 0
+end
+pos = ulong 0
+ln = ulong 0
+slen = get ae_srclen 0
+while lt pos slen bound 262144
+ln = add ln 1
+put ae_stat 4 ln
+llen = ulong 0
+got_nl = false
+while lt pos slen bound 512
+ch = get ae_src pos
+pos = add pos 1
+if eq ch 10
+got_nl = true
+break
+end
+if ge llen AE_MAX_LINE
+ret AE_ERR_SYNTAX
+end
+put ae_line llen ch
+llen = add llen 1
+end
+if not got_nl
+if lt pos slen
+ret AE_ERR_SYNTAX
+end
+end
+nt = ae_split llen
+if eq ln 1
+if ne nt 1
+ret AE_ERR_SYNTAX
+end
+if not ae_eq_t0 ae_kw_om3
+ret AE_ERR_SYNTAX
+end
+if not ae_emit_str ae_s_om2
+ret AE_ERR_SYNTAX
+end
+continue
+end
+if eq nt 0
+if not ae_emit_push 10
+ret AE_ERR_SYNTAX
+end
+continue
+end
+if ae_eq_t0 ae_kw_note
+if not ae_emit_line llen
+ret AE_ERR_SYNTAX
+end
+continue
+end
+if eq get ae_tok0 0 64
+if ae_is_ng_contract
+put ae_stat 5 add get ae_stat 5 1
+if not ae_emit_line llen
+ret AE_ERR_SYNTAX
+end
+continue
+end
+rc = ae_dispatch_at nt
+if ne rc 0
+ret rc
+end
+continue
+end
+if ae_check_raw_ptr llen
+ret AE_ERR_RAW_PTR
+end
+if not ae_emit_line llen
+ret AE_ERR_SYNTAX
+end
+end
+ret ae_check_leaks
+end
+
+note ---- File I/O, Telemetry Envelope & OMEGA-MEMO Binding ----
+
+fn ae_env_put_u64 off ulong v ulong to void
+for j ulong 8
+put mm_val_buf add off j uchar and shr v mul j 8 255
+end
+end
+
+fn ae_env_get_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+b = ulong get mm_val_buf add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn ae_pack_memo_payload to void
+ae_env_put_u64 0 get ae_rcnt 0
+ae_env_put_u64 8 get ae_stat 0
+ae_env_put_u64 16 get ae_stat 1
+ae_env_put_u64 24 get ae_stat 2
+ae_env_put_u64 32 get ae_stat 3
+ae_env_put_u64 40 get ae_stat 5
+n = get ae_emitlen 0
+for i ulong n bound 262144
+put mm_val_buf add AE_ENV_HDR i get ae_emit i
+end
+put mm_val_len 0 add AE_ENV_HDR n
+end
+
+fn ae_unpack_memo_payload to bool
+tot = get mm_val_len 0
+if lt tot AE_ENV_HDR
+ret false
+end
+put ae_rcnt 0 ae_env_get_u64 0
+put ae_stat 0 ae_env_get_u64 8
+put ae_stat 1 ae_env_get_u64 16
+put ae_stat 2 ae_env_get_u64 24
+put ae_stat 3 ae_env_get_u64 32
+put ae_stat 5 ae_env_get_u64 40
+ret true
+end
+
+fn ae_is_memo_corrupt rc ulong to bool
+if eq rc MM_ERR_TAMPER
+ret true
+end
+if eq rc MM_ERR_MAGIC
+ret true
+end
+if eq rc MM_ERR_VERSION
+ret true
+end
+if eq rc MM_ERR_TRUNCATED
+ret true
+end
+if eq rc MM_ERR_TRAILING
+ret true
+end
+if eq rc MM_ERR_KEY_MISMATCH
+ret true
+end
+if eq rc MM_ERR_FORMAT
+ret true
+end
+if eq rc MM_ERR_IMPURE
+ret true
+end
+if eq rc MM_ERR_CONTRACT
+ret true
+end
+ret false
+end
+
+fn ae_read_src pathIdx ulong to bool
+pl = argread pathIdx ae_arg 0 1020
+if lt pl 1
+ret false
+end
+fd = fopen ae_arg 0 ulong pl 0 0
+if lt fd 0
+ret false
+end
+n = ulong 0
+while lt n AE_MAX_SRC bound 4096
+k = read int fd ae_src n sub AE_MAX_SRC n
+if lt k 0
+c = fclose int fd
+ret false
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+c2 = fclose int fd
+if eq n 0
+ret false
+end
+put ae_srclen 0 n
+ret true
+end
+
+fn ae_write_emit pathIdx ulong useMemo bool to bool
+pl = argread pathIdx ae_arg 0 1020
+if lt pl 1
+ret false
+end
+fd = fopen ae_arg 0 ulong pl 577 420
+if lt fd 0
+ret false
+end
+n = get ae_emitlen 0
+if useMemo
+n = sub get mm_val_len 0 AE_ENV_HDR
+end
+o = ulong 0
+while lt o n bound 4096
+k = long 0
+if useMemo
+k = write int fd mm_val_buf add AE_ENV_HDR o sub n o
+else
+k = write int fd ae_emit o sub n o
+end
+if le k 0
+c = fclose int fd
+ret false
+end
+o = add o ulong k
+end
+c2 = fclose int fd
+ret true
+end
+
+fn ae_init_memo rootIdx ulong to bool
+mp_init
+put mp_cfg 0 MP_OVR_FORCE
+rl = argread rootIdx mm_env_buf 0 1800
+if lt rl 1
+ret false
+end
+rc = mm_set_root_from_envbuf ulong rl
+ret eq rc MM_OK
+end
+
+fn ae_hash_src_and_fid to void
+n = get ae_srclen 0
+for i ulong n bound 262144
+put sh_dat i get ae_src i
+end
+sh_all n
+for i ulong 32
+put ae_src_sha i get sh_dig i
+end
+tl = len ae_tag_fid
+for i ulong tl bound 64
+put sh_dat i get ae_tag_fid i
+end
+put sh_dat tl 0
+for i ulong 32
+put sh_dat add add tl 1 i get ae_src_sha i
+end
+sh_all add add tl 1 32
+for i ulong 32
+put ae_fid i get sh_dig i
+end
+end
+
+fn ae_hash_emit useMemo bool to void
+n = get ae_emitlen 0
+if useMemo
+n = sub get mm_val_len 0 AE_ENV_HDR
+for i ulong n bound 262144
+put sh_dat i get mm_val_buf add AE_ENV_HDR i
+end
+else
+for i ulong n bound 262144
+put sh_dat i get ae_emit i
+end
+end
+sh_all n
+for i ulong 32
+put ae_om2_sha i get sh_dig i
+end
+end
+
+fn ae_prep_memo_req to void
+mm_reset_req
+for i ulong 32
+put mm_req_fid i get ae_fid i
+put mm_req_in_sha i get ae_src_sha i
+put mm_req_ir_sha i get ae_src_sha i
+end
+put mm_req_contract 0 1
+put mm_req_contract 1 1
+put mm_req_contract 2 MM_TIER_EXACT
+put mm_req_contract 3 0
+put mm_req_contract 5 5
+end
+
+fn ae_print_pass isHit bool to void
+ae_wrt 1 ae_s_pass1
+if isHit
+ae_wrt 1 ae_s_hit
+else
+ae_wrt 1 ae_s_cold
+end
+ae_wrt 1 ae_s_reg
+ae_num 1 get ae_rcnt 0
+ae_wrt 1 ae_s_map
+ae_num 1 get ae_stat 0
+ae_wrt 1 ae_s_bnd
+ae_num 1 get ae_stat 1
+ae_wrt 1 ae_s_fnc
+ae_num 1 get ae_stat 2
+ae_wrt 1 ae_s_rcl
+ae_num 1 get ae_stat 3
+ae_wrt 1 ae_s_ctr
+ae_num 1 get ae_stat 5
+ae_wrt 1 ae_s_osh
+ae_wrhex 1 0
+ae_wrt 1 ae_s_2sh
+ae_wrhex 1 1
+ae_wrt 1 ae_s_nl
+end
+
+fn ae_cmd_verify_om3 to int
+if lt argcnt 4
+ae_wrt 2 ae_use
+ret 2
+end
+if not ae_read_src 2
+ret ae_refuse AE_ERR_SYNTAX 0
+end
+if not ae_init_memo 3
+ret ae_refuse AE_ERR_SYNTAX 0
+end
+ae_hash_src_and_fid
+ae_prep_memo_req
+lrc = mm_lookup
+if ae_is_memo_corrupt lrc
+ret ae_refuse AE_ERR_MEMO_TAMPER 0
+end
+if eq lrc MM_OK
+if not ae_unpack_memo_payload
+ret ae_refuse AE_ERR_MEMO_TAMPER 0
+end
+ae_hash_emit true
+if ge argcnt 5
+if not ae_write_emit 4 true
+ret ae_refuse AE_ERR_SYNTAX 0
+end
+end
+ae_print_pass true
+ret 0
+end
+t0 = monons
+vrc = ae_verify_and_lower
+if ne vrc 0
+ret ae_refuse vrc get ae_stat 4
+end
+t1 = monons
+dt = ulong 10000
+if gt t1 t0
+dt = add ulong sub t1 t0 10000
+end
+ae_hash_emit false
+ae_pack_memo_payload
+src = mm_store dt 1000
+if ne src MM_OK
+if ne src MM_OK_ALARM
+ret ae_refuse AE_ERR_MEMO_TAMPER 0
+end
+end
+if ge argcnt 5
+if not ae_write_emit 4 false
+ret ae_refuse AE_ERR_SYNTAX 0
+end
+end
+ae_print_pass false
+ret 0
+end
+
+note ---- Strand 5 @ng + OMEGA-MEMO DDC Convergence Receipt Mode ----
+
+fn ae_cmd_memo_ddc to int
+if ne argcnt 6
+ae_wrt 2 ae_use
+ret 2
+end
+l2 = argread 2 ae_tok0 0 64
+l3 = argread 3 ae_tok1 0 64
+l4 = argread 4 ae_tok2 0 64
+if ne l2 64
+ae_wrt 2 ae_use
+ret 2
+end
+if ne l3 64
+ae_wrt 2 ae_use
+ret 2
+end
+if ne l4 64
+ae_wrt 2 ae_use
+ret 2
+end
+for i ulong 64
+if ne get ae_tok1 i get ae_tok2 i
+ae_wrt 2 ae_s_ddc_bad
+ret int AE_ERR_DDC_MISMATCH
+end
+end
+if not ae_init_memo 5
+ret 2
+end
+tl = len ae_tag_ddc
+for i ulong tl bound 64
+put sh_dat i get ae_tag_ddc i
+end
+for i ulong 64
+put sh_dat add tl i get ae_tok0 i
+end
+sh_all add tl 64
+for i ulong 32
+put ae_fid i get sh_dig i
+end
+for i ulong 64
+put sh_dat i get ae_tok1 i
+end
+sh_all 64
+for i ulong 32
+put ae_src_sha i get sh_dig i
+end
+ae_prep_memo_req
+lrc = mm_lookup
+if ae_is_memo_corrupt lrc
+ret ae_refuse AE_ERR_MEMO_TAMPER 0
+end
+isHit = false
+if eq lrc MM_OK
+isHit = true
+else
+for i ulong 64
+put mm_val_buf i get ae_tok1 i
+end
+put mm_val_len 0 64
+src = mm_store 50000 1000
+if ne src MM_OK
+if ne src MM_OK_ALARM
+ret ae_refuse AE_ERR_MEMO_TAMPER 0
+end
+end
+end
+ae_wrt 1 ae_s_ddc_ok
+if isHit
+ae_wrt 1 ae_s_hit
+else
+ae_wrt 1 ae_s_cold
+end
+ae_wrt 1 ae_s_ddc_pin
+r = write 1 ae_tok1 0 64
+ae_wrt 1 ae_s_nl
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+ae_wrt 2 ae_use
+ret 2
+end
+cl = argread 1 ae_arg 0 64
+if lt cl 1
+ae_wrt 2 ae_use
+ret 2
+end
+if ae_eq_arg ae_c_ver ulong cl
+ret ae_cmd_verify_om3
+end
+if ae_eq_arg ae_c_ddc ulong cl
+ret ae_cmd_memo_ddc
+end
+ae_wrt 2 ae_use
+ret 2
+end
