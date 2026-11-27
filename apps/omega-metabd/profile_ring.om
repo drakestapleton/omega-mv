@@ -1,0 +1,538 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-metabd/profile_ring.om: Stage 4 (Pillar 1) Hot-Path Shared-Memory Profile Ring.
+note Pure seeded OM-2 library unit (no om2 header, no fn main; all symbols prefixed pr_ / PR_).
+note
+note Architecture:
+note   - Shared-memory ring buffer mapped strictly RW (PROT_READ|PROT_WRITE, NEVER executable / W^X!)
+note     via Linux mmap (mapnew anonymous-shared across fork OR file-backed MAP_SHARED).
+note   - Ordered cross-process publication using cpufence (DSB SY) + aligned 64-bit mapget/mapset.
+note   - Records live (sem_id, arg_sig, branch_bias_bp, sparsity_pct, cycle_cost, call_count, pid, flags).
+note   - No arbitrary silent hard cap: ring wraps cleanly with loud overwrite counters & structured
+note     alarm log; hot-candidate aggregator evicts coldest entry with loud eviction telemetry.
+
+const PR_MAGIC ulong 1380994383
+const PR_VERSION ulong 1
+const PR_HDR_BYTES ulong 64
+const PR_REC_BYTES ulong 64
+const PR_DEFAULT_CAP ulong 64
+const PR_CAND_CAP ulong 32
+const PR_DEFAULT_HOT_THRESH ulong 4
+const PR_NONE ulong 999999
+
+note Profile specialization kind bitflags:
+const PR_KIND_CONST ulong 1
+const PR_KIND_BRANCH ulong 2
+const PR_KIND_SPARSE_LOOP ulong 4
+const PR_KIND_GPU_GEMM ulong 8
+
+note Status / refusal codes:
+const PR_OK ulong 0
+const PR_ERR_MAP ulong 1
+const PR_ERR_BAD_REC ulong 2
+const PR_ERR_NOT_OPEN ulong 3
+const PR_ERR_BAD_CAP ulong 4
+const PR_ERR_MAGIC ulong 5
+
+note Alarm reason tags:
+const PR_ALARM_RING_OVERWRITE ulong 1
+const PR_ALARM_CAND_EVICT ulong 2
+const PR_ALARM_BAD_RECORD ulong 3
+
+note Shared-memory mapping state (strictly RW, access=3, NEVER exec):
+global pr_shm_h long 1
+global pr_shm_cap ulong 1
+global pr_shm_bytes ulong 1
+global pr_hot_thresh ulong 1
+
+note Loud telemetry & alarm counters:
+global pr_overwrites ulong 1
+global pr_alarms ulong 1
+global pr_dropped_invalid ulong 1
+global pr_drained_total ulong 1
+global pr_pushed_total ulong 1
+global pr_cand_evictions ulong 1
+global pr_alarm_stderr ulong 1
+global pr_last_pid ulong 1
+
+note Structured loud alarm text buffer:
+global pr_alarm_buf uchar 4096
+global pr_alarm_len ulong 1
+global pr_num_tmp uchar 24
+
+note Hot-candidate aggregator table (evicts coldest entry with loud alarm when saturated):
+global pr_c_used ulong 32
+global pr_c_sem ulong 32
+global pr_c_sig ulong 32
+global pr_c_calls ulong 32
+global pr_c_bias_sum ulong 32
+global pr_c_sparse_sum ulong 32
+global pr_c_cycles_sum ulong 32
+global pr_c_kind ulong 32
+global pr_c_done ulong 32
+global pr_c_pid ulong 32
+global pr_c_score ulong 32
+global pr_c_last_seq ulong 32
+
+note Staging record scratch for push/drain (keeps register pressure well under omc's 16-slot limit):
+note [0]=sem [1]=sig [2]=bias_bp [3]=sparsity [4]=cycles [5]=calls [6]=pid [7]=flags
+global pr_rec ulong 8
+
+text pr_t_al_pfx "OMEGA-METABD ALARM "
+text pr_t_al_ow "ring_overwrite seq="
+text pr_t_al_ev "cand_evict sem="
+text pr_t_al_bd "bad_record sem="
+text pr_t_al_b " b="
+text pr_t_al_c " c="
+text pr_t_al_nl "\n"
+
+fn pr_al_put_view s view uchar * to void
+p = get pr_alarm_len 0
+n = len s
+for i ulong n bound 128
+if lt p 4095
+put pr_alarm_buf p get s i
+p = add p 1
+end
+end
+put pr_alarm_len 0 p
+end
+
+fn pr_al_put_u64 v ulong to void
+x = v
+idx = ulong 24
+for i ulong 21
+idx = sub idx 1
+put pr_num_tmp idx uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+p = get pr_alarm_len 0
+while lt idx 24 bound 24
+if lt p 4095
+put pr_alarm_buf p get pr_num_tmp idx
+p = add p 1
+end
+idx = add idx 1
+end
+put pr_alarm_len 0 p
+end
+
+fn pr_emit_alarm kind ulong a ulong b ulong c ulong to void
+put pr_alarms 0 add get pr_alarms 0 1
+start = get pr_alarm_len 0
+pr_al_put_view pr_t_al_pfx
+if eq kind PR_ALARM_RING_OVERWRITE
+pr_al_put_view pr_t_al_ow
+else
+if eq kind PR_ALARM_CAND_EVICT
+pr_al_put_view pr_t_al_ev
+else
+pr_al_put_view pr_t_al_bd
+end
+end
+pr_al_put_u64 a
+pr_al_put_view pr_t_al_b
+pr_al_put_u64 b
+pr_al_put_view pr_t_al_c
+pr_al_put_u64 c
+pr_al_put_view pr_t_al_nl
+if ne get pr_alarm_stderr 0 0
+endp = get pr_alarm_len 0
+if gt endp start
+w = write 2 pr_alarm_buf start sub endp start
+end
+end
+end
+
+fn pr_init to void
+put pr_shm_h 0 neg long 1
+put pr_shm_cap 0 0
+put pr_shm_bytes 0 0
+put pr_hot_thresh 0 PR_DEFAULT_HOT_THRESH
+put pr_overwrites 0 0
+put pr_alarms 0 0
+put pr_dropped_invalid 0 0
+put pr_drained_total 0 0
+put pr_pushed_total 0 0
+put pr_cand_evictions 0 0
+put pr_alarm_stderr 0 0
+put pr_last_pid 0 0
+put pr_alarm_len 0 0
+for i ulong PR_CAND_CAP
+put pr_c_used i 0
+put pr_c_sem i 0
+put pr_c_sig i 0
+put pr_c_calls i 0
+put pr_c_bias_sum i 0
+put pr_c_sparse_sum i 0
+put pr_c_cycles_sum i 0
+put pr_c_kind i 0
+put pr_c_done i 0
+put pr_c_pid i 0
+put pr_c_score i 0
+put pr_c_last_seq i 0
+end
+for j ulong 8
+put pr_rec j 0
+end
+end
+
+fn pr_set_hot_thresh th ulong to void
+if eq th 0
+put pr_hot_thresh 0 1
+ret
+end
+put pr_hot_thresh 0 th
+end
+
+fn pr_set_alarm_stderr on ulong to void
+put pr_alarm_stderr 0 on
+end
+
+fn pr_cap_valid cap ulong to bool
+if or lt cap 4 gt cap 128
+ret false
+end
+ret eq and cap sub cap 1 0
+end
+
+fn pr_calc_bytes cap ulong to ulong
+raw = add PR_HDR_BYTES mul cap PR_REC_BYTES
+rem4k = rem raw 4096
+if eq rem4k 0
+ret raw
+end
+ret add raw sub 4096 rem4k
+end
+
+fn pr_init_shm_hdr h long cap ulong to void
+z = mapset h 0 8 PR_MAGIC
+z = mapset h 8 8 PR_VERSION
+z = mapset h 16 8 cap
+z = mapset h 24 8 0
+z = mapset h 32 8 0
+z = mapset h 40 8 0
+z = mapset h 48 8 0
+z = mapset h 56 8 0
+cpufence
+end
+
+note Open shared anonymous profile ring (shared across fork; strictly RW access=3, mode=33 MAP_SHARED|ANON).
+fn pr_shm_open_anon cap ulong to ulong
+if not pr_cap_valid cap
+ret PR_ERR_BAD_CAP
+end
+if ge get pr_shm_h 0 0
+z = mapdrop get pr_shm_h 0
+put pr_shm_h 0 neg long 1
+end
+nbytes = pr_calc_bytes cap
+h = mapnew neg int 1 0 nbytes 3 33
+if lt h 0
+ret PR_ERR_MAP
+end
+put pr_shm_h 0 h
+put pr_shm_cap 0 cap
+put pr_shm_bytes 0 nbytes
+pr_init_shm_hdr h cap
+ret PR_OK
+end
+
+note Open file-backed shared profile ring (cross-process IPC; strictly RW access=3, mode=1 MAP_SHARED).
+fn pr_shm_open_file path view uchar * cap ulong init_new bool to ulong
+if not pr_cap_valid cap
+ret PR_ERR_BAD_CAP
+end
+if ge get pr_shm_h 0 0
+z = mapdrop get pr_shm_h 0
+put pr_shm_h 0 neg long 1
+end
+nbytes = pr_calc_bytes cap
+flags = int 2
+if init_new
+flags = int 578
+end
+fd = fopen path 0 len path flags 384
+if lt fd 0
+ret PR_ERR_MAP
+end
+if init_new
+tr = ftrunc int fd long nbytes
+if lt tr 0
+cl = fclose int fd
+ret PR_ERR_MAP
+end
+end
+h = mapnew int fd 0 nbytes 3 1
+cl = fclose int fd
+if lt h 0
+ret PR_ERR_MAP
+end
+put pr_shm_h 0 h
+put pr_shm_cap 0 cap
+put pr_shm_bytes 0 nbytes
+if init_new
+pr_init_shm_hdr h cap
+else
+if ne mapget h 0 8 PR_MAGIC
+z = mapdrop h
+put pr_shm_h 0 neg long 1
+ret PR_ERR_MAGIC
+end
+end
+ret PR_OK
+end
+
+fn pr_shm_close to void
+h = get pr_shm_h 0
+if ge h 0
+z = mapdrop h
+put pr_shm_h 0 neg long 1
+end
+put pr_shm_cap 0 0
+put pr_shm_bytes 0 0
+end
+
+fn pr_stage_rec sem_id ulong arg_sig ulong bias_bp ulong sparse_pct ulong cycles ulong flags ulong to void
+put pr_rec 0 sem_id
+put pr_rec 1 arg_sig
+put pr_rec 2 bias_bp
+put pr_rec 3 sparse_pct
+put pr_rec 4 cycles
+put pr_rec 5 1
+put pr_rec 6 ulong getpid
+put pr_rec 7 flags
+end
+
+fn pr_set_rec_calls calls ulong to void
+put pr_rec 5 calls
+end
+
+fn pr_rec_valid to bool
+if eq get pr_rec 0 0
+ret false
+end
+if gt get pr_rec 2 10000
+ret false
+end
+if gt get pr_rec 3 100
+ret false
+end
+if eq get pr_rec 5 0
+ret false
+end
+ret true
+end
+
+note Push staged pr_rec[0..7] into shared-memory ring buffer.
+note Overwrites oldest entry cleanly if ring is full, bumping loud overwrite counters & alarm log.
+fn pr_push_staged to ulong
+h = get pr_shm_h 0
+if lt h 0
+ret PR_ERR_NOT_OPEN
+end
+if not pr_rec_valid
+put pr_dropped_invalid 0 add get pr_dropped_invalid 0 1
+inv = add mapget h 56 8 1
+z = mapset h 56 8 inv
+pr_emit_alarm PR_ALARM_BAD_RECORD get pr_rec 0 get pr_rec 2 get pr_rec 3
+ret PR_ERR_BAD_REC
+end
+cap = get pr_shm_cap 0
+mask = sub cap 1
+wseq = mapget h 24 8
+rseq = mapget h 32 8
+if and ge wseq rseq ge sub wseq rseq cap
+new_r = add sub wseq cap 1
+z = mapset h 32 8 new_r
+ow = add mapget h 40 8 1
+z = mapset h 40 8 ow
+put pr_overwrites 0 ow
+pr_emit_alarm PR_ALARM_RING_OVERWRITE wseq cap ow
+end
+slot = and wseq mask
+base = add PR_HDR_BYTES mul slot PR_REC_BYTES
+for f ulong 8
+z = mapset h add base mul f 8 8 get pr_rec f
+end
+cpufence
+z = mapset h 24 8 add wseq 1
+put pr_pushed_total 0 add get pr_pushed_total 0 1
+ret PR_OK
+end
+
+note Convenience 6-arg push (sets flags = kind, calls = 1)
+fn pr_push_obs sem_id ulong arg_sig ulong bias_bp ulong sparse_pct ulong cycles ulong kind ulong to ulong
+pr_stage_rec sem_id arg_sig bias_bp sparse_pct cycles kind
+ret pr_push_staged
+end
+
+fn pr_find_cand_slot sem_id ulong arg_sig ulong to ulong
+for i ulong PR_CAND_CAP
+if eq get pr_c_used i 1
+if and eq get pr_c_sem i sem_id eq get pr_c_sig i arg_sig
+ret i
+end
+end
+end
+ret PR_NONE
+end
+
+fn pr_find_free_cand to ulong
+for i ulong PR_CAND_CAP
+if eq get pr_c_used i 0
+ret i
+end
+end
+ret PR_NONE
+end
+
+note When all PR_CAND_CAP slots are occupied, evict coldest candidate with a LOUD eviction alarm (no silent drop).
+fn pr_evict_coldest new_sem ulong to ulong
+best = ulong 0
+best_sc = get pr_c_score 0
+for i ulong PR_CAND_CAP
+sc = get pr_c_score i
+if lt sc best_sc
+best_sc = sc
+best = i
+end
+end
+ev = add get pr_cand_evictions 0 1
+put pr_cand_evictions 0 ev
+pr_emit_alarm PR_ALARM_CAND_EVICT new_sem best ev
+put pr_c_used best 0
+ret best
+end
+
+fn pr_upsert_staged seq ulong to ulong
+idx = pr_find_cand_slot get pr_rec 0 get pr_rec 1
+if eq idx PR_NONE
+idx = pr_find_free_cand
+if eq idx PR_NONE
+idx = pr_evict_coldest get pr_rec 0
+end
+put pr_c_used idx 1
+put pr_c_sem idx get pr_rec 0
+put pr_c_sig idx get pr_rec 1
+put pr_c_calls idx 0
+put pr_c_bias_sum idx 0
+put pr_c_sparse_sum idx 0
+put pr_c_cycles_sum idx 0
+put pr_c_kind idx get pr_rec 7
+put pr_c_done idx 0
+end
+calls = get pr_rec 5
+put pr_c_calls idx add get pr_c_calls idx calls
+put pr_c_bias_sum idx add get pr_c_bias_sum idx mul get pr_rec 2 calls
+put pr_c_sparse_sum idx add get pr_c_sparse_sum idx mul get pr_rec 3 calls
+ncyc = add get pr_c_cycles_sum idx mul get pr_rec 4 calls
+put pr_c_cycles_sum idx ncyc
+put pr_c_kind idx or get pr_c_kind idx get pr_rec 7
+put pr_c_pid idx get pr_rec 6
+put pr_c_score idx ncyc
+put pr_c_last_seq idx seq
+put pr_last_pid 0 get pr_rec 6
+ret idx
+end
+
+fn pr_drain_sync_hdr h long wseq ulong cap ulong to void
+ow = mapget h 40 8
+if gt ow get pr_overwrites 0
+put pr_overwrites 0 ow
+pr_emit_alarm PR_ALARM_RING_OVERWRITE wseq cap ow
+end
+inv = mapget h 56 8
+if gt inv get pr_dropped_invalid 0
+put pr_dropped_invalid 0 inv
+end
+end
+
+note Drain all unread entries from the shared-memory profile ring into the hot-candidate table.
+fn pr_drain to ulong
+h = get pr_shm_h 0
+if lt h 0
+ret 0
+end
+cpufence
+cap = get pr_shm_cap 0
+wseq = mapget h 24 8
+rseq = mapget h 32 8
+pr_drain_sync_hdr h wseq cap
+if ge rseq wseq
+ret 0
+end
+if gt sub wseq rseq cap
+rseq = sub wseq cap
+end
+cnt = ulong 0
+while lt rseq wseq bound 256
+base = add PR_HDR_BYTES mul and rseq sub cap 1 PR_REC_BYTES
+for f ulong 8
+put pr_rec f mapget h add base mul f 8 8
+end
+if pr_rec_valid
+ign = pr_upsert_staged rseq
+cnt = add cnt 1
+else
+put pr_dropped_invalid 0 add get pr_dropped_invalid 0 1
+pr_emit_alarm PR_ALARM_BAD_RECORD get pr_rec 0 rseq 0
+end
+rseq = add rseq 1
+end
+z = mapset h 32 8 rseq
+cpufence
+put pr_drained_total 0 add get pr_drained_total 0 cnt
+ret cnt
+end
+
+note Pick highest-score hot candidate exceeding pr_hot_thresh that has not yet been specialized.
+fn pr_pick_hottest to ulong
+th = get pr_hot_thresh 0
+best = PR_NONE
+best_sc = ulong 0
+for i ulong PR_CAND_CAP
+if and eq get pr_c_used i 1 eq get pr_c_done i 0
+if ge get pr_c_calls i th
+sc = get pr_c_score i
+if or eq best PR_NONE gt sc best_sc
+best = i
+best_sc = sc
+end
+end
+end
+end
+ret best
+end
+
+fn pr_cand_avg_bias idx ulong to ulong
+c = get pr_c_calls idx
+if eq c 0
+ret 5000
+end
+ret div get pr_c_bias_sum idx c
+end
+
+fn pr_cand_avg_sparse idx ulong to ulong
+c = get pr_c_calls idx
+if eq c 0
+ret 0
+end
+ret div get pr_c_sparse_sum idx c
+end
+
+fn pr_cand_avg_cycles idx ulong to ulong
+c = get pr_c_calls idx
+if eq c 0
+ret 0
+end
+ret div get pr_c_cycles_sum idx c
+end
+
+fn pr_mark_done idx ulong st ulong to void
+if lt idx PR_CAND_CAP
+put pr_c_done idx st
+end
+end

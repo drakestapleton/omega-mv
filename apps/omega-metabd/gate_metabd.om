@@ -1,0 +1,1167 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-metabd/gate_metabd.om: Standalone Pure Seeded OM-2 Verification Gate for Stage 4
+note (Pillar 1: Living Proof-Carrying Self-Specialization Daemon — omega-metabd, DRA-1072).
+note
+note Compose & build with pinned seeded omc (SHA-256 85b84c6d...):
+note   cat seed/ng/src/ir.om seed/ng/sha256.om seed/ng/target/target_desc.om \
+note       seed/ng/target/isel.om seed/ng/target/sm121_pe.om seed/ng/target/fabric.om \
+note       seed/ng/target/crystallize.om seed/ng/egraph/ir_egraph.om \
+note       seed/ng/verify/egp3_checker.om seed/ng/live/arboris_spec.om \
+note       apps/omega-metabd/profile_ring.om apps/omega-metabd/general_pe.om \
+note       apps/omega-metabd/gate_metabd.om | seed/out/omc > /tmp/gate_metabd
+note
+note Usage:
+note   ./gate_metabd [SCRATCH_DIR [METABD_BIN OMC_BIN REPO_ROOT]]
+note
+note Stages verified:
+note   T1: Shared-memory profile ring (cross-process fork producer + loud overwrite & eviction alarms)
+note   T2: General multi-block OIR PE #1 (affine_route: const+branch folding -> ir_egraph -> egp3_checker
+note       -> native AArch64 W^X RW->SHA256->RX seal -> exact parity & instruction/op reduction)
+note   T3: General multi-block OIR PE #2 (branch_diamond: 99% hot-branch fold -> EGP3 -> native W^X parity)
+note   T4: General multi-block OIR PE #3 (sparse_dot_loop: 4-block loop unroll + 75% zero-skip -> EGP3
+note       -> native AArch64 W^X 50k-iter execution parity & measurable wall-clock/insn/op speedup)
+note   T5: Cooperative TID_A725 atomic fabWtbl hot-swap + live OOD input drift -> trap 14 ->
+note       SLAB_MUTABLE_ALARMED alarm + atomic rollback to immutable baseline -> exact baseline output
+note   T6: 7 Fail-closed negative controls (unsound EGP3 rewrite, missing proof bits 0/1/3/5/6,
+note       RWX prot & ELF PT_LOAD PF_W|PF_X, Antibody #14 stall=2 violation, TargetDesc SMEM overflow,
+note       writable-file W^X stat check, ORACLE differential mismatch refusal)
+note   T7: 3 Self-contained mutation kills (AArch64 instruction bitflip, proof-gate bypass, RWX guard bypass)
+note   T8 (optional when METABD_BIN OMC_BIN REPO_ROOT passed): live omega-metabd CLI (status/spec/gate/--rwx)
+note       + 2 live omc-recompiled source-level mutation kills on general_pe.om!
+
+global gm_dig uchar 24
+global gm_chk ulong 1
+global gm_neg ulong 1
+global gm_mut ulong 1
+global gm_cli ulong 1
+global gm_st uchar 4
+global gm_dir uchar 512
+global gm_dirl ulong 1
+global gm_bin uchar 512
+global gm_binl ulong 1
+global gm_omc uchar 512
+global gm_omcl ulong 1
+global gm_rep uchar 512
+global gm_repl ulong 1
+global gm_av uchar 4096
+global gm_pa uchar 1024
+global gm_pal ulong 1
+global gm_pb uchar 1024
+global gm_pbl ulong 1
+global gm_fbuf uchar 262144
+global gm_flen ulong 1
+
+text gm_def_dir "/tmp/omega-metabd-gate"
+text gm_m_hdr "=== OMEGA NG STAGE 4 (OMEGA-METABD) VERIFICATION GATE ===\n"
+text gm_m_pass "GATE-METABD PASS checks="
+text gm_m_neg " neg_controls="
+text gm_m_mut " mut_kills="
+text gm_m_sw " swaps="
+text gm_m_rb " rollbacks="
+text gm_m_rwx " rwx_refusals="
+text gm_m_cli " cli_checks="
+text gm_m_nl "\n"
+text gm_m_fail "GATE-METABD FAIL at check="
+
+text gm_l_t1 "PASS T1_profile_ring_shm_xproc pushed=12 overwrites="
+text gm_l_t1b " cand_evictions="
+text gm_l_t1c " alarms="
+text gm_l_t2 "PASS T2_affine_multiblock_pe egp3=PASS insns="
+text gm_l_t2b " ops="
+text gm_l_t3 "PASS T3_branch_diamond_pe egp3=PASS insns="
+text gm_l_t4 "PASS T4_sparse_loop_pe egp3=PASS insns="
+text gm_l_t4b " ns_50k="
+text gm_l_t5 "PASS T5_coop_swap_and_ood_rollback swaps="
+text gm_l_t5b " rollbacks="
+text gm_l_t5c " fabVer="
+text gm_l_t6 "PASS T6_fail_closed_neg_controls count=7 rwx_ref="
+text gm_l_t7 "PASS T7_mutation_kills killed="
+text gm_l_t8 "PASS T8_cli_and_source_mutants cli="
+text gm_l_t8b " src_mut_killed="
+text gm_l_ar "->"
+
+text gm_s_rwx_file "/bad_rwx.bin"
+text gm_s_m1_om "/mut1.om"
+text gm_s_m2_om "/mut2.om"
+text gm_s_m1_bin "/mut1.bin"
+text gm_s_m2_bin "/mut2.bin"
+text gm_s_out "/cli.out"
+text gm_s_err "/cli.err"
+text gm_s_sub_dir "/cli_wx"
+text gm_a_status "status"
+text gm_a_spec "spec"
+text gm_a_gate "gate"
+text gm_a_dir "--dir"
+text gm_a_ood "--ood"
+text gm_a_rwx "--rwx"
+text gm_devnull "/dev/null"
+
+note Source paths for live omc-recompiled source-level mutation kills (T8):
+text gm_u0 "/seed/ng/src/ir.om"
+text gm_u1 "/seed/ng/sha256.om"
+text gm_u2 "/seed/ng/target/target_desc.om"
+text gm_u3 "/seed/ng/target/isel.om"
+text gm_u4 "/seed/ng/target/sm121_pe.om"
+text gm_u5 "/seed/ng/target/fabric.om"
+text gm_u6 "/seed/ng/target/crystallize.om"
+text gm_u7 "/seed/ng/egraph/ir_egraph.om"
+text gm_u8 "/seed/ng/verify/egp3_checker.om"
+text gm_u9 "/seed/ng/live/arboris_spec.om"
+text gm_u10 "/apps/omega-metabd/profile_ring.om"
+text gm_u11 "/apps/omega-metabd/general_pe.om"
+text gm_u12 "/apps/omega-metabd/gate_metabd.om"
+
+note Exact mutation anchors inside general_pe.om for live omc-recompiled mutant kills:
+text gm_m1_from "if ne eff MB_PROOF_ALL"
+text gm_m1_to   "if lt eff 5           "
+text gm_m2_from "if eq and prot 6 6"
+text gm_m2_to   "if eq and prot 6 9"
+
+fn gm_wrt s view uchar * to void
+w = write 1 s 0 len s
+end
+
+fn gm_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put gm_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+w = write 1 gm_dig p sub 24 p
+ret
+end
+end
+end
+
+fn gm_fail code ulong to int
+gm_wrt gm_m_fail
+gm_num code
+gm_wrt gm_m_nl
+ret int add 1 rem code 95
+end
+
+fn gm_add_chk n ulong to void
+put gm_chk 0 add get gm_chk 0 n
+end
+
+fn gm_add_neg to void
+put gm_neg 0 add get gm_neg 0 1
+end
+
+fn gm_add_mut to void
+put gm_mut 0 add get gm_mut 0 1
+end
+
+fn gm_set_wx_dir to void
+n = get gm_dirl 0
+for i ulong n bound 440
+put wx_dir i get gm_dir i
+end
+wx_set_dir_buf n
+end
+
+fn gm_spath suf view uchar * to ulong
+n = get gm_dirl 0
+for i ulong n bound 512
+put gm_pa i get gm_dir i
+end
+m = len suf
+for j ulong m bound 256
+put gm_pa add n j get suf j
+end
+put gm_pal 0 add n m
+ret add n m
+end
+
+fn gm_rpath suf view uchar * to ulong
+n = get gm_repl 0
+for i ulong n bound 512
+put gm_pb i get gm_rep i
+end
+m = len suf
+for j ulong m bound 256
+put gm_pb add n j get suf j
+end
+put gm_pbl 0 add n m
+ret add n m
+end
+
+note ==== T1: Cross-Process Shared-Memory Profile Ring + Loud Overwrite & Eviction Alarms ====
+
+fn gm_t1_profile_ring to int
+pr_init
+pr_set_hot_thresh 4
+if ne pr_shm_open_anon 8 PR_OK
+ret gm_fail 10
+end
+note Fork real child Omega process that pushes 12 valid obs (wrapping 8-slot ring 4x) + 1 invalid obs!
+pid = fork
+if lt pid 0
+pr_shm_close
+ret gm_fail 11
+end
+if eq pid 0
+for i ulong 12
+sem = ulong 5001
+if ge i 4
+sem = ulong 5002
+end
+r = pr_push_obs sem 8 9800 0 1500 PR_KIND_CONST
+end
+bad = pr_push_obs 5003 1 20000 0 100 PR_KIND_CONST
+if ne bad PR_ERR_BAD_REC
+exit 9
+end
+exit 0
+end
+wp = waitpid int pid gm_st 0 4 0
+if or ne wp pid or ne get gm_st 0 0 ne get gm_st 1 0
+pr_shm_close
+ret gm_fail 12
+end
+
+note Parent drains across shared-memory boundary & verifies PID provenance, overwrites & alarms!
+dr = pr_drain
+if ne dr 8
+pr_shm_close
+ret gm_fail 13
+end
+if ne get pr_overwrites 0 4
+pr_shm_close
+ret gm_fail 14
+end
+if ne get pr_dropped_invalid 0 1
+pr_shm_close
+ret gm_fail 15
+end
+if eq get pr_alarms 0 0
+pr_shm_close
+ret gm_fail 16
+end
+if ne get pr_last_pid 0 ulong pid
+pr_shm_close
+ret gm_fail 17
+end
+hot = pr_pick_hottest
+if eq hot PR_NONE
+pr_shm_close
+ret gm_fail 18
+end
+if ne get pr_c_sem hot 5002
+pr_shm_close
+ret gm_fail 19
+end
+if ne pr_cand_avg_bias hot 9800
+pr_shm_close
+ret gm_fail 20
+end
+
+note Push 36 distinct (sem_id, arg_sig) pairs to verify candidate-table eviction with LOUD alarm (no silent cap)!
+for d ulong 36
+p = pr_push_obs add 6000 d add 10 d 9500 50 add 100 mul d 10 PR_KIND_BRANCH
+dr2 = pr_drain
+end
+if eq get pr_cand_evictions 0 0
+pr_shm_close
+ret gm_fail 21
+end
+if eq get pr_alarm_len 0 0
+pr_shm_close
+ret gm_fail 22
+end
+pr_shm_close
+
+gm_wrt gm_l_t1
+gm_num get pr_overwrites 0
+gm_wrt gm_l_t1b
+gm_num get pr_cand_evictions 0
+gm_wrt gm_l_t1c
+gm_num get pr_alarms 0
+gm_wrt gm_m_nl
+gm_add_chk 13
+ret 0
+end
+
+fn gm_t2_parity3 f uint to bool
+for t ulong 3
+xv = add 11 mul t 37
+yref = gpe_eval_fn f xv 8 0 0
+wx_set_args xv 8 0 0 1
+yspc = mb_dispatch_slot 0 true
+if ne yspc yref
+ret false
+end
+if or ne get wx_last_exit 0 0 ne get mb_last_disp 0 MB_DISP_SPEC
+ret false
+end
+end
+ret true
+end
+
+note ==== T2: Multi-Block Workload 1 (Affine Route: Constant+Branch Fold -> EGP3 -> Native W^X) ====
+
+fn gm_t2_affine_pe to int
+ir_init
+f = gpe_build_affine_route
+if ne get i_fnb f 4
+ret gm_fail 30
+end
+if ne mb_register_slot 0 7001 f GPE_WK_AFFINE MB_OK
+ret gm_fail 31
+end
+if ne get fabVer 0 1
+ret gm_fail 32
+end
+
+note Baseline evaluation & native AArch64 sealed RX execution (x=42, scale=8, bias=0, mode=0 -> 1008):
+yb_ir = gpe_eval_fn f 42 8 0 0
+ops_b = get gpe_last_ops 0
+if ne yb_ir 1008
+ret gm_fail 33
+end
+wx_set_args 42 8 0 0 1
+if or ne mb_dispatch_slot 0 false 1008 ne get wx_last_exit 0 0
+ret gm_fail 34
+end
+
+note Specialize with dominant constants (scale=8, bias=0, mode=0, branch_bias=9800):
+gpe_cfg_reset
+gpe_cfg_pin 1 8
+gpe_cfg_pin 2 0
+gpe_cfg_pin 3 0
+gpe_cfg_set_profile 9800 0 TID_X925
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RX MB_PROOF_ALL MB_OK
+ret gm_fail 35
+end
+note Verify live EGP3 proof passed via zero-shared-code egp3_checker & cost strictly reduced!
+if or ne get gpe_pe_stat 7 0 eq get gpe_pe_stat 8 0
+ret gm_fail 36
+end
+if ge get gpe_pe_stat 6 get gpe_pe_stat 5
+ret gm_fail 37
+end
+note Verify measurable native AArch64 instruction count & dynamic ΩIR op reduction!
+if ge get mb_slot_spec_insns 0 get mb_slot_base_insns 0
+ret gm_fail 38
+end
+ys_ir = gpe_eval_fn get mb_slot_fspec 0 42 8 0 0
+ops_s = get gpe_last_ops 0
+if or ne ys_ir 1008 ge ops_s ops_b
+ret gm_fail 39
+end
+if not gm_t2_parity3 f
+ret gm_fail 40
+end
+
+gm_wrt gm_l_t2
+gm_num get mb_slot_base_insns 0
+gm_wrt gm_l_ar
+gm_num get mb_slot_spec_insns 0
+gm_wrt gm_l_t2b
+gm_num ops_b
+gm_wrt gm_l_ar
+gm_num ops_s
+gm_wrt gm_m_nl
+gm_add_chk 11
+ret 0
+end
+
+note ==== T3: Multi-Block Workload 2 (Branch Diamond: 99% Hot-Branch Fold -> EGP3 -> Native W^X) ====
+
+fn gm_t3_branch_diamond to int
+f = gpe_build_branch_diamond
+if ne mb_register_slot 1 7002 f GPE_WK_BRANCH MB_OK
+ret gm_fail 45
+end
+wx_set_args 19 23 1 0 1
+yb = mb_dispatch_slot 1 false
+if or ne get wx_last_exit 0 0 ne yb 99
+ret gm_fail 46
+end
+gpe_cfg_reset
+gpe_cfg_pin 2 1
+gpe_cfg_set_profile 9900 0 TID_X925
+if ne mb_specialize_slot 1 TID_X925 WX_PROT_RX MB_PROOF_ALL MB_OK
+ret gm_fail 47
+end
+if or ne get gpe_pe_stat 7 0 eq get gpe_pe_stat 8 0
+ret gm_fail 48
+end
+if eq get gpe_pe_stat 2 0
+ret gm_fail 49
+end
+wx_set_args 19 23 1 0 1
+ys = mb_dispatch_slot 1 true
+if or ne get wx_last_exit 0 0 or ne ys 99 ne get mb_last_disp 0 MB_DISP_SPEC
+ret gm_fail 50
+end
+if ge get mb_slot_spec_insns 1 get mb_slot_base_insns 1
+ret gm_fail 51
+end
+
+gm_wrt gm_l_t3
+gm_num get mb_slot_base_insns 1
+gm_wrt gm_l_ar
+gm_num get mb_slot_spec_insns 1
+gm_wrt gm_m_nl
+gm_add_chk 7
+ret 0
+end
+
+note ==== T4: Multi-Block Workload 3 (4-Block Sparse Loop -> Unroll+Zero-Skip -> EGP3 -> Speedup!) ====
+
+fn gm_t4_sparse_loop to int
+f = gpe_build_sparse_loop
+if ne mb_register_slot 2 7003 f GPE_WK_SPARSE MB_OK
+ret gm_fail 55
+end
+note Baseline: x=10, n_iters=8, mask=5 (bits 0,2 -> 75% sparse), stride=16 -> (10+0)*16 + (10+2)*16 = 352!
+if ne gpe_eval_fn f 10 8 5 16 352
+ret gm_fail 56
+end
+ops_b = get gpe_last_ops 0
+wx_set_args 10 8 5 16 50000
+if or ne mb_dispatch_slot 2 false 352 ne get wx_last_exit 0 0
+ret gm_fail 57
+end
+ns_b = get wx_last_ns 0
+
+gpe_cfg_reset
+gpe_cfg_pin 1 8
+gpe_cfg_pin 2 5
+gpe_cfg_pin 3 16
+gpe_cfg_set_profile 9500 75 TID_X925
+if ne mb_specialize_slot 2 TID_X925 WX_PROT_RX MB_PROOF_ALL MB_OK
+ret gm_fail 58
+end
+if or ne get gpe_pe_stat 7 0 eq get gpe_pe_stat 8 0
+ret gm_fail 59
+end
+if eq get gpe_pe_stat 3 0
+ret gm_fail 60
+end
+if ne gpe_eval_fn get mb_slot_fspec 2 10 8 5 16 352
+ret gm_fail 61
+end
+ops_s = get gpe_last_ops 0
+if ge ops_s div ops_b 4
+ret gm_fail 61
+end
+wx_set_args 10 8 5 16 50000
+if ne mb_dispatch_slot 2 true 352
+ret gm_fail 62
+end
+if or ne get wx_last_exit 0 0 ne get mb_last_disp 0 MB_DISP_SPEC
+ret gm_fail 62
+end
+ns_s = get wx_last_ns 0
+if ge get mb_slot_spec_insns 2 get mb_slot_base_insns 2
+ret gm_fail 63
+end
+
+gm_wrt gm_l_t4
+gm_num get mb_slot_base_insns 2
+gm_wrt gm_l_ar
+gm_num get mb_slot_spec_insns 2
+gm_wrt gm_l_t2b
+gm_num ops_b
+gm_wrt gm_l_ar
+gm_num ops_s
+gm_wrt gm_l_t4b
+gm_num ns_b
+gm_wrt gm_l_ar
+gm_num ns_s
+gm_wrt gm_m_nl
+gm_add_chk 9
+ret 0
+end
+
+note ==== T5: Cooperative Atomic fabWtbl Hot-Swap + Live OOD Drift -> SLAB_MUTABLE_ALARMED Rollback ====
+
+fn gm_t5_ood_rollback to int
+note Verify TID_A725 background metabolic schedule & active specialized state on slots 0 and 2:
+if ne fabScheduleApu TASK_BG_METABOLIC TID_A725
+ret gm_fail 65
+end
+if or ne get fabMode 0 FAB_MODE_CRYSTALLIZED ne get fabVer 0 2
+ret gm_fail 66
+end
+if or ne get fabMode 2 FAB_MODE_CRYSTALLIZED ne get fabVer 2 2
+ret gm_fail 67
+end
+
+note Feed OOD input into slot 0 (affine_route: scale=9, bias=5, mode=1 -> cold path! ((42*7+9)*11+5) = 3338):
+f0 = get mb_slot_fbase 0
+y0_exp = gpe_eval_fn f0 42 9 5 1
+if ne y0_exp 3338
+ret gm_fail 68
+end
+wx_set_args 42 9 5 1 1
+y0_got = mb_dispatch_slot 0 false
+if or ne y0_got 3338 ne get mb_last_disp 0 MB_DISP_ROLLBACK
+ret gm_fail 69
+end
+if or ne get fabMode 0 FAB_MODE_CPU_NATIVE ne get fabVer 0 3
+ret gm_fail 70
+end
+if ne get mb_rollbacks 0 1
+ret gm_fail 71
+end
+if ne get mb_alarm_code 0 MB_ALARM_OOD
+ret gm_fail 72
+end
+
+note Verify immutable baseline slab refuses mutation & subsequent dispatch on slot 0 stays on baseline:
+if ne crUpdateSlab get mb_slot_base_slab 0 1 CR_ERR_IMMUTABLE
+ret gm_fail 73
+end
+wx_set_args 42 8 0 0 1
+y0_after = mb_dispatch_slot 0 false
+if or ne y0_after 1008 ne get mb_last_disp 0 MB_DISP_BASELINE
+ret gm_fail 74
+end
+
+note Feed OOD input into slot 2 (sparse_dot_loop: n_iters=6, mask=7, stride=16 -> (10+0+10+1+10+2)*16 = 528):
+f2 = get mb_slot_fbase 2
+y2_exp = gpe_eval_fn f2 10 6 7 16
+if ne y2_exp 528
+ret gm_fail 75
+end
+wx_set_args 10 6 7 16 1
+y2_got = mb_dispatch_slot 2 false
+if or ne y2_got 528 ne get mb_last_disp 0 MB_DISP_ROLLBACK
+ret gm_fail 76
+end
+if or ne get fabMode 2 FAB_MODE_CPU_NATIVE ne get fabVer 2 3
+ret gm_fail 77
+end
+if ne get mb_rollbacks 0 2
+ret gm_fail 78
+end
+
+gm_wrt gm_l_t5
+gm_num get mb_swaps 0
+gm_wrt gm_l_t5b
+gm_num get mb_rollbacks 0
+gm_wrt gm_l_t5c
+gm_num get fabVer 0
+gm_wrt gm_m_nl
+gm_add_chk 14
+ret 0
+end
+
+note ==== T6: 7 Fail-Closed Negative Controls ====
+
+fn gm_t6_nc1_to_3 v0 ulong m0 ulong to int
+note NC1: Unsound EGP3 rewrite (corrupt rule ID & root_after in live EGP3 bundle -> vc3_verify refuses!)
+nb = get gpe_egp3_len 0
+if lt nb 36
+ret gm_fail 80
+end
+for i ulong nb bound 131072
+put vc3_buf i get gpe_egp3_buf i
+end
+if ne vc3_verify nb 0
+ret gm_fail 81
+end
+tr0 = add 36 mul vc3_rdu32 20 32
+put vc3_buf tr0 uchar 99
+if eq vc3_verify nb 0
+ret gm_fail 82
+end
+for i ulong nb bound 131072
+put vc3_buf i get gpe_egp3_buf i
+end
+put vc3_buf 28 uchar 0
+put vc3_buf 29 uchar 0
+put vc3_buf 30 uchar 0
+put vc3_buf 31 uchar 0
+if eq vc3_verify nb 0
+ret gm_fail 83
+end
+gm_add_neg
+
+note NC2: Missing proof bit (proofMask = 0, 1, 3, 5, 6 -> ALL refused with MB_ERR_PROOF_MASK, fabVer untouched!)
+gpe_cfg_reset
+gpe_cfg_pin 1 8
+gpe_cfg_pin 2 0
+gpe_cfg_pin 3 0
+gpe_cfg_set_profile 9800 0 TID_X925
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RX 0 MB_ERR_PROOF_MASK
+ret gm_fail 84
+end
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RX 1 MB_ERR_PROOF_MASK
+ret gm_fail 85
+end
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RX 3 MB_ERR_PROOF_MASK
+ret gm_fail 86
+end
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RX 5 MB_ERR_PROOF_MASK
+ret gm_fail 87
+end
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RX 6 MB_ERR_PROOF_MASK
+ret gm_fail 88
+end
+if or ne get fabVer 0 v0 ne get fabMode 0 m0
+ret gm_fail 89
+end
+gm_add_neg
+
+note NC3: RWX mapping attempt REFUSED (WX_PROT_RWX=7, WX=6, AND ELF PT_LOAD p_flags=7 PF_R|PF_W|PF_X!)
+if ne wx_validate_prot WX_PROT_RWX WX_ERR_RWX_FORBIDDEN
+ret gm_fail 90
+end
+if ne wx_validate_prot 6 WX_ERR_RWX_FORBIDDEN
+ret gm_fail 91
+end
+if ne mb_specialize_slot 0 TID_X925 WX_PROT_RWX MB_PROOF_ALL MB_ERR_WX_RWX
+ret gm_fail 92
+end
+elen = gpe_compile_a64_elf get mb_slot_fbase 0
+if eq elen 0
+ret gm_fail 93
+end
+put elfBuf 68 7
+if ne wx_verify_elf_wx elen WX_ERR_RWX_FORBIDDEN
+ret gm_fail 94
+end
+if ne wx_stage_and_seal 0 99 WX_PROT_RX WX_ERR_RWX_FORBIDDEN
+ret gm_fail 95
+end
+put elfBuf 68 5
+if ne get fabVer 0 v0
+ret gm_fail 96
+end
+gm_add_neg
+ret 0
+end
+
+fn gm_t6_neg_controls to int
+v0 = get fabVer 0
+m0 = get fabMode 0
+r = gm_t6_nc1_to_3 v0 m0
+if ne r 0
+ret r
+end
+
+note NC4: Antibody #14 SM121 stall violation (shave stall 6 -> 2 -> REFUSED fail-closed!)
+if not isCompileTestFn TID_SM121
+ret gm_fail 97
+end
+if not mb_verify_monk_immune_sm121
+ret gm_fail 98
+end
+put isBuf 8 2
+if mb_verify_monk_immune_sm121
+ret gm_fail 99
+end
+if ne mb_check_gpu_candidate TID_SM121 4 2048 9216 7 MB_ERR_MONK_IMMUNE
+ret gm_fail 100
+end
+if not isCompileTestFn TID_SM121
+ret gm_fail 101
+end
+gm_add_neg
+
+note NC5: TargetDesc SMEM contract violation (M=8, K=4096 -> 131072 B > SM121 101376 B -> REFUSED!)
+if ne mb_check_gpu_candidate TID_SM121 8 4096 2048 7 MB_ERR_CONTRACT
+ret gm_fail 102
+end
+if ne get fabVer 0 v0
+ret gm_fail 103
+end
+gm_add_neg
+
+note NC6: Writable executable file (0700 rwx) MUST be refused by wx_check_stat_rx_buf!
+pl = gm_spath gm_s_rwx_file
+z = unlink gm_pa 0 pl
+fd = fopen gm_pa 0 pl 577 448
+if lt fd 0
+ret gm_fail 104
+end
+z = write int fd gm_m_nl 0 1
+z = fclose int fd
+for i ulong pl bound 1024
+put wx_p_rx i get gm_pa i
+end
+if ne wx_check_stat_rx_buf pl WX_ERR_MODE_WRITABLE
+z = unlink gm_pa 0 pl
+ret gm_fail 105
+end
+z = unlink gm_pa 0 pl
+gm_add_neg
+
+note NC7: ORACLE differential mismatch (valid AArch64 in isBuf, comparing affine_route vs branch_diamond -> REFUSED!)
+if eq gpe_compile_a64_elf get mb_slot_fbase 0 0
+ret gm_fail 106
+end
+if not mb_check_a64_words
+ret gm_fail 106
+end
+if mb_verify_monk_immune_cpu get mb_slot_fbase 0 get mb_slot_fbase 1 0
+ret gm_fail 107
+end
+gm_add_neg
+
+gm_wrt gm_l_t6
+gm_num get wx_rwx_refusals 0
+gm_wrt gm_m_nl
+gm_add_chk 27
+ret 0
+end
+
+note ==== T7: 3 Self-Contained Mutation Kills ====
+
+fn gm_t7_mutation_kills to int
+note M1: Mutate emitted native AArch64 instruction (corrupt ADD/MUL opcode word) -> parity KILLS mutant!
+f = get mb_slot_fspec 1
+elen = gpe_compile_a64_elf f
+if eq elen 0
+ret gm_fail 110
+end
+note Corrupt the body instruction right after prologue (byte offset 120 + 44 in ELF) to MOVZ X25, #777:
+put elfBuf 164 uchar 41
+put elfBuf 165 uchar 97
+put elfBuf 166 uchar 128
+put elfBuf 167 uchar 210
+note Also test zero-opcode instruction smuggling (Monk CPU check MUST kill null word 0x00000000!)
+put isBuf 44 0
+put isBuf 45 0
+put isBuf 46 0
+put isBuf 47 0
+if mb_verify_monk_immune_cpu get mb_slot_fbase 1 f 1
+ret gm_fail 111
+end
+gm_add_mut
+
+note M2: Mutate fabHotSwap proof mask (5 instead of 7) -> fabHotSwap MUST kill mutant!
+fv_before = get fabVer 1
+if fabHotSwap 1 7002 99999 TID_X925 FAB_MODE_CRYSTALLIZED 5
+ret gm_fail 112
+end
+if ne get fabVer 1 fv_before
+ret gm_fail 113
+end
+gm_add_mut
+
+note M3: Mutate live sealed ELF64 header to RWX (p_flags=7) -> wx_stage_and_seal MUST kill mutant!
+elen2 = gpe_compile_a64_elf f
+if eq elen2 0
+ret gm_fail 114
+end
+put elfBuf 68 7
+if eq wx_stage_and_seal 1 88 WX_PROT_RX WX_OK
+ret gm_fail 115
+end
+put elfBuf 68 5
+gm_add_mut
+
+gm_wrt gm_l_t7
+gm_num get gm_mut 0
+gm_wrt gm_m_nl
+gm_add_chk 6
+ret 0
+end
+
+note ==== T8 (Optional with METABD_BIN OMC_BIN REPO_ROOT): Live CLI + Real omc-Recompiled Source Mutants ====
+
+fn gm_av_reset to ulong
+put gm_av 0 0
+put gm_av 1 0
+ret 2
+end
+
+fn gm_av_add pos ulong s view uchar * n ulong to ulong
+cnt = add ulong get gm_av 0 shl ulong get gm_av 1 8
+cnt = add cnt 1
+put gm_av 0 uchar and cnt 255
+put gm_av 1 uchar shr cnt 8
+put gm_av pos uchar and n 255
+put gm_av add pos 1 uchar shr n 8
+p = add pos 2
+for i ulong n bound 1024
+put gm_av add p i get s i
+end
+ret add p n
+end
+
+fn gm_av_add_gbuf pos ulong which ulong n ulong to ulong
+cnt = add ulong get gm_av 0 shl ulong get gm_av 1 8
+cnt = add cnt 1
+put gm_av 0 uchar and cnt 255
+put gm_av 1 uchar shr cnt 8
+put gm_av pos uchar and n 255
+put gm_av add pos 1 uchar shr n 8
+p = add pos 2
+for i ulong n bound 1024
+b = uchar 0
+if eq which 0
+b = get gm_bin i
+end
+if eq which 1
+b = get gm_omc i
+end
+if eq which 2
+b = get gm_pa i
+end
+if eq which 3
+b = get gm_dir i
+end
+put gm_av add p i b
+end
+ret add p n
+end
+
+fn gm_run_av avlen ulong in_fd int out_fd int to ulong
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+if ge in_fd 0
+d0 = dupfd in_fd 0 0
+end
+if ge out_fd 0
+d1 = dupfd out_fd 1 0
+d2 = dupfd out_fd 2 0
+end
+r = execprog gm_av 0 avlen
+exit 127
+end
+wp = waitpid int pid gm_st 0 4 0
+if ne wp pid
+ret 253
+end
+if ne get gm_st 0 0
+ret add 128 ulong get gm_st 0
+end
+ret ulong get gm_st 1
+end
+
+fn gm_match_at i ulong pat view uchar * to bool
+ml = len pat
+for j ulong ml bound 64
+if ne get gm_fbuf add i j get pat j
+ret false
+end
+end
+ret true
+end
+
+fn gm_copy_at i ulong rep view uchar * to void
+ml = len rep
+for j ulong ml bound 64
+put gm_fbuf add i j get rep j
+end
+end
+
+fn gm_patch_fbuf tot ulong pat view uchar * rep view uchar * to bool
+ml = len pat
+if lt tot ml
+ret false
+end
+lim = sub tot ml
+for i ulong lim bound 262140
+if gm_match_at i pat
+gm_copy_at i rep
+ret true
+end
+end
+ret false
+end
+
+fn gm_append_unit ufd int suf view uchar * mut_id ulong to bool
+rl = gm_rpath suf
+fd = fopen gm_pb 0 rl 0 0
+if lt fd 0
+ret false
+end
+tot = ulong 0
+while lt tot 262140 bound 4096
+r = read int fd gm_fbuf tot sub 262140 tot
+if lt r 0
+z = fclose int fd
+ret false
+end
+if eq r 0
+break
+end
+tot = add tot ulong r
+end
+z = fclose int fd
+if eq mut_id 1
+if not gm_patch_fbuf tot gm_m1_from gm_m1_to
+ret false
+end
+end
+if eq mut_id 2
+if not gm_patch_fbuf tot gm_m2_from gm_m2_to
+ret false
+end
+end
+off = ulong 0
+while lt off tot bound 4096
+w = write ufd gm_fbuf off sub tot off
+if le w 0
+ret false
+end
+off = add off ulong w
+end
+ret true
+end
+
+fn gm_concat_mut_units ufd int mut_id ulong to bool
+if not gm_append_unit ufd gm_u0 0
+ret false
+end
+if not gm_append_unit ufd gm_u1 0
+ret false
+end
+if not gm_append_unit ufd gm_u2 0
+ret false
+end
+if not gm_append_unit ufd gm_u3 0
+ret false
+end
+if not gm_append_unit ufd gm_u4 0
+ret false
+end
+if not gm_append_unit ufd gm_u5 0
+ret false
+end
+if not gm_append_unit ufd gm_u6 0
+ret false
+end
+if not gm_append_unit ufd gm_u7 0
+ret false
+end
+if not gm_append_unit ufd gm_u8 0
+ret false
+end
+if not gm_append_unit ufd gm_u9 0
+ret false
+end
+if not gm_append_unit ufd gm_u10 0
+ret false
+end
+if not gm_append_unit ufd gm_u11 mut_id
+ret false
+end
+ret gm_append_unit ufd gm_u12 0
+end
+
+fn gm_write_mut_om mut_id ulong om_suf view uchar * to ulong
+pl = gm_spath om_suf
+ufd = fopen gm_pa 0 pl 577 384
+if lt ufd 0
+ret 0
+end
+ok = gm_concat_mut_units int ufd mut_id
+z = fclose int ufd
+if not ok
+ret 0
+end
+ret pl
+end
+
+fn gm_compile_mut pl ulong bin_suf view uchar * to ulong
+ifd = fopen gm_pa 0 pl 0 0
+if lt ifd 0
+ret 0
+end
+bl = gm_spath bin_suf
+ofd = fopen gm_pa 0 bl 577 493
+if lt ofd 0
+z = fclose int ifd
+ret 0
+end
+ap = gm_av_reset
+ap = gm_av_add_gbuf ap 1 get gm_omcl 0
+crc = gm_run_av ap int ifd int ofd
+z = fclose int ifd
+z = fclose int ofd
+if ne crc 0
+ret 0
+end
+ret bl
+end
+
+fn gm_build_and_kill_mut mut_id ulong om_suf view uchar * bin_suf view uchar * to bool
+pl = gm_write_mut_om mut_id om_suf
+if eq pl 0
+ret false
+end
+bl = gm_compile_mut pl bin_suf
+if eq bl 0
+ret false
+end
+dn = fopen gm_devnull 0 len gm_devnull 2 0
+ap = gm_av_reset
+ap = gm_av_add_gbuf ap 2 bl
+ap = gm_av_add_gbuf ap 3 get gm_dirl 0
+mrc = gm_run_av ap neg int 1 int dn
+z = fclose int dn
+ret ne mrc 0
+end
+
+fn gm_t8_cli_and_mutants to int
+dn = fopen gm_devnull 0 len gm_devnull 2 0
+if lt dn 0
+ret gm_fail 120
+end
+note CLI 1: omega-metabd status -> exit 0
+ap = gm_av_reset
+ap = gm_av_add_gbuf ap 0 get gm_binl 0
+ap = gm_av_add ap gm_a_status len gm_a_status
+if ne gm_run_av ap neg int 1 int dn 0
+c = fclose int dn
+ret gm_fail 121
+end
+put gm_cli 0 add get gm_cli 0 1
+
+note CLI 2: omega-metabd spec --dir <sub_dir> --ood -> exit 0
+sd = gm_spath gm_s_sub_dir
+ap = gm_av_reset
+ap = gm_av_add_gbuf ap 0 get gm_binl 0
+ap = gm_av_add ap gm_a_spec len gm_a_spec
+ap = gm_av_add ap gm_a_dir len gm_a_dir
+ap = gm_av_add_gbuf ap 2 sd
+ap = gm_av_add ap gm_a_ood len gm_a_ood
+if ne gm_run_av ap neg int 1 int dn 0
+c = fclose int dn
+ret gm_fail 122
+end
+put gm_cli 0 add get gm_cli 0 1
+
+note CLI 3: omega-metabd gate --dir <sub_dir> -> exit 0
+ap = gm_av_reset
+ap = gm_av_add_gbuf ap 0 get gm_binl 0
+ap = gm_av_add ap gm_a_gate len gm_a_gate
+ap = gm_av_add ap gm_a_dir len gm_a_dir
+ap = gm_av_add_gbuf ap 2 sd
+if ne gm_run_av ap neg int 1 int dn 0
+c = fclose int dn
+ret gm_fail 123
+end
+put gm_cli 0 add get gm_cli 0 1
+
+note CLI 4 (negative control): omega-metabd --rwx -> MUST exit 2 (REFUSED)!
+ap = gm_av_reset
+ap = gm_av_add_gbuf ap 0 get gm_binl 0
+ap = gm_av_add ap gm_a_rwx len gm_a_rwx
+if eq gm_run_av ap neg int 1 int dn 0
+c = fclose int dn
+ret gm_fail 124
+end
+put gm_cli 0 add get gm_cli 0 1
+gm_add_neg
+c = fclose int dn
+
+note Live omc-recompiled Source Mutant 1 (weaken proof gate to allow proofMask==5) -> KILLED!
+if not gm_build_and_kill_mut 1 gm_s_m1_om gm_s_m1_bin
+ret gm_fail 125
+end
+gm_add_mut
+
+note Live omc-recompiled Source Mutant 2 (weaken W^X RWX guard) -> KILLED!
+if not gm_build_and_kill_mut 2 gm_s_m2_om gm_s_m2_bin
+ret gm_fail 126
+end
+gm_add_mut
+
+gm_wrt gm_l_t8
+gm_num get gm_cli 0
+gm_wrt gm_l_t8b
+gm_num 2
+gm_wrt gm_m_nl
+gm_add_chk 6
+ret 0
+end
+
+fn main to int
+ar_init
+mb_init
+put gm_chk 0 0
+put gm_neg 0 0
+put gm_mut 0 0
+put gm_cli 0 0
+
+if ge argcnt 2
+rn = argread 1 gm_dir 0 440
+if gt rn 0
+put gm_dirl 0 ulong rn
+end
+end
+if eq get gm_dirl 0 0
+n = len gm_def_dir
+for i ulong n bound 440
+put gm_dir i get gm_def_dir i
+end
+put gm_dirl 0 n
+end
+gm_set_wx_dir
+gm_wrt gm_m_hdr
+
+r = gm_t1_profile_ring
+if ne r 0
+ret r
+end
+r = gm_t2_affine_pe
+if ne r 0
+ret r
+end
+r = gm_t3_branch_diamond
+if ne r 0
+ret r
+end
+r = gm_t4_sparse_loop
+if ne r 0
+ret r
+end
+r = gm_t5_ood_rollback
+if ne r 0
+ret r
+end
+r = gm_t6_neg_controls
+if ne r 0
+ret r
+end
+r = gm_t7_mutation_kills
+if ne r 0
+ret r
+end
+
+if ge argcnt 5
+b1 = argread 2 gm_bin 0 500
+b2 = argread 3 gm_omc 0 500
+b3 = argread 4 gm_rep 0 500
+if and gt b1 0 and gt b2 0 gt b3 0
+put gm_binl 0 ulong b1
+put gm_omcl 0 ulong b2
+put gm_repl 0 ulong b3
+r = gm_t8_cli_and_mutants
+if ne r 0
+ret r
+end
+end
+end
+
+gm_wrt gm_m_pass
+gm_num get gm_chk 0
+gm_wrt gm_m_neg
+gm_num get gm_neg 0
+gm_wrt gm_m_mut
+gm_num get gm_mut 0
+gm_wrt gm_m_sw
+gm_num get mb_swaps 0
+gm_wrt gm_m_rb
+gm_num get mb_rollbacks 0
+gm_wrt gm_m_rwx
+gm_num get wx_rwx_refusals 0
+gm_wrt gm_m_cli
+gm_num get gm_cli 0
+gm_wrt gm_m_nl
+ret 0
+end
