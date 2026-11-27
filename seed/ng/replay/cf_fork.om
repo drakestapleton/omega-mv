@@ -1,0 +1,567 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/replay/cf_fork.om: Counterfactual Fork Engine (>= 16 branches from checkpoint T)
+note with mutated tok-event injection (power drop to 12 W 300 ms earlier, delayed packet #42,
+note sensor fault, SLAB store perturbation) and exact first causal divergence detection.
+note Pure seeded OM-2. Requires sha256.om, tok_journal.om, and slab_ckpt.om linked earlier.
+
+const CF_OK ulong 0
+const CF_ERR_CKPT ulong 1
+const CF_ERR_JRN ulong 2
+const CF_ERR_RANGE ulong 3
+
+note Counterfactual mutation kinds
+const CF_MUT_NONE ulong 0
+const CF_MUT_POWER_DROP ulong 1
+const CF_MUT_PKT_DELAY ulong 2
+const CF_MUT_SENSOR_FAULT ulong 3
+const CF_MUT_SLAB_PERTURB ulong 4
+const CF_MUT_COMBO_PWR_PKT ulong 5
+
+note Simulation register indices inside sc_regs[0..15]
+const CFR_POWER_MW ulong 0
+const CFR_THERMAL_MC ulong 1
+const CFR_FREQ_MHZ ulong 2
+const CFR_PKT_SEQ ulong 3
+const CFR_PKT_RX ulong 4
+const CFR_PKT_DROP ulong 5
+const CFR_QUEUE_DEP ulong 6
+const CFR_SENSOR ulong 7
+const CFR_FAULT_FLG ulong 8
+const CFR_CTRL_OUT ulong 9
+const CFR_SAFE_MODE ulong 10
+const CFR_ACC_HASH ulong 11
+const CFR_LAST_TOK ulong 12
+const CFR_TRAP_CODE ulong 13
+
+const CF_NREGS ulong 16
+const CF_SLAB_SZ ulong 4096
+const CF_MAX_STEPS ulong 128
+const CF_MAX_BRANCHES ulong 32
+
+note Baseline per-step golden record for exact causal divergence comparison
+global cf_base_regs ulong 2048
+global cf_base_dig uchar 4096
+global cf_base_slab uchar 524288
+global cf_base_steps ulong 1
+global cf_base_fin_dig uchar 32
+
+note Active mutation state for the currently running branch:
+note 0 mut_kind, 1 mut_step, 2 mut_v0, 3 mut_v1, 4 pending_pkt_step, 5 pending_pkt_id, 6 pending_pkt_val, 7 rec_jrn
+global cf_mut ulong 8
+
+note Scratch state for current branch divergence scan (0..9):
+note 0 div_found, 1 div_step, 2 div_blk, 3 div_opi, 4 div_tok, 5 div_fmask,
+note 6 div_bval, 7 div_cval, 8 div_soff, 9 ck_step
+global cf_cur ulong 12
+
+note Per-branch divergence report table (up to 32 branches, 16 ulongs per branch):
+note +0 div_found, +1 div_step, +2 div_blk, +3 div_opidx, +4 div_tok_seq, +5 div_field_mask,
+note +6 div_base_val, +7 div_cf_val, +8 div_slab_off, +9 fork_ckpt_step,
+note +10 mut_kind, +11 mut_step, +12 final_safe_mode, +13 final_trap, +14 final_ctrl, +15 parity_exact
+global cf_rep ulong 512
+global cf_br_dig uchar 1024
+global cf_br_cnt ulong 1
+
+fn cff_base_reg step ulong r ulong to ulong
+ret get cf_base_regs add mul step CF_NREGS r
+end
+
+fn cff_set_base_reg step ulong r ulong v ulong to void
+put cf_base_regs add mul step CF_NREGS r v
+end
+
+fn cff_rep_get br ulong fld ulong to ulong
+ret get cf_rep add mul br 16 fld
+end
+
+fn cff_rep_set br ulong fld ulong v ulong to void
+put cf_rep add mul br 16 fld v
+end
+
+fn cff_set_mut mk ulong ms ulong mv0 ulong mv1 ulong to void
+for j ulong 8
+put cf_mut j 0
+end
+put cf_mut 0 mk
+put cf_mut 1 ms
+put cf_mut 2 mv0
+put cf_mut 3 mv1
+end
+
+fn cff_step_pwr step ulong rec_jrn ulong to ulong
+pwr = ulong 45000
+mk = get cf_mut 0
+ms = get cf_mut 1
+if or eq mk CF_MUT_POWER_DROP eq mk CF_MUT_COMBO_PWR_PKT
+if ge step ms
+pwr = get cf_mut 2
+end
+end
+put sc_vm 0 step
+put sc_vm 1 1
+put sc_vm 2 0
+put sc_regs CFR_POWER_MW pwr
+tok_seq = add get sc_vm 3 1
+put sc_vm 3 tok_seq
+put sc_regs CFR_LAST_TOK tok_seq
+if ne rec_jrn 0
+tkj_pack_u64x4 step pwr get sc_regs CFR_THERMAL_MC 0
+rc = tkj_append TKJ_OP_POWER 1 0 32
+if ne rc TKJ_OK
+ret CF_ERR_JRN
+end
+end
+th = get sc_regs CFR_THERMAL_MC
+freq = ulong 2400
+mode = get sc_regs CFR_SAFE_MODE
+if lt pwr 20000
+freq = ulong 900
+if lt mode 1
+mode = ulong 1
+end
+end
+if lt pwr 10000
+freq = ulong 400
+mode = ulong 2
+end
+th = add th div pwr 1000
+if gt th 85000
+mode = ulong 2
+freq = ulong 600
+end
+put sc_regs CFR_THERMAL_MC th
+put sc_regs CFR_FREQ_MHZ freq
+put sc_regs CFR_SAFE_MODE mode
+ret CF_OK
+end
+
+fn cff_step_net step ulong rec_jrn ulong to ulong
+pkt_id = add 30 step
+arrived = ulong 1
+pval = add 500 mul step 13
+mk = get cf_mut 0
+if or eq mk CF_MUT_PKT_DELAY eq mk CF_MUT_COMBO_PWR_PKT
+tgt = get cf_mut 2
+if eq mk CF_MUT_COMBO_PWR_PKT
+tgt = ulong 42
+end
+if eq pkt_id tgt
+arrived = ulong 0
+dt = get cf_mut 3
+if gt dt 0
+put cf_mut 4 add step dt
+put cf_mut 5 pkt_id
+put cf_mut 6 pval
+end
+end
+if and ne get cf_mut 5 0 eq step get cf_mut 4
+arrived = ulong 2
+pkt_id = get cf_mut 5
+pval = get cf_mut 6
+put cf_mut 5 0
+end
+end
+put sc_vm 1 2
+put sc_vm 2 0
+tok_seq = add get sc_vm 3 1
+put sc_vm 3 tok_seq
+put sc_regs CFR_LAST_TOK tok_seq
+if eq arrived 0
+put sc_regs CFR_PKT_DROP add get sc_regs CFR_PKT_DROP 1
+put sc_regs CFR_QUEUE_DEP add get sc_regs CFR_QUEUE_DEP 1
+if lt get sc_regs CFR_SAFE_MODE 1
+put sc_regs CFR_SAFE_MODE 1
+end
+else
+put sc_regs CFR_PKT_SEQ pkt_id
+put sc_regs CFR_PKT_RX add get sc_regs CFR_PKT_RX 1
+if eq arrived 2
+q = get sc_regs CFR_QUEUE_DEP
+if gt q 0
+put sc_regs CFR_QUEUE_DEP sub q 1
+end
+end
+end
+if ne rec_jrn 0
+tkj_pack_u64x4 step pkt_id arrived pval
+rc = tkj_append TKJ_OP_NET 2 0 32
+if ne rc TKJ_OK
+ret CF_ERR_JRN
+end
+end
+ret CF_OK
+end
+
+fn cff_step_sens step ulong rec_jrn ulong to ulong
+sens = add 1000 mul step 7
+mk = get cf_mut 0
+if and eq mk CF_MUT_SENSOR_FAULT eq step get cf_mut 1
+mv0 = get cf_mut 2
+mv1 = get cf_mut 3
+if eq mv0 0
+sens = ulong 0
+else
+if eq mv0 1
+sens = add sens mv1
+else
+if gt sens mv1
+sens = sub sens mv1
+else
+sens = ulong 0
+end
+end
+end
+end
+put sc_vm 1 3
+put sc_vm 2 0
+tok_seq = add get sc_vm 3 1
+put sc_vm 3 tok_seq
+put sc_regs CFR_LAST_TOK tok_seq
+mode = get sc_regs CFR_SAFE_MODE
+if ne rec_jrn 0
+tkj_pack_u64x4 step sens mode 0
+rc = tkj_append TKJ_OP_SENSOR 3 0 32
+if ne rc TKJ_OK
+ret CF_ERR_JRN
+end
+end
+put sc_regs CFR_SENSOR sens
+if or eq sens 0 gt sens 2500
+put sc_regs CFR_FAULT_FLG add get sc_regs CFR_FAULT_FLG 1
+mode = ulong 2
+end
+if gt sens 3000
+mode = ulong 3
+put sc_regs CFR_TRAP_CODE 9
+put sc_vm 7 9
+end
+put sc_regs CFR_SAFE_MODE mode
+ret CF_OK
+end
+
+fn cff_write_slot slot_off ulong ctrl ulong pwr ulong sens ulong acc ulong to void
+for j ulong 8
+s = mul j 8
+put sc_slab add slot_off j uchar and shr ctrl s 255
+put sc_slab add add slot_off 8 j uchar and shr pwr s 255
+put sc_slab add add slot_off 16 j uchar and shr sens s 255
+put sc_slab add add slot_off 24 j uchar and shr acc s 255
+end
+end
+
+fn cff_maybe_perturb step ulong to void
+if and eq get cf_mut 0 CF_MUT_SLAB_PERTURB eq step get cf_mut 1
+poff = rem get cf_mut 2 CF_SLAB_SZ
+oldb = get sc_slab poff
+mask = uchar and get cf_mut 3 255
+put sc_slab poff xor oldb mask
+end
+end
+
+fn cff_step_ctrl step ulong rec_jrn ulong to ulong
+freq = get sc_regs CFR_FREQ_MHZ
+sens = get sc_regs CFR_SENSOR
+pwr = get sc_regs CFR_POWER_MW
+mode = get sc_regs CFR_SAFE_MODE
+ctrl = add mul freq 3 add div sens 2 mul get sc_regs CFR_PKT_RX 5
+if eq mode 2
+ctrl = div ctrl 4
+end
+if eq mode 3
+ctrl = ulong 0
+end
+put sc_regs CFR_CTRL_OUT ctrl
+acc = xor mul get sc_regs CFR_ACC_HASH 1315423911 add ctrl add pwr sens
+put sc_regs CFR_ACC_HASH acc
+slot_off = mul rem step 128 32
+cff_write_slot slot_off ctrl pwr sens acc
+cff_maybe_perturb step
+put sc_vm 1 4
+put sc_vm 2 0
+tok_seq = add get sc_vm 3 1
+put sc_vm 3 tok_seq
+put sc_regs CFR_LAST_TOK tok_seq
+if ne rec_jrn 0
+tkj_pack_u64x4 step slot_off ctrl acc
+rc = tkj_append TKJ_OP_STORE 4 0 32
+if ne rc TKJ_OK
+ret CF_ERR_JRN
+end
+end
+ret CF_OK
+end
+
+fn cff_step_exec step ulong rec_jrn ulong to ulong
+rc = cff_step_pwr step rec_jrn
+if ne rc CF_OK
+ret rc
+end
+rc = cff_step_net step rec_jrn
+if ne rc CF_OK
+ret rc
+end
+rc = cff_step_sens step rec_jrn
+if ne rc CF_OK
+ret rc
+end
+ret cff_step_ctrl step rec_jrn
+end
+
+note Run baseline timeline of n_steps with periodic SLAB checkpoints every ckpt_iv steps.
+fn cff_run_baseline n_steps ulong ckpt_iv ulong to ulong
+if or eq n_steps 0 gt n_steps CF_MAX_STEPS
+ret CF_ERR_RANGE
+end
+rc = tkj_reset
+if ne rc TKJ_OK
+ret CF_ERR_JRN
+end
+rc = sck_init CF_NREGS CF_SLAB_SZ ckpt_iv 4
+if ne rc SCK_OK
+ret CF_ERR_CKPT
+end
+cff_set_mut 0 0 0 0
+put sc_regs CFR_POWER_MW 45000
+put sc_regs CFR_THERMAL_MC 45000
+put sc_regs CFR_FREQ_MHZ 2400
+put sc_vm 0 0
+rc = sck_take
+if ne rc SCK_OK
+ret CF_ERR_CKPT
+end
+for s ulong n_steps bound 128
+step_id = add s 1
+rc = cff_step_exec step_id 1
+if ne rc CF_OK
+ret rc
+end
+if sck_should_take step_id
+rc = sck_take
+if ne rc SCK_OK
+ret CF_ERR_CKPT
+end
+end
+for r ulong CF_NREGS
+cff_set_base_reg s r get sc_regs r
+end
+rc = sck_hash_live
+if ne rc SCK_OK
+ret CF_ERR_CKPT
+end
+doff = mul s 32
+for j ulong 32
+put cf_base_dig add doff j get sh_dig j
+end
+soff = mul s CF_SLAB_SZ
+for j ulong CF_SLAB_SZ
+b = get sc_slab j
+put cf_base_slab add soff j b
+end
+end
+for j ulong 32
+put cf_base_fin_dig j get sh_dig j
+end
+put cf_base_steps 0 n_steps
+put cf_br_cnt 0 0
+ret CF_OK
+end
+
+fn cff_find_slab_div sidx ulong to ulong
+soff = mul sidx CF_SLAB_SZ
+for j ulong CF_SLAB_SZ
+b = get sc_slab j
+if ne b get cf_base_slab add soff j
+ret j
+end
+end
+ret 4294967295
+end
+
+note Inspect current step cur_s against baseline golden record; record first divergence in cf_cur.
+fn cff_check_div cur_s ulong to void
+if ne get cf_cur 0 0
+ret
+end
+sidx = sub cur_s 1
+fmask = ulong 0
+first_r = ulong 99
+for r ulong CF_NREGS
+bv = cff_base_reg sidx r
+cv = get sc_regs r
+if ne bv cv
+fmask = or fmask shl ulong 1 r
+if eq first_r 99
+first_r = r
+put cf_cur 6 bv
+put cf_cur 7 cv
+end
+end
+end
+first_sb = cff_find_slab_div sidx
+if and eq fmask 0 eq first_sb 4294967295
+ret
+end
+put cf_cur 0 1
+put cf_cur 1 cur_s
+put cf_cur 5 fmask
+put cf_cur 8 first_sb
+dblk = ulong 4
+dtok = get sc_vm 3
+if ne and fmask shl ulong 1 CFR_POWER_MW 0
+dblk = ulong 1
+dtok = sub get sc_vm 3 3
+else
+pmask = or shl ulong 1 CFR_PKT_SEQ or shl ulong 1 CFR_PKT_DROP shl ulong 1 CFR_PKT_RX
+if ne and fmask pmask 0
+dblk = ulong 2
+dtok = sub get sc_vm 3 2
+else
+if ne and fmask shl ulong 1 CFR_SENSOR 0
+dblk = ulong 3
+dtok = sub get sc_vm 3 1
+end
+end
+end
+put cf_cur 2 dblk
+put cf_cur 3 0
+put cf_cur 4 dtok
+end
+
+note Fork branch br from nearest checkpoint <= fork_step using active cf_mut settings.
+fn cff_run_branch br ulong fork_step ulong to ulong
+if ge br CF_MAX_BRANCHES
+ret CF_ERR_RANGE
+end
+n_steps = get cf_base_steps 0
+rc = sck_restore_nearest fork_step
+if ne rc SCK_OK
+ret CF_ERR_CKPT
+end
+ck_step = sck_last_restored_step
+for j ulong 10
+put cf_cur j 0
+end
+put cf_cur 8 4294967295
+put cf_cur 9 ck_step
+cur_s = add ck_step 1
+while le cur_s n_steps bound 128
+rc = cff_step_exec cur_s 0
+if ne rc CF_OK
+ret rc
+end
+cff_check_div cur_s
+cur_s = add cur_s 1
+end
+rc = sck_hash_live
+if ne rc SCK_OK
+ret CF_ERR_CKPT
+end
+parity = ulong 1
+boff = mul br 32
+for j ulong 32
+b = get sh_dig j
+put cf_br_dig add boff j b
+if ne b get cf_base_fin_dig j
+parity = ulong 0
+end
+end
+for j ulong 10
+cff_rep_set br j get cf_cur j
+end
+cff_rep_set br 10 get cf_mut 0
+cff_rep_set br 11 get cf_mut 1
+cff_rep_set br 12 get sc_regs CFR_SAFE_MODE
+cff_rep_set br 13 get sc_regs CFR_TRAP_CODE
+cff_rep_set br 14 get sc_regs CFR_CTRL_OUT
+cff_rep_set br 15 parity
+if ge br get cf_br_cnt 0
+put cf_br_cnt 0 add br 1
+end
+ret CF_OK
+end
+
+fn cff_fork_branch br ulong fork_step ulong mk ulong ms ulong mv0 ulong mv1 ulong to ulong
+cff_set_mut mk ms mv0 mv1
+ret cff_run_branch br fork_step
+end
+
+note Run the full 18-branch (>= 16 required) counterfactual fork matrix over a 48-step baseline.
+fn cff_run_matrix18 to ulong
+rc = cff_run_baseline 48 4
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 0 8 CF_MUT_NONE 0 0 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 1 8 CF_MUT_POWER_DROP 12 12000 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 2 16 CF_MUT_POWER_DROP 18 12000 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 3 12 CF_MUT_POWER_DROP 14 15000 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 4 12 CF_MUT_POWER_DROP 16 18000 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 5 20 CF_MUT_POWER_DROP 22 25000 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 6 20 CF_MUT_POWER_DROP 24 8000 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 7 8 CF_MUT_PKT_DELAY 12 42 1
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 8 8 CF_MUT_PKT_DELAY 12 42 3
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 9 8 CF_MUT_PKT_DELAY 12 42 6
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 10 8 CF_MUT_PKT_DELAY 12 42 12
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 11 8 CF_MUT_PKT_DELAY 12 42 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 12 16 CF_MUT_SENSOR_FAULT 20 0 0
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 13 16 CF_MUT_SENSOR_FAULT 21 1 1600
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 14 16 CF_MUT_SENSOR_FAULT 22 1 2500
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 15 24 CF_MUT_SENSOR_FAULT 26 2 400
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 16 8 CF_MUT_COMBO_PWR_PKT 12 12000 6
+if ne rc CF_OK
+ret rc
+end
+rc = cff_fork_branch 17 24 CF_MUT_SLAB_PERTURB 28 777 129
+if ne rc CF_OK
+ret rc
+end
+ret CF_OK
+end

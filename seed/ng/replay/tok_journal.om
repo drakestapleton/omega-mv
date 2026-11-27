@@ -1,0 +1,659 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/replay/tok_journal.om: Hash-chained tok-boundary effect journal ("OTKJ" v1).
+note Pure seeded OM-2. Requires seed/ng/sha256.om linked earlier (for sh_dat, sh_all, sh_dig).
+note
+note Wire format ("OTKJ" v1, little-endian, no padding):
+note   Header (16 bytes):
+note     [0..3]   magic "OTKJ" (79 84 75 74)
+note     [4]      version = 1
+note     [5]      flags = 0 (reserved, must be 0)
+note     [6..7]   reserved = 0 (must be 0)
+note     [8..15]  entry_count u64
+note   Entry (85 + payload_len bytes):
+note     [0..7]   seq u64 (strictly monotonic 0, 1, 2, ...)
+note     [8]      op_kind u8 (closed set 1..13)
+note     [9..12]  block_id u32
+note     [13..16] op_idx u32
+note     [17..20] payload_len u32
+note     [21..]   payload_bytes[payload_len]
+note     [+0..31] prev_hash[32] (zeros for seq 0, else previous entry_hash)
+note     [+32..63] entry_hash[32] = SHA-256("OTKJ1\0" || seq || op_kind || block_id || op_idx || payload_len || payload_bytes || prev_hash)
+note
+note Growable run-time pools (no arbitrary small hard cap) + direct disk streaming + alarm threshold.
+
+const TKJ_OK ulong 0
+const TKJ_ERR_MAGIC ulong 1
+const TKJ_ERR_VER ulong 2
+const TKJ_ERR_TRUNC ulong 3
+const TKJ_ERR_TRAILING ulong 4
+const TKJ_ERR_SEQ ulong 5
+const TKJ_ERR_KIND ulong 6
+const TKJ_ERR_CHAIN ulong 7
+const TKJ_ERR_HASH ulong 8
+const TKJ_ERR_IO ulong 9
+const TKJ_ERR_NOMEM ulong 10
+
+const TKJ_HDR_LEN ulong 16
+const TKJ_ENT_FIXED ulong 85
+
+note Closed set of tok-crossing event kinds (1..13)
+const TKJ_OP_CHECK ulong 1
+const TKJ_OP_STORE ulong 2
+const TKJ_OP_ATOM ulong 3
+const TKJ_OP_ALLOCA ulong 4
+const TKJ_OP_CALL ulong 5
+const TKJ_OP_HOST ulong 6
+const TKJ_OP_POOL ulong 7
+const TKJ_OP_TRAP ulong 8
+const TKJ_OP_EXIT ulong 9
+const TKJ_OP_POWER ulong 10
+const TKJ_OP_NET ulong 11
+const TKJ_OP_SENSOR ulong 12
+const TKJ_OP_CKPT_MARK ulong 13
+const TKJ_OP_MAX ulong 13
+
+text tj_magic "OTKJ"
+text tj_dom "OTKJ1"
+
+note Growable run-time pools (unbounded by any small fixed cap)
+global tj_buf uchar *
+global tj_eoff ulong *
+global tj_epoff ulong *
+global tj_eplen uint *
+global tj_eseq ulong *
+global tj_ekind uchar *
+global tj_eblk uint *
+global tj_eopi uint *
+
+note State: 0 buf_used, 1 entry_count, 2 alarm_bytes (0=off), 3 alarm_tripped,
+note        4 stream_fd_open, 5 stream_fd, 6 stream_bytes, 7 stream_entries, 8 verify_next_pos
+global tj_st ulong 12
+global tj_last_h uchar 32
+global tj_cur_h uchar 32
+global tj_tmp_p uchar 65536
+global tj_io uchar 65536
+global tj_path uchar 4096
+global tj_plen ulong 1
+
+fn tkj_ensure_buf need ulong to ulong
+cur = len tj_buf
+if le need cur
+ret TKJ_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge tj_buf cap
+if lt rc 0
+ret TKJ_ERR_NOMEM
+end
+ret TKJ_OK
+end
+
+fn tkj_ensure_idx need ulong to ulong
+cur = len tj_eoff
+if le need cur
+ret TKJ_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 64
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+r0 = enlarge tj_eoff cap
+if lt r0 0
+ret TKJ_ERR_NOMEM
+end
+r1 = enlarge tj_epoff cap
+if lt r1 0
+ret TKJ_ERR_NOMEM
+end
+r2 = enlarge tj_eplen cap
+if lt r2 0
+ret TKJ_ERR_NOMEM
+end
+r3 = enlarge tj_eseq cap
+if lt r3 0
+ret TKJ_ERR_NOMEM
+end
+r4 = enlarge tj_ekind cap
+if lt r4 0
+ret TKJ_ERR_NOMEM
+end
+r5 = enlarge tj_eblk cap
+if lt r5 0
+ret TKJ_ERR_NOMEM
+end
+r6 = enlarge tj_eopi cap
+if lt r6 0
+ret TKJ_ERR_NOMEM
+end
+ret TKJ_OK
+end
+
+fn tkj_put_u32 off ulong v ulong to void
+put tj_buf off uchar and v 255
+put tj_buf add off 1 uchar and shr v 8 255
+put tj_buf add off 2 uchar and shr v 16 255
+put tj_buf add off 3 uchar and shr v 24 255
+end
+
+fn tkj_put_u64 off ulong v ulong to void
+for j ulong 8
+b = uchar and shr v mul j 8 255
+put tj_buf add off j b
+end
+end
+
+fn tkj_get_u32 off ulong to ulong
+v = ulong 0
+for j ulong 4
+b = ulong get tj_buf add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn tkj_get_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+b = ulong get tj_buf add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn tkj_reset to ulong
+put tj_st 0 0
+put tj_st 1 0
+put tj_st 3 0
+for j ulong 32
+put tj_last_h j 0
+put tj_cur_h j 0
+end
+rc = tkj_ensure_buf TKJ_HDR_LEN
+if ne rc TKJ_OK
+ret rc
+end
+for j ulong 4
+b = get tj_magic j
+put tj_buf j b
+end
+put tj_buf 4 1
+put tj_buf 5 0
+put tj_buf 6 0
+put tj_buf 7 0
+tkj_put_u64 8 0
+put tj_st 0 TKJ_HDR_LEN
+ret TKJ_OK
+end
+
+fn tkj_set_alarm_bytes limit ulong to void
+put tj_st 2 limit
+put tj_st 3 0
+end
+
+fn tkj_alarm_tripped to ulong
+ret get tj_st 3
+end
+
+fn tkj_count to ulong
+ret get tj_st 1
+end
+
+fn tkj_bytes to ulong
+ret get tj_st 0
+end
+
+note Compute entry_hash for serialized entry at buf_off with payload_len plen.
+fn tkj_hash_entry buf_off ulong plen ulong to ulong
+body_len = add add 21 plen 32
+tot = add 6 body_len
+if gt tot len sh_dat
+ret TKJ_ERR_NOMEM
+end
+for j ulong 5
+put sh_dat j get tj_dom j
+end
+put sh_dat 5 0
+for j ulong body_len bound 16777216
+b = get tj_buf add buf_off j
+put sh_dat add 6 j b
+end
+sh_all tot
+ret TKJ_OK
+end
+
+note Pack 4 u64 words into tj_tmp_p[0..32) (call tkj_append kind blk op_idx 32 next).
+fn tkj_pack_u64x4 w0 ulong w1 ulong w2 ulong w3 ulong to void
+for j ulong 8
+s = mul j 8
+put tj_tmp_p j uchar and shr w0 s 255
+put tj_tmp_p add 8 j uchar and shr w1 s 255
+put tj_tmp_p add 16 j uchar and shr w2 s 255
+put tj_tmp_p add 24 j uchar and shr w3 s 255
+end
+end
+
+fn tkj_append_tail seq ulong off ulong plen ulong to ulong
+p_off = add off 21
+for j ulong plen bound 65536
+b = get tj_tmp_p j
+put tj_buf add p_off j b
+end
+h_off = add p_off plen
+for j ulong 32
+b = get tj_last_h j
+put tj_buf add h_off j b
+end
+rc = tkj_hash_entry off plen
+if ne rc TKJ_OK
+ret rc
+end
+eh_off = add h_off 32
+for j ulong 32
+b = get sh_dig j
+put tj_buf add eh_off j b
+put tj_last_h j b
+end
+put tj_eoff seq off
+put tj_epoff seq p_off
+put tj_eplen seq uint plen
+put tj_eseq seq seq
+ret TKJ_OK
+end
+
+note Append one tok-crossing event using tj_tmp_p[0..plen) as payload.
+fn tkj_append kind ulong blk ulong op_idx ulong plen ulong to ulong
+if or eq kind 0 gt kind TKJ_OP_MAX
+ret TKJ_ERR_KIND
+end
+if gt plen len tj_tmp_p
+ret TKJ_ERR_NOMEM
+end
+seq = get tj_st 1
+rc = tkj_ensure_idx add seq 1
+if ne rc TKJ_OK
+ret rc
+end
+off = get tj_st 0
+rec_len = add TKJ_ENT_FIXED plen
+rc = tkj_ensure_buf add off rec_len
+if ne rc TKJ_OK
+ret rc
+end
+tkj_put_u64 off seq
+put tj_buf add off 8 uchar kind
+tkj_put_u32 add off 9 blk
+tkj_put_u32 add off 13 op_idx
+tkj_put_u32 add off 17 plen
+rc = tkj_append_tail seq off plen
+if ne rc TKJ_OK
+ret rc
+end
+put tj_ekind seq uchar kind
+put tj_eblk seq uint blk
+put tj_eopi seq uint op_idx
+new_cnt = add seq 1
+new_used = add off rec_len
+put tj_st 1 new_cnt
+put tj_st 0 new_used
+tkj_put_u64 8 new_cnt
+lim = get tj_st 2
+if and ne lim 0 ge new_used lim
+put tj_st 3 1
+end
+ret TKJ_OK
+end
+
+note Read u64 word widx from entry e's payload.
+fn tkj_entry_u64 e ulong widx ulong to ulong
+po = get tj_epoff e
+pl = ulong get tj_eplen e
+bo = mul widx 8
+if gt add bo 8 pl
+ret 0
+end
+ret tkj_get_u64 add po bo
+end
+
+note Verify one entry at pos; on success sets tj_st[8] to next pos and returns TKJ_OK.
+fn tkj_verify_hashes pos ulong plen ulong to ulong
+ph_off = add add pos 21 plen
+for j ulong 32
+b = get tj_buf add ph_off j
+if ne b get tj_cur_h j
+ret TKJ_ERR_CHAIN
+end
+end
+rc = tkj_hash_entry pos plen
+if ne rc TKJ_OK
+ret rc
+end
+eh_off = add ph_off 32
+for j ulong 32
+b = get tj_buf add eh_off j
+d = get sh_dig j
+if ne b d
+ret TKJ_ERR_HASH
+end
+put tj_cur_h j d
+end
+put tj_st 8 add eh_off 32
+ret TKJ_OK
+end
+
+fn tkj_verify_one i ulong pos ulong tot_bytes ulong to ulong
+if gt add pos TKJ_ENT_FIXED tot_bytes
+ret TKJ_ERR_TRUNC
+end
+seq = tkj_get_u64 pos
+if ne seq i
+ret TKJ_ERR_SEQ
+end
+kind = ulong get tj_buf add pos 8
+if or eq kind 0 gt kind TKJ_OP_MAX
+ret TKJ_ERR_KIND
+end
+blk = tkj_get_u32 add pos 9
+opi = tkj_get_u32 add pos 13
+plen = tkj_get_u32 add pos 17
+if gt plen sub tot_bytes add pos TKJ_ENT_FIXED
+ret TKJ_ERR_TRUNC
+end
+rc = tkj_verify_hashes pos plen
+if ne rc TKJ_OK
+ret rc
+end
+rc = tkj_ensure_idx add i 1
+if ne rc TKJ_OK
+ret rc
+end
+put tj_eoff i pos
+put tj_epoff i add pos 21
+put tj_eplen i uint plen
+put tj_eseq i seq
+put tj_ekind i uchar kind
+put tj_eblk i uint blk
+put tj_eopi i uint opi
+ret TKJ_OK
+end
+
+note Fail-closed verification and indexing of tj_buf[0..tot_bytes).
+fn tkj_verify_buf tot_bytes ulong to ulong
+if lt tot_bytes TKJ_HDR_LEN
+ret TKJ_ERR_TRUNC
+end
+for j ulong 4
+b = get tj_buf j
+if ne b get tj_magic j
+ret TKJ_ERR_MAGIC
+end
+end
+v4 = get tj_buf 4
+if ne v4 1
+ret TKJ_ERR_VER
+end
+v5 = get tj_buf 5
+v6 = get tj_buf 6
+v7 = get tj_buf 7
+if or ne v5 0 or ne v6 0 ne v7 0
+ret TKJ_ERR_VER
+end
+ecnt = tkj_get_u64 8
+for j ulong 32
+put tj_cur_h j 0
+end
+pos = ulong TKJ_HDR_LEN
+for i ulong ecnt bound 16777216
+rc = tkj_verify_one i pos tot_bytes
+if ne rc TKJ_OK
+ret rc
+end
+pos = get tj_st 8
+end
+if ne pos tot_bytes
+ret TKJ_ERR_TRAILING
+end
+put tj_st 0 tot_bytes
+put tj_st 1 ecnt
+for j ulong 32
+put tj_last_h j get tj_cur_h j
+end
+ret TKJ_OK
+end
+
+note Serialize tj_buf[0..tj_st[0]) cleanly to disk file at path.
+fn tkj_write_chunk fd int off ulong n ulong to ulong
+for j ulong n bound 65536
+b = get tj_buf add off j
+put tj_io j b
+end
+w = ulong 0
+while lt w n bound 65536
+k = write fd tj_io w sub n w
+if le k 0
+ret TKJ_ERR_IO
+end
+w = add w ulong k
+end
+ret TKJ_OK
+end
+
+fn tkj_write_fd fd int to ulong
+tot = get tj_st 0
+off = ulong 0
+while lt off tot bound 1048576
+n = sub tot off
+if gt n 65536
+n = ulong 65536
+end
+rc = tkj_write_chunk fd off n
+if ne rc TKJ_OK
+r = fclose fd
+ret rc
+end
+off = add off n
+end
+r = fclose fd
+if ne r 0
+ret TKJ_ERR_IO
+end
+ret TKJ_OK
+end
+
+fn tkj_write_file path view uchar * to ulong
+fd = fopen path 0 len path 577 420
+if lt fd 0
+ret TKJ_ERR_IO
+end
+ret tkj_write_fd int fd
+end
+
+fn tkj_write_path to ulong
+fd = fopen tj_path 0 get tj_plen 0 577 420
+if lt fd 0
+ret TKJ_ERR_IO
+end
+ret tkj_write_fd int fd
+end
+
+note Read disk file from open fd into growable tj_buf and fail-closed verify it.
+fn tkj_read_fd fd int to ulong
+off = ulong 0
+while true bound 1048576
+k = read fd tj_io 0 65536
+if lt k 0
+r = fclose fd
+ret TKJ_ERR_IO
+end
+if eq k 0
+break
+end
+n = ulong k
+rc = tkj_ensure_buf add off n
+if ne rc TKJ_OK
+r = fclose fd
+ret rc
+end
+for j ulong n bound 65536
+b = get tj_io j
+put tj_buf add off j b
+end
+off = add off n
+end
+r = fclose fd
+ret tkj_verify_buf off
+end
+
+fn tkj_read_file path view uchar * to ulong
+fd = fopen path 0 len path 0 0
+if lt fd 0
+ret TKJ_ERR_IO
+end
+ret tkj_read_fd int fd
+end
+
+fn tkj_read_path to ulong
+fd = fopen tj_path 0 get tj_plen 0 0 0
+if lt fd 0
+ret TKJ_ERR_IO
+end
+ret tkj_read_fd int fd
+end
+
+note Direct streaming writer for unbounded disk-backed journals.
+fn tkj_stream_init_fd fd int to ulong
+for j ulong 4
+put tj_io j get tj_magic j
+end
+put tj_io 4 1
+for j ulong 11
+put tj_io add 5 j 0
+end
+k = write fd tj_io 0 TKJ_HDR_LEN
+if ne k long TKJ_HDR_LEN
+r = fclose fd
+ret TKJ_ERR_IO
+end
+put tj_st 4 1
+put tj_st 5 ulong fd
+put tj_st 6 TKJ_HDR_LEN
+put tj_st 7 0
+put tj_st 3 0
+for j ulong 32
+put tj_last_h j 0
+end
+ret TKJ_OK
+end
+
+fn tkj_stream_open path view uchar * to ulong
+fd = fopen path 0 len path 577 420
+if lt fd 0
+ret TKJ_ERR_IO
+end
+ret tkj_stream_init_fd int fd
+end
+
+fn tkj_stream_open_path to ulong
+fd = fopen tj_path 0 get tj_plen 0 577 420
+if lt fd 0
+ret TKJ_ERR_IO
+end
+ret tkj_stream_init_fd int fd
+end
+
+fn tkj_stream_flush rec_len ulong to ulong
+fd = int get tj_st 5
+w = ulong 0
+while lt w rec_len bound 65536
+k = write fd tj_io w sub rec_len w
+if le k 0
+ret TKJ_ERR_IO
+end
+w = add w ulong k
+end
+new_bytes = add get tj_st 6 rec_len
+put tj_st 6 new_bytes
+put tj_st 7 add get tj_st 7 1
+lim = get tj_st 2
+if and ne lim 0 ge new_bytes lim
+put tj_st 3 1
+end
+ret TKJ_OK
+end
+
+fn tkj_stream_append kind ulong blk ulong op_idx ulong plen ulong to ulong
+if eq get tj_st 4 0
+ret TKJ_ERR_IO
+end
+if or eq kind 0 gt kind TKJ_OP_MAX
+ret TKJ_ERR_KIND
+end
+if gt plen 65000
+ret TKJ_ERR_NOMEM
+end
+seq = get tj_st 7
+for j ulong 8
+put tj_io j uchar and shr seq mul j 8 255
+end
+put tj_io 8 uchar kind
+for j ulong 4
+s = mul j 8
+put tj_io add 9 j uchar and shr blk s 255
+put tj_io add 13 j uchar and shr op_idx s 255
+put tj_io add 17 j uchar and shr plen s 255
+end
+for j ulong plen bound 65000
+put tj_io add 21 j get tj_tmp_p j
+end
+ph_off = add 21 plen
+for j ulong 32
+put tj_io add ph_off j get tj_last_h j
+end
+body_len = add ph_off 32
+for j ulong 5
+put sh_dat j get tj_dom j
+end
+put sh_dat 5 0
+for j ulong body_len bound 65536
+put sh_dat add 6 j get tj_io j
+end
+sh_all add 6 body_len
+for j ulong 32
+b = get sh_dig j
+put tj_io add body_len j b
+put tj_last_h j b
+end
+ret tkj_stream_flush add body_len 32
+end
+
+fn tkj_stream_close to ulong
+if eq get tj_st 4 0
+ret TKJ_ERR_IO
+end
+fd = int get tj_st 5
+cnt = get tj_st 7
+for j ulong 8
+put tj_io j uchar and shr cnt mul j 8 255
+end
+sk = fseek fd 8 0
+if lt sk 0
+r = fclose fd
+put tj_st 4 0
+ret TKJ_ERR_IO
+end
+k = write fd tj_io 0 8
+r = fclose fd
+put tj_st 4 0
+if ne k 8
+ret TKJ_ERR_IO
+end
+ret TKJ_OK
+end

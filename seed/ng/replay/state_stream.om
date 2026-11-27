@@ -1,0 +1,483 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/replay/state_stream.om: Compact Semantic State-Stream Delta Codec ("OSTM" v1).
+note Proves bit-exact full-state reconstruction from tiny kilobyte tok-delta frames and
+note measures exact byte compression ratio vs. raw full-frame state dumps.
+note Pure seeded OM-2. Requires seed/ng/sha256.om linked earlier.
+
+const SST_OK ulong 0
+const SST_ERR_MAGIC ulong 1
+const SST_ERR_VER ulong 2
+const SST_ERR_TRUNC ulong 3
+const SST_ERR_TRAILING ulong 4
+const SST_ERR_SEQ ulong 5
+const SST_ERR_OOB ulong 6
+const SST_ERR_HASH ulong 7
+const SST_ERR_NOMEM ulong 8
+
+const SST_HDR_LEN ulong 24
+const SST_MAX_REGS ulong 64
+
+text ss_magic "OSTM"
+text ss_dom "OSTM1"
+
+note Growable output/input stream pool
+global ss_buf uchar *
+
+note Encoder shadow state (previous frame), Decoder reconstructed state, Live reference state
+global ss_enc_regs ulong 64
+global ss_enc_slab uchar *
+global ss_dec_regs ulong 64
+global ss_dec_slab uchar *
+global ss_cur_regs ulong 64
+global ss_cur_slab uchar *
+
+note State: 0 buf_used, 1 frame_count, 2 n_regs, 3 slab_size, 4 raw_total_bytes,
+note        5 dec_frames_ok, 6 tmp_pos, 7 tmp_cnt
+global ss_st ulong 8
+
+fn sst_ensure_buf need ulong to ulong
+cur = len ss_buf
+if le need cur
+ret SST_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge ss_buf cap
+if lt rc 0
+ret SST_ERR_NOMEM
+end
+ret SST_OK
+end
+
+fn sst_ensure_slabs n ulong to ulong
+cur = len ss_enc_slab
+if le n cur
+ret SST_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap n bound 64
+cap = shl cap 1
+end
+r0 = enlarge ss_enc_slab cap
+if lt r0 0
+ret SST_ERR_NOMEM
+end
+r1 = enlarge ss_dec_slab cap
+if lt r1 0
+ret SST_ERR_NOMEM
+end
+r2 = enlarge ss_cur_slab cap
+if lt r2 0
+ret SST_ERR_NOMEM
+end
+ret SST_OK
+end
+
+fn sst_put_u16 off ulong v ulong to void
+put ss_buf off uchar and v 255
+put ss_buf add off 1 uchar and shr v 8 255
+end
+
+fn sst_put_u32 off ulong v ulong to void
+for j ulong 4
+b = uchar and shr v mul j 8 255
+put ss_buf add off j b
+end
+end
+
+fn sst_put_u64 off ulong v ulong to void
+for j ulong 8
+b = uchar and shr v mul j 8 255
+put ss_buf add off j b
+end
+end
+
+fn sst_get_u16 off ulong to ulong
+b0 = ulong get ss_buf off
+b1 = ulong get ss_buf add off 1
+ret or b0 shl b1 8
+end
+
+fn sst_get_u32 off ulong to ulong
+v = ulong 0
+for j ulong 4
+b = ulong get ss_buf add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn sst_get_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+b = ulong get ss_buf add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn sst_sh_put64 pos ulong v ulong to void
+for j ulong 8
+b = uchar and shr v mul j 8 255
+put sh_dat add pos j b
+end
+end
+
+note Compute canonical SHA-256 of either encoder live state (which=0) or decoder state (which=1).
+fn sst_hash_state which ulong to ulong
+nr = get ss_st 2
+ssz = get ss_st 3
+tot = add add 14 mul nr 8 ssz
+if gt tot len sh_dat
+ret SST_ERR_NOMEM
+end
+for j ulong 5
+put sh_dat j get ss_dom j
+end
+put sh_dat 5 0
+for j ulong 4
+s = mul j 8
+put sh_dat add 6 j uchar and shr nr s 255
+put sh_dat add 10 j uchar and shr ssz s 255
+end
+pos = ulong 14
+for i ulong nr bound 64
+v = ulong 0
+if eq which 0
+v = get ss_cur_regs i
+else
+v = get ss_dec_regs i
+end
+sst_sh_put64 pos v
+pos = add pos 8
+end
+if eq which 0
+for i ulong ssz bound 16777216
+b = get ss_cur_slab i
+put sh_dat add pos i b
+end
+else
+for i ulong ssz bound 16777216
+b = get ss_dec_slab i
+put sh_dat add pos i b
+end
+end
+sh_all tot
+ret SST_OK
+end
+
+fn sst_enc_init n_regs ulong slab_size ulong to ulong
+if gt n_regs SST_MAX_REGS
+ret SST_ERR_OOB
+end
+rc = sst_ensure_slabs slab_size
+if ne rc SST_OK
+ret rc
+end
+rc = sst_ensure_buf SST_HDR_LEN
+if ne rc SST_OK
+ret rc
+end
+for j ulong 8
+put ss_st j 0
+end
+put ss_st 2 n_regs
+put ss_st 3 slab_size
+for i ulong SST_MAX_REGS
+put ss_enc_regs i 0
+put ss_cur_regs i 0
+put ss_dec_regs i 0
+end
+for i ulong slab_size bound 16777216
+put ss_enc_slab i 0
+put ss_cur_slab i 0
+put ss_dec_slab i 0
+end
+for j ulong 4
+b = get ss_magic j
+put ss_buf j b
+end
+put ss_buf 4 1
+put ss_buf 5 0
+put ss_buf 6 0
+put ss_buf 7 0
+sst_put_u32 8 n_regs
+sst_put_u32 12 slab_size
+sst_put_u64 16 0
+put ss_st 0 SST_HDR_LEN
+ret SST_OK
+end
+
+fn sst_write_span p ulong start ulong slen ulong to ulong
+sst_put_u32 p start
+sst_put_u16 add p 4 slen
+q = add p 6
+for j ulong slen bound 65536
+b = get ss_cur_slab add start j
+put ss_buf add q j b
+put ss_enc_slab add start j b
+end
+ret add q slen
+end
+
+fn sst_emit_spans p0 ulong ssz ulong to ulong
+p = p0
+scnt = ulong 0
+i = ulong 0
+while lt i ssz bound 16777216
+ca = get ss_cur_slab i
+ea = get ss_enc_slab i
+if ne ca ea
+start = i
+slen = ulong 0
+while and lt i ssz lt slen 65535 bound 65536
+cb = get ss_cur_slab i
+eb = get ss_enc_slab i
+if eq cb eb
+break
+end
+i = add i 1
+slen = add slen 1
+end
+rc = sst_ensure_buf add p add 6 slen
+if ne rc SST_OK
+ret rc
+end
+p = sst_write_span p start slen
+scnt = add scnt 1
+else
+i = add i 1
+end
+end
+put ss_st 6 p
+put ss_st 7 scnt
+ret SST_OK
+end
+
+note Emit one semantic tok-delta frame comparing ss_cur_* against ss_enc_*.
+fn sst_emit_frame tok_seq ulong to ulong
+fseq = get ss_st 1
+nr = get ss_st 2
+ssz = get ss_st 3
+off = get ss_st 0
+rc = sst_ensure_buf add off add 22 mul nr 10
+if ne rc SST_OK
+ret rc
+end
+sst_put_u64 off fseq
+sst_put_u64 add off 8 tok_seq
+p = add off 18
+rcnt = ulong 0
+for i ulong nr bound 64
+v = get ss_cur_regs i
+if ne v get ss_enc_regs i
+sst_put_u16 p i
+sst_put_u64 add p 2 v
+put ss_enc_regs i v
+p = add p 10
+rcnt = add rcnt 1
+end
+end
+sst_put_u16 add off 16 rcnt
+scnt_off = p
+rc = sst_emit_spans add p 4 ssz
+if ne rc SST_OK
+ret rc
+end
+p = get ss_st 6
+sst_put_u32 scnt_off get ss_st 7
+rc = sst_ensure_buf add p 32
+if ne rc SST_OK
+ret rc
+end
+rc = sst_hash_state 0
+if ne rc SST_OK
+ret rc
+end
+for j ulong 32
+b = get sh_dig j
+put ss_buf add p j b
+end
+p = add p 32
+new_cnt = add fseq 1
+put ss_st 0 p
+put ss_st 1 new_cnt
+sst_put_u64 16 new_cnt
+raw_frame = add mul nr 8 ssz
+put ss_st 4 add get ss_st 4 raw_frame
+ret SST_OK
+end
+
+fn sst_apply_span cur ulong soff ulong slen ulong to void
+for k ulong slen bound 65536
+b = get ss_buf add cur k
+put ss_dec_slab add soff k b
+end
+end
+
+fn sst_dec_spans pos ulong scnt ulong tot_bytes ulong ssz ulong to ulong
+cur = pos
+for j ulong scnt bound 1048576
+if gt add cur 6 tot_bytes
+ret SST_ERR_TRUNC
+end
+soff = sst_get_u32 cur
+slen = sst_get_u16 add cur 4
+cur = add cur 6
+if gt slen sub tot_bytes cur
+ret SST_ERR_TRUNC
+end
+if or gt soff ssz gt slen sub ssz soff
+ret SST_ERR_OOB
+end
+sst_apply_span cur soff slen
+cur = add cur slen
+end
+put ss_st 6 cur
+ret SST_OK
+end
+
+fn sst_dec_frame f ulong pos ulong tot_bytes ulong to ulong
+if gt add pos 22 tot_bytes
+ret SST_ERR_TRUNC
+end
+fseq = sst_get_u64 pos
+if ne fseq f
+ret SST_ERR_SEQ
+end
+rcnt = sst_get_u16 add pos 16
+cur = add pos 18
+if gt mul rcnt 10 sub tot_bytes cur
+ret SST_ERR_TRUNC
+end
+nr = get ss_st 2
+for j ulong rcnt bound 65536
+ri = sst_get_u16 cur
+rv = sst_get_u64 add cur 2
+if ge ri nr
+ret SST_ERR_OOB
+end
+put ss_dec_regs ri rv
+cur = add cur 10
+end
+if gt add cur 4 tot_bytes
+ret SST_ERR_TRUNC
+end
+scnt = sst_get_u32 cur
+rc = sst_dec_spans add cur 4 scnt tot_bytes get ss_st 3
+if ne rc SST_OK
+ret rc
+end
+cur = get ss_st 6
+if gt add cur 32 tot_bytes
+ret SST_ERR_TRUNC
+end
+rc = sst_hash_state 1
+if ne rc SST_OK
+ret rc
+end
+for j ulong 32
+b = get ss_buf add cur j
+if ne b get sh_dig j
+ret SST_ERR_HASH
+end
+end
+put ss_st 6 add cur 32
+ret SST_OK
+end
+
+note Fail-closed decode entire ss_buf[0..tot_bytes) from zero initial state into ss_dec_*.
+fn sst_decode_verify tot_bytes ulong to ulong
+if lt tot_bytes SST_HDR_LEN
+ret SST_ERR_TRUNC
+end
+for j ulong 4
+b = get ss_buf j
+if ne b get ss_magic j
+ret SST_ERR_MAGIC
+end
+end
+v4 = get ss_buf 4
+if ne v4 1
+ret SST_ERR_VER
+end
+v5 = get ss_buf 5
+v6 = get ss_buf 6
+v7 = get ss_buf 7
+if or ne v5 0 or ne v6 0 ne v7 0
+ret SST_ERR_VER
+end
+nr = sst_get_u32 8
+ssz = sst_get_u32 12
+fcnt = sst_get_u64 16
+if gt nr SST_MAX_REGS
+ret SST_ERR_OOB
+end
+rc = sst_ensure_slabs ssz
+if ne rc SST_OK
+ret rc
+end
+put ss_st 2 nr
+put ss_st 3 ssz
+for i ulong SST_MAX_REGS
+put ss_dec_regs i 0
+end
+for i ulong ssz bound 16777216
+put ss_dec_slab i 0
+end
+pos = ulong SST_HDR_LEN
+for f ulong fcnt bound 1048576
+rc = sst_dec_frame f pos tot_bytes
+if ne rc SST_OK
+ret rc
+end
+pos = get ss_st 6
+end
+if ne pos tot_bytes
+ret SST_ERR_TRAILING
+end
+put ss_st 5 fcnt
+ret SST_OK
+end
+
+fn sst_verify_exact_match to bool
+nr = get ss_st 2
+ssz = get ss_st 3
+for i ulong nr bound 64
+if ne get ss_dec_regs i get ss_cur_regs i
+ret false
+end
+end
+for i ulong ssz bound 16777216
+a = get ss_dec_slab i
+b = get ss_cur_slab i
+if ne a b
+ret false
+end
+end
+ret true
+end
+
+fn sst_stream_bytes to ulong
+ret get ss_st 0
+end
+
+fn sst_raw_bytes to ulong
+ret get ss_st 4
+end
+
+fn sst_frame_count to ulong
+ret get ss_st 1
+end
+
+fn sst_decoded_frames to ulong
+ret get ss_st 5
+end
