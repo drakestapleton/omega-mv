@@ -135,7 +135,49 @@ set -e
 [ "$RC_NG" -eq 73 ] || fail "@ng a64 lowered OM-3 binary returned $RC_NG, expected 73"
 printf '  PASS OM-3 -> OIR v2 -> ngcheck ACCEPT -> @ng opt -> @ng a64 native exec exit=73\n'
 
-printf '\n=== [4/7] ADVERSARIAL NEGATIVE CONTROLS (ALL OM-3 REFUSAL CODES 101..111, 120, 130) ===\n'
+printf '\n=== [3b/7] POSITIVE TEST 3: CFG-SOUND CONDITIONAL EARLY-RETURN & LOOP-INVARIANT OM-3 ===\n'
+cat > "$B/cases/pos_cfg.om3" << 'EOF'
+om3
+fn run_dma err ulong to int
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x10000
+@gpu_submit gbuf 1
+if ne err 0
+@unmap gbuf
+@tlbinval gbuf
+@fence_drain gbuf 1
+@reclaim gbuf
+ret 1
+end
+for i ulong 4
+@access gbuf 0 4096
+end
+@unmap gbuf
+@tlbinval gbuf
+@fence_drain gbuf 1
+@reclaim gbuf
+ret 0
+end
+
+fn main to int
+a = run_dma 1
+b = run_dma 0
+ret add mul a 10 add b 32
+end
+EOF
+
+OUT_CFG=$("$B/om3_aegis" verify-om3 "$B/cases/pos_cfg.om3" "$B/memo" "$B/cases/pos_cfg.om")
+printf '  %s\n' "$OUT_CFG"
+"$OMC" < "$B/cases/pos_cfg.om" > "$B/cases/pos_cfg.bin"
+chmod +x "$B/cases/pos_cfg.bin"
+set +e
+"$B/cases/pos_cfg.bin"
+RC_CFG=$?
+set -e
+[ "$RC_CFG" -eq 42 ] || fail "CFG positive binary returned $RC_CFG, expected 42"
+printf '  PASS CFG-sound early-return + loop-invariant OM-3 lowered & executed exit=42\n'
+
+printf '\n=== [4/7] ADVERSARIAL NEGATIVE CONTROLS (ALL OM-3 REFUSAL CODES 101..112, 120, 130) ===\n'
 neg_cnt=0
 expect_refuse() {
   name=$1
@@ -367,6 +409,172 @@ end
 EOF
 expect_refuse "eof_unfenced_dma_leak" 106 "$B/cases/n106_eof_leak.om3"
 
+# RCCA v2 Red-Team Adversarial Controls:
+# 112 CFG branch bypass (conditional unmap/tlb/drain in `if`, unconditional @reclaim after `end`)
+cat > "$B/cases/n112_branch_bypass.om3" << 'EOF'
+om3
+fn main to int
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x400000
+@gpu_submit gbuf 1
+if eq 0 1
+@unmap gbuf
+@tlbinval gbuf
+@fence_drain gbuf 1
+end
+@reclaim gbuf
+ret 0
+end
+EOF
+expect_refuse "cfg_branch_teardown_bypass" 112 "$B/cases/n112_branch_bypass.om3"
+
+# 104 Early return inside `if` before unmap/tlb/fence/reclaim
+cat > "$B/cases/n104_early_ret.om3" << 'EOF'
+om3
+fn main to int
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x400000
+@gpu_submit gbuf 1
+if eq 1 1
+ret 0
+end
+@unmap gbuf
+@tlbinval gbuf
+@fence_drain gbuf 1
+@reclaim gbuf
+ret 0
+end
+EOF
+expect_refuse "cfg_early_ret_dma_leak" 104 "$B/cases/n104_early_ret.om3"
+
+# 112 Reclaim inside `for` loop (double-reclaim / UAF on iteration 2)
+cat > "$B/cases/n112_loop_reclaim.om3" << 'EOF'
+om3
+fn main to int
+@region gbuf 3 0x20000000 0x400000
+for i ulong 2
+@reclaim gbuf
+end
+ret 0
+end
+EOF
+expect_refuse "cfg_loop_reclaim_uaf" 112 "$B/cases/n112_loop_reclaim.om3"
+
+# 101 Expanded raw device-mapping primitive (mapnew / devcall)
+cat > "$B/cases/n101_mapnew.om3" << 'EOF'
+om3
+fn main to int
+x = mapnew 0 4096 3 1 0
+ret int x
+end
+EOF
+expect_refuse "raw_ptr_mapnew" 101 "$B/cases/n101_mapnew.om3"
+
+# 111 Extra trailing token on @region & @pure smuggling
+cat > "$B/cases/n111_extra_tok.om3" << 'EOF'
+om3
+@region buf 1 0x1000 0x1000 EXTRA_GARBAGE
+fn main to int
+ret 0
+end
+EOF
+expect_refuse "extra_trailing_token" 111 "$B/cases/n111_extra_tok.om3"
+
+cat > "$B/cases/n101_pure_smuggle.om3" << 'EOF'
+om3
+@pure fwld 4096 8
+fn main to int
+ret 0
+end
+EOF
+expect_refuse "pure_contract_smuggle" 101 "$B/cases/n101_pure_smuggle.om3"
+
+# 103 GPU access past mapped vlen (< psize)
+cat > "$B/cases/n103_vlen_oob.om3" << 'EOF'
+om3
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x1000
+@access gbuf 0x2000 0x1000
+@unmap gbuf
+@tlbinval gbuf
+@reclaim gbuf
+fn main to int
+ret 0
+end
+EOF
+expect_refuse "oob_past_mapped_vlen" 103 "$B/cases/n103_vlen_oob.om3"
+
+# 111 Source > 262144 B truncation smuggling attack (fail-closed)
+{
+  printf 'om3\n'
+  printf '@region buf 1 0x10000000 0x1000\n'
+  i=0
+  while [ "$i" -lt 2600 ]; do
+    printf 'note 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456\n'
+    i=$((i + 1))
+  done
+  printf 'fn main to int\nx = fwld 4096 8\nret int x\nend\n'
+} > "$B/cases/n111_src_trunc.om3"
+expect_refuse "src_gt_256k_truncation" 111 "$B/cases/n111_src_trunc.om3"
+
+# 106 Unreclaimed TLB-flushed GPU VA leak at EOF
+cat > "$B/cases/n106_unreclaimed_va.om3" << 'EOF'
+om3
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x400000
+@gpu_submit gbuf 1
+@unmap gbuf
+@tlbinval gbuf
+@fence_drain gbuf 1
+fn main to int
+ret 0
+end
+EOF
+expect_refuse "unreclaimed_gpu_va_leak" 106 "$B/cases/n106_unreclaimed_va.om3"
+
+# 112 Loop break after @unmap (invariant violation on loop exit)
+cat > "$B/cases/n112_loop_break.om3" << 'EOF'
+om3
+fn main to int
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x400000
+for i ulong 4
+@unmap gbuf
+break
+end
+@tlbinval gbuf
+@reclaim gbuf
+ret 0
+end
+EOF
+expect_refuse "cfg_loop_break_unmap" 112 "$B/cases/n112_loop_break.om3"
+
+# 104 VMA pin after PTE unmap
+cat > "$B/cases/n104_pin_after_unmap.om3" << 'EOF'
+om3
+fn main to int
+@region gbuf 3 0x20000000 0x400000
+@map gbuf 0x200000000 0x400000
+@unmap gbuf
+@vma_pin gbuf
+@tlbinval gbuf
+@vma_revoke gbuf
+@reclaim gbuf
+ret 0
+end
+EOF
+expect_refuse "vma_pin_after_unmap" 104 "$B/cases/n104_pin_after_unmap.om3"
+
+# 101 Smuggled `target a64efi` directive
+cat > "$B/cases/n101_target_efi.om3" << 'EOF'
+om3
+target a64efi
+fn main to int
+ret 0
+end
+EOF
+expect_refuse "smuggled_target_a64efi" 101 "$B/cases/n101_target_efi.om3"
+
 # 120 OMEGA_MEMO_PROOF_TAMPER (1-byte flip in cached .ome file)
 cp -R "$B/memo" "$B/memo_tampered"
 T_CNT=0
@@ -410,7 +618,7 @@ printf '  %s\n' "$DDC2"
 printf '%s\n' "$DDC1" | grep -q 'mode=COLD_PROVED' || fail "DDC1 not COLD_PROVED"
 printf '%s\n' "$DDC2" | grep -q 'mode=MEMO_HIT' || fail "DDC2 not MEMO_HIT"
 
-# 130 DDC_MISMATCH negative control
+# 130 DDC_MISMATCH negative control + non-hex SHA refusal
 BAD_SHA="0000000000000000000000000000000000000000000000000000000000000000"
 set +e
 "$B/om3_aegis" memo-ddc "$SRC_SHA" "$BAD_SHA" "$PIN_SHA" "$B/memo_ddc" > /dev/null 2> "$B/cases/ddc_bad.err"
@@ -419,6 +627,15 @@ set -e
 [ "$DRC" -eq 130 ] || fail "DDC mismatch expected exit 130, got $DRC"
 neg_cnt=$((neg_cnt + 1))
 printf '  KILL [%02d] %-28s -> exit=%d (%s)\n' "$neg_cnt" "ddc_poisoned_omc_sha" "$DRC" "$(cat "$B/cases/ddc_bad.err" | tr -d '\n')"
+
+NONHEX_SHA="ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+set +e
+"$B/om3_aegis" memo-ddc "$NONHEX_SHA" "$NONHEX_SHA" "$NONHEX_SHA" "$B/memo_ddc" > /dev/null 2> "$B/cases/ddc_nonhex.err"
+NHRC=$?
+set -e
+[ "$NHRC" -eq 2 ] || fail "DDC non-hex expected exit 2, got $NHRC"
+neg_cnt=$((neg_cnt + 1))
+printf '  KILL [%02d] %-28s -> exit=%d (non-hex SHA rejected)\n' "$neg_cnt" "ddc_nonhex_sha_rejected" "$NHRC"
 
 printf '\n=== [6/7] LEAN 4.36.0 MACHINE-CHECKED PROOFS (Om3MemorySafety.lean) ===\n'
 LEAN_BIN=""
@@ -436,4 +653,4 @@ else
 fi
 
 printf '\n=== [7/7] SUMMARY ===\n'
-printf 'STRAND5_AEGIS PASS om2_fixpoint=%s ng_ddc=%s neg_controls=%d/21\n' "$SEED_OMC_SHA" "$S5_OMC_SHA" "$neg_cnt"
+printf 'STRAND5_AEGIS PASS om2_fixpoint=%s ng_ddc=%s neg_controls=%d/34\n' "$SEED_OMC_SHA" "$S5_OMC_SHA" "$neg_cnt"

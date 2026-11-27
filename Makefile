@@ -1138,7 +1138,7 @@ $(RX_R13_HOST): $(RX_R13_SRCS) src/runtime/rx_living.h src/runtime/rx_argus.h $(
 RX_R13_CORTEX = $(TRT5_R13E_BIN)
 
 test-r13-cortex-episode: $(RX_R13_CORTEX)
-	./$(RX_R13_CORTEX)
+	$(RX_R13_CORTEX)
 
 # ADAPTIVE-M4: bounded resource regulation, pure seeded OM-2.
 RX_REGULATE_TEST = $(TRT1_REG_BIN)

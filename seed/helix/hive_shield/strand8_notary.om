@@ -14,13 +14,14 @@ note
 note Fail-closed refusal codes:
 note   161 HS_ERR_HASH_TAMPER     SHA-256 mismatch on manifest file (1-bit tamper caught)
 note   162 HS_ERR_MISSING_FILE    file named in SHA256SUMS missing or unreadable
-note   163 HS_ERR_BAD_MANIFEST    empty or malformed SHA256SUMS manifest
+note   163 HS_ERR_BAD_MANIFEST    empty, malformed, >64 KiB manifest, >16 MiB obj, path traversal, or overlong line
 note   164 HS_ERR_SAFETY_VETO     at least one defense strand vetoed (1-of-K Veto Law)
-note   165 HS_ERR_BFT_NO_QUORUM   compiler strand quorum failed (n < 3f+1 or ok < n-f)
+note   165 HS_ERR_BFT_NO_QUORUM   compiler strand quorum failed (n < 3f+1, ok < n-f, or 3f+1 overflow)
 note   166 HS_ERR_MEMO_TAMPER     OMEGA-MEMO attestation entry tampered or corrupt
 
 const S8_MAX_MAN ulong 65536
 const S8_MAX_OBJ ulong 16777216
+const S8_MAX_F ulong 6148914691236517204
 
 const S8_ERR_TAMPER ulong 161
 const S8_ERR_MISSING ulong 162
@@ -48,7 +49,7 @@ global s8_probe uchar 4
 text s8_use "usage: strand8_notary verify-sums <base_dir> <sums_file> | hive-quorum <n> <f> <ok> <veto> <memo_root> <omc_sha64>\n"
 text s8_c_sums "verify-sums"
 text s8_c_quor "hive-quorum"
-text s8_tag_att "omega.hive.notary.attest.v1"
+text s8_tag_att "omega.hive.notary.attest.v2"
 
 text s8_p_s1 "STRAND8_NOTARY VERIFY_SUMS PASS verified_files="
 text s8_p_s2 " manifest_sha256="
@@ -91,6 +92,16 @@ if lt v 10
 ret uchar add 48 v
 end
 ret uchar add 87 v
+end
+
+fn s8_is_lhex c ulong to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 97 le c 102
+ret true
+end
+ret false
 end
 
 fn s8_wrhex_msha fd int to void
@@ -140,25 +151,36 @@ end
 ret true
 end
 
+note Overflow-safe unsigned decimal CLI arg parser (rejects >= 2^64 and >20 digits)
 fn s8_parse_arg_u idx ulong to ulong
-al = argread idx s8_arg 0 64
+bad = not ulong 0
+al = argread idx s8_arg 0 32
 if lt al 1
-ret not ulong 0
+ret bad
 end
 n = ulong al
 if gt n 20
-ret not ulong 0
+ret bad
 end
 v = ulong 0
 for i ulong n bound 20
 c = ulong get s8_arg i
 if lt c 48
-ret not ulong 0
+ret bad
 end
 if gt c 57
-ret not ulong 0
+ret bad
 end
-v = add mul v 10 sub c 48
+if gt v 1844674407370955161
+ret bad
+end
+p10 = mul v 10
+d = sub c 48
+nxt = add p10 d
+if lt nxt p10
+ret bad
+end
+v = nxt
 end
 ret v
 end
@@ -195,12 +217,19 @@ fn s8_rel_is_safe rel_off ulong rel_len ulong to bool
 if eq rel_len 0
 ret false
 end
+if gt rel_len 1000
+ret false
+end
 if eq get s8_man rel_off 47
 ret false
 end
 for i ulong rel_len bound 1024
+ch = get s8_man add rel_off i
+if eq ch 0
+ret false
+end
 if lt add i 1 rel_len
-if eq get s8_man add rel_off i 46
+if eq ch 46
 if eq get s8_man add add rel_off i 1 46
 ret false
 end
@@ -235,6 +264,7 @@ if lt fd 0
 ret S8_ERR_MISSING
 end
 n = ulong 0
+eof = false
 while lt n S8_MAX_OBJ bound 262144
 want = sub S8_MAX_OBJ n
 if gt want 65536
@@ -246,13 +276,14 @@ c1 = fclose int fd
 ret S8_ERR_MISSING
 end
 if eq k 0
+eof = true
 break
 end
 n = add n ulong k
 end
-if eq n S8_MAX_OBJ
+if not eof
 extra = read int fd s8_probe 0 1
-if gt extra 0
+if ne extra 0
 c3 = fclose int fd
 ret S8_ERR_BADMAN
 end
@@ -321,6 +352,7 @@ if lt fd 0
 ret s8_refuse S8_ERR_MISSING
 end
 n = ulong 0
+eof = false
 while lt n S8_MAX_MAN bound 1024
 k = read int fd s8_man n sub S8_MAX_MAN n
 if lt k 0
@@ -328,9 +360,17 @@ c1 = fclose int fd
 ret s8_refuse S8_ERR_MISSING
 end
 if eq k 0
+eof = true
 break
 end
 n = add n ulong k
+end
+if not eof
+ex = read int fd s8_probe 0 1
+if ne ex 0
+c3 = fclose int fd
+ret s8_refuse S8_ERR_BADMAN
+end
 end
 c2 = fclose int fd
 if eq n 0
@@ -347,12 +387,25 @@ end
 pos = ulong 0
 vcnt = ulong 0
 while lt pos n bound 4096
+if ge vcnt 4090
+ret s8_refuse S8_ERR_BADMAN
+end
 lstart = pos
+got_nl = false
 while lt pos n bound 1024
 if eq get s8_man pos 10
+got_nl = true
 break
 end
+if ge sub pos lstart 1020
+ret s8_refuse S8_ERR_BADMAN
+end
 pos = add pos 1
+end
+if not got_nl
+if lt pos n
+ret s8_refuse S8_ERR_BADMAN
+end
 end
 llen = sub pos lstart
 if lt pos n
@@ -409,7 +462,13 @@ end
 ret false
 end
 
-fn s8_seal_attest n_comp ulong c_ok ulong to int
+fn s8_put_sh_u64 off ulong v ulong to void
+for j ulong 8
+put sh_dat add off j uchar and shr v mul j 8 255
+end
+end
+
+fn s8_seal_attest n_comp ulong f_max ulong c_ok ulong to int
 tl = len s8_tag_att
 for i ulong tl bound 64
 put sh_dat i get s8_tag_att i
@@ -421,12 +480,13 @@ sh_all add tl 64
 for i ulong 32
 put s8_fid i get sh_dig i
 end
-put sh_dat 0 uchar and n_comp 255
-put sh_dat 1 uchar and c_ok 255
+s8_put_sh_u64 0 n_comp
+s8_put_sh_u64 8 f_max
+s8_put_sh_u64 16 c_ok
 for i ulong 64
-put sh_dat add 2 i get s8_omc i
+put sh_dat add 24 i get s8_omc i
 end
-sh_all 66
+sh_all 88
 for i ulong 32
 put s8_insha i get sh_dig i
 end
@@ -500,7 +560,10 @@ note Law 1: 1-of-K Safety Veto Law (ANY defense strand veto halts execution imme
 if ne veto 0
 ret s8_refuse S8_ERR_VETO
 end
-note Law 2: Compiler BFT Quorum Law (n >= 3f + 1 and ok >= n - f and ok <= n)
+note Law 2: Overflow-safe Compiler BFT Quorum Law (f <= (2^64-2)/3, n >= 3f+1, n-f <= ok <= n)
+if gt f_max S8_MAX_F
+ret s8_refuse S8_ERR_NOQUORUM
+end
 min_n = add mul 3 f_max 1
 if lt n_comp min_n
 ret s8_refuse S8_ERR_NOQUORUM
@@ -512,9 +575,16 @@ thresh = sub n_comp f_max
 if lt c_ok thresh
 ret s8_refuse S8_ERR_NOQUORUM
 end
-ol = argread 7 s8_omc 0 64
+ol = argread 7 s8_arg 0 65
 if ne ol 64
 ret 2
+end
+for i ulong 64
+ch = get s8_arg i
+if not s8_is_lhex ulong ch
+ret 2
+end
+put s8_omc i ch
 end
 mp_init
 put mp_cfg 0 MP_OVR_FORCE
@@ -526,7 +596,7 @@ rc = mm_set_root_from_envbuf ulong rl
 if ne rc MM_OK
 ret s8_refuse S8_ERR_MEMO
 end
-ret s8_seal_attest n_comp c_ok
+ret s8_seal_attest n_comp f_max c_ok
 end
 
 fn main to int
