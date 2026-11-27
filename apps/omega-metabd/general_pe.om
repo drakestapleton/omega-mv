@@ -1,0 +1,2261 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-metabd/general_pe.om: Stage 4 (Pillar 1) General Multi-Block ΩIR Partial Evaluator,
+note EGP3 Proof Pipeline, Native AArch64 Machine-Code Emitter, Strict W^X (RW->SHA256->RX) Sealer,
+note 3-Bit Proof Gate (Contract|EGP3|Monk+Immune == 7), Cooperative fabWtbl Hot-Swap & OOD Rollback.
+note
+note Pure seeded OM-2 library unit (no om2 header, no fn main).
+note Prefixes: gpe_/GPE_ (partial evaluator + ΩIR eval + AArch64 emit), wx_/WX_ (strict W^X), mb_/MB_ (daemon core).
+note Links unchanged after: ir.om, sha256.om, target_desc.om, isel.om, sm121_pe.om, fabric.om,
+note crystallize.om, ir_egraph.om, egp3_checker.om, arboris_spec.om, profile_ring.om.
+
+note ==== Part 1: Constants & State ====
+
+const GPE_TRAP_DEOPT ulong 14
+const GPE_MAX_UNROLL ulong 32
+const GPE_MAX_VALS ulong 2048
+const GPE_MAX_BLKS ulong 64
+const GPE_MAX_FIX ulong 128
+
+const GPE_WK_AFFINE ulong 1
+const GPE_WK_BRANCH ulong 2
+const GPE_WK_SPARSE ulong 3
+
+note Strict W^X protection flags (Linux PROT_* bitmask):
+const WX_PROT_NONE ulong 0
+const WX_PROT_READ ulong 1
+const WX_PROT_WRITE ulong 2
+const WX_PROT_EXEC ulong 4
+const WX_PROT_RW ulong 3
+const WX_PROT_RX ulong 5
+const WX_PROT_RWX ulong 7
+
+const WX_OK ulong 0
+const WX_ERR_RWX_FORBIDDEN ulong 1
+const WX_ERR_ELF_BAD ulong 2
+const WX_ERR_IO ulong 3
+const WX_ERR_SHA_MISMATCH ulong 4
+const WX_ERR_MODE_WRITABLE ulong 5
+const WX_ERR_EXEC ulong 6
+const WX_ERR_NOT_RX ulong 7
+
+note 3-bit proof gate masks & refusal codes:
+const MB_BIT_CONTRACT ulong 1
+const MB_BIT_EGP3 ulong 2
+const MB_BIT_MONK_IMMUNE ulong 4
+const MB_PROOF_ALL ulong 7
+
+const MB_OK ulong 0
+const MB_ERR_SLOT ulong 1
+const MB_ERR_PROOF_MASK ulong 2
+const MB_ERR_CONTRACT ulong 3
+const MB_ERR_EGP3 ulong 4
+const MB_ERR_MONK_IMMUNE ulong 5
+const MB_ERR_WX_RWX ulong 6
+const MB_ERR_PARITY ulong 7
+const MB_ERR_SWAP ulong 8
+const MB_ERR_NOT_A725 ulong 9
+const MB_ERR_PE ulong 10
+
+const MB_DISP_BASELINE ulong 0
+const MB_DISP_SPEC ulong 1
+const MB_DISP_ROLLBACK ulong 2
+
+const MB_ALARM_OOD ulong 1
+const MB_ALARM_ORACLE ulong 2
+const MB_ALARM_RWX ulong 3
+
+const MB_MAX_SLOTS ulong 8
+
+note Multi-block ΩIR evaluator state:
+global gpe_ev_val ulong 2048
+global gpe_ev_tmp ulong 16
+global gpe_last_ops ulong 1
+global gpe_last_blks ulong 1
+global gpe_last_trap ulong 1
+
+note General PE configuration & abstract environment:
+global gpe_pin_mask ulong 1
+global gpe_pin_val ulong 4
+global gpe_cfg_bias ulong 1
+global gpe_cfg_sparse ulong 1
+global gpe_cfg_tid ulong 1
+
+global gpe_v_kind ulong 2048
+global gpe_v_cval ulong 2048
+global gpe_v_sym uint 2048
+global gpe_b_vis ulong 64
+global gpe_pe_stat ulong 16
+note gpe_pe_stat: [0]=blks_src [1]=blks_spec [2]=br_folded [3]=loops_unrolled [4]=ops_folded
+note              [5]=eg_cost_bef [6]=eg_cost_aft [7]=egp3_rc [8]=egp3_certs [9]=egp3_steps
+note              [10]=egp3_evals [11]=hot_blk_handle [12]=hot_root_val [13]=opt_fn [14]=egp3_bytes
+
+note Saved live EGP3 bundle from general PE -> egp3_checker verification & negative controls:
+global gpe_egp3_buf uchar 131072
+global gpe_egp3_len ulong 1
+
+note E-graph SSA-id to ΩIR value handle mapping (for materializing extracted optimal DAG):
+global gpe_eg_mat uint 512
+global gpe_eg_mat_ok uchar 512
+
+note Native AArch64 multi-block compiler state (emits directly into isBuf[0..1024) + elfBuf):
+global gpe_a6_vbase ulong 1
+global gpe_a6_p_h uint 4
+global gpe_a6_vslot ulong 2048
+global gpe_a6_vnext ulong 1
+global gpe_a6_blks uint 64
+global gpe_a6_boff ulong 64
+global gpe_a6_nblk ulong 1
+global gpe_a6_fpc ulong 128
+global gpe_a6_ftgt uint 128
+global gpe_a6_fkind ulong 128
+global gpe_a6_freg ulong 128
+global gpe_a6_nfix ulong 1
+global gpe_a6_epi_pc ulong 1
+global gpe_a6_top_pc ulong 1
+global gpe_a6_insns ulong 1
+global gpe_a6_ovf ulong 1
+
+note Strict W^X staging/sealing state:
+global wx_dir uchar 512
+global wx_dir_len ulong 1
+global wx_p_stage uchar 1024
+global wx_p_stagel ulong 1
+global wx_p_rx uchar 1024
+global wx_p_rxl ulong 1
+global wx_ren_pkt uchar 2200
+global wx_stat_buf uchar 128
+global wx_rb_buf uchar 4096
+global wx_sha_exp uchar 32
+global wx_sha_got uchar 32
+global wx_av_pkt uchar 1200
+global wx_p_in uchar 8
+global wx_p_out uchar 8
+global wx_io_in uchar 40
+global wx_io_out uchar 8
+global wx_wait_st uchar 4
+global wx_args ulong 5
+
+global wx_rwx_refusals ulong 1
+global wx_sha_refusals ulong 1
+global wx_mode_refusals ulong 1
+global wx_seals_ok ulong 1
+global wx_last_exit ulong 1
+global wx_last_ns ulong 1
+global wx_last_out ulong 1
+
+note Cooperative slot table & daemon telemetry:
+global mb_slot_valid ulong 8
+global mb_slot_sem ulong 8
+global mb_slot_fbase uint 8
+global mb_slot_fspec uint 8
+global mb_slot_base_insns ulong 8
+global mb_slot_spec_insns ulong 8
+global mb_slot_base_ops ulong 8
+global mb_slot_spec_ops ulong 8
+global mb_slot_base_ptr ulong 8
+global mb_slot_spec_ptr ulong 8
+global mb_slot_base_tid ulong 8
+global mb_slot_spec_tid ulong 8
+global mb_slot_base_slab ulong 8
+global mb_slot_alarm_slab ulong 8
+global mb_slot_base_path uchar 4096
+global mb_slot_base_plen ulong 8
+global mb_slot_spec_path uchar 4096
+global mb_slot_spec_plen ulong 8
+global mb_slot_pin_mask ulong 8
+global mb_slot_pin_v0 ulong 8
+global mb_slot_pin_v1 ulong 8
+global mb_slot_pin_v2 ulong 8
+global mb_slot_pin_v3 ulong 8
+global mb_slot_wk ulong 8
+
+global mb_worker_cpu ulong 1
+global mb_swaps ulong 1
+global mb_refusals ulong 1
+global mb_rollbacks ulong 1
+global mb_spec_hits ulong 1
+global mb_base_hits ulong 1
+global mb_alarms ulong 1
+global mb_last_disp ulong 1
+global mb_last_err ulong 1
+global mb_alarm_cnt ulong 1
+global mb_alarm_slot ulong 32
+global mb_alarm_code ulong 32
+global mb_alarm_x0 ulong 32
+global mb_alarm_x1 ulong 32
+global mb_cpu_mask uchar 128
+global mb_mut_flag ulong 1
+
+text wx_t_def_dir "/tmp/omega-metabd-wx"
+text wx_t_sl "/slot_"
+text wx_t_v "_v"
+text wx_t_stg ".stage"
+text wx_t_rx ".rx"
+
+note ==== Part 2: Multi-Block ΩIR Benchmark Builders (real ir.om functions, @pure @exact v2) ====
+
+fn gpe_mk_bin b uint op uint a uint bv uint to uint
+o = ir_op b op 5 0 2
+ir_set o 0 a
+ir_set o 1 bv
+ret ir_res o
+end
+
+fn gpe_mk_cmp b uint op uint a uint bv uint to uint
+o = ir_op b op 1 0 2
+ir_set o 0 a
+ir_set o 1 bv
+ret ir_res o
+end
+
+fn gpe_mk_cbr b uint tk uint cond uint bt uint bf uint to void
+cb = ir_op b 61 0 0 4
+ir_set cb 0 tk
+ir_set cb 1 cond
+ir_set cb 2 bt
+ir_set cb 3 bf
+end
+
+fn gpe_mk_br1 b uint tgt uint tk uint v0 uint to void
+br = ir_op b 60 0 0 3
+ir_set br 0 tgt
+ir_set br 1 tk
+ir_set br 2 v0
+end
+
+fn gpe_mk_br2 b uint tgt uint tk uint v0 uint v1 uint to void
+br = ir_op b 60 0 0 4
+ir_set br 0 tgt
+ir_set br 1 tk
+ir_set br 2 v0
+ir_set br 3 v1
+end
+
+fn gpe_mk_retv b uint tk uint v uint to void
+rv = ir_op b 63 0 0 2
+ir_set rv 0 tk
+ir_set rv 1 v
+end
+
+note Helper globals for builder params/blocks (keeps every builder well below omc's 16-slot limit)
+global gpe_bp uint 8
+global gpe_bb uint 8
+
+fn gpe_new_fn4 to uint
+f = ir_fnew 0 0 5
+ir_fset_mode f 1 1 0
+ir_fset_phys f 0 5000 15000
+put gpe_bp 0 ir_fpar f 5
+put gpe_bp 1 ir_fpar f 5
+put gpe_bp 2 ir_fpar f 5
+put gpe_bp 3 ir_fpar f 5
+ret f
+end
+
+note Workload 1 (4 blocks): affine_route(x, scale, bias, mode) -> u64
+note Hot path (mode==0, scale=8, bias=0): ((x*scale + bias)*3 + bias)*1 + (x - x) == 24*x
+note Cold path (mode!=0): ((x*7 + scale)*11 + bias)*1 + (x - x)
+fn gpe_build_affine_arms to void
+bf = get gpe_bb 1
+bc = get gpe_bb 2
+bm = get gpe_bb 3
+p0 = get gpe_bp 0
+p1 = get gpe_bp 1
+p2 = get gpe_bp 2
+c3 = ir_res ir_op bf 1 5 3 0
+t = gpe_mk_bin bf 12 p0 p1
+t = gpe_mk_bin bf 10 t p2
+t = gpe_mk_bin bf 12 t c3
+t = gpe_mk_bin bf 10 t p2
+gpe_mk_br1 bf bm ir_btok bf t
+c7 = ir_res ir_op bc 1 5 7 0
+c11 = ir_res ir_op bc 1 5 11 0
+k = gpe_mk_bin bc 12 p0 c7
+k = gpe_mk_bin bc 10 k p1
+k = gpe_mk_bin bc 12 k c11
+k = gpe_mk_bin bc 10 k p2
+gpe_mk_br1 bc bm ir_btok bc k
+end
+
+fn gpe_build_affine_route to uint
+f = gpe_new_fn4
+b0 = ir_blk f
+put gpe_bb 0 b0
+put gpe_bb 1 ir_blk f
+put gpe_bb 2 ir_blk f
+bm = ir_blk f
+put gpe_bb 3 bm
+mv = ir_bpar bm 5
+c0 = ir_res ir_op b0 1 5 0 0
+cond = gpe_mk_cmp b0 30 get gpe_bp 3 c0
+gpe_mk_cbr b0 ir_ftok f cond get gpe_bb 1 get gpe_bb 2
+gpe_build_affine_arms
+c1 = ir_res ir_op bm 1 5 1 0
+m1 = gpe_mk_bin bm 12 mv c1
+z0 = gpe_mk_bin bm 11 get gpe_bp 0 get gpe_bp 0
+gpe_mk_retv bm ir_btok bm gpe_mk_bin bm 10 m1 z0
+ret f
+end
+
+note Workload 2 (4 blocks): branch_diamond(x, y, flag, pad) -> u64
+note Hot arm (flag==1): (x*4 + y) + 0; Cold arm (flag!=1): x*5 + y*9
+fn gpe_build_branch_arms to void
+bh = get gpe_bb 1
+bc = get gpe_bb 2
+bj = get gpe_bb 3
+c4 = ir_res ir_op bh 1 5 4 0
+h = gpe_mk_bin bh 12 get gpe_bp 0 c4
+h = gpe_mk_bin bh 10 h get gpe_bp 1
+gpe_mk_br1 bh bj ir_btok bh h
+q1 = gpe_mk_bin bc 12 get gpe_bp 0 ir_res ir_op bc 1 5 5 0
+q2 = gpe_mk_bin bc 12 get gpe_bp 1 ir_res ir_op bc 1 5 9 0
+gpe_mk_br1 bc bj ir_btok bc gpe_mk_bin bc 10 q1 q2
+end
+
+fn gpe_build_branch_diamond to uint
+f = gpe_new_fn4
+b0 = ir_blk f
+bh = ir_blk f
+bc = ir_blk f
+bj = ir_blk f
+jv = ir_bpar bj 5
+put gpe_bb 0 b0
+put gpe_bb 1 bh
+put gpe_bb 2 bc
+put gpe_bb 3 bj
+c1 = ir_res ir_op b0 1 5 1 0
+cond = gpe_mk_cmp b0 30 get gpe_bp 2 c1
+gpe_mk_cbr b0 ir_ftok f cond bh bc
+gpe_build_branch_arms
+c0 = ir_res ir_op bj 1 5 0 0
+r = gpe_mk_bin bj 10 jv c0
+gpe_mk_retv bj ir_btok bj r
+ret f
+end
+
+note Workload 3 (4-block loop CFG with back-edge): sparse_dot_loop(x, n_iters, mask, stride) -> u64
+note Sums (x + i) * stride for i in 0..n_iters-1 where ((mask >> i) & 1) != 0.
+fn gpe_build_sparse_body iv uint ac uint to void
+bb = get gpe_bb 2
+c0 = ir_res ir_op bb 1 5 0 0
+c1 = ir_res ir_op bb 1 5 1 0
+t = gpe_mk_bin bb 21 get gpe_bp 2 iv
+t = gpe_mk_bin bb 16 t c1
+act = gpe_mk_cmp bb 31 t c0
+t = gpe_mk_bin bb 10 get gpe_bp 0 iv
+t = gpe_mk_bin bb 12 t get gpe_bp 3
+so = ir_op bb 2 5 0 3
+ir_set so 0 act
+ir_set so 1 t
+ir_set so 2 c0
+ac2 = gpe_mk_bin bb 10 ac ir_res so
+iv2 = gpe_mk_bin bb 10 iv c1
+gpe_mk_br2 bb get gpe_bb 1 ir_btok bb iv2 ac2
+end
+
+fn gpe_build_sparse_loop to uint
+f = gpe_new_fn4
+b0 = ir_blk f
+bh = ir_blk f
+iv = ir_bpar bh 5
+ac = ir_bpar bh 5
+bb = ir_blk f
+bx = ir_blk f
+put gpe_bb 0 b0
+put gpe_bb 1 bh
+put gpe_bb 2 bb
+put gpe_bb 3 bx
+z0 = ir_res ir_op b0 1 5 0 0
+gpe_mk_br2 b0 bh ir_ftok f z0 z0
+cond = gpe_mk_cmp bh 32 iv get gpe_bp 1
+gpe_mk_cbr bh ir_btok bh cond bb bx
+gpe_build_sparse_body iv ac
+gpe_mk_retv bx ir_btok bx ac
+ret f
+end
+
+note ==== Part 3: Exact Multi-Block ΩIR Interpreter (Semantic Oracle) ====
+
+fn gpe_eval_pure op ulong a ulong b ulong c ulong to ulong
+if eq op 10
+ret add a b
+end
+if eq op 11
+ret sub a b
+end
+if eq op 12
+ret mul a b
+end
+if eq op 13
+if eq b 0
+ret 0
+end
+ret div a b
+end
+if eq op 14
+if eq b 0
+ret 0
+end
+ret rem a b
+end
+if eq op 16
+ret and a b
+end
+if eq op 17
+ret or a b
+end
+if eq op 18
+ret xor a b
+end
+if eq op 20
+ret shl a and b 63
+end
+if eq op 21
+ret shr a and b 63
+end
+if eq op 46
+ret add mul a b c
+end
+if eq op 2
+if ne a 0
+ret b
+end
+ret c
+end
+if eq op 30
+if eq a b
+ret 1
+end
+ret 0
+end
+if eq op 31
+if ne a b
+ret 1
+end
+ret 0
+end
+if eq op 32
+if lt a b
+ret 1
+end
+ret 0
+end
+if eq op 33
+if le a b
+ret 1
+end
+ret 0
+end
+if eq op 34
+if gt a b
+ret 1
+end
+ret 0
+end
+if eq op 35
+if ge a b
+ret 1
+end
+ret 0
+end
+ret 0
+end
+
+fn gpe_ev_get vbase ulong h uint to ulong
+idx = sub ulong h vbase
+if ge idx GPE_MAX_VALS
+ret 0
+end
+ret get gpe_ev_val idx
+end
+
+fn gpe_ev_set vbase ulong h uint val ulong to void
+idx = sub ulong h vbase
+if lt idx GPE_MAX_VALS
+put gpe_ev_val idx val
+end
+end
+
+global gpe_ev_ret ulong 1
+global gpe_ev_done ulong 1
+
+fn gpe_eval_br vbase ulong o uint to uint
+tgt = ir_arg o 0
+na = ulong get i_ona o
+if gt na 2
+nk = sub na 2
+for j ulong nk bound 16
+put gpe_ev_tmp j gpe_ev_get vbase ir_arg o uint add j 2
+end
+bp = get i_vnx get i_bp1 tgt
+for j ulong nk bound 16
+if eq bp 0
+break
+end
+gpe_ev_set vbase bp get gpe_ev_tmp j
+bp = get i_vnx bp
+end
+end
+ret tgt
+end
+
+fn gpe_eval_blk vbase ulong blk uint to uint
+o = get i_bo1 blk
+while ne o 0 bound 512
+op = ulong get i_oop o
+put gpe_last_ops 0 add get gpe_last_ops 0 1
+if eq op 1
+gpe_ev_set vbase get i_ors o get i_oim o
+o = get i_onx o
+continue
+end
+if eq op 63
+put gpe_ev_ret 0 gpe_ev_get vbase ir_arg o 1
+put gpe_ev_done 0 1
+ret 0
+end
+if eq op 65
+put gpe_last_trap 0 get i_oim o
+put gpe_ev_done 0 1
+ret 0
+end
+if eq op 61
+if ne gpe_ev_get vbase ir_arg o 1 0
+ret ir_arg o 2
+end
+ret ir_arg o 3
+end
+if eq op 60
+ret gpe_eval_br vbase o
+end
+va = gpe_ev_get vbase ir_arg o 0
+vb = ulong 0
+vc = ulong 0
+if ge get i_ona o 2
+vb = gpe_ev_get vbase ir_arg o 1
+end
+if ge get i_ona o 3
+vc = gpe_ev_get vbase ir_arg o 2
+end
+gpe_ev_set vbase get i_ors o gpe_eval_pure op va vb vc
+o = get i_onx o
+end
+ret 0
+end
+
+fn gpe_eval_fn f uint a0 ulong a1 ulong a2 ulong a3 ulong to ulong
+vbase = ulong get i_ftk f
+put gpe_last_ops 0 0
+put gpe_last_blks 0 0
+put gpe_last_trap 0 0
+put gpe_ev_ret 0 0
+put gpe_ev_done 0 0
+p = get i_fp1 f
+k = ulong 0
+while ne p 0 bound 8
+if eq k 0
+gpe_ev_set vbase p a0
+end
+if eq k 1
+gpe_ev_set vbase p a1
+end
+if eq k 2
+gpe_ev_set vbase p a2
+end
+if eq k 3
+gpe_ev_set vbase p a3
+end
+p = get i_vnx p
+k = add k 1
+end
+blk = get i_fb1 f
+for step ulong 256
+if eq blk 0
+put gpe_last_trap 0 13
+ret 0
+end
+put gpe_last_blks 0 add get gpe_last_blks 0 1
+blk = gpe_eval_blk vbase blk
+if ne get gpe_ev_done 0 0
+ret get gpe_ev_ret 0
+end
+end
+put gpe_last_trap 0 4
+ret 0
+end
+
+note ==== Part 4: General Multi-Block ΩIR Partial Evaluator + Live ir_egraph -> EGP3 -> egp3_checker ====
+
+fn gpe_cfg_reset to void
+put gpe_pin_mask 0 0
+for i ulong 4
+put gpe_pin_val i 0
+end
+put gpe_cfg_bias 0 5000
+put gpe_cfg_sparse 0 0
+put gpe_cfg_tid 0 TID_X925
+for j ulong 16
+put gpe_pe_stat j 0
+end
+end
+
+fn gpe_cfg_pin idx ulong val ulong to void
+if lt idx 4
+put gpe_pin_mask 0 or get gpe_pin_mask 0 shl ulong 1 idx
+put gpe_pin_val idx val
+end
+end
+
+fn gpe_cfg_set_profile bias ulong sparse ulong tid ulong to void
+put gpe_cfg_bias 0 bias
+put gpe_cfg_sparse 0 sparse
+put gpe_cfg_tid 0 tid
+end
+
+fn gpe_pe_set_k vbase ulong h uint val ulong to void
+idx = sub ulong h vbase
+if lt idx GPE_MAX_VALS
+put gpe_v_kind idx 1
+put gpe_v_cval idx val
+put gpe_v_sym idx 0
+end
+end
+
+fn gpe_pe_set_s vbase ulong h uint sym uint to void
+idx = sub ulong h vbase
+if lt idx GPE_MAX_VALS
+put gpe_v_kind idx 2
+put gpe_v_cval idx 0
+put gpe_v_sym idx sym
+end
+end
+
+fn gpe_pe_materialize b_hot uint vbase ulong h uint to uint
+idx = sub ulong h vbase
+if ge idx GPE_MAX_VALS
+ret 0
+end
+if eq get gpe_v_kind idx 2
+ret get gpe_v_sym idx
+end
+ret ir_res ir_op b_hot 1 5 get gpe_v_cval idx 0
+end
+
+fn gpe_pe_blk_idx f uint tgt uint to ulong
+b = get i_fb1 f
+k = ulong 0
+while ne b 0 bound 64
+if eq b tgt
+ret k
+end
+b = get i_bnx b
+k = add k 1
+end
+ret 0
+end
+
+global gpe_ca_k ulong 16
+global gpe_ca_c ulong 16
+global gpe_ca_s uint 16
+
+note Copy abstract value state from src block-arg list to dst block parameters (eliminates br PHI args!).
+fn gpe_pe_copy_bargs vbase ulong br_op uint dst_blk uint to void
+na = ulong get i_ona br_op
+if le na 2
+ret
+end
+nk = sub na 2
+for j ulong nk bound 16
+ai = sub ulong ir_arg br_op uint add j 2 vbase
+put gpe_ca_k j get gpe_v_kind ai
+put gpe_ca_c j get gpe_v_cval ai
+put gpe_ca_s j get gpe_v_sym ai
+end
+bp = get i_vnx get i_bp1 dst_blk
+for j ulong nk bound 16
+if eq bp 0
+break
+end
+bi = sub ulong bp vbase
+put gpe_v_kind bi get gpe_ca_k j
+put gpe_v_cval bi get gpe_ca_c j
+put gpe_v_sym bi get gpe_ca_s j
+bp = get i_vnx bp
+end
+end
+
+note Partially evaluate one select op (fold immediately when condition is known constant -> zero sparse ops!).
+fn gpe_pe_step_select b_hot uint vbase ulong o uint to void
+rs = get i_ors o
+a0 = ir_arg o 0
+a1 = ir_arg o 1
+a2 = ir_arg o 2
+i0 = sub ulong a0 vbase
+if eq get gpe_v_kind i0 1
+put gpe_pe_stat 4 add get gpe_pe_stat 4 1
+src_i = sub ulong a2 vbase
+if ne get gpe_v_cval i0 0
+src_i = sub ulong a1 vbase
+end
+dst_i = sub ulong rs vbase
+put gpe_v_kind dst_i get gpe_v_kind src_i
+put gpe_v_cval dst_i get gpe_v_cval src_i
+put gpe_v_sym dst_i get gpe_v_sym src_i
+ret
+end
+no = ir_op b_hot 2 5 0 3
+ir_set no 0 gpe_pe_materialize b_hot vbase a0
+ir_set no 1 gpe_pe_materialize b_hot vbase a1
+ir_set no 2 gpe_pe_materialize b_hot vbase a2
+gpe_pe_set_s vbase rs ir_res no
+end
+
+fn gpe_pe_emit_res b_hot uint vbase ulong o uint to void
+op = uint get i_oop o
+s0 = gpe_pe_materialize b_hot vbase ir_arg o 0
+s1 = gpe_pe_materialize b_hot vbase ir_arg o 1
+if eq op 46
+s2 = gpe_pe_materialize b_hot vbase ir_arg o 2
+no = ir_op b_hot 46 get i_oty o 0 3
+ir_set no 0 s0
+ir_set no 1 s1
+ir_set no 2 s2
+gpe_pe_set_s vbase get i_ors o ir_res no
+ret
+end
+no = ir_op b_hot op get i_oty o 0 2
+ir_set no 0 s0
+ir_set no 1 s1
+gpe_pe_set_s vbase get i_ors o ir_res no
+end
+
+note Partially evaluate one pure op o from f_src into b_hot.
+fn gpe_pe_step_pure b_hot uint vbase ulong o uint to void
+op = ulong get i_oop o
+rs = get i_ors o
+if eq op 1
+gpe_pe_set_k vbase rs get i_oim o
+ret
+end
+if eq op 2
+gpe_pe_step_select b_hot vbase o
+ret
+end
+i0 = sub ulong ir_arg o 0 vbase
+i1 = sub ulong ir_arg o 1 vbase
+if and eq get gpe_v_kind i0 1 eq get gpe_v_kind i1 1
+if eq op 46
+i2 = sub ulong ir_arg o 2 vbase
+if eq get gpe_v_kind i2 1
+put gpe_pe_stat 4 add get gpe_pe_stat 4 1
+gpe_pe_set_k vbase rs gpe_eval_pure op get gpe_v_cval i0 get gpe_v_cval i1 get gpe_v_cval i2
+ret
+end
+else
+put gpe_pe_stat 4 add get gpe_pe_stat 4 1
+gpe_pe_set_k vbase rs gpe_eval_pure op get gpe_v_cval i0 get gpe_v_cval i1 0
+ret
+end
+end
+gpe_pe_emit_res b_hot vbase o
+end
+
+note Helper: build f_spec with entry guard blocks FIRST, b_hot next, and b_deopt(trap 14) LAST (valid ΩIR entry!).
+fn gpe_build_spec_shell f_src uint to uint
+f_spec = ir_fnew 0 0 get i_frs f_src
+ir_fset_mode f_spec ulong get i_fpur f_src ulong get i_fprc f_src ulong get i_fhd f_src
+ir_fset_phys f_spec get i_ferr f_src get i_fdl f_src get i_fpwr f_src
+vbase = ulong get i_ftk f_src
+p_src = get i_fp1 f_src
+k = ulong 0
+pm = get gpe_pin_mask 0
+while ne p_src 0 bound 8
+p_new = ir_fpar f_spec get i_vty p_src
+if ne and pm shl ulong 1 k 0
+gpe_pe_set_k vbase p_src get gpe_pin_val k
+else
+gpe_pe_set_s vbase p_src p_new
+end
+p_src = get i_vnx p_src
+k = add k 1
+end
+ret f_spec
+end
+
+fn gpe_emit_guard_diff b uint p uint v ulong acc uint to uint
+d = p
+if ne v 0
+ck = ir_res ir_op b 1 5 v 0
+d = gpe_mk_bin b 18 p ck
+end
+if eq acc 0
+ret d
+end
+ret gpe_mk_bin b 17 acc d
+end
+
+fn gpe_emit_guards_ordered f_spec uint to uint
+pm = get gpe_pin_mask 0
+b_ent = ir_blk f_spec
+if eq pm 0
+ret b_ent
+end
+b_deopt = ir_blk f_spec
+td = ir_op b_deopt 65 0 GPE_TRAP_DEOPT 1
+ir_set td 0 ir_btok b_deopt
+b_hot = ir_blk f_spec
+acc = uint 0
+ps = get i_fp1 f_spec
+for k ulong 4
+if eq ps 0
+break
+end
+if ne and pm shl ulong 1 k 0
+acc = gpe_emit_guard_diff b_ent ps get gpe_pin_val k acc
+end
+ps = get i_vnx ps
+end
+c0 = ir_res ir_op b_ent 1 5 0 0
+cond = gpe_mk_cmp b_ent 30 acc c0
+gpe_mk_cbr b_ent ir_ftok f_spec cond b_hot b_deopt
+ret b_hot
+end
+
+global gpe_pe_bhot uint 1
+global gpe_pe_tkhot uint 1
+global gpe_pe_done ulong 1
+global gpe_pe_fail ulong 1
+
+fn gpe_pe_handle_cbr f_spec uint vbase ulong o uint to uint
+ch = ir_arg o 1
+ci = sub ulong ch vbase
+if eq get gpe_v_kind ci 1
+put gpe_pe_stat 2 add get gpe_pe_stat 2 1
+if ne get gpe_v_cval ci 0
+ret ir_arg o 2
+end
+ret ir_arg o 3
+end
+bias = get gpe_cfg_bias 0
+if or ge bias 9000 le bias 1000
+b_deopt = ir_blk f_spec
+td = ir_op b_deopt 65 0 GPE_TRAP_DEOPT 1
+ir_set td 0 ir_btok b_deopt
+b_cont = ir_blk f_spec
+bh = get gpe_pe_bhot 0
+sc = gpe_pe_materialize bh vbase ch
+if ge bias 9000
+gpe_mk_cbr bh get gpe_pe_tkhot 0 sc b_cont b_deopt
+put gpe_pe_bhot 0 b_cont
+put gpe_pe_tkhot 0 ir_btok b_cont
+put gpe_pe_stat 2 add get gpe_pe_stat 2 1
+ret ir_arg o 2
+end
+gpe_mk_cbr bh get gpe_pe_tkhot 0 sc b_deopt b_cont
+put gpe_pe_bhot 0 b_cont
+put gpe_pe_tkhot 0 ir_btok b_cont
+put gpe_pe_stat 2 add get gpe_pe_stat 2 1
+ret ir_arg o 3
+end
+put gpe_pe_fail 0 1
+ret 0
+end
+
+fn gpe_pe_trace_blk f_spec uint vbase ulong blk uint to uint
+o = get i_bo1 blk
+while ne o 0 bound 512
+op = ulong get i_oop o
+if eq op 63
+bh = get gpe_pe_bhot 0
+rv_h = gpe_pe_materialize bh vbase ir_arg o 1
+gpe_mk_retv bh get gpe_pe_tkhot 0 rv_h
+put gpe_pe_stat 11 ulong bh
+put gpe_pe_stat 12 ulong rv_h
+put gpe_pe_done 0 1
+ret 0
+end
+if eq op 65
+tp = ir_op get gpe_pe_bhot 0 65 0 get i_oim o 1
+ir_set tp 0 get gpe_pe_tkhot 0
+put gpe_pe_done 0 1
+ret 0
+end
+if eq op 60
+tgt = ir_arg o 0
+gpe_pe_copy_bargs vbase o tgt
+ret tgt
+end
+if eq op 61
+ret gpe_pe_handle_cbr f_spec vbase o
+end
+gpe_pe_step_pure get gpe_pe_bhot 0 vbase o
+o = get i_onx o
+end
+ret 0
+end
+
+fn gpe_specialize_fn f_src uint to uint
+vbase = ulong get i_ftk f_src
+for i ulong GPE_MAX_VALS
+put gpe_v_kind i 0
+put gpe_v_cval i 0
+put gpe_v_sym i 0
+end
+for b ulong GPE_MAX_BLKS
+put gpe_b_vis b 0
+end
+for s ulong 16
+put gpe_pe_stat s 0
+end
+put gpe_pe_stat 0 ulong get i_fnb f_src
+put gpe_pe_done 0 0
+put gpe_pe_fail 0 0
+
+f_spec = gpe_build_spec_shell f_src
+bh = gpe_emit_guards_ordered f_spec
+tk = ir_btok bh
+if eq tk 0
+tk = ir_ftok f_spec
+end
+put gpe_pe_bhot 0 bh
+put gpe_pe_tkhot 0 tk
+
+blk = get i_fb1 f_src
+for step ulong 128
+if or ne get gpe_pe_done 0 0 or ne get gpe_pe_fail 0 0 eq blk 0
+break
+end
+bidx = gpe_pe_blk_idx f_src blk
+vis = add get gpe_b_vis bidx 1
+if gt vis GPE_MAX_UNROLL
+ret 0
+end
+put gpe_b_vis bidx vis
+if gt vis 1
+put gpe_pe_stat 3 add get gpe_pe_stat 3 1
+end
+blk = gpe_pe_trace_blk f_spec vbase blk
+end
+
+if or eq get gpe_pe_done 0 0 ne get gpe_pe_fail 0 0
+ret 0
+end
+put gpe_pe_stat 1 ulong get i_fnb f_spec
+ret f_spec
+end
+
+note Materialize winning e-graph node `nid` recursively into target ΩIR block `b_dst` (depth-bounded).
+fn gpe_eg_find_ssa_val sid ulong to uint
+n = get eg3_ir_vn 0
+for i ulong n bound 256
+nod = get eg3_ir_nod i
+if eq get eg3_op nod EG3_OP_SSA
+if eq get eg3_vlo nod sid
+ret get eg3_ir_val i
+end
+end
+end
+ret 0
+end
+
+fn gpe_eg_map_ssa sid ulong f_spec uint f_opt uint to uint
+orig_v = gpe_eg_find_ssa_val sid
+p_s = get i_fp1 f_spec
+p_o = get i_fp1 f_opt
+while ne p_s 0 bound 8
+if eq p_s orig_v
+ret p_o
+end
+p_s = get i_vnx p_s
+p_o = get i_vnx p_o
+end
+ret 0
+end
+
+fn gpe_eg_op_to_ir op ulong to uint
+if eq op EG3_OP_SUB
+ret 11
+end
+if eq op EG3_OP_MUL
+ret 12
+end
+if eq op EG3_OP_SHL
+ret 20
+end
+if eq op EG3_OP_SHR
+ret 21
+end
+if eq op EG3_OP_AND
+ret 16
+end
+if eq op EG3_OP_OR
+ret 17
+end
+if eq op EG3_OP_XOR
+ret 18
+end
+ret 10
+end
+
+fn gpe_eg_materialize b_dst uint nid ulong f_spec uint f_opt uint depth ulong to uint
+if gt depth 32
+ret 0
+end
+b = eg3_get_best nid
+if eq get gpe_eg_mat_ok b 1
+ret get gpe_eg_mat b
+end
+op = get eg3_op b
+if eq op EG3_OP_CONST
+vh = ir_res ir_op b_dst 1 5 eg3_node_val b 0
+put gpe_eg_mat b vh
+put gpe_eg_mat_ok b 1
+ret vh
+end
+if eq op EG3_OP_SSA
+vh = gpe_eg_map_ssa get eg3_vlo b f_spec f_opt
+if ne vh 0
+put gpe_eg_mat b vh
+put gpe_eg_mat_ok b 1
+end
+ret vh
+end
+va = gpe_eg_materialize b_dst get eg3_a b f_spec f_opt add depth 1
+vb = gpe_eg_materialize b_dst get eg3_b b f_spec f_opt add depth 1
+if or eq va 0 eq vb 0
+ret 0
+end
+if eq op EG3_OP_FMA
+vc = gpe_eg_materialize b_dst get eg3_c b f_spec f_opt add depth 1
+if eq vc 0
+ret 0
+end
+nf = ir_op b_dst 46 5 0 3
+ir_set nf 0 va
+ir_set nf 1 vb
+ir_set nf 2 vc
+vh = ir_res nf
+put gpe_eg_mat b vh
+put gpe_eg_mat_ok b 1
+ret vh
+end
+vh = gpe_mk_bin b_dst gpe_eg_op_to_ir op va vb
+put gpe_eg_mat b vh
+put gpe_eg_mat_ok b 1
+ret vh
+end
+
+fn gpe_eg_copy_and_verify to ulong
+nb = get eg3_bpos 0
+put gpe_pe_stat 14 nb
+put gpe_egp3_len 0 nb
+for i ulong nb bound 131072
+b = get eg3_buf i
+put gpe_egp3_buf i b
+put vc3_buf i b
+end
+vrc = vc3_verify nb
+put gpe_pe_stat 7 vrc
+put gpe_pe_stat 8 get vc3_stat 0
+put gpe_pe_stat 9 get vc3_stat 1
+put gpe_pe_stat 10 get vc3_stat 2
+ret vrc
+end
+
+note Feed specialized ΩIR block through live ir_egraph.om -> emit live EGP3 cert -> verify via zero-shared-code egp3_checker.om!
+note If verified and strictly lower cost, materializes optimal post-egraph ΩIR function f_opt!
+fn gpe_prove_and_optimize f_spec uint target_tid ulong to uint
+b_hot = uint get gpe_pe_stat 11
+if eq b_hot 0
+ret 0
+end
+eg3_cert_init
+eg3_set_target_costs tdGet target_tid TDF_EXEC tdGet target_tid TDF_MULLAT tdGet target_tid TDF_DIVLAT tdGet target_tid TDF_FEAT
+delta = eg3_opt_ir_block 0 0 b_hot 64 true
+put gpe_pe_stat 5 get eg3_ir_stat 5
+put gpe_pe_stat 6 get eg3_ir_stat 6
+if or ne gpe_eg_copy_and_verify 0 eq get vc3_stat 0 0
+ret 0
+end
+
+f_opt = ir_fnew 0 0 get i_frs f_spec
+ir_fset_mode f_opt ulong get i_fpur f_spec ulong get i_fprc f_spec ulong get i_fhd f_spec
+ir_fset_phys f_opt get i_ferr f_spec get i_fdl f_spec get i_fpwr f_spec
+p_s = get i_fp1 f_spec
+while ne p_s 0 bound 8
+ign = ir_fpar f_opt get i_vty p_s
+p_s = get i_vnx p_s
+end
+b_opt = gpe_emit_guards_ordered f_opt
+tk_opt = ir_btok b_opt
+if eq tk_opt 0
+tk_opt = ir_ftok f_opt
+end
+for j ulong 512
+put gpe_eg_mat j 0
+put gpe_eg_mat_ok j 0
+end
+res_v = gpe_eg_materialize b_opt get eg3_ir_stat 8 f_spec f_opt 0
+if eq res_v 0
+ret 0
+end
+gpe_mk_retv b_opt tk_opt res_v
+put gpe_pe_stat 13 ulong f_opt
+ret f_opt
+end
+
+note ==== Part 5: Real Native AArch64 Machine-Code Compiler from Multi-Block ΩIR ====
+note Emits real Arm ARM DDI 0487 AArch64 instructions into isBuf[0..1024) using isel.om (isEmitOp TID_X925),
+note wrapped into a strict W^X static Linux AArch64 ELF64 (PT_LOAD PF_R|PF_X=5) via elfEmitStatic!
+note Runtime ABI of emitted ELF:
+note   stdin:  40 bytes = 5 x u64 LE (a0, a1, a2, a3, repeat_count)
+note   stdout:  8 bytes = 1 x u64 LE return value
+note   exit:    0 on normal return, 100+code (114 for OOD trap 14) on trap!
+
+fn gpe_a6_emitw w ulong to void
+if gt add get isLen 0 4 1020
+put gpe_a6_ovf 0 1
+ret
+end
+isEmitU32 w
+put gpe_a6_insns 0 add get gpe_a6_insns 0 1
+end
+
+fn gpe_a6_patch_u32 off ulong w ulong to void
+put isBuf off uchar and w 255
+put isBuf add off 1 uchar and shr w 8 255
+put isBuf add off 2 uchar and shr w 16 255
+put isBuf add off 3 uchar and shr w 24 255
+end
+
+fn gpe_a6_movz rd ulong imm16 ulong hw ulong to void
+w = or 0xd2800000 or shl hw 21 or shl and imm16 65535 5 rd
+gpe_a6_emitw w
+end
+
+fn gpe_a6_movk rd ulong imm16 ulong hw ulong to void
+w = or 0xf2800000 or shl hw 21 or shl and imm16 65535 5 rd
+gpe_a6_emitw w
+end
+
+fn gpe_a6_mov_imm rd ulong val ulong to void
+gpe_a6_movz rd and val 65535 0
+v1 = and shr val 16 65535
+if ne v1 0
+gpe_a6_movk rd v1 1
+end
+v2 = and shr val 32 65535
+if ne v2 0
+gpe_a6_movk rd v2 2
+end
+v3 = and shr val 48 65535
+if ne v3 0
+gpe_a6_movk rd v3 3
+end
+end
+
+fn gpe_a6_mov_reg rd ulong rm ulong to void
+if eq rd rm
+ret
+end
+gpe_a6_emitw or 0xaa0003e0 or shl rm 16 rd
+end
+
+fn gpe_a6_ldr_sp rt ulong idx8 ulong to void
+gpe_a6_emitw or 0xf94003e0 or shl idx8 10 rt
+end
+
+fn gpe_a6_str_sp rt ulong idx8 ulong to void
+gpe_a6_emitw or 0xf90003e0 or shl idx8 10 rt
+end
+
+fn gpe_a6_vreg h uint to ulong
+for k ulong 4
+if eq h get gpe_a6_p_h k
+ret add 19 k
+end
+end
+idx = sub ulong h get gpe_a6_vbase 0
+sl = get gpe_a6_vslot idx
+if eq sl 0
+sl = get gpe_a6_vnext 0
+put gpe_a6_vslot idx sl
+put gpe_a6_vnext 0 add sl 1
+end
+if le sl 10
+ret add 8 sl
+end
+ret 99
+end
+
+fn gpe_a6_vstack_idx h uint to ulong
+idx = sub ulong h get gpe_a6_vbase 0
+sl = get gpe_a6_vslot idx
+ret add 12 sub sl 11
+end
+
+fn gpe_a6_load_to dst_r ulong h uint to ulong
+r = gpe_a6_vreg h
+if lt r 32
+ret r
+end
+gpe_a6_ldr_sp dst_r gpe_a6_vstack_idx h
+ret dst_r
+end
+
+fn gpe_a6_store_from h uint src_r ulong to void
+r = gpe_a6_vreg h
+if lt r 32
+gpe_a6_mov_reg r src_r
+ret
+end
+gpe_a6_str_sp src_r gpe_a6_vstack_idx h
+end
+
+fn gpe_a6_add_fix tgt uint kind ulong reg ulong to void
+n = get gpe_a6_nfix 0
+if lt n GPE_MAX_FIX
+put gpe_a6_fpc n get isLen 0
+put gpe_a6_ftgt n tgt
+put gpe_a6_fkind n kind
+put gpe_a6_freg n reg
+put gpe_a6_nfix 0 add n 1
+end
+gpe_a6_emitw 0xd503201f
+end
+
+fn gpe_a6_cmp_cond op ulong to ulong
+if eq op 30
+ret 0
+end
+if eq op 31
+ret 1
+end
+if eq op 32
+ret 3
+end
+if eq op 33
+ret 9
+end
+if eq op 34
+ret 8
+end
+ret 2
+end
+
+fn gpe_a6_emit_br o uint to void
+tgt = ir_arg o 0
+na = ulong get i_ona o
+if gt na 2
+nk = sub na 2
+for j ulong nk bound 8
+rv = gpe_a6_load_to 0 ir_arg o uint add j 2
+gpe_a6_str_sp rv add 6 j
+end
+bp = get i_vnx get i_bp1 tgt
+for j ulong nk bound 8
+if eq bp 0
+break
+end
+gpe_a6_ldr_sp 0 add 6 j
+gpe_a6_store_from bp 0
+bp = get i_vnx bp
+end
+end
+gpe_a6_add_fix tgt 0 0
+end
+
+fn gpe_a6_emit_pure o uint op ulong to void
+rs = get i_ors o
+ra = gpe_a6_load_to 0 ir_arg o 0
+rb = gpe_a6_load_to 1 ir_arg o 1
+rd = gpe_a6_vreg rs
+tr = rd
+if ge tr 32
+tr = ulong 0
+end
+if or eq op 10 or eq op 11 eq op 12
+oir = OIR_ADD
+if eq op 11
+oir = OIR_SUB
+end
+if eq op 12
+oir = OIR_MUL
+end
+ok = isEmitOp TID_X925 oir tr ra rb
+put gpe_a6_insns 0 add get gpe_a6_insns 0 1
+if ge rd 32
+gpe_a6_store_from rs tr
+end
+ret
+end
+if eq op 16
+gpe_a6_emitw or 0x8a000000 or shl rb 16 or shl ra 5 tr
+end
+if eq op 17
+gpe_a6_emitw or 0xaa000000 or shl rb 16 or shl ra 5 tr
+end
+if eq op 18
+gpe_a6_emitw or 0xca000000 or shl rb 16 or shl ra 5 tr
+end
+if eq op 20
+gpe_a6_emitw or 0x9ac02000 or shl rb 16 or shl ra 5 tr
+end
+if eq op 21
+gpe_a6_emitw or 0x9ac02400 or shl rb 16 or shl ra 5 tr
+end
+if eq op 46
+rc = gpe_a6_load_to 2 ir_arg o 2
+gpe_a6_emitw or 0x9b000000 or shl rb 16 or shl rc 10 or shl ra 5 tr
+end
+if eq op 2
+rc = gpe_a6_load_to 2 ir_arg o 2
+gpe_a6_emitw or 0xf100001f shl ra 5
+gpe_a6_emitw or 0x9a801000 or shl rc 16 or shl rb 5 tr
+end
+if and ge op 30 le op 35
+gpe_a6_emitw or 0xeb00001f or shl rb 16 shl ra 5
+gpe_a6_emitw or 0x9a9f07e0 or shl xor gpe_a6_cmp_cond op 1 12 tr
+end
+if ge rd 32
+gpe_a6_store_from rs tr
+end
+end
+
+fn gpe_a6_emit_op o uint to void
+op = ulong get i_oop o
+if eq op 1
+rs = get i_ors o
+rd = gpe_a6_vreg rs
+if lt rd 32
+gpe_a6_mov_imm rd get i_oim o
+else
+gpe_a6_mov_imm 0 get i_oim o
+gpe_a6_store_from rs 0
+end
+ret
+end
+if eq op 63
+rv = gpe_a6_load_to 0 ir_arg o 1
+gpe_a6_mov_reg 25 rv
+gpe_a6_add_fix 0 2 0
+ret
+end
+if eq op 65
+gpe_a6_movz 0 add 100 get i_oim o 0
+gpe_a6_movz 8 93 0
+gpe_a6_emitw 0xd4000001
+ret
+end
+if eq op 61
+rc = gpe_a6_load_to 0 ir_arg o 1
+gpe_a6_add_fix ir_arg o 2 1 rc
+gpe_a6_add_fix ir_arg o 3 0 0
+ret
+end
+if eq op 60
+gpe_a6_emit_br o
+ret
+end
+gpe_a6_emit_pure o op
+end
+
+fn gpe_a6_find_boff tgt uint to ulong
+n = get gpe_a6_nblk 0
+for i ulong n bound 64
+if eq get gpe_a6_blks i tgt
+ret get gpe_a6_boff i
+end
+end
+ret 0
+end
+
+fn gpe_a6_emit_prologue to void
+gpe_a6_emitw 0xd11003ff
+gpe_a6_movz 0 0 0
+gpe_a6_emitw 0x910003e1
+gpe_a6_movz 2 40 0
+gpe_a6_movz 8 63 0
+gpe_a6_emitw 0xd4000001
+gpe_a6_ldr_sp 19 0
+gpe_a6_ldr_sp 20 1
+gpe_a6_ldr_sp 21 2
+gpe_a6_ldr_sp 22 3
+gpe_a6_ldr_sp 23 4
+put gpe_a6_top_pc 0 get isLen 0
+end
+
+fn gpe_a6_sbits d long bits ulong to ulong
+mod = shl ulong 1 bits
+mask = sub mod 1
+if ge d 0
+ret and ulong d mask
+end
+mag = and ulong neg d mask
+ret and sub mod mag mask
+end
+
+fn gpe_a6_emit_epilogue to ulong
+epi_pc = get isLen 0
+put gpe_a6_epi_pc 0 epi_pc
+gpe_a6_emitw 0xf10006f7
+back_d = div sub long get gpe_a6_top_pc 0 long get isLen 0 4
+gpe_a6_emitw or 0x54000008 shl gpe_a6_sbits back_d 19 5
+gpe_a6_str_sp 25 0
+gpe_a6_movz 0 1 0
+gpe_a6_emitw 0x910003e1
+gpe_a6_movz 2 8 0
+gpe_a6_movz 8 64 0
+gpe_a6_emitw 0xd4000001
+gpe_a6_movz 0 0 0
+gpe_a6_movz 8 93 0
+gpe_a6_emitw 0xd4000001
+ret epi_pc
+end
+
+fn gpe_a6_patch_one i ulong epi_pc ulong to void
+fpc = get gpe_a6_fpc i
+fk = get gpe_a6_fkind i
+tpc = epi_pc
+if ne fk 2
+tpc = gpe_a6_find_boff get gpe_a6_ftgt i
+end
+disp = div sub long tpc long fpc 4
+if eq fk 1
+im = shl gpe_a6_sbits disp 19 5
+w = or 0xb5000000 or im get gpe_a6_freg i
+gpe_a6_patch_u32 fpc w
+else
+w = or 0x14000000 gpe_a6_sbits disp 26
+gpe_a6_patch_u32 fpc w
+end
+end
+
+fn gpe_a6_patch_fixups epi_pc ulong to void
+nf = get gpe_a6_nfix 0
+for i ulong nf bound 128
+gpe_a6_patch_one i epi_pc
+end
+end
+
+note Compile multi-block ΩIR function f directly to a static AArch64 ELF64 executable in elfBuf[0..elfLen).
+note Returns total ELF byte length (0 on overflow/error); sets gpe_a6_insns to exact emitted AArch64 instruction count.
+fn gpe_compile_a64_elf f uint to ulong
+isBufReset
+put gpe_a6_vbase 0 ulong get i_ftk f
+put gpe_a6_vnext 0 1
+put gpe_a6_nblk 0 0
+put gpe_a6_nfix 0 0
+put gpe_a6_insns 0 0
+put gpe_a6_ovf 0 0
+for i ulong GPE_MAX_VALS
+put gpe_a6_vslot i 0
+end
+for p ulong 4
+put gpe_a6_p_h p 0
+end
+ph = get i_fp1 f
+pk = ulong 0
+while ne ph 0 bound 4
+put gpe_a6_p_h pk ph
+ph = get i_vnx ph
+pk = add pk 1
+end
+gpe_a6_emit_prologue
+b = get i_fb1 f
+while ne b 0 bound 64
+nb = get gpe_a6_nblk 0
+put gpe_a6_blks nb b
+put gpe_a6_boff nb get isLen 0
+put gpe_a6_nblk 0 add nb 1
+o = get i_bo1 b
+while ne o 0 bound 256
+gpe_a6_emit_op o
+o = get i_onx o
+end
+b = get i_bnx b
+end
+epi_pc = gpe_a6_emit_epilogue
+gpe_a6_patch_fixups epi_pc
+if ne get gpe_a6_ovf 0 0
+ret 0
+end
+ret elfEmitStatic TID_X925
+end
+
+note ==== Part 6: Strict W^X (RW -> SHA-256 -> RX) Staging, Sealing & Native Execution ====
+
+fn wx_init to void
+put wx_rwx_refusals 0 0
+put wx_sha_refusals 0 0
+put wx_mode_refusals 0 0
+put wx_seals_ok 0 0
+put wx_last_exit 0 0
+put wx_last_ns 0 0
+put wx_last_out 0 0
+n = len wx_t_def_dir
+for i ulong n bound 512
+put wx_dir i get wx_t_def_dir i
+end
+put wx_dir_len 0 n
+end
+
+fn wx_set_dir d view uchar * to void
+n = len d
+if gt n 440
+n = ulong 440
+end
+for i ulong n bound 440
+put wx_dir i get d i
+end
+put wx_dir_len 0 n
+r = makedir wx_dir 0 n 448
+end
+
+fn wx_set_dir_buf n ulong to void
+if gt n 440
+n = ulong 440
+end
+put wx_dir_len 0 n
+r = makedir wx_dir 0 n 448
+end
+
+note Strict W^X policy gate: REFUSE ANY protection mask with BOTH PROT_WRITE(2) and PROT_EXEC(4) set!
+fn wx_validate_prot prot ulong to ulong
+if eq and prot 6 6
+put wx_rwx_refusals 0 add get wx_rwx_refusals 0 1
+ret WX_ERR_RWX_FORBIDDEN
+end
+ret WX_OK
+end
+
+note Inspect ELF64 header & PT_LOAD program header: MUST be EM_AARCH64=183 and PT_LOAD PF_R|PF_X (5), NEVER PF_W|PF_X!
+fn wx_verify_elf_wx n ulong to ulong
+if lt n 136
+ret WX_ERR_ELF_BAD
+end
+if or ne get elfBuf 0 127 or ne get elfBuf 1 69 or ne get elfBuf 2 76 ne get elfBuf 3 70
+ret WX_ERR_ELF_BAD
+end
+if ne get elfBuf 18 183
+ret WX_ERR_ELF_BAD
+end
+if ne get elfBuf 64 1
+ret WX_ERR_ELF_BAD
+end
+pf = ulong get elfBuf 68
+note ELF p_flags: PF_X=1, PF_W=2, PF_R=4 -> PF_W|PF_X (3) is RWX and strictly FORBIDDEN!
+if eq and pf 3 3
+put wx_rwx_refusals 0 add get wx_rwx_refusals 0 1
+ret WX_ERR_RWX_FORBIDDEN
+end
+if ne pf 5
+ret WX_ERR_NOT_RX
+end
+ret WX_OK
+end
+
+fn wx_p_append dst ulong s view uchar * to void
+n = len s
+if eq dst 0
+p = get wx_p_stagel 0
+for i ulong n bound 64
+put wx_p_stage add p i get s i
+end
+put wx_p_stagel 0 add p n
+else
+p = get wx_p_rxl 0
+for i ulong n bound 64
+put wx_p_rx add p i get s i
+end
+put wx_p_rxl 0 add p n
+end
+end
+
+fn wx_p_append_u64 dst ulong v ulong to void
+tmp = new uchar 24 0
+idx = ulong 24
+x = v
+for i ulong 21
+idx = sub idx 1
+put tmp idx uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+if eq dst 0
+p = get wx_p_stagel 0
+while lt idx 24 bound 24
+put wx_p_stage p get tmp idx
+p = add p 1
+idx = add idx 1
+end
+put wx_p_stagel 0 p
+else
+p = get wx_p_rxl 0
+while lt idx 24 bound 24
+put wx_p_rx p get tmp idx
+p = add p 1
+idx = add idx 1
+end
+put wx_p_rxl 0 p
+end
+end
+
+fn wx_build_paths slot ulong ver ulong to void
+dn = get wx_dir_len 0
+for i ulong dn bound 512
+b = get wx_dir i
+put wx_p_stage i b
+put wx_p_rx i b
+end
+put wx_p_stagel 0 dn
+put wx_p_rxl 0 dn
+wx_p_append 0 wx_t_sl
+wx_p_append_u64 0 slot
+wx_p_append 0 wx_t_v
+wx_p_append_u64 0 ver
+wx_p_append 0 wx_t_stg
+wx_p_append 1 wx_t_sl
+wx_p_append_u64 1 slot
+wx_p_append 1 wx_t_v
+wx_p_append_u64 1 ver
+wx_p_append 1 wx_t_rx
+end
+
+note Check Linux AArch64 stat st_mode (offset 16) on global wx_p_rx[0..plen): MUST have X (0100=64) and ZERO W bits (0222=146)!
+fn wx_check_stat_rx_buf plen ulong to ulong
+r = stat wx_p_rx 0 plen wx_stat_buf 0 128
+if ne r 0
+ret WX_ERR_IO
+end
+m = ulong get wx_stat_buf 16
+m = or m shl ulong get wx_stat_buf 17 8
+if ne and m 146 0
+put wx_mode_refusals 0 add get wx_mode_refusals 0 1
+ret WX_ERR_MODE_WRITABLE
+end
+if eq and m 64 0
+ret WX_ERR_NOT_RX
+end
+ret WX_OK
+end
+
+fn wx_write_and_verify_stage elen ulong to ulong
+for i ulong elen bound 4096
+put sh_dat i get elfBuf i
+end
+sh_all elen
+for j ulong 32
+put wx_sha_exp j get sh_dig j
+end
+z = unlink wx_p_stage 0 get wx_p_stagel 0
+fd = fopen wx_p_stage 0 get wx_p_stagel 0 578 384
+if lt fd 0
+ret WX_ERR_IO
+end
+if ne write int fd elfBuf 0 elen long elen
+z = fclose int fd
+z = unlink wx_p_stage 0 get wx_p_stagel 0
+ret WX_ERR_IO
+end
+if lt fseek int fd 0 0 0
+z = fclose int fd
+ret WX_ERR_IO
+end
+if ne read int fd wx_rb_buf 0 elen long elen
+z = fclose int fd
+ret WX_ERR_IO
+end
+for i ulong elen bound 4096
+put sh_dat i get wx_rb_buf i
+end
+sh_all elen
+for j ulong 32
+if ne get sh_dig j get wx_sha_exp j
+put wx_sha_refusals 0 add get wx_sha_refusals 0 1
+z = fclose int fd
+z = unlink wx_p_stage 0 get wx_p_stagel 0
+ret WX_ERR_SHA_MISMATCH
+end
+end
+cm = fchmod int fd 320
+z = fsync int fd
+z = fclose int fd
+if ne cm 0
+z = unlink wx_p_stage 0 get wx_p_stagel 0
+ret WX_ERR_IO
+end
+ret WX_OK
+end
+
+fn wx_seal_rename to ulong
+sl = get wx_p_stagel 0
+rl = get wx_p_rxl 0
+z = unlink wx_p_rx 0 rl
+put wx_ren_pkt 0 2
+put wx_ren_pkt 1 0
+put wx_ren_pkt 2 uchar and sl 255
+put wx_ren_pkt 3 uchar shr sl 8
+for i ulong sl bound 1024
+put wx_ren_pkt add 4 i get wx_p_stage i
+end
+off = add 4 sl
+put wx_ren_pkt off uchar and rl 255
+put wx_ren_pkt add off 1 uchar shr rl 8
+off = add off 2
+for i ulong rl bound 1024
+put wx_ren_pkt add off i get wx_p_rx i
+end
+if ne renames wx_ren_pkt 0 add off rl 0 0
+z = unlink wx_p_stage 0 sl
+ret WX_ERR_IO
+end
+rc = wx_check_stat_rx_buf rl
+if ne rc WX_OK
+z = unlink wx_p_rx 0 rl
+ret rc
+end
+ret WX_OK
+end
+
+note 3-Phase Strict W^X Staging & Seal:
+note   1. Validate req_prot (refuse RWX) + ELF PT_LOAD PF_R|PF_X
+note   2. Write RW-only staging file (mode 0600), read back, verify FIPS 180-4 SHA-256
+note   3. fchmod(0500 = r-x, zero write bits!), fsync, atomic renames -> .rx, stat-verify W^X!
+fn wx_stage_and_seal slot ulong ver ulong req_prot ulong to ulong
+rc = wx_validate_prot req_prot
+if ne rc WX_OK
+ret rc
+end
+if ne req_prot WX_PROT_RX
+ret WX_ERR_NOT_RX
+end
+elen = get elfLen 0
+rc = wx_verify_elf_wx elen
+if ne rc WX_OK
+ret rc
+end
+z = makedir wx_dir 0 get wx_dir_len 0 448
+wx_build_paths slot ver
+rc = wx_write_and_verify_stage elen
+if ne rc WX_OK
+ret rc
+end
+rc = wx_seal_rename
+if ne rc WX_OK
+ret rc
+end
+put wx_seals_ok 0 add get wx_seals_ok 0 1
+ret WX_OK
+end
+
+fn wx_put_u64_in off ulong v ulong to void
+for j ulong 8
+put wx_io_in add off j uchar and shr v mul j 8 255
+end
+end
+
+fn wx_get_u64_out to ulong
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get wx_io_out j mul j 8
+end
+ret v
+end
+
+fn wx_rd_fd32 which ulong off ulong to int
+b0 = ulong 0
+b1 = ulong 0
+b2 = ulong 0
+b3 = ulong 0
+if eq which 0
+b0 = ulong get wx_p_in off
+b1 = shl ulong get wx_p_in add off 1 8
+b2 = shl ulong get wx_p_in add off 2 16
+b3 = shl ulong get wx_p_in add off 3 24
+else
+b0 = ulong get wx_p_out off
+b1 = shl ulong get wx_p_out add off 1 8
+b2 = shl ulong get wx_p_out add off 2 16
+b3 = shl ulong get wx_p_out add off 3 24
+end
+ret int or or b0 b1 or b2 b3
+end
+
+fn wx_set_args a0 ulong a1 ulong a2 ulong a3 ulong reps ulong to void
+put wx_args 0 a0
+put wx_args 1 a1
+put wx_args 2 a2
+put wx_args 3 a3
+put wx_args 4 reps
+end
+
+fn wx_pack_io_in to void
+wx_put_u64_in 0 get wx_args 0
+wx_put_u64_in 8 get wx_args 1
+wx_put_u64_in 16 get wx_args 2
+wx_put_u64_in 24 get wx_args 3
+wx_put_u64_in 32 get wx_args 4
+end
+
+fn wx_exec_collect pid long out_rd int t0 long to ulong
+for j ulong 8
+put wx_io_out j 0
+end
+tot = ulong 0
+while lt tot 8 bound 16
+rn = read out_rd wx_io_out tot sub 8 tot
+if le rn 0
+break
+end
+tot = add tot ulong rn
+end
+z = fclose out_rd
+z = waitpid int pid wx_wait_st 0 4 0
+t1 = monons
+if ge t1 t0
+put wx_last_ns 0 ulong sub t1 t0
+end
+if ne get wx_wait_st 0 0
+put wx_last_exit 0 add 128 ulong get wx_wait_st 0
+ret 0
+end
+put wx_last_exit 0 ulong get wx_wait_st 1
+if eq tot 8
+res = wx_get_u64_out
+put wx_last_out 0 res
+ret res
+end
+ret 0
+end
+
+note Execute sealed RX AArch64 ELF binary at global wx_p_rx[0..plen) with staged wx_args[0..4].
+note Enforces stat W^X re-check before exec; measures native duration via monons.
+fn wx_exec_sealed plen ulong to ulong
+put wx_last_exit 0 255
+put wx_last_ns 0 0
+put wx_last_out 0 0
+if ne wx_check_stat_rx_buf plen WX_OK
+ret 0
+end
+if ne pipefds wx_p_in 0 8 0 0
+ret 0
+end
+if ne pipefds wx_p_out 0 8 0 0
+z = fclose wx_rd_fd32 0 0
+z = fclose wx_rd_fd32 0 4
+ret 0
+end
+in_rd = wx_rd_fd32 0 0
+in_wr = wx_rd_fd32 0 4
+out_rd = wx_rd_fd32 1 0
+out_wr = wx_rd_fd32 1 4
+wx_pack_io_in
+z = write in_wr wx_io_in 0 40
+z = fclose in_wr
+put wx_av_pkt 0 1
+put wx_av_pkt 1 0
+put wx_av_pkt 2 uchar and plen 255
+put wx_av_pkt 3 uchar shr plen 8
+for i ulong plen bound 1024
+put wx_av_pkt add 4 i get wx_p_rx i
+end
+t0 = monons
+pid = fork
+if lt pid 0
+z = fclose in_rd
+z = fclose out_rd
+z = fclose out_wr
+ret 0
+end
+if eq pid 0
+z = dupfd in_rd 0 0
+z = dupfd out_wr 1 0
+z = fclose in_rd
+z = fclose out_rd
+z = fclose out_wr
+z = execprog wx_av_pkt 0 add 4 plen
+exit 127
+end
+z = fclose in_rd
+z = fclose out_wr
+ret wx_exec_collect pid out_rd t0
+end
+
+note ==== Part 7: 3-Bit Proof Gate + Monk/Immune + Cooperative fabWtbl Hot-Swap + OOD Rollback ====
+
+fn mb_init to void
+tdInitAll
+isInitRules
+tdCacheInit
+fabInit
+crInit
+as_init
+pr_init
+wx_init
+put mb_worker_cpu 0 0
+put mb_swaps 0 0
+put mb_refusals 0 0
+put mb_rollbacks 0 0
+put mb_spec_hits 0 0
+put mb_base_hits 0 0
+put mb_alarms 0 0
+put mb_last_disp 0 MB_DISP_BASELINE
+put mb_last_err 0 MB_OK
+put mb_alarm_cnt 0 0
+put mb_mut_flag 0 0
+for s ulong MB_MAX_SLOTS
+put mb_slot_valid s 0
+put mb_slot_sem s 0
+put mb_slot_fbase s 0
+put mb_slot_fspec s 0
+put mb_slot_base_insns s 0
+put mb_slot_spec_insns s 0
+put mb_slot_base_ops s 0
+put mb_slot_spec_ops s 0
+put mb_slot_base_ptr s 0
+put mb_slot_spec_ptr s 0
+put mb_slot_base_tid s 0
+put mb_slot_spec_tid s 0
+put mb_slot_base_slab s 0
+put mb_slot_alarm_slab s 0
+put mb_slot_base_plen s 0
+put mb_slot_spec_plen s 0
+put mb_slot_pin_mask s 0
+put mb_slot_pin_v0 s 0
+put mb_slot_pin_v1 s 0
+put mb_slot_pin_v2 s 0
+put mb_slot_pin_v3 s 0
+put mb_slot_wk s 0
+end
+end
+
+fn mb_log_alarm slot ulong code ulong x0 ulong x1 ulong to void
+put mb_alarms 0 add get mb_alarms 0 1
+idx = get mb_alarm_cnt 0
+if lt idx 32
+put mb_alarm_slot idx slot
+put mb_alarm_code idx code
+put mb_alarm_x0 idx x0
+put mb_alarm_x1 idx x1
+put mb_alarm_cnt 0 add idx 1
+end
+end
+
+fn mb_save_path is_spec bool slot ulong to void
+base = mul slot 512
+rl = get wx_p_rxl 0
+if gt rl 511
+rl = ulong 511
+end
+for i ulong rl bound 512
+if is_spec
+put mb_slot_spec_path add base i get wx_p_rx i
+else
+put mb_slot_base_path add base i get wx_p_rx i
+end
+end
+if is_spec
+put mb_slot_spec_plen slot rl
+else
+put mb_slot_base_plen slot rl
+end
+end
+
+fn mb_exec_slot_bin is_spec bool slot ulong to ulong
+base = mul slot 512
+pl = get mb_slot_base_plen slot
+if is_spec
+pl = get mb_slot_spec_plen slot
+end
+for i ulong pl bound 512
+if is_spec
+put wx_p_rx i get mb_slot_spec_path add base i
+else
+put wx_p_rx i get mb_slot_base_path add base i
+end
+end
+put wx_p_rxl 0 pl
+ret wx_exec_sealed pl
+end
+
+note Register an immutable verified baseline ΩIR function into fabWtbl[slot] + SLAB_IMMUTABLE + SLAB_MUTABLE_ALARMED!
+fn mb_register_slot slot ulong sem_id ulong f_base uint wk ulong to ulong
+if ge slot MB_MAX_SLOTS
+ret MB_ERR_SLOT
+end
+elen = gpe_compile_a64_elf f_base
+if eq elen 0
+ret MB_ERR_PE
+end
+insns = get gpe_a6_insns 0
+rc = wx_stage_and_seal slot 1 WX_PROT_RX
+if ne rc WX_OK
+ret MB_ERR_WX_RWX
+end
+mb_save_path false slot
+b_ptr = add 0x100000 mul slot 0x10000
+if not fabHotSwap slot sem_id b_ptr TID_X925 FAB_MODE_CPU_NATIVE MB_PROOF_ALL
+ret MB_ERR_SWAP
+end
+cpufence
+s_imm = mul slot 2
+s_alm = add s_imm 1
+crRegSlab s_imm SLAB_IMMUTABLE 0 TID_X925
+crRegSlab s_alm SLAB_MUTABLE_ALARMED 100 TID_X925
+put mb_slot_valid slot 1
+put mb_slot_sem slot sem_id
+put mb_slot_fbase slot f_base
+put mb_slot_fspec slot 0
+put mb_slot_base_insns slot insns
+put mb_slot_spec_insns slot 0
+put mb_slot_base_ptr slot b_ptr
+put mb_slot_spec_ptr slot 0
+put mb_slot_base_tid slot TID_X925
+put mb_slot_spec_tid slot TID_X925
+put mb_slot_base_slab slot s_imm
+put mb_slot_alarm_slab slot s_alm
+put mb_slot_wk slot wk
+ret MB_OK
+end
+
+fn mb_check_a64_words to bool
+if ne wx_verify_elf_wx get elfLen 0 WX_OK
+ret false
+end
+clen = get isLen 0
+if or lt clen 16 ne rem clen 4 0
+ret false
+end
+has_svc = false
+nins = div clen 4
+for i ulong nins bound 256
+off = mul i 4
+w = ulong get isBuf off
+w = or w shl ulong get isBuf add off 1 8
+w = or w shl ulong get isBuf add off 2 16
+w = or w shl ulong get isBuf add off 3 24
+if eq w 0
+ret false
+end
+if eq w 0xd4000001
+has_svc = true
+end
+end
+ret has_svc
+end
+
+fn mb_verify_monk_immune_cpu f_base uint f_opt uint slot ulong to bool
+if not mb_check_a64_words
+ret false
+end
+pm = get gpe_pin_mask 0
+for t ulong 3
+x0 = add 5 mul t 17
+x1 = add 3 mul t 11
+x2 = add 7 mul t 13
+x3 = add 2 mul t 5
+if ne and pm 1 0
+x0 = get gpe_pin_val 0
+end
+if ne and pm 2 0
+x1 = get gpe_pin_val 1
+end
+if ne and pm 4 0
+x2 = get gpe_pin_val 2
+end
+if ne and pm 8 0
+x3 = get gpe_pin_val 3
+end
+yb = gpe_eval_fn f_base x0 x1 x2 x3
+ys = gpe_eval_fn f_opt x0 x1 x2 x3
+if or ne get gpe_last_trap 0 0 ne yb ys
+ret false
+end
+end
+ret true
+end
+
+fn mb_verify_monk_immune_sm121 to bool
+ret as_verify_antibodies
+end
+
+fn mb_refuse code ulong to ulong
+put mb_refusals 0 add get mb_refusals 0 1
+put mb_last_err 0 code
+ret code
+end
+
+fn mb_spec_check_contract f_base uint target_tid ulong to bool
+tdSetReq EXEC_SCALAR_SIMD 0 12 4 0 FEAT_FMA
+if ne tdCheckKernelContract target_tid TDK_OK
+ret false
+end
+pur = ulong get i_fpur f_base
+prc = ulong get i_fprc f_base
+hd = ulong get i_fhd f_base
+eb = get i_ferr f_base
+dl = get i_fdl f_base
+ret ir_fc_ok pur prc hd 0 eb dl
+end
+
+fn mb_spec_commit slot ulong target_tid ulong f_opt uint insns ulong eff ulong to ulong
+nxt_ver = add get fabVer slot 1
+s_ptr = add 0x200000 add mul slot 0x10000 mul nxt_ver 4096
+if not fabHotSwap slot get mb_slot_sem slot s_ptr target_tid FAB_MODE_CRYSTALLIZED eff
+ret mb_refuse MB_ERR_SWAP
+end
+cpufence
+put mb_slot_fspec slot f_opt
+put mb_slot_spec_insns slot insns
+put mb_slot_spec_ptr slot s_ptr
+put mb_slot_spec_tid slot target_tid
+put mb_slot_pin_mask slot get gpe_pin_mask 0
+put mb_slot_pin_v0 slot get gpe_pin_val 0
+put mb_slot_pin_v1 slot get gpe_pin_val 1
+put mb_slot_pin_v2 slot get gpe_pin_val 2
+put mb_slot_pin_v3 slot get gpe_pin_val 3
+put mb_swaps 0 add get mb_swaps 0 1
+ret MB_OK
+end
+
+note Efficiency-core (TID_A725) background specialization with strict 3-bit proof gate & W^X seal!
+fn mb_specialize_slot slot ulong target_tid ulong req_prot ulong caller_proof_mask ulong to ulong
+put mb_last_err 0 MB_OK
+if or ge slot MB_MAX_SLOTS eq get mb_slot_valid slot 0
+ret mb_refuse MB_ERR_SLOT
+end
+if ne fabScheduleApu TASK_BG_METABOLIC TID_A725
+ret mb_refuse MB_ERR_NOT_A725
+end
+z = cpuget 0 mb_cpu_mask 0 128
+z = cpunow
+if ge z 0
+put mb_worker_cpu 0 ulong z
+end
+if ne wx_validate_prot req_prot WX_OK
+mb_log_alarm slot MB_ALARM_RWX req_prot 0
+ret mb_refuse MB_ERR_WX_RWX
+end
+f_base = get mb_slot_fbase slot
+computed = ulong 0
+if mb_spec_check_contract f_base target_tid
+computed = or computed MB_BIT_CONTRACT
+end
+if eq and computed MB_BIT_CONTRACT 0
+ret mb_refuse MB_ERR_CONTRACT
+end
+f_spec = gpe_specialize_fn f_base
+if eq f_spec 0
+ret mb_refuse MB_ERR_PE
+end
+f_opt = gpe_prove_and_optimize f_spec target_tid
+if ne f_opt 0
+if and eq get gpe_pe_stat 7 0 ge get gpe_pe_stat 8 1
+if ge get gpe_pe_stat 10 4
+computed = or computed MB_BIT_EGP3
+end
+end
+end
+if eq and computed MB_BIT_EGP3 0
+ret mb_refuse MB_ERR_EGP3
+end
+if eq gpe_compile_a64_elf f_opt 0
+ret mb_refuse MB_ERR_PE
+end
+if mb_verify_monk_immune_cpu f_base f_opt slot
+computed = or computed MB_BIT_MONK_IMMUNE
+end
+if eq and computed MB_BIT_MONK_IMMUNE 0
+ret mb_refuse MB_ERR_MONK_IMMUNE
+end
+eff = and computed caller_proof_mask
+if ne eff MB_PROOF_ALL
+ret mb_refuse MB_ERR_PROOF_MASK
+end
+if ne wx_stage_and_seal slot add get fabVer slot 1 req_prot WX_OK
+ret mb_refuse MB_ERR_WX_RWX
+end
+mb_save_path true slot
+ret mb_spec_commit slot target_tid f_opt get gpe_a6_insns 0 eff
+end
+
+note SM121 GPU specialization check via TargetDesc contract + Antibody #13-#15 (for negative control & GPU lane)
+fn mb_check_gpu_candidate target_tid ulong M ulong K ulong N ulong proof_mask ulong to ulong
+pePlanRegime M K N
+crc = tdCheckKernelContract target_tid
+if ne crc TDK_OK
+put mb_refusals 0 add get mb_refusals 0 1
+put mb_last_err 0 MB_ERR_CONTRACT
+ret MB_ERR_CONTRACT
+end
+if not mb_verify_monk_immune_sm121
+put mb_refusals 0 add get mb_refusals 0 1
+put mb_last_err 0 MB_ERR_MONK_IMMUNE
+ret MB_ERR_MONK_IMMUNE
+end
+if ne and proof_mask MB_PROOF_ALL MB_PROOF_ALL
+put mb_refusals 0 add get mb_refusals 0 1
+put mb_last_err 0 MB_ERR_PROOF_MASK
+ret MB_ERR_PROOF_MASK
+end
+ret MB_OK
+end
+
+note Atomic rollback of fabWtbl[slot] back to immutable baseline slot, tripping SLAB_MUTABLE_ALARMED!
+fn mb_rollback_slot slot ulong reason ulong x0 ulong x1 ulong to bool
+if or ge slot MB_MAX_SLOTS eq get mb_slot_valid slot 0
+ret false
+end
+note Trip SLAB_MUTABLE_ALARMED norm alarm (delta 200 > limit 100 -> CR_ERR_ALARM, slab norm untouched!)
+a_rc = crUpdateSlab get mb_slot_alarm_slab slot 200
+mb_log_alarm slot reason x0 x1
+ok = fabHotSwap slot get mb_slot_sem slot get mb_slot_base_ptr slot get mb_slot_base_tid slot FAB_MODE_CPU_NATIVE MB_PROOF_ALL
+cpufence
+if ok
+put mb_rollbacks 0 add get mb_rollbacks 0 1
+end
+ret ok
+end
+
+note Cooperative guarded dispatch on fabWtbl[slot] using staged wx_args[0..4]:
+note   - If specialized (FAB_MODE_CRYSTALLIZED): runs sealed RX specialized AArch64 ELF!
+note   - If specialized binary trips OOD trap 14 (exit 114) or spot-check mismatches baseline oracle:
+note     instantly trips SLAB_MUTABLE_ALARMED, atomically rolls back fabWtbl[slot] to immutable baseline,
+note     and executes the immutable baseline RX ELF returning the exact baseline result!
+fn mb_dispatch_slot slot ulong spot_check bool to ulong
+if or ge slot MB_MAX_SLOTS eq get mb_slot_valid slot 0
+put mb_last_disp 0 MB_DISP_BASELINE
+ret 0
+end
+a0 = get wx_args 0
+a1 = get wx_args 1
+a2 = get wx_args 2
+a3 = get wx_args 3
+mode = get fabMode slot
+if eq mode FAB_MODE_CRYSTALLIZED
+y_spec = mb_exec_slot_bin true slot
+ex = get wx_last_exit 0
+if ne ex 0
+rb = mb_rollback_slot slot MB_ALARM_OOD a0 a1
+put mb_last_disp 0 MB_DISP_ROLLBACK
+ret mb_exec_slot_bin false slot
+end
+if spot_check
+y_ref = gpe_eval_fn get mb_slot_fbase slot a0 a1 a2 a3
+if ne y_spec y_ref
+rb = mb_rollback_slot slot MB_ALARM_ORACLE a0 a1
+put mb_last_disp 0 MB_DISP_ROLLBACK
+ret mb_exec_slot_bin false slot
+end
+end
+put mb_spec_hits 0 add get mb_spec_hits 0 1
+put mb_last_disp 0 MB_DISP_SPEC
+ret y_spec
+end
+put mb_base_hits 0 add get mb_base_hits 0 1
+put mb_last_disp 0 MB_DISP_BASELINE
+ret mb_exec_slot_bin false slot
+end
