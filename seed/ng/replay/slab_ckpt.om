@@ -1,0 +1,568 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/replay/slab_ckpt.om: Periodic SLAB + VM state checkpointing (hybrid snapshot + sparse delta)
+note with SHA-256 integrity verification and O(interval) rewind to nearest checkpoint <= target step.
+note Pure seeded OM-2. Requires seed/ng/sha256.om linked earlier.
+
+const SCK_OK ulong 0
+const SCK_ERR_NONE ulong 1
+const SCK_ERR_RANGE ulong 2
+const SCK_ERR_DIGEST ulong 3
+const SCK_ERR_NOMEM ulong 4
+const SCK_ERR_CORRUPT ulong 5
+
+const SCK_MAX_REGS ulong 64
+
+text sc_dom "OSCK1"
+
+note Live VM + SLAB state
+note sc_vm: 0 step, 1 pc_blk, 2 pc_op, 3 tok_seq, 4 call_depth, 5 n_regs, 6 slab_len, 7 trap_code
+global sc_vm ulong 8
+global sc_regs ulong 64
+global sc_slab uchar *
+
+note Reference copy of previous checkpoint's full state (for computing sparse deltas)
+global sc_prev_regs ulong 64
+global sc_prev_slab uchar *
+global sc_prev_valid ulong 1
+
+note Checkpoint table (growable run-time pools; no arbitrary small cap)
+global sc_ck_step ulong *
+global sc_ck_is_kf uchar *
+global sc_ck_base uint *
+global sc_ck_off ulong *
+global sc_ck_len ulong *
+global sc_ck_dig uchar *
+global sc_data uchar *
+
+note Control/metrics:
+note 0 ckpt_count, 1 data_used, 2 ckpt_interval, 3 keyframe_stride,
+note 4 last_restored_id, 5 last_restored_step, 6 total_restores, 7 total_raw_bytes
+global sc_st ulong 8
+
+fn sck_ensure_slab n ulong to ulong
+cur = len sc_slab
+if le n cur
+ret SCK_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap n bound 64
+cap = shl cap 1
+end
+r0 = enlarge sc_slab cap
+if lt r0 0
+ret SCK_ERR_NOMEM
+end
+r1 = enlarge sc_prev_slab cap
+if lt r1 0
+ret SCK_ERR_NOMEM
+end
+ret SCK_OK
+end
+
+fn sck_ensure_data need ulong to ulong
+cur = len sc_data
+if le need cur
+ret SCK_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 8192
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge sc_data cap
+if lt rc 0
+ret SCK_ERR_NOMEM
+end
+ret SCK_OK
+end
+
+fn sck_ensure_ck need ulong to ulong
+cur = len sc_ck_step
+if le need cur
+ret SCK_OK
+end
+cap = cur
+if eq cap 0
+cap = ulong 64
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+r0 = enlarge sc_ck_step cap
+if lt r0 0
+ret SCK_ERR_NOMEM
+end
+r1 = enlarge sc_ck_is_kf cap
+if lt r1 0
+ret SCK_ERR_NOMEM
+end
+r2 = enlarge sc_ck_base cap
+if lt r2 0
+ret SCK_ERR_NOMEM
+end
+r3 = enlarge sc_ck_off cap
+if lt r3 0
+ret SCK_ERR_NOMEM
+end
+r4 = enlarge sc_ck_len cap
+if lt r4 0
+ret SCK_ERR_NOMEM
+end
+r5 = enlarge sc_ck_dig mul cap 32
+if lt r5 0
+ret SCK_ERR_NOMEM
+end
+ret SCK_OK
+end
+
+fn sck_init n_regs ulong slab_len ulong interval ulong kf_stride ulong to ulong
+if gt n_regs SCK_MAX_REGS
+ret SCK_ERR_RANGE
+end
+rc = sck_ensure_slab slab_len
+if ne rc SCK_OK
+ret rc
+end
+for j ulong 8
+put sc_vm j 0
+put sc_st j 0
+end
+put sc_vm 5 n_regs
+put sc_vm 6 slab_len
+for j ulong SCK_MAX_REGS
+put sc_regs j 0
+put sc_prev_regs j 0
+end
+for j ulong slab_len bound 16777216
+put sc_slab j 0
+put sc_prev_slab j 0
+end
+put sc_prev_valid 0 0
+iv = interval
+if eq iv 0
+iv = ulong 8
+end
+ks = kf_stride
+if eq ks 0
+ks = ulong 4
+end
+put sc_st 2 iv
+put sc_st 3 ks
+ret SCK_OK
+end
+
+fn sck_should_take step ulong to bool
+iv = get sc_st 2
+if eq iv 0
+ret false
+end
+ret eq rem step iv 0
+end
+
+fn sck_put_u32 off ulong v ulong to void
+put sc_data off uchar and v 255
+put sc_data add off 1 uchar and shr v 8 255
+put sc_data add off 2 uchar and shr v 16 255
+put sc_data add off 3 uchar and shr v 24 255
+end
+
+fn sck_put_u64 off ulong v ulong to void
+for j ulong 8
+b = uchar and shr v mul j 8 255
+put sc_data add off j b
+end
+end
+
+fn sck_get_u32 off ulong to ulong
+v = ulong 0
+for j ulong 4
+b = ulong get sc_data add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn sck_get_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+b = ulong get sc_data add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn sck_sh_put64 pos ulong v ulong to void
+for j ulong 8
+b = uchar and shr v mul j 8 255
+put sh_dat add pos j b
+end
+end
+
+note Compute canonical SHA-256 of the current live VM + SLAB state into sh_dig[0..32).
+fn sck_hash_live to ulong
+n_regs = get sc_vm 5
+s_len = get sc_vm 6
+tot = add add 6 add 64 mul n_regs 8 s_len
+if gt tot len sh_dat
+ret SCK_ERR_NOMEM
+end
+for j ulong 5
+put sh_dat j get sc_dom j
+end
+put sh_dat 5 0
+pos = ulong 6
+for i ulong 8
+sck_sh_put64 pos get sc_vm i
+pos = add pos 8
+end
+for i ulong n_regs bound 64
+sck_sh_put64 pos get sc_regs i
+pos = add pos 8
+end
+for i ulong s_len bound 16777216
+b = get sc_slab i
+put sh_dat add pos i b
+end
+sh_all tot
+ret SCK_OK
+end
+
+fn sck_take_kf idx ulong n_regs ulong s_len ulong to ulong
+off = get sc_st 1
+raw_sz = add add 64 mul n_regs 8 s_len
+rc = sck_ensure_data add off raw_sz
+if ne rc SCK_OK
+ret rc
+end
+p = off
+for i ulong 8
+sck_put_u64 p get sc_vm i
+p = add p 8
+end
+for i ulong n_regs bound 64
+sck_put_u64 p get sc_regs i
+p = add p 8
+end
+for i ulong s_len bound 16777216
+b = get sc_slab i
+put sc_data add p i b
+end
+p = add p s_len
+put sc_ck_step idx get sc_vm 0
+put sc_ck_is_kf idx 1
+put sc_ck_base idx uint idx
+put sc_ck_off idx off
+put sc_ck_len idx sub p off
+put sc_st 1 p
+ret SCK_OK
+end
+
+fn sck_count_slab_diff s_len ulong to ulong
+scnt = ulong 0
+for i ulong s_len bound 16777216
+a = get sc_slab i
+b = get sc_prev_slab i
+if ne a b
+scnt = add scnt 1
+end
+end
+ret scnt
+end
+
+fn sck_emit_reg_delta p0 ulong n_regs ulong to ulong
+p = p0
+for i ulong n_regs bound 64
+v = get sc_regs i
+if ne v get sc_prev_regs i
+sck_put_u32 p i
+sck_put_u64 add p 4 v
+p = add p 12
+end
+end
+ret p
+end
+
+fn sck_emit_slab_delta p0 ulong s_len ulong to ulong
+p = p0
+for i ulong s_len bound 16777216
+a = get sc_slab i
+b = get sc_prev_slab i
+if ne a b
+sck_put_u32 p i
+put sc_data add p 4 a
+p = add p 5
+end
+end
+ret p
+end
+
+fn sck_take_delta idx ulong base_id ulong n_regs ulong s_len ulong to ulong
+rcnt = ulong 0
+for i ulong n_regs bound 64
+if ne get sc_regs i get sc_prev_regs i
+rcnt = add rcnt 1
+end
+end
+scnt = sck_count_slab_diff s_len
+off = get sc_st 1
+need = add add 72 mul rcnt 12 mul scnt 5
+rc = sck_ensure_data add off need
+if ne rc SCK_OK
+ret rc
+end
+p = off
+for i ulong 8
+sck_put_u64 p get sc_vm i
+p = add p 8
+end
+sck_put_u32 p rcnt
+p = sck_emit_reg_delta add p 4 n_regs
+sck_put_u32 p scnt
+p = sck_emit_slab_delta add p 4 s_len
+put sc_ck_step idx get sc_vm 0
+put sc_ck_is_kf idx 0
+put sc_ck_base idx uint base_id
+put sc_ck_off idx off
+put sc_ck_len idx sub p off
+put sc_st 1 p
+ret SCK_OK
+end
+
+fn sck_save_prev n_regs ulong s_len ulong to void
+for i ulong n_regs bound 64
+put sc_prev_regs i get sc_regs i
+end
+for i ulong s_len bound 16777216
+b = get sc_slab i
+put sc_prev_slab i b
+end
+put sc_prev_valid 0 1
+end
+
+note Take a checkpoint of the current live VM + SLAB state (keyframe or sparse delta).
+fn sck_take to ulong
+idx = get sc_st 0
+rc = sck_ensure_ck add idx 1
+if ne rc SCK_OK
+ret rc
+end
+rc = sck_hash_live
+if ne rc SCK_OK
+ret rc
+end
+dig_off = mul idx 32
+for j ulong 32
+b = get sh_dig j
+put sc_ck_dig add dig_off j b
+end
+n_regs = get sc_vm 5
+s_len = get sc_vm 6
+ks = get sc_st 3
+is_kf = ulong 0
+if or eq get sc_prev_valid 0 0 eq rem idx ks 0
+is_kf = ulong 1
+end
+if eq is_kf 1
+rc = sck_take_kf idx n_regs s_len
+else
+base_id = ulong get sc_ck_base sub idx 1
+rc = sck_take_delta idx base_id n_regs s_len
+end
+if ne rc SCK_OK
+ret rc
+end
+sck_save_prev n_regs s_len
+raw_sz = add add 64 mul n_regs 8 s_len
+put sc_st 0 add idx 1
+put sc_st 7 add get sc_st 7 raw_sz
+ret SCK_OK
+end
+
+fn sck_apply_kf p ulong clen ulong n_regs ulong s_len ulong to ulong
+need = add add 64 mul n_regs 8 s_len
+if ne clen need
+ret SCK_ERR_CORRUPT
+end
+cur = p
+for i ulong n_regs bound 64
+put sc_regs i sck_get_u64 cur
+cur = add cur 8
+end
+for i ulong s_len bound 16777216
+b = get sc_data add cur i
+put sc_slab i b
+end
+ret SCK_OK
+end
+
+fn sck_apply_delta p ulong end_off ulong n_regs ulong s_len ulong to ulong
+if gt add p 4 end_off
+ret SCK_ERR_CORRUPT
+end
+rcnt = sck_get_u32 p
+cur = add p 4
+if gt mul rcnt 12 sub end_off cur
+ret SCK_ERR_CORRUPT
+end
+for j ulong rcnt bound 64
+ri = sck_get_u32 cur
+rv = sck_get_u64 add cur 4
+if ge ri n_regs
+ret SCK_ERR_CORRUPT
+end
+put sc_regs ri rv
+cur = add cur 12
+end
+if gt add cur 4 end_off
+ret SCK_ERR_CORRUPT
+end
+scnt = sck_get_u32 cur
+cur = add cur 4
+if gt mul scnt 5 sub end_off cur
+ret SCK_ERR_CORRUPT
+end
+for j ulong scnt bound 16777216
+so = sck_get_u32 cur
+sb = get sc_data add cur 4
+if ge so s_len
+ret SCK_ERR_CORRUPT
+end
+put sc_slab so sb
+cur = add cur 5
+end
+if ne cur end_off
+ret SCK_ERR_CORRUPT
+end
+ret SCK_OK
+end
+
+note Apply single checkpoint record idx (keyframe loads full state, delta patches live state).
+fn sck_apply_one idx ulong to ulong
+off = get sc_ck_off idx
+clen = get sc_ck_len idx
+end_off = add off clen
+if gt end_off get sc_st 1
+ret SCK_ERR_CORRUPT
+end
+if lt clen 64
+ret SCK_ERR_CORRUPT
+end
+p = off
+for i ulong 8
+put sc_vm i sck_get_u64 p
+p = add p 8
+end
+n_regs = get sc_vm 5
+s_len = get sc_vm 6
+if gt n_regs SCK_MAX_REGS
+ret SCK_ERR_CORRUPT
+end
+rc = sck_ensure_slab s_len
+if ne rc SCK_OK
+ret rc
+end
+kf = ulong get sc_ck_is_kf idx
+if eq kf 1
+ret sck_apply_kf p clen n_regs s_len
+end
+ret sck_apply_delta p end_off n_regs s_len
+end
+
+note Restore exact checkpoint idx by replaying from its base keyframe and fail-closed checking SHA-256!
+fn sck_restore_id idx ulong to ulong
+cnt = get sc_st 0
+if ge idx cnt
+ret SCK_ERR_RANGE
+end
+base_id = ulong get sc_ck_base idx
+if gt base_id idx
+ret SCK_ERR_CORRUPT
+end
+bkf = ulong get sc_ck_is_kf base_id
+if ne bkf 1
+ret SCK_ERR_CORRUPT
+end
+cur = base_id
+while le cur idx bound 1048576
+rc = sck_apply_one cur
+if ne rc SCK_OK
+ret rc
+end
+cur = add cur 1
+end
+rc = sck_hash_live
+if ne rc SCK_OK
+ret rc
+end
+dig_off = mul idx 32
+for j ulong 32
+d = get sc_ck_dig add dig_off j
+if ne get sh_dig j d
+ret SCK_ERR_DIGEST
+end
+end
+put sc_st 4 idx
+put sc_st 5 get sc_ck_step idx
+put sc_st 6 add get sc_st 6 1
+ret SCK_OK
+end
+
+note Find nearest checkpoint with step <= target_step and restore it.
+fn sck_restore_nearest target_step ulong to ulong
+cnt = get sc_st 0
+if eq cnt 0
+ret SCK_ERR_NONE
+end
+found = ulong 0
+best = ulong 0
+for i ulong cnt bound 1048576
+st = get sc_ck_step i
+if le st target_step
+best = i
+found = ulong 1
+else
+break
+end
+end
+if eq found 0
+ret SCK_ERR_NONE
+end
+ret sck_restore_id best
+end
+
+fn sck_count to ulong
+ret get sc_st 0
+end
+
+fn sck_last_restored_id to ulong
+ret get sc_st 4
+end
+
+fn sck_last_restored_step to ulong
+ret get sc_st 5
+end
+
+fn sck_data_bytes to ulong
+ret get sc_st 1
+end
+
+fn sck_raw_bytes to ulong
+ret get sc_st 7
+end
+
+fn sck_tamper_digest idx ulong byte_i ulong to void
+off = add mul idx 32 byte_i
+b = get sc_ck_dig off
+put sc_ck_dig off xor b uchar 1
+end
+
+fn sck_tamper_data idx ulong byte_i ulong to void
+off = add get sc_ck_off idx byte_i
+b = get sc_data off
+put sc_data off xor b uchar 1
+end
