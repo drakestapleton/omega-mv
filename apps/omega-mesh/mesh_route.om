@@ -1,0 +1,1446 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-mesh/mesh_route.om
+note Sovereign Intelligence 2.0 Stage 5 (Pillar 5: Zero-Trust Personal Silicon Mesh, DRA-1073)
+note
+note Pure seeded OM-2 Compile-on-Arrive Mesh Router, heterogeneous TargetDesc + WattCBF
+note offload profitability solver, OMSH v1 signed wire framing, loopback-only TCP socket
+note transport, and deterministic pure Compute-on-Arrive worker/client engine.
+note
+note HARD SAFETY INVARIANTS:
+note   - Zero GPU device opens, zero UEFI/SPI touches, zero sysfs writes (hw_writes == 0).
+note   - Wildcard 0.0.0.0 bind/endpoint is STRICTLY REFUSED fail-closed (loopback 127.0.0.1
+note     or explicit non-zero WireGuard/LAN unicast endpoints only).
+note   - Remote outputs enter OMEGA-MEMO ONLY through mesh_verify.om's fail-closed gate.
+note
+note Library unit (no om2 header, no fn main; prefix mr_ / MR_).
+note Link directly after apps/omega-mesh/mesh_verify.om.
+
+note Heterogeneous personal-mesh TargetDesc IDs (extending target_desc.om slots 10..12)
+const MR_TID_MACBOOK ulong 10
+const MR_TID_STEAMDECK ulong 11
+const MR_TID_PC ulong 12
+
+note Node roles
+const MR_ROLE_MACBOOK ulong 1
+const MR_ROLE_STEAMDECK ulong 2
+const MR_ROLE_PC ulong 3
+const MR_ROLE_SPARK_CPU ulong 4
+const MR_ROLE_SPARK_GPU ulong 5
+
+note Capacities, IPv4 constants & protocol framing
+const MR_NODE_CAP ulong 16
+const MR_NONE ulong 999999
+const MR_IPV4_LOOPBACK ulong 2130706433
+const MR_OFFLOAD_MARGIN_US ulong 200
+const MR_OMSH_HDR_LEN ulong 32
+const MR_OMSH_VER ulong 1
+const MR_MSG_DISPATCH_REQ ulong 1
+const MR_MSG_DISPATCH_RESP ulong 2
+const MR_MSG_ERROR ulong 3
+const MR_MAX_FRAME_PAYLOAD ulong 32768
+const MR_MAX_WIRE ulong 33024
+const MR_MAX_INPUT_LEN ulong 16384
+const MR_REQ_FIXED_HDR ulong 96
+const MR_RESP_FIXED_HDR ulong 304
+const MR_FLAG_TIER_B ulong 1
+const MR_FLAG_MERKLE ulong 2
+const MR_FLAG_FREIVALDS ulong 4
+
+note Pure Compute-on-Arrive workload kinds
+const MR_WORK_POLY_PURE ulong 1
+const MR_WORK_MATMUL_INT64 ulong 2
+const MR_WORK_MERKLE_STEPS ulong 3
+
+note Routing decisions & fail-closed status codes
+const MR_OK ulong 0
+const MR_DEC_MEMO_HIT ulong 1
+const MR_DEC_LOCAL ulong 2
+const MR_DEC_REMOTE ulong 3
+const MR_ERR_NO_NODE ulong 10
+const MR_ERR_BAD_OMPK ulong 11
+const MR_ERR_WILDCARD_BIND ulong 12
+const MR_ERR_BAD_NODE ulong 13
+const MR_ERR_UNAUTH_PEER ulong 14
+const MR_ERR_FRAME_MAGIC ulong 15
+const MR_ERR_FRAME_VER ulong 16
+const MR_ERR_FRAME_LEN ulong 17
+const MR_ERR_FRAME_TYPE ulong 18
+const MR_ERR_FRAME_SIG ulong 19
+const MR_ERR_SOCK ulong 20
+const MR_ERR_IO ulong 21
+const MR_ERR_TIMEOUT ulong 22
+const MR_ERR_REMOTE_REFUSED ulong 23
+const MR_ERR_VERIFY_FAILED ulong 24
+const MR_ERR_MEMO_FAILED ulong 25
+const MR_ERR_IMPURE ulong 26
+
+note Worker test fault-injection modes (0 = honest production)
+const MR_FAULT_NONE ulong 0
+const MR_FAULT_FLIP_OUT_BEFORE_SIGN ulong 1
+const MR_FAULT_FORGE_SIG ulong 2
+const MR_FAULT_UNKNOWN_KEY ulong 3
+const MR_FAULT_MATMUL_CORRUPT ulong 4
+const MR_FAULT_MERKLE_CHUNK11 ulong 5
+const MR_FAULT_WRONG_INPUT_HASH ulong 6
+
+note Heterogeneous mesh node table (slot 0 = local device, slots 1..15 = remote peers)
+global mr_n_used ulong 16
+global mr_n_tid ulong 16
+global mr_n_feat ulong 16
+global mr_n_role ulong 16
+global mr_n_tier ulong 16
+global mr_n_ipv4 ulong 16
+global mr_n_port ulong 16
+global mr_n_rtt_us ulong 16
+global mr_n_bw_mbps ulong 16
+global mr_n_speed ulong 16
+global mr_n_online ulong 16
+global mr_n_tdie long 16
+global mr_n_tsink long 16
+global mr_n_tamb long 16
+global mr_n_pbud long 16
+global mr_n_pgbud long 16
+global mr_n_tceil long 16
+global mr_n_tau long 16
+global mr_n_bcpu long 16
+global mr_n_bunc long 16
+global mr_n_pk uchar 512
+
+note Staging arrays for node registration
+note mr_st_u: [0]=slot [1]=tid [2]=feat [3]=role [4]=tier [5]=ipv4
+note          [6]=port [7]=rtt_us [8]=bw_mbps [9]=speed [10]=online
+global mr_st_u ulong 12
+note mr_st_i: [0]=tdie [1]=tsink [2]=tamb [3]=pbud [4]=pgbud
+note          [5]=tceil [6]=tau [7]=bcpu [8]=bunc
+global mr_st_i long 10
+
+note Routing decision telemetry:
+note [0]=decision [1]=sel_slot [2]=sel_tid [3]=local_us [4]=remote_us
+note [5]=best_rtt_us [6]=best_xfer_us [7]=local_wc_ok [8]=remote_wc_ok
+note [9]=rej_contract [10]=rej_wattcbf [11]=rej_unauth [12]=rej_deadline
+note [13]=sel_p_safe_mw [14]=sel_barrier_h
+global mr_route_out ulong 16
+
+note Last WattCBF probe result: [0]=ok [1]=p_safe_mw [2]=barrier_h [3]=fail_closed
+global mr_wc_out long 4
+
+note OMSH v1 wire framing, payload, socket, and identity buffers
+global mr_wire uchar 33024
+global mr_wire_len ulong 1
+global mr_in_buf uchar 16384
+global mr_in_len ulong 1
+global mr_aux_buf uchar 4096
+global mr_aux_len ulong 1
+global mr_sockaddr uchar 16
+global mr_sopt uchar 4
+note mr_req_meta: [0]=flags [1]=nonce [2]=epoch [3]=ompk_len [4]=in_len
+note              [5]=work_kind [6]=prec_tier [7]=err_bound [8]=target_tid
+note              [9]=resp_status [10]=resp_out_len [11]=resp_aux_len
+global mr_req_meta ulong 12
+global mr_req_cli_pk uchar 32
+global mr_req_in_sha uchar 32
+global mr_cli_seed uchar 32
+global mr_cli_pk uchar 32
+global mr_wrk_seed uchar 32
+global mr_wrk_pk uchar 32
+note mr_net_stats: [0]=net_dispatches [1]=memo_hits [2]=local_execs [3]=remote_execs
+note               [4]=frames_sent [5]=frames_recv [6]=last_verify_rc [7]=last_bound_port
+global mr_net_stats ulong 8
+global mr_poly_tmp uchar 32
+
+text mr_omsh_magic "OMSH"
+text mr_poly_tag "OM-MESH-POLY-V1:"
+text mr_rogue_tag "OM-MESH-ROGUE-TEST-KEY"
+
+note ---- Initialization & Heterogeneous TargetDesc Registration ----
+
+fn mr_register_mesh_targets to void
+tdInitAll
+tdCacheInit
+note 10: MacBook Apple Silicon (a64macos: 8-wide OOO, 128b NEON, SHA/AES/BF16, battery thermal cap)
+tdRegIsa MR_TID_MACBOOK ISA_A64 EXEC_SCALAR_SIMD 64 30 32
+tdRegVec MR_TID_MACBOOK 0 128 0 0 4
+tdRegCache MR_TID_MACBOOK 128 4096 128 0
+tdRegLat MR_TID_MACBOOK 8 2 7 10
+tdRegFeat MR_TID_MACBOOK 399 0 0 0 262143
+note 11: Steam Deck (x86linux: Zen 2 AVX2 APU, 4-wide OOO, 15W handheld thermal cap)
+tdRegIsa MR_TID_STEAMDECK ISA_X64 EXEC_SCALAR_SIMD 64 15 16
+tdRegVec MR_TID_STEAMDECK 0 256 0 1 8
+tdRegCache MR_TID_STEAMDECK 32 512 64 0
+tdRegLat MR_TID_STEAMDECK 4 3 14 14
+tdRegFeat MR_TID_STEAMDECK 913 0 0 0 1983
+note 12: Personal PC (x86linux: AVX-512 workstation, 6-wide OOO, 95W thermal cap)
+tdRegIsa MR_TID_PC ISA_X64 EXEC_SCALAR_SIMD 64 15 32
+tdRegVec MR_TID_PC 8 512 0 1 16
+tdRegCache MR_TID_PC 48 2048 64 0
+tdRegLat MR_TID_PC 6 3 14 14
+tdRegFeat MR_TID_PC 953 MMA_161616_AMX 0 0 1983
+put tdCount 0 13
+end
+
+fn mr_init to void
+mr_register_mesh_targets
+for i ulong MR_NODE_CAP
+put mr_n_used i 0
+put mr_n_tid i 0
+put mr_n_feat i 0
+put mr_n_role i 0
+put mr_n_tier i 0
+put mr_n_ipv4 i 0
+put mr_n_port i 0
+put mr_n_rtt_us i 0
+put mr_n_bw_mbps i 0
+put mr_n_speed i 0
+put mr_n_online i 0
+put mr_n_tdie i 0
+put mr_n_tsink i 0
+put mr_n_tamb i 0
+put mr_n_pbud i 0
+put mr_n_pgbud i 0
+put mr_n_tceil i 0
+put mr_n_tau i 0
+put mr_n_bcpu i 0
+put mr_n_bunc i 0
+end
+for i ulong 16
+put mr_route_out i 0
+end
+for i ulong 12
+put mr_req_meta i 0
+end
+for i ulong 8
+put mr_net_stats i 0
+end
+put mr_wire_len 0 0
+put mr_in_len 0 0
+put mr_aux_len 0 0
+end
+
+note ---- Endpoint Safety Guards (0.0.0.0 Wildcard Strictly Refused) ----
+
+fn mr_pack_ipv4 a ulong b ulong c ulong d ulong to ulong
+p0 = shl and a 255 24
+p1 = shl and b 255 16
+p2 = shl and c 255 8
+p3 = and d 255
+ret or or p0 p1 or p2 p3
+end
+
+note Refuse 0.0.0.0 wildcard and broadcast; allow 127.0.0.1 or explicit private/WireGuard unicast
+fn mr_ip_is_safe_endpoint ipv4 ulong to bool
+if eq ipv4 0
+ret false
+end
+if eq ipv4 4294967295
+ret false
+end
+if eq ipv4 MR_IPV4_LOOPBACK
+ret true
+end
+o0 = and shr ipv4 24 255
+o1 = and shr ipv4 16 255
+o3 = and ipv4 255
+if or eq o3 0 eq o3 255
+ret false
+end
+if eq o0 10
+ret true
+end
+if and eq o0 100 and ge o1 64 le o1 127
+ret true
+end
+if and eq o0 172 and ge o1 16 le o1 31
+ret true
+end
+if and eq o0 192 eq o1 168
+ret true
+end
+ret false
+end
+
+note Bind guard: strictly refuses 0.0.0.0 wildcard; allows 127.0.0.1 or explicit WireGuard IP
+fn mr_ip_is_safe_bind ipv4 ulong to bool
+if eq ipv4 0
+ret false
+end
+if eq ipv4 MR_IPV4_LOOPBACK
+ret true
+end
+o0 = and shr ipv4 24 255
+o1 = and shr ipv4 16 255
+o3 = and ipv4 255
+if or eq o3 0 eq o3 255
+ret false
+end
+if eq o0 10
+ret true
+end
+if and eq o0 100 and ge o1 64 le o1 127
+ret true
+end
+ret false
+end
+
+note ---- Node Registration Helpers ----
+
+fn mr_stage_node_id slot ulong tid ulong feat ulong role ulong tier ulong to void
+put mr_st_u 0 slot
+put mr_st_u 1 tid
+put mr_st_u 2 feat
+put mr_st_u 3 role
+put mr_st_u 4 tier
+end
+
+fn mr_stage_node_net ipv4 ulong port ulong rtt_us ulong bw_mbps ulong speed ulong online ulong to void
+put mr_st_u 5 ipv4
+put mr_st_u 6 port
+put mr_st_u 7 rtt_us
+put mr_st_u 8 bw_mbps
+put mr_st_u 9 speed
+put mr_st_u 10 online
+end
+
+fn mr_stage_node_therm tdie long tsink long tamb long bcpu long bunc long to void
+put mr_st_i 0 tdie
+put mr_st_i 1 tsink
+put mr_st_i 2 tamb
+put mr_st_i 7 bcpu
+put mr_st_i 8 bunc
+end
+
+fn mr_stage_node_policy pbud long pgbud long tceil long tau long to void
+put mr_st_i 3 pbud
+put mr_st_i 4 pgbud
+put mr_st_i 5 tceil
+put mr_st_i 6 tau
+end
+
+note Commit staged node (copies mv_ed_pk[0..32) as the node's Ed25519 identity)
+fn mr_commit_node to ulong
+slot = get mr_st_u 0
+if ge slot MR_NODE_CAP
+ret MR_ERR_BAD_NODE
+end
+tid = get mr_st_u 1
+if ge tid get tdCount 0
+ret MR_ERR_BAD_NODE
+end
+ip = get mr_st_u 5
+if not mr_ip_is_safe_endpoint ip
+ret MR_ERR_WILDCARD_BIND
+end
+if eq get mr_st_u 9 0
+ret MR_ERR_BAD_NODE
+end
+put mr_n_used slot 1
+put mr_n_tid slot tid
+put mr_n_feat slot get mr_st_u 2
+put mr_n_role slot get mr_st_u 3
+put mr_n_tier slot get mr_st_u 4
+put mr_n_ipv4 slot ip
+put mr_n_port slot get mr_st_u 6
+put mr_n_rtt_us slot get mr_st_u 7
+put mr_n_bw_mbps slot get mr_st_u 8
+put mr_n_speed slot get mr_st_u 9
+put mr_n_online slot get mr_st_u 10
+put mr_n_tdie slot get mr_st_i 0
+put mr_n_tsink slot get mr_st_i 1
+put mr_n_tamb slot get mr_st_i 2
+put mr_n_pbud slot get mr_st_i 3
+put mr_n_pgbud slot get mr_st_i 4
+put mr_n_tceil slot get mr_st_i 5
+put mr_n_tau slot get mr_st_i 6
+put mr_n_bcpu slot get mr_st_i 7
+put mr_n_bunc slot get mr_st_i 8
+base = mul slot 32
+for i ulong 32
+put mr_n_pk add base i get mv_ed_pk i
+end
+ret MR_OK
+end
+
+note ---- WattCBF Thermal/Power Headroom Evaluation (calls watt_cbf.om UNCHANGED) ----
+
+fn mr_tid_is_gpu tid ulong to bool
+if eq tid TID_SM121
+ret true
+end
+if eq tid TID_APU_GB10
+ret true
+end
+if eq tid TID_SPARK_RING
+ret true
+end
+ret false
+end
+
+fn mr_wc_check_barrier st view WattThermal pol view WattPolicy cmd view WattCmd to bool
+dt = wc_next_die_delta st get cmd p_gpu get cmd p_cpu get cmd p_unc
+bh = wc_barrier_h get pol t_ceil get st t_die get pol tau dt
+put mr_wc_out 2 bh
+ret ge bh 0
+end
+
+fn mr_wc_eval_inner slot ulong req_pw long st view WattThermal pol view WattPolicy to bool
+pr = new WattProp 0 0 0 40
+if mr_tid_is_gpu get mr_n_tid slot
+put pr p_gpu req_pw
+put pr p_cpu get mr_n_bcpu slot
+put pr p_unc get mr_n_bunc slot
+else
+put pr p_gpu 0
+put pr p_cpu add get mr_n_bcpu slot req_pw
+put pr p_unc get mr_n_bunc slot
+end
+cmd = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pr cmd
+put mr_wc_out 3 get cmd fail_closed
+if ne get cmd fail_closed 0
+ret false
+end
+if not mr_wc_check_barrier st pol cmd
+ret false
+end
+if mr_tid_is_gpu get mr_n_tid slot
+put mr_wc_out 1 get cmd p_gpu
+else
+c_ex = sub get cmd p_cpu get mr_n_bcpu slot
+if lt c_ex 0
+c_ex = long 0
+end
+put mr_wc_out 1 c_ex
+end
+if ne get cmd p_gpu get pr p_gpu
+ret false
+end
+if ne get cmd p_cpu get pr p_cpu
+ret false
+end
+if ne get cmd p_unc get pr p_unc
+ret false
+end
+put mr_wc_out 0 1
+ret true
+end
+
+fn mr_eval_node_wattcbf slot ulong req_pw long to bool
+put mr_wc_out 0 0
+put mr_wc_out 1 0
+put mr_wc_out 2 0
+put mr_wc_out 3 1
+if or ge slot MR_NODE_CAP eq get mr_n_used slot 0
+ret false
+end
+if lt req_pw 0
+ret false
+end
+cpw = pk_get_power_mw
+if gt cpw 0
+if gt req_pw long cpw
+ret false
+end
+end
+st = new WattThermal get mr_n_tdie slot get mr_n_tsink slot get mr_n_tamb slot
+pol = new WattPolicy get mr_n_pbud slot get mr_n_pgbud slot get mr_n_tceil slot get mr_n_tau slot
+if wc_must_fail_closed st pol
+ret false
+end
+ret mr_wc_eval_inner slot req_pw st pol
+end
+
+note ---- Compile-on-Arrive Profitability & Multi-Target Routing Solver ----
+
+fn mr_ceil_div_u a ulong b ulong to ulong
+if eq b 0
+ret a
+end
+q = div a b
+if gt rem a b 0
+ret add q 1
+end
+ret q
+end
+
+fn mr_node_authorized slot ulong to bool
+if eq slot 0
+ret true
+end
+base = mul slot 32
+for i ulong 32
+put mv_ed_pk i get mr_n_pk add base i
+end
+ps = mv_peer_find_pk
+if ne ps MV_NONE
+if ne get mv_peer_quar ps 0
+ret false
+end
+ret true
+end
+ret eq get mr_n_tier slot MV_TIER_B_ZEROTRUST
+end
+
+fn mr_calc_remote_us slot ulong work_units ulong est_out ulong to ulong
+xb = add get pk_len 0 get mr_in_len 0
+xb = add xb add est_out 352
+bw = get mr_n_bw_mbps slot
+if eq bw 0
+bw = ulong 1
+end
+tot = mr_ceil_div_u xb bw
+tot = add tot get mr_n_rtt_us slot
+tot = add tot div tdGet get mr_n_tid slot TDF_COHNS 1000
+tot = add tot mr_ceil_div_u work_units get mr_n_speed slot
+if eq get mr_n_tier slot MV_TIER_B_ZEROTRUST
+ret add tot 1200
+end
+ret add tot 400
+end
+
+fn mr_route_reset_out to void
+for i ulong 16
+put mr_route_out i 0
+end
+put mr_route_out 1 MR_NONE
+put mr_route_out 3 MR_NONE
+put mr_route_out 4 MR_NONE
+end
+
+fn mr_route_eval_local work_units ulong req_pw long to bool
+if or eq get mr_n_used 0 0 eq get mr_n_online 0 0
+ret false
+end
+tid = get mr_n_tid 0
+feat = get mr_n_feat 0
+if ne pk_check_contract tid feat TDK_OK
+put mr_route_out 9 add get mr_route_out 9 1
+ret false
+end
+if not mr_eval_node_wattcbf 0 req_pw
+put mr_route_out 10 add get mr_route_out 10 1
+ret false
+end
+put mr_route_out 7 1
+lus = mr_ceil_div_u work_units get mr_n_speed 0
+dl = pk_get_deadline_us
+if and eq pk_get_hard_dl 1 gt dl 0
+if gt lus dl
+put mr_route_out 12 add get mr_route_out 12 1
+ret false
+end
+end
+put mr_route_out 3 lus
+ret true
+end
+
+fn mr_route_consider_peer s ulong work_units ulong req_pw long est_out ulong to void
+if or eq get mr_n_used s 0 eq get mr_n_online s 0
+ret
+end
+if not mr_node_authorized s
+put mr_route_out 11 add get mr_route_out 11 1
+ret
+end
+tid = get mr_n_tid s
+if ne pk_check_contract tid get mr_n_feat s TDK_OK
+put mr_route_out 9 add get mr_route_out 9 1
+ret
+end
+if not mr_eval_node_wattcbf s req_pw
+put mr_route_out 10 add get mr_route_out 10 1
+ret
+end
+put mr_route_out 8 1
+rus = mr_calc_remote_us s work_units est_out
+dl = pk_get_deadline_us
+if and eq pk_get_hard_dl 1 gt dl 0
+if gt rus dl
+put mr_route_out 12 add get mr_route_out 12 1
+ret
+end
+end
+if or eq get mr_route_out 1 MR_NONE lt rus get mr_route_out 4
+put mr_route_out 1 s
+put mr_route_out 4 rus
+put mr_route_out 5 add get mr_n_rtt_us s div tdGet tid TDF_COHNS 1000
+bw = get mr_n_bw_mbps s
+if eq bw 0
+bw = ulong 1
+end
+xb = add get pk_len 0 get mr_in_len 0
+xb = add xb add est_out 352
+put mr_route_out 6 mr_ceil_div_u xb bw
+if gt get mr_wc_out 1 0
+put mr_route_out 13 ulong get mr_wc_out 1
+else
+put mr_route_out 13 0
+end
+if gt get mr_wc_out 2 0
+put mr_route_out 14 ulong get mr_wc_out 2
+else
+put mr_route_out 14 0
+end
+end
+end
+
+fn mr_route_scan_peers work_units ulong req_pw long est_out ulong to ulong
+put mr_route_out 1 MR_NONE
+put mr_route_out 4 MR_NONE
+s = ulong 1
+while lt s MR_NODE_CAP bound 16
+mr_route_consider_peer s work_units req_pw est_out
+s = add s 1
+end
+ret get mr_route_out 1
+end
+
+note Primary Compile-on-Arrive Mesh Router:
+note 1. Checks OMEGA-MEMO first (when check_memo is true) -> instant MR_DEC_MEMO_HIT.
+note 2. On miss, verifies OMPK v1/v2, evaluates local vs peer TargetDesc + WattCBF + RTT/transfer.
+note 3. Fails closed (MR_ERR_NO_NODE) if no safe, contract-compatible node exists.
+fn mr_route_select work_units ulong req_pw long est_out ulong check_memo bool to ulong
+mr_route_reset_out
+if check_memo
+if eq mm_lookup MM_OK
+put mr_route_out 0 MR_DEC_MEMO_HIT
+put mr_route_out 1 0
+put mr_route_out 2 get mr_n_tid 0
+put mr_net_stats 1 add get mr_net_stats 1 1
+ret MR_DEC_MEMO_HIT
+end
+end
+if ne pk_verify PK_OK
+put mr_route_out 0 MR_ERR_BAD_OMPK
+ret MR_ERR_BAD_OMPK
+end
+loc_ok = mr_route_eval_local work_units req_pw
+best_rem = mr_route_scan_peers work_units req_pw est_out
+if and not loc_ok eq best_rem MR_NONE
+put mr_route_out 0 MR_ERR_NO_NODE
+ret MR_ERR_NO_NODE
+end
+if not loc_ok
+put mr_route_out 0 MR_DEC_REMOTE
+put mr_route_out 1 best_rem
+put mr_route_out 2 get mr_n_tid best_rem
+ret MR_DEC_REMOTE
+end
+if eq best_rem MR_NONE
+put mr_route_out 0 MR_DEC_LOCAL
+put mr_route_out 1 0
+put mr_route_out 2 get mr_n_tid 0
+ret MR_DEC_LOCAL
+end
+if lt add get mr_route_out 4 MR_OFFLOAD_MARGIN_US get mr_route_out 3
+put mr_route_out 0 MR_DEC_REMOTE
+put mr_route_out 1 best_rem
+put mr_route_out 2 get mr_n_tid best_rem
+ret MR_DEC_REMOTE
+end
+put mr_route_out 0 MR_DEC_LOCAL
+put mr_route_out 1 0
+put mr_route_out 2 get mr_n_tid 0
+ret MR_DEC_LOCAL
+end
+
+note ---- OMSH v1 Binary Wire Framing (Fail-Closed & Ed25519 Signed) ----
+
+fn mr_w_put_u16 off ulong v ulong to void
+put mr_wire off uchar and v 255
+put mr_wire add off 1 uchar and shr v 8 255
+end
+
+fn mr_w_put_u32 off ulong v ulong to void
+put mr_wire off uchar and v 255
+put mr_wire add off 1 uchar and shr v 8 255
+put mr_wire add off 2 uchar and shr v 16 255
+put mr_wire add off 3 uchar and shr v 24 255
+end
+
+fn mr_w_put_u64 off ulong v ulong to void
+mr_w_put_u32 off and v 4294967295
+mr_w_put_u32 add off 4 shr v 32
+end
+
+fn mr_w_get_u16 off ulong to ulong
+b0 = ulong get mr_wire off
+b1 = shl ulong get mr_wire add off 1 8
+ret or b0 b1
+end
+
+fn mr_w_get_u32 off ulong to ulong
+b0 = ulong get mr_wire off
+b1 = shl ulong get mr_wire add off 1 8
+b2 = shl ulong get mr_wire add off 2 16
+b3 = shl ulong get mr_wire add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn mr_w_get_u64 off ulong to ulong
+lo = mr_w_get_u32 off
+hi = mr_w_get_u32 add off 4
+ret or lo shl hi 32
+end
+
+fn mr_wire_check_hdr want_type ulong to ulong
+wlen = get mr_wire_len 0
+if or lt wlen MR_OMSH_HDR_LEN gt wlen MR_MAX_WIRE
+ret MR_ERR_FRAME_LEN
+end
+for i ulong 4
+if ne get mr_wire i get mr_omsh_magic i
+ret MR_ERR_FRAME_MAGIC
+end
+end
+if ne mr_w_get_u16 4 MR_OMSH_VER
+ret MR_ERR_FRAME_VER
+end
+mtype = mr_w_get_u16 6
+if ne mtype want_type
+ret MR_ERR_FRAME_TYPE
+end
+plen = mr_w_get_u32 8
+if gt plen MR_MAX_FRAME_PAYLOAD
+ret MR_ERR_FRAME_LEN
+end
+if ne wlen add MR_OMSH_HDR_LEN plen
+ret MR_ERR_FRAME_LEN
+end
+ret MR_OK
+end
+
+fn mr_sign_req_wire sig_off ulong to ulong
+for i ulong 32
+put mv_ed_seed i get mr_cli_seed i
+end
+for i ulong sig_off bound 33024
+put mv_ed_msg i get mr_wire i
+end
+if ne mv_ed_sign_buf sig_off MV_OK
+ret MR_ERR_FRAME_SIG
+end
+for i ulong 64
+put mr_wire add sig_off i get mv_ed_sig i
+end
+put mr_wire_len 0 add sig_off 64
+ret MR_OK
+end
+
+fn mr_encode_req_copy_body ompk_l ulong in_l ulong to ulong
+for i ulong in_l bound 16384
+put sh_dat i get mr_in_buf i
+end
+sh_all in_l
+for i ulong 32
+put mr_req_in_sha i get sh_dig i
+put mr_wire add 32 i get mr_cli_pk i
+put mr_wire add 64 i get sh_dig i
+end
+for i ulong ompk_l bound 4768
+put mr_wire add 128 i get pk_buf i
+end
+p_in = add 128 ompk_l
+for i ulong in_l bound 16384
+put mr_wire add p_in i get mr_in_buf i
+end
+ret mr_sign_req_wire add p_in in_l
+end
+
+note Encode OMSH v1 DISPATCH_REQ into mr_wire and sign with mr_cli_seed
+fn mr_encode_req_frame work_kind ulong prec_tier ulong err_b ulong target_tid ulong flags ulong to ulong
+ompk_l = get pk_len 0
+in_l = get mr_in_len 0
+if or eq ompk_l 0 gt ompk_l PK_MAX_PKG_LEN
+ret MR_ERR_BAD_OMPK
+end
+if gt in_l MR_MAX_INPUT_LEN
+ret MR_ERR_FRAME_LEN
+end
+plen = add MR_REQ_FIXED_HDR ompk_l
+plen = add plen add in_l 64
+if gt plen MR_MAX_FRAME_PAYLOAD
+ret MR_ERR_FRAME_LEN
+end
+put mr_wire 0 get mr_omsh_magic 0
+put mr_wire 1 get mr_omsh_magic 1
+put mr_wire 2 get mr_omsh_magic 2
+put mr_wire 3 get mr_omsh_magic 3
+mr_w_put_u16 4 MR_OMSH_VER
+mr_w_put_u16 6 MR_MSG_DISPATCH_REQ
+mr_w_put_u32 8 plen
+mr_w_put_u32 12 flags
+mr_w_put_u64 16 get mr_req_meta 1
+mr_w_put_u64 24 get mr_req_meta 2
+mr_w_put_u32 96 ompk_l
+mr_w_put_u32 100 in_l
+mr_w_put_u32 104 work_kind
+mr_w_put_u32 108 prec_tier
+mr_w_put_u64 112 err_b
+mr_w_put_u64 120 target_tid
+ret mr_encode_req_copy_body ompk_l in_l
+end
+
+fn mr_decode_req_verify_sig sig_off ulong req_cli_allowlist bool to ulong
+for i ulong 32
+b = get mr_wire add 32 i
+put mr_req_cli_pk i b
+put mv_ed_pk i b
+end
+if req_cli_allowlist
+cs = mv_peer_find_pk
+if eq cs MV_NONE
+ret MR_ERR_UNAUTH_PEER
+end
+if ne get mv_peer_quar cs 0
+ret MR_ERR_UNAUTH_PEER
+end
+end
+for i ulong sig_off bound 33024
+put mv_ed_msg i get mr_wire i
+end
+for i ulong 64
+put mv_ed_sig i get mr_wire add sig_off i
+end
+if not mv_ed_verify_buf sig_off
+ret MR_ERR_FRAME_SIG
+end
+ret MR_OK
+end
+
+fn mr_decode_req_extract ompk_l ulong in_l ulong to ulong
+for i ulong 32
+put mr_req_in_sha i get mr_wire add 64 i
+end
+for i ulong ompk_l bound 4768
+put pk_buf i get mr_wire add 128 i
+end
+put pk_len 0 ompk_l
+p_in = add 128 ompk_l
+for i ulong in_l bound 16384
+put mr_in_buf i get mr_wire add p_in i
+put sh_dat i get mr_wire add p_in i
+end
+put mr_in_len 0 in_l
+sh_all in_l
+for i ulong 32
+if ne get sh_dig i get mr_req_in_sha i
+ret MR_ERR_FRAME_SIG
+end
+end
+if ne pk_verify PK_OK
+ret MR_ERR_BAD_OMPK
+end
+if ne pk_get_purity 1
+ret MR_ERR_IMPURE
+end
+ret MR_OK
+end
+
+note Decode & fail-closed verify OMSH v1 DISPATCH_REQ from mr_wire
+fn mr_decode_req_frame req_cli_allowlist bool to ulong
+hrc = mr_wire_check_hdr MR_MSG_DISPATCH_REQ
+if ne hrc MR_OK
+ret hrc
+end
+plen = mr_w_get_u32 8
+if lt plen add MR_REQ_FIXED_HDR 64
+ret MR_ERR_FRAME_LEN
+end
+ompk_l = mr_w_get_u32 96
+in_l = mr_w_get_u32 100
+if or eq ompk_l 0 gt ompk_l PK_MAX_PKG_LEN
+ret MR_ERR_FRAME_LEN
+end
+if gt in_l MR_MAX_INPUT_LEN
+ret MR_ERR_FRAME_LEN
+end
+want_p = add MR_REQ_FIXED_HDR ompk_l
+want_p = add want_p add in_l 64
+if ne plen want_p
+ret MR_ERR_FRAME_LEN
+end
+hrc = mr_decode_req_verify_sig add add 128 ompk_l in_l req_cli_allowlist
+if ne hrc MR_OK
+ret hrc
+end
+put mr_req_meta 0 mr_w_get_u32 12
+put mr_req_meta 1 mr_w_get_u64 16
+put mr_req_meta 2 mr_w_get_u64 24
+put mr_req_meta 3 ompk_l
+put mr_req_meta 4 in_l
+put mr_req_meta 5 mr_w_get_u32 104
+put mr_req_meta 6 mr_w_get_u32 108
+put mr_req_meta 7 mr_w_get_u64 112
+put mr_req_meta 8 mr_w_get_u64 120
+ret mr_decode_req_extract ompk_l in_l
+end
+
+note Encode OMSH v1 DISPATCH_RESP from mv_rcpt + mm_val_buf + mr_aux_buf into mr_wire
+fn mr_encode_resp_frame status ulong olen ulong aux_l ulong to ulong
+if gt olen 16384
+ret MR_ERR_FRAME_LEN
+end
+if gt aux_l 4096
+ret MR_ERR_FRAME_LEN
+end
+plen = add add MR_RESP_FIXED_HDR olen aux_l
+if gt plen MR_MAX_FRAME_PAYLOAD
+ret MR_ERR_FRAME_LEN
+end
+for i ulong 4
+put mr_wire i get mr_omsh_magic i
+end
+mr_w_put_u16 4 MR_OMSH_VER
+mr_w_put_u16 6 MR_MSG_DISPATCH_RESP
+mr_w_put_u32 8 plen
+mr_w_put_u32 12 get mr_req_meta 0
+mr_w_put_u64 16 get mr_req_meta 1
+mr_w_put_u64 24 get mr_req_meta 2
+mr_w_put_u32 32 status
+mr_w_put_u32 36 olen
+mr_w_put_u32 40 aux_l
+mr_w_put_u32 44 0
+for i ulong MV_RCPT_LEN
+put mr_wire add 48 i get mv_rcpt i
+end
+p_out = add 48 MV_RCPT_LEN
+for i ulong olen bound 16384
+put mr_wire add p_out i get mm_val_buf i
+end
+p_aux = add p_out olen
+for i ulong aux_l bound 4096
+put mr_wire add p_aux i get mr_aux_buf i
+end
+put mr_wire_len 0 add MR_OMSH_HDR_LEN plen
+ret MR_OK
+end
+
+fn mr_decode_resp_copy olen ulong aux_l ulong to void
+for i ulong MV_RCPT_LEN
+put mv_rcpt i get mr_wire add 48 i
+end
+p_out = add 48 MV_RCPT_LEN
+for i ulong olen bound 16384
+put mm_val_buf i get mr_wire add p_out i
+end
+put mm_val_len 0 olen
+p_aux = add p_out olen
+for i ulong aux_l bound 4096
+put mr_aux_buf i get mr_wire add p_aux i
+end
+put mr_aux_len 0 aux_l
+end
+
+note Decode OMSH v1 DISPATCH_RESP from mr_wire into mv_rcpt + mm_val_buf + mr_aux_buf
+fn mr_decode_resp_frame to ulong
+hrc = mr_wire_check_hdr MR_MSG_DISPATCH_RESP
+if ne hrc MR_OK
+ret hrc
+end
+plen = mr_w_get_u32 8
+if lt plen MR_RESP_FIXED_HDR
+ret MR_ERR_FRAME_LEN
+end
+olen = mr_w_get_u32 36
+aux_l = mr_w_get_u32 40
+if ne mr_w_get_u32 44 0
+ret MR_ERR_FRAME_LEN
+end
+if or gt olen 16384 gt aux_l 4096
+ret MR_ERR_FRAME_LEN
+end
+if ne plen add add MR_RESP_FIXED_HDR olen aux_l
+ret MR_ERR_FRAME_LEN
+end
+put mr_req_meta 9 mr_w_get_u32 32
+put mr_req_meta 10 olen
+put mr_req_meta 11 aux_l
+mr_decode_resp_copy olen aux_l
+ret MR_OK
+end
+
+note ---- Loopback-Safe Native Pure-OM-2 TCP Socket Engine ----
+
+fn mr_fill_sockaddr ipv4 ulong port ulong to void
+for i ulong 16
+put mr_sockaddr i 0
+end
+note AF_INET = 2 (LE u16), port (BE u16), ipv4 (BE u32)
+put mr_sockaddr 0 2
+put mr_sockaddr 1 0
+put mr_sockaddr 2 uchar and shr port 8 255
+put mr_sockaddr 3 uchar and port 255
+put mr_sockaddr 4 uchar and shr ipv4 24 255
+put mr_sockaddr 5 uchar and shr ipv4 16 255
+put mr_sockaddr 6 uchar and shr ipv4 8 255
+put mr_sockaddr 7 uchar and ipv4 255
+end
+
+fn mr_tcp_listen ipv4 ulong port ulong to long
+if not mr_ip_is_safe_bind ipv4
+ret neg long MR_ERR_WILDCARD_BIND
+end
+fd = socknew 2 1 0
+if lt fd 0
+ret neg long MR_ERR_SOCK
+end
+put mr_sopt 0 1
+put mr_sopt 1 0
+put mr_sopt 2 0
+put mr_sopt 3 0
+sr = sockopt int fd 1 2 mr_sopt 0 4
+mr_fill_sockaddr ipv4 port
+br = bind int fd mr_sockaddr 0 16
+if ne br 0
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+snr = sockname int fd mr_sockaddr 0 16
+if ne snr 16
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+bport = or shl ulong get mr_sockaddr 2 8 ulong get mr_sockaddr 3
+put mr_net_stats 7 bport
+lr = listen int fd 8
+if ne lr 0
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+ret fd
+end
+
+fn mr_tcp_connect ipv4 ulong port ulong to long
+if not mr_ip_is_safe_endpoint ipv4
+ret neg long MR_ERR_WILDCARD_BIND
+end
+fd = socknew 2 1 0
+if lt fd 0
+ret neg long MR_ERR_SOCK
+end
+mr_fill_sockaddr ipv4 port
+cr = connect int fd mr_sockaddr 0 16
+if ne cr 0
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+ret fd
+end
+
+fn mr_tcp_send_wire fd int to ulong
+tot = get mr_wire_len 0
+if or eq tot 0 gt tot MR_MAX_WIRE
+ret MR_ERR_FRAME_LEN
+end
+off = ulong 0
+while lt off tot bound 4096
+k = send fd mr_wire off sub tot off 0
+if le k 0
+ret MR_ERR_IO
+end
+off = add off ulong k
+end
+put mr_net_stats 4 add get mr_net_stats 4 1
+ret MR_OK
+end
+
+fn mr_tcp_recv_exact fd int start ulong need ulong to ulong
+off = ulong 0
+while lt off need bound 4096
+wr = waitio fd 1 3000000000
+if lt wr 0
+ret MR_ERR_IO
+end
+if eq and wr 1 0
+ret MR_ERR_TIMEOUT
+end
+k = recv fd mr_wire add start off sub need off 0
+if le k 0
+ret MR_ERR_IO
+end
+off = add off ulong k
+end
+ret MR_OK
+end
+
+fn mr_tcp_recv_wire fd int to ulong
+rc = mr_tcp_recv_exact fd 0 MR_OMSH_HDR_LEN
+if ne rc MR_OK
+ret rc
+end
+for i ulong 4
+if ne get mr_wire i get mr_omsh_magic i
+ret MR_ERR_FRAME_MAGIC
+end
+end
+if ne mr_w_get_u16 4 MR_OMSH_VER
+ret MR_ERR_FRAME_VER
+end
+plen = mr_w_get_u32 8
+if gt plen MR_MAX_FRAME_PAYLOAD
+ret MR_ERR_FRAME_LEN
+end
+if gt plen 0
+rc2 = mr_tcp_recv_exact fd MR_OMSH_HDR_LEN plen
+if ne rc2 MR_OK
+ret rc2
+end
+end
+put mr_wire_len 0 add MR_OMSH_HDR_LEN plen
+put mr_net_stats 5 add get mr_net_stats 5 1
+ret MR_OK
+end
+
+note ---- Pure Compute-on-Arrive Execution Kernels ----
+
+fn mr_in_get_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mr_in_buf add off j mul j 8
+end
+ret v
+end
+
+fn mr_exec_poly_core to void
+tl = len mr_poly_tag
+for i ulong tl bound 32
+put sh_dat i get mr_poly_tag i
+end
+for i ulong 32
+put sh_dat add tl i get pk_buf add 40 i
+end
+inl = get mr_in_len 0
+if gt inl 4096
+inl = ulong 4096
+end
+for i ulong inl bound 4096
+put sh_dat add add tl 32 i get mr_in_buf i
+end
+sh_all add add tl 32 inl
+for i ulong 32
+put mr_poly_tmp i get sh_dig i
+end
+for r ulong 16
+for i ulong 32
+put sh_dat i get mr_poly_tmp i
+end
+mv_sh_put_u64 32 r
+sh_all 40
+for i ulong 32
+put mr_poly_tmp i get sh_dig i
+end
+end
+end
+
+fn mr_exec_poly_to_valbuf to ulong
+mr_exec_poly_core
+for i ulong 32
+put mm_val_buf i get mr_poly_tmp i
+end
+put mm_val_len 0 32
+ret MR_OK
+end
+
+fn mr_exec_poly_to_spot to void
+mr_exec_poly_core
+for i ulong 32
+put mv_spot_local i get mr_poly_tmp i
+end
+put mv_spot_llen 0 32
+end
+
+fn mr_exec_matmul_from_in fault_mode ulong to ulong
+inl = get mr_in_len 0
+if lt inl 8
+ret MR_ERR_FRAME_LEN
+end
+n = mr_in_get_u64 0
+if or eq n 0 gt n 32
+ret MR_ERR_FRAME_LEN
+end
+elems = mul n n
+need = add 8 mul elems 16
+if ne inl need
+ret MR_ERR_FRAME_LEN
+end
+for idx ulong elems bound 1024
+put mv_mat_a idx mr_in_get_u64 add 8 mul idx 8
+put mv_mat_b idx mr_in_get_u64 add add 8 mul elems 8 mul idx 8
+end
+crc = mv_matmul_compute n
+if ne crc MV_OK
+ret MR_ERR_FRAME_LEN
+end
+if eq fault_mode MR_FAULT_MATMUL_CORRUPT
+put mv_mat_c 5 add get mv_mat_c 5 1
+end
+erc = mv_mat_c_encode_to_valbuf n
+if ne erc MV_OK
+ret MR_ERR_FRAME_LEN
+end
+ret MR_OK
+end
+
+fn mr_exec_merkle_from_in fault_mode ulong to ulong
+if ne get mr_in_len 0 16
+ret MR_ERR_FRAME_LEN
+end
+m = mr_in_get_u64 0
+sseed = mr_in_get_u64 8
+bad_c = MV_NONE
+if eq fault_mode MR_FAULT_MERKLE_CHUNK11
+bad_c = ulong 11
+end
+mrc = mv_merkle_run_trace true m sseed bad_c
+if ne mrc MV_OK
+ret MR_ERR_FRAME_LEN
+end
+for i ulong 32
+put mm_val_buf i get mv_mk_state i
+end
+put mm_val_len 0 32
+tbytes = mul mul m 2 32
+for i ulong tbytes bound 4096
+put mr_aux_buf i get mv_mk_rem i
+end
+put mr_aux_len 0 tbytes
+ret MR_OK
+end
+
+note ---- Real TCP Loopback Worker & Client Dispatch Engine ----
+
+fn mr_worker_apply_fault fault_mode ulong to void
+if eq fault_mode MR_FAULT_FLIP_OUT_BEFORE_SIGN
+if gt get mm_val_len 0 0
+put mm_val_buf 0 xor get mm_val_buf 0 uchar 1
+end
+end
+if eq fault_mode MR_FAULT_WRONG_INPUT_HASH
+put mv_exp_in_sha 0 xor get mv_exp_in_sha 0 uchar 1
+end
+end
+
+fn mr_worker_post_sign_fault fault_mode ulong to void
+if eq fault_mode MR_FAULT_FORGE_SIG
+put mv_rcpt 224 xor get mv_rcpt 224 uchar 1
+end
+end
+
+fn mr_worker_sign_resp worker_tid ulong fault_mode ulong cns ulong to ulong
+for i ulong 32
+put mv_exp_ompk_sem i get pk_buf add 8 i
+put mv_exp_fid i get pk_buf add 40 i
+put mv_exp_in_sha i get mr_req_in_sha i
+end
+vtier = MV_TIER_A_SOVEREIGN
+if ne and get mr_req_meta 0 MR_FLAG_TIER_B 0
+vtier = MV_TIER_B_ZEROTRUST
+end
+mv_set_expected_meta get mr_req_meta 6 get mr_req_meta 7 get mr_req_meta 1 get mr_req_meta 2 vtier
+mr_worker_apply_fault fault_mode
+if eq fault_mode MR_FAULT_UNKNOWN_KEY
+mv_ed_derive_seed mr_rogue_tag 777
+else
+for i ulong 32
+put mv_ed_seed i get mr_wrk_seed i
+end
+end
+if ne mv_rcpt_sign worker_tid get mr_req_meta 6 vtier get mr_req_meta 7 cns MV_OK
+ret MR_ERR_FRAME_SIG
+end
+mr_worker_post_sign_fault fault_mode
+ret MR_OK
+end
+
+fn mr_worker_exec_and_sign worker_tid ulong worker_feat ulong fault_mode ulong to ulong
+if ne pk_realize_on_arrive worker_tid worker_feat 1 7 PK_OK
+ret MR_ERR_REMOTE_REFUSED
+end
+t0 = monons
+put mr_aux_len 0 0
+wk = get mr_req_meta 5
+xrc = ulong MR_ERR_FRAME_TYPE
+if eq wk MR_WORK_POLY_PURE
+xrc = mr_exec_poly_to_valbuf
+else
+if eq wk MR_WORK_MATMUL_INT64
+xrc = mr_exec_matmul_from_in fault_mode
+else
+if eq wk MR_WORK_MERKLE_STEPS
+xrc = mr_exec_merkle_from_in fault_mode
+end
+end
+end
+t1 = monons
+cns = ulong 10000
+if gt t1 t0
+cns = ulong sub t1 t0
+if lt cns 10000
+cns = ulong 10000
+end
+end
+if ne xrc MR_OK
+ret xrc
+end
+ret mr_worker_sign_resp worker_tid fault_mode cns
+end
+
+note Serve one Compile-on-Arrive OMSH v1 request over an accepted TCP connection
+fn mr_worker_serve_one lfd int worker_tid ulong worker_feat ulong fault_mode ulong req_cli_auth bool to ulong
+wr = waitio lfd 1 5000000000
+if lt wr 0
+ret MR_ERR_IO
+end
+if eq and wr 1 0
+ret MR_ERR_TIMEOUT
+end
+cfd = accept lfd 0
+if lt cfd 0
+ret MR_ERR_SOCK
+end
+rc = mr_tcp_recv_wire int cfd
+if ne rc MR_OK
+cf = fclose int cfd
+ret rc
+end
+rc = mr_decode_req_frame req_cli_auth
+if eq rc MR_OK
+rc = mr_worker_exec_and_sign worker_tid worker_feat fault_mode
+end
+if ne rc MR_OK
+put mr_aux_len 0 0
+put mm_val_len 0 0
+if eq mr_encode_resp_frame rc 0 0 MR_OK
+sr = mr_tcp_send_wire int cfd
+end
+cf = fclose int cfd
+ret rc
+end
+rc = mr_encode_resp_frame MR_OK get mm_val_len 0 get mr_aux_len 0
+if eq rc MR_OK
+rc = mr_tcp_send_wire int cfd
+end
+cf = fclose int cfd
+ret rc
+end
+
+note Client-side single TCP roundtrip to ipv4:port (expects pk_buf, mr_in_buf, mr_req_meta[1..2] staged)
+fn mr_client_tcp_call ipv4 ulong port ulong work_kind ulong prec_tier ulong err_b ulong flags ulong to ulong
+rc = mr_encode_req_frame work_kind prec_tier err_b get mr_req_meta 8 flags
+if ne rc MR_OK
+ret rc
+end
+fd = mr_tcp_connect ipv4 port
+if lt fd 0
+ret MR_ERR_SOCK
+end
+rc = mr_tcp_send_wire int fd
+if eq rc MR_OK
+rc = mr_tcp_recv_wire int fd
+end
+cf = fclose int fd
+if ne rc MR_OK
+ret rc
+end
+rc = mr_decode_resp_frame
+if ne rc MR_OK
+ret rc
+end
+if ne get mr_req_meta 9 MR_OK
+ret MR_ERR_REMOTE_REFUSED
+end
+put mr_net_stats 0 add get mr_net_stats 0 1
+ret MR_OK
+end
+
+note Sync mm_req_* and mv_exp_* from current pk_buf (OMPK v2) + mr_in_buf
+fn mr_stage_memo_and_exp prec_tier ulong err_b ulong nonce ulong epoch ulong vtier ulong to ulong
+if ne pk_verify PK_OK
+ret MR_ERR_BAD_OMPK
+end
+if ne pk_get_purity 1
+ret MR_ERR_IMPURE
+end
+inl = get mr_in_len 0
+if gt inl MR_MAX_INPUT_LEN
+ret MR_ERR_FRAME_LEN
+end
+for i ulong inl bound 16384
+put sh_dat i get mr_in_buf i
+end
+sh_all inl
+for i ulong 32
+put mv_exp_ompk_sem i get pk_buf add 8 i
+put mv_exp_fid i get pk_buf add 40 i
+put mv_exp_in_sha i get sh_dig i
+put mm_req_ir_sha i get pk_buf add 8 i
+put mm_req_fid i get pk_buf add 40 i
+put mm_req_in_sha i get sh_dig i
+end
+mm_set_contract 1 1 prec_tier err_b
+mv_set_expected_meta prec_tier err_b nonce epoch vtier
+mv_set_expected_purity 1 1 get mr_req_meta 8
+ret MR_OK
+end
+
+fn mr_client_verify_resp work_kind ulong vtier ulong nonce ulong to ulong
+olen = get mm_val_len 0
+if eq vtier MV_TIER_A_SOVEREIGN
+has_spot = false
+if mv_should_spot_check nonce
+if eq work_kind MR_WORK_POLY_PURE
+mr_exec_poly_to_spot
+has_spot = true
+end
+end
+ret mv_tier_a_verify olen has_spot
+end
+if eq work_kind MR_WORK_MATMUL_INT64
+ret mv_tier_b_verify_freivalds mr_in_get_u64 0 32 0
+end
+if eq work_kind MR_WORK_MERKLE_STEPS
+m = mr_in_get_u64 0
+tbytes = mul mul m 2 32
+if ne get mr_aux_len 0 tbytes
+ret MV_ERR_FORMAT
+end
+for i ulong tbytes bound 4096
+put mv_mk_rem i get mr_aux_buf i
+end
+ret mv_tier_b_verify_merkle olen m
+end
+ret MV_ERR_UNVERIFIED
+end
+
+note Full transparent Client Compile-on-Arrive + Verification + OMEGA-MEMO path:
+note 1. Checks OMEGA-MEMO first -> instant 0-recompute MR_DEC_MEMO_HIT.
+note 2. On miss, dispatches OMSH v1 over TCP to peer slot.
+note 3. Verifies via Tier A (Ed25519 + optional spot-check) or Tier B (Freivalds / Merkle).
+note 4. Admits to OMEGA-MEMO ONLY AFTER verification passes!
+fn mr_client_dispatch_and_memo slot ulong work_kind ulong prec_tier ulong err_b ulong vtier ulong flags ulong to ulong
+if ge slot MR_NODE_CAP
+ret MR_ERR_BAD_NODE
+end
+put mr_req_meta 8 get mr_n_tid slot
+rc = mr_stage_memo_and_exp prec_tier err_b get mr_req_meta 1 get mr_req_meta 2 vtier
+if ne rc MR_OK
+ret rc
+end
+if eq mm_lookup MM_OK
+put mr_net_stats 1 add get mr_net_stats 1 1
+ret MR_DEC_MEMO_HIT
+end
+rc = mr_client_tcp_call get mr_n_ipv4 slot get mr_n_port slot work_kind prec_tier err_b flags
+if ne rc MR_OK
+ret rc
+end
+rc = mr_client_verify_resp work_kind vtier get mr_req_meta 1
+put mr_net_stats 6 rc
+if ne rc MV_OK
+ret MR_ERR_VERIFY_FAILED
+end
+if ne mv_admit_to_memo get mv_parsed 7 1000 MV_OK
+ret MR_ERR_MEMO_FAILED
+end
+put mr_net_stats 3 add get mr_net_stats 3 1
+ret MR_DEC_REMOTE
+end
