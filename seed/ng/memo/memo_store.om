@@ -1,0 +1,1122 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/memo/memo_store.om: Universal Content-Addressed Memoization (OMEGA-MEMO)
+note Stage 1 (Pillar 2) of Sovereign Intelligence 2.0.
+note
+note Pure seeded OM-2-compatible library unit (no om2 header, no fn main; prefix mm_ / MM_).
+note Link after seed/ng/sha256.om and seed/ng/memo/memo_policy.om.
+note
+note Disk-backed CAS layout (NO arbitrary fixed entry cap):
+note   <root>/<2hex>/<64hex>.ome
+note   where base_key = SHA-256("omega.memo.key.v1\0" || func_sem_id[32] || inputs_sha256[32]).
+note
+note Binary .ome format (OMEM v1, fixed 224-byte header + output_bytes[0..output_len)):
+note   [0..3]     magic "OMEM" (79, 77, 69, 77)
+note   [4..7]     version u32 LE (1)
+note   [8]        purity_flag u8 (MUST be 1)
+note   [9]        precision_tier u8 (1 = @exact, 2 = @tol)
+note   [10]       prov_flags u8 (bit 0 = ck_pure verified, bit 1 = OMPK v2 verified; bits 2..7 = 0)
+note   [11]       reserved0 u8 (MUST be 0)
+note   [12..15]   reserved1 u32 LE (MUST be 0)
+note   [16..23]   err_bound u64 LE (MUST be 0 when precision_tier == 1)
+note   [24..55]   func_sem_id [32B]
+note   [56..87]   inputs_sha256 [32B]
+note   [88..95]   output_len u64 LE
+note   [96..127]  output_sha256 [32B] (FIPS 180-4 SHA-256 of output_bytes)
+note   [128..135] prov_created_ns u64 LE (realns)
+note   [136..143] prov_compute_ns u64 LE
+note   [144..151] prov_creator_pid u64 LE
+note   [152..159] prov_target_id u64 LE
+note   [160..191] prov_ir_sha256 [32B]
+note   [192..223] entry_sha256 [32B] (FIPS 180-4 SHA-256 of bytes [0..192))
+note   [224..end) output_bytes [output_len B]
+
+const MM_MAGIC_0 ulong 79
+const MM_MAGIC_1 ulong 77
+const MM_MAGIC_2 ulong 69
+const MM_MAGIC_3 ulong 77
+const MM_VERSION ulong 1
+const MM_HDR_LEN ulong 224
+const MM_MAX_VAL_LEN ulong 4194304
+const MM_MAX_ROOT_LEN ulong 1900
+
+note Precision tiers & provenance bits
+const MM_TIER_EXACT ulong 1
+const MM_TIER_TOL ulong 2
+const MM_PROV_CK_PURE ulong 1
+const MM_PROV_OMPK_V2 ulong 2
+
+note Return & fail-closed refusal codes
+const MM_OK ulong 0
+const MM_MISS ulong 1
+const MM_OK_DOMINATED ulong 2
+const MM_SKIP_UNPROFITABLE ulong 3
+const MM_OK_ALARM ulong 4
+
+const MM_ERR_MAGIC ulong 10
+const MM_ERR_VERSION ulong 11
+const MM_ERR_TRUNCATED ulong 12
+const MM_ERR_TRAILING ulong 13
+const MM_ERR_TAMPER ulong 14
+const MM_ERR_KEY_MISMATCH ulong 15
+const MM_ERR_FORMAT ulong 16
+const MM_ERR_PRECISION_MISS ulong 17
+const MM_ERR_IMPURE ulong 20
+const MM_ERR_CONTRACT ulong 21
+const MM_ERR_NONDET ulong 22
+const MM_ERR_NO_ROOT ulong 23
+const MM_ERR_IO ulong 24
+const MM_ERR_OMPK ulong 25
+
+note Linux ARM64 fopen flags (with O_NOFOLLOW = 32768)
+const MM_O_RDONLY int 32768
+const MM_O_WRNEW int 33345
+
+note Active root directory
+global mm_root uchar 4096
+global mm_root_len ulong 1
+
+note Active request staging: func_sem_id, inputs_sha256, contract, provenance
+global mm_req_fid uchar 32
+global mm_req_in_sha uchar 32
+note [0]=purity_flag [1]=ck_pure_verified [2]=precision_tier [3]=err_bound
+note [4]=prov_compute_ns [5]=prov_target_id [6]=prov_flags_extra
+global mm_req_contract ulong 8
+global mm_req_ir_sha uchar 32
+
+note Active value payload buffer (caller writes before mm_store, reads after mm_lookup hit)
+global mm_val_buf uchar 4194304
+global mm_val_len ulong 1
+global mm_val_sha uchar 32
+
+note Verified hit metadata from last read/lookup:
+note [0]=purity [1]=tier [2]=err_bound [3]=prov_flags
+note [4]=created_ns [5]=compute_ns [6]=creator_pid [7]=target_id
+global mm_hit_meta ulong 8
+global mm_hit_ir_sha uchar 32
+global mm_hit_entry_sha uchar 32
+
+note Internal key, path, header, atomic-rename, and environment scratch buffers
+global mm_key_dig uchar 32
+global mm_key_hex uchar 64
+global mm_shard_path uchar 4096
+global mm_shard_plen ulong 1
+global mm_file_path uchar 4096
+global mm_file_plen ulong 1
+global mm_tmp_path uchar 4096
+global mm_tmp_plen ulong 1
+global mm_ren_pkt uchar 4096
+global mm_hdr uchar 224
+global mm_chk_hdr uchar 224
+global mm_chk_sha uchar 32
+global mm_env_buf uchar 4096
+global mm_home_buf uchar 2048
+global mm_home_len ulong 1
+global mm_probe_b uchar 16
+global mm_tmp_seq ulong 1
+global mm_ndig uchar 24
+
+note Telemetry counters:
+note [0]=lookups [1]=hits [2]=dominance_hits [3]=misses [4]=precision_refusals
+note [5]=purity_refusals [6]=tamper_refusals [7]=stores [8]=upgrades
+note [9]=downgrade_refusals [10]=policy_skips [11]=disk_alarms
+global mm_stats ulong 16
+
+text mm_key_tag "omega.memo.key.v1"
+text mm_ext_ome ".ome"
+text mm_ext_tmp ".tmp"
+text mm_env_dir "OMEGA_MEMO_DIR="
+text mm_env_home "HOME="
+text mm_def_suf "/.local/share/omega-memo"
+
+note ---- Reset & Little-Endian Header Helpers ----
+
+fn mm_reset_stats to void
+for i ulong 16
+put mm_stats i 0
+end
+end
+
+fn mm_reset_req to void
+for i ulong 32
+put mm_req_fid i 0
+put mm_req_in_sha i 0
+put mm_req_ir_sha i 0
+end
+for i ulong 8
+put mm_req_contract i 0
+end
+put mm_val_len 0 0
+end
+
+fn mm_hdr_put_u32 off ulong v ulong to void
+put mm_hdr off uchar and v 255
+put mm_hdr add off 1 uchar and shr v 8 255
+put mm_hdr add off 2 uchar and shr v 16 255
+put mm_hdr add off 3 uchar and shr v 24 255
+end
+
+fn mm_hdr_put_u64 off ulong v ulong to void
+mm_hdr_put_u32 off and v 4294967295
+mm_hdr_put_u32 add off 4 shr v 32
+end
+
+fn mm_hdr_get_u32 use_chk bool off ulong to ulong
+b0 = ulong 0
+b1 = ulong 0
+b2 = ulong 0
+b3 = ulong 0
+if use_chk
+b0 = ulong get mm_chk_hdr off
+b1 = shl ulong get mm_chk_hdr add off 1 8
+b2 = shl ulong get mm_chk_hdr add off 2 16
+b3 = shl ulong get mm_chk_hdr add off 3 24
+else
+b0 = ulong get mm_hdr off
+b1 = shl ulong get mm_hdr add off 1 8
+b2 = shl ulong get mm_hdr add off 2 16
+b3 = shl ulong get mm_hdr add off 3 24
+end
+ret or or b0 b1 or b2 b3
+end
+
+fn mm_hdr_get_u64 use_chk bool off ulong to ulong
+lo = mm_hdr_get_u32 use_chk off
+hi = mm_hdr_get_u32 use_chk add off 4
+ret or lo shl hi 32
+end
+
+note ---- Root Directory Management & Default Env Resolution ----
+
+fn mm_sync_policy_root to void
+n = get mm_root_len 0
+for i ulong n bound 4096
+put mp_root i get mm_root i
+end
+put mp_root_len 0 n
+end
+
+fn mm_mkdir_p to ulong
+n = get mm_root_len 0
+if eq n 0
+ret MM_ERR_NO_ROOT
+end
+i = ulong 1
+while lt i n bound 4096
+if eq get mm_root i 47
+r = makedir mm_root 0 i 493
+if and ne r 0 ne r neg long 17
+ret MM_ERR_IO
+end
+end
+i = add i 1
+end
+r2 = makedir mm_root 0 n 493
+if and ne r2 0 ne r2 neg long 17
+ret MM_ERR_IO
+end
+ret MM_OK
+end
+
+note Set root from mm_env_buf[0..n) (strips trailing slashes except single "/")
+fn mm_set_root_from_envbuf n ulong to ulong
+if eq n 0
+ret MM_ERR_NO_ROOT
+end
+m = n
+while gt m 1 bound 4096
+if ne get mm_env_buf sub m 1 47
+break
+end
+m = sub m 1
+end
+if gt m MM_MAX_ROOT_LEN
+ret MM_ERR_NO_ROOT
+end
+for i ulong m bound 4096
+ch = get mm_env_buf i
+if eq ch 0
+ret MM_ERR_NO_ROOT
+end
+put mm_root i ch
+end
+put mm_root_len 0 m
+mm_sync_policy_root
+ret mm_mkdir_p
+end
+
+fn mm_env_starts_dir n ulong to bool
+pl = len mm_env_dir
+if le n pl
+ret false
+end
+for i ulong pl bound 32
+if ne get mm_env_buf i get mm_env_dir i
+ret false
+end
+end
+ret true
+end
+
+fn mm_env_starts_home n ulong to bool
+pl = len mm_env_home
+if le n pl
+ret false
+end
+for i ulong pl bound 16
+if ne get mm_env_buf i get mm_env_home i
+ret false
+end
+end
+ret true
+end
+
+fn mm_init_from_home to ulong
+hl = get mm_home_len 0
+if eq hl 0
+ret MM_ERR_NO_ROOT
+end
+while gt hl 1 bound 2048
+if ne get mm_home_buf sub hl 1 47
+break
+end
+hl = sub hl 1
+end
+sl = len mm_def_suf
+tot = add hl sl
+if gt tot MM_MAX_ROOT_LEN
+ret MM_ERR_NO_ROOT
+end
+for j ulong hl bound 2048
+put mm_env_buf j get mm_home_buf j
+end
+for j ulong sl bound 64
+put mm_env_buf add hl j get mm_def_suf j
+end
+ret mm_set_root_from_envbuf tot
+end
+
+fn mm_env_take_dir n ulong to ulong
+pl = len mm_env_dir
+vlen = sub n pl
+for j ulong vlen bound 4096
+put mm_env_buf j get mm_env_buf add pl j
+end
+ret mm_set_root_from_envbuf vlen
+end
+
+fn mm_env_take_home n ulong to void
+pl = len mm_env_home
+vlen = sub n pl
+if and gt vlen 0 le vlen 1800
+for j ulong vlen bound 2048
+put mm_home_buf j get mm_env_buf add pl j
+end
+put mm_home_len 0 vlen
+end
+end
+
+note Resolve default root: OMEGA_MEMO_DIR if set, else $HOME/.local/share/omega-memo
+fn mm_init_default_root to ulong
+c = envcnt
+if lt c 0
+ret MM_ERR_NO_ROOT
+end
+cnt = ulong c
+put mm_home_len 0 0
+i = ulong 0
+while lt i cnt bound 4096
+rn = envread i mm_env_buf 0 4095
+if gt rn 0
+n = ulong rn
+if mm_env_starts_dir n
+ret mm_env_take_dir n
+end
+if mm_env_starts_home n
+mm_env_take_home n
+end
+end
+i = add i 1
+end
+ret mm_init_from_home
+end
+
+note ---- Contract, Purity Admission, and One-Way Dominance ----
+
+fn mm_set_contract pur ulong ck_pure_ok ulong tier ulong err_b ulong to void
+put mm_req_contract 0 pur
+put mm_req_contract 1 ck_pure_ok
+put mm_req_contract 2 tier
+put mm_req_contract 3 err_b
+end
+
+fn mm_set_provenance target_id ulong extra_flags ulong to void
+put mm_req_contract 5 target_id
+put mm_req_contract 6 extra_flags
+end
+
+fn mm_set_fid_from_sh to void
+for i ulong 32
+put mm_req_fid i get sh_dig i
+end
+end
+
+fn mm_set_in_sha_from_sh to void
+for i ulong 32
+put mm_req_in_sha i get sh_dig i
+end
+end
+
+fn mm_set_ir_sha_from_sh to void
+for i ulong 32
+put mm_req_ir_sha i get sh_dig i
+end
+end
+
+note Hash an 8-byte u64 input cleanly into mm_req_in_sha
+fn mm_hash_input_u64 v ulong to void
+for j ulong 8
+put sh_dat j uchar and shr v mul j 8 255
+end
+sh_all 8
+mm_set_in_sha_from_sh
+end
+
+note Hash mm_val_buf[0..n) into mm_req_in_sha (for arbitrary input buffers)
+fn mm_hash_valbuf_as_input n ulong to ulong
+if gt n MM_MAX_VAL_LEN
+ret MM_ERR_FORMAT
+end
+for i ulong n bound 4194304
+put sh_dat i get mm_val_buf i
+end
+sh_all n
+mm_set_in_sha_from_sh
+ret MM_OK
+end
+
+fn mm_val_u32 off ulong to ulong
+b0 = ulong get mm_val_buf off
+b1 = shl ulong get mm_val_buf add off 1 8
+b2 = shl ulong get mm_val_buf add off 2 16
+b3 = shl ulong get mm_val_buf add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn mm_val_u64 off ulong to ulong
+lo = mm_val_u32 off
+hi = mm_val_u32 add off 4
+ret or lo shl hi 32
+end
+
+note Admit directly from raw OMPK v2 wire bytes staged in mm_val_buf[0..plen)
+note Extracts func_sem_id, prov_ir_sha256, purity_flag, precision_tier, err_bound;
+note fails closed on OMPK v1, malformed header, or purity_flag != 1!
+fn mm_admit_ompk_v2 plen ulong ck_pure_ok ulong to ulong
+if lt plen 128
+ret MM_ERR_OMPK
+end
+if or ne ulong get mm_val_buf 0 79 ne ulong get mm_val_buf 1 77
+ret MM_ERR_OMPK
+end
+if or ne ulong get mm_val_buf 2 80 ne ulong get mm_val_buf 3 75
+ret MM_ERR_OMPK
+end
+ver = mm_val_u32 4
+if eq ver 1
+put mm_stats 5 add get mm_stats 5 1
+ret MM_ERR_IMPURE
+end
+if or ne ver 2 lt plen 160
+ret MM_ERR_OMPK
+end
+if ne mm_val_u32 132 844516176
+ret MM_ERR_OMPK
+end
+if ne ulong get mm_val_buf 131 0
+ret MM_ERR_OMPK
+end
+pur = ulong get mm_val_buf 128
+if or ne pur 1 ne ck_pure_ok 1
+put mm_stats 5 add get mm_stats 5 1
+ret MM_ERR_IMPURE
+end
+tier = ulong get mm_val_buf 129
+err_b = mm_val_u64 136
+if or lt tier 1 gt tier 2
+ret MM_ERR_CONTRACT
+end
+if and eq tier 1 ne err_b 0
+ret MM_ERR_CONTRACT
+end
+for i ulong 32
+put mm_req_ir_sha i get mm_val_buf add 8 i
+put mm_req_fid i get mm_val_buf add 40 i
+end
+mm_set_contract pur ck_pure_ok tier err_b
+put mm_req_contract 6 MM_PROV_OMPK_V2
+ret MM_OK
+end
+
+note Core contract & purity admission gate (fail-closed)
+fn mm_check_admission to ulong
+pur = get mm_req_contract 0
+ckp = get mm_req_contract 1
+if or ne pur 1 ne ckp 1
+put mm_stats 5 add get mm_stats 5 1
+ret MM_ERR_IMPURE
+end
+tier = get mm_req_contract 2
+err_b = get mm_req_contract 3
+if or lt tier 1 gt tier 2
+ret MM_ERR_CONTRACT
+end
+if and eq tier 1 ne err_b 0
+ret MM_ERR_CONTRACT
+end
+ret MM_OK
+end
+
+note One-way precision dominance relation:
+note   (1, 0) satisfies (1, 0) and (2, any)
+note   (2, e1) satisfies (2, e2) iff e1 <= e2
+note   (2, any) NEVER satisfies (1, 0)
+fn mm_dominates c_tier ulong c_err ulong r_tier ulong r_err ulong to bool
+if or lt c_tier 1 gt c_tier 2
+ret false
+end
+if or lt r_tier 1 gt r_tier 2
+ret false
+end
+if and eq c_tier 1 ne c_err 0
+ret false
+end
+if and eq r_tier 1 ne r_err 0
+ret false
+end
+if eq r_tier 1
+ret eq c_tier 1
+end
+if eq c_tier 1
+ret true
+end
+ret le c_err r_err
+end
+
+fn mm_strictly_tighter a_tier ulong a_err ulong b_tier ulong b_err ulong to bool
+if not mm_dominates a_tier a_err b_tier b_err
+ret false
+end
+ret not mm_dominates b_tier b_err a_tier a_err
+end
+
+note ---- CAS Key & Sharded Path Derivation (<root>/<2hex>/<64hex>.ome) ----
+
+fn mm_derive_paths to ulong
+rl = get mm_root_len 0
+if or eq rl 0 gt rl MM_MAX_ROOT_LEN
+ret MM_ERR_NO_ROOT
+end
+tl = len mm_key_tag
+for i ulong tl bound 32
+put sh_dat i get mm_key_tag i
+end
+put sh_dat tl 0
+o1 = add tl 1
+for i ulong 32
+put sh_dat add o1 i get mm_req_fid i
+end
+o2 = add o1 32
+for i ulong 32
+put sh_dat add o2 i get mm_req_in_sha i
+end
+sh_all add o2 32
+for i ulong 32
+b = get sh_dig i
+put mm_key_dig i b
+u = uint b
+put mm_key_hex mul i 2 sh_hexd shr u 4
+put mm_key_hex add mul i 2 1 sh_hexd and u 15
+end
+for i ulong rl bound 2048
+put mm_shard_path i get mm_root i
+put mm_file_path i get mm_root i
+end
+put mm_shard_path rl 47
+put mm_shard_path add rl 1 get mm_key_hex 0
+put mm_shard_path add rl 2 get mm_key_hex 1
+put mm_shard_plen 0 add rl 3
+
+put mm_file_path rl 47
+put mm_file_path add rl 1 get mm_key_hex 0
+put mm_file_path add rl 2 get mm_key_hex 1
+put mm_file_path add rl 3 47
+p0 = add rl 4
+for i ulong 64
+put mm_file_path add p0 i get mm_key_hex i
+end
+p1 = add p0 64
+for j ulong 4
+put mm_file_path add p1 j get mm_ext_ome j
+end
+put mm_file_plen 0 add p1 4
+ret MM_OK
+end
+
+fn mm_tmp_push_num v ulong p ulong to ulong
+x = v
+q = ulong 24
+for i ulong 21
+q = sub q 1
+put mm_ndig q uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+dc = sub 24 q
+for j ulong dc bound 24
+put mm_tmp_path add p j get mm_ndig add q j
+end
+ret add p dc
+end
+
+fn mm_build_tmp_path to void
+sl = get mm_shard_plen 0
+for i ulong sl bound 2048
+put mm_tmp_path i get mm_shard_path i
+end
+put mm_tmp_path sl 47
+p = add sl 1
+for i ulong 16
+put mm_tmp_path add p i get mm_key_hex i
+end
+p = add p 16
+put mm_tmp_path p 46
+p = mm_tmp_push_num ulong getpid add p 1
+put mm_tmp_path p 46
+seq = add get mm_tmp_seq 0 1
+put mm_tmp_seq 0 seq
+p = mm_tmp_push_num seq add p 1
+for j ulong 4
+put mm_tmp_path add p j get mm_ext_tmp j
+end
+put mm_tmp_plen 0 add p 4
+end
+
+note ---- Exact Read/Write Loops ----
+
+fn mm_read_hdr fd int use_chk bool to ulong
+off = ulong 0
+while lt off MM_HDR_LEN bound 512
+k = long 0
+if use_chk
+k = read fd mm_chk_hdr off sub MM_HDR_LEN off
+else
+k = read fd mm_hdr off sub MM_HDR_LEN off
+end
+if lt k 0
+ret MM_ERR_IO
+end
+if eq k 0
+ret MM_ERR_TRUNCATED
+end
+off = add off ulong k
+end
+ret MM_OK
+end
+
+fn mm_read_body_val fd int olen ulong to ulong
+off = ulong 0
+while lt off olen bound 1048576
+want = sub olen off
+if gt want 65536
+want = ulong 65536
+end
+k = read fd mm_val_buf off want
+if lt k 0
+ret MM_ERR_IO
+end
+if eq k 0
+ret MM_ERR_TRUNCATED
+end
+off = add off ulong k
+end
+ret MM_OK
+end
+
+fn mm_read_body_sh fd int olen ulong to ulong
+off = ulong 0
+while lt off olen bound 1048576
+want = sub olen off
+if gt want 65536
+want = ulong 65536
+end
+k = read fd sh_dat off want
+if lt k 0
+ret MM_ERR_IO
+end
+if eq k 0
+ret MM_ERR_TRUNCATED
+end
+off = add off ulong k
+end
+ret MM_OK
+end
+
+fn mm_check_eof fd int to ulong
+k = read fd mm_probe_b 0 1
+if lt k 0
+ret MM_ERR_IO
+end
+if gt k 0
+ret MM_ERR_TRAILING
+end
+ret MM_OK
+end
+
+fn mm_write_hdr fd int to ulong
+off = ulong 0
+while lt off MM_HDR_LEN bound 512
+k = write fd mm_hdr off sub MM_HDR_LEN off
+if le k 0
+ret MM_ERR_IO
+end
+off = add off ulong k
+end
+ret MM_OK
+end
+
+fn mm_write_val fd int olen ulong to ulong
+off = ulong 0
+while lt off olen bound 1048576
+want = sub olen off
+if gt want 65536
+want = ulong 65536
+end
+k = write fd mm_val_buf off want
+if le k 0
+ret MM_ERR_IO
+end
+off = add off ulong k
+end
+ret MM_OK
+end
+
+note ---- Fail-Closed Header & Digest Verification ----
+
+fn mm_hdr_byte use_chk bool off ulong to uchar
+if use_chk
+ret get mm_chk_hdr off
+end
+ret get mm_hdr off
+end
+
+fn mm_verify_hdr_fields use_chk bool to ulong
+if or ne ulong mm_hdr_byte use_chk 0 MM_MAGIC_0 ne ulong mm_hdr_byte use_chk 1 MM_MAGIC_1
+ret MM_ERR_MAGIC
+end
+if or ne ulong mm_hdr_byte use_chk 2 MM_MAGIC_2 ne ulong mm_hdr_byte use_chk 3 MM_MAGIC_3
+ret MM_ERR_MAGIC
+end
+if ne mm_hdr_get_u32 use_chk 4 MM_VERSION
+ret MM_ERR_VERSION
+end
+pur = ulong mm_hdr_byte use_chk 8
+if ne pur 1
+ret MM_ERR_IMPURE
+end
+tier = ulong mm_hdr_byte use_chk 9
+pflags = ulong mm_hdr_byte use_chk 10
+rsv0 = ulong mm_hdr_byte use_chk 11
+rsv1 = mm_hdr_get_u32 use_chk 12
+if or ne rsv0 0 ne rsv1 0
+ret MM_ERR_FORMAT
+end
+if or eq and pflags MM_PROV_CK_PURE 0 gt pflags 3
+ret MM_ERR_FORMAT
+end
+err_b = mm_hdr_get_u64 use_chk 16
+if or lt tier 1 gt tier 2
+ret MM_ERR_CONTRACT
+end
+if and eq tier 1 ne err_b 0
+ret MM_ERR_CONTRACT
+end
+for i ulong 32
+if ne mm_hdr_byte use_chk add 24 i get mm_req_fid i
+ret MM_ERR_KEY_MISMATCH
+end
+if ne mm_hdr_byte use_chk add 56 i get mm_req_in_sha i
+ret MM_ERR_KEY_MISMATCH
+end
+end
+olen = mm_hdr_get_u64 use_chk 88
+if gt olen MM_MAX_VAL_LEN
+ret MM_ERR_FORMAT
+end
+ret MM_OK
+end
+
+fn mm_sh_eq_hdr use_chk bool off ulong to bool
+diff = ulong 0
+for i ulong 32
+if ne get sh_dig i mm_hdr_byte use_chk add off i
+diff = add diff 1
+end
+end
+ret eq diff 0
+end
+
+fn mm_verify_entry_digest use_chk bool to bool
+for i ulong 192
+put sh_dat i mm_hdr_byte use_chk i
+end
+sh_all 192
+ret mm_sh_eq_hdr use_chk 192
+end
+
+note Read & cryptographically verify mm_file_path into mm_hdr + mm_val_buf
+fn mm_read_and_verify to ulong
+fd = fopen mm_file_path 0 get mm_file_plen 0 MM_O_RDONLY 0
+if lt fd 0
+if eq fd neg long 2
+ret MM_MISS
+end
+ret MM_ERR_IO
+end
+rc = mm_read_hdr int fd false
+if ne rc MM_OK
+cf = fclose int fd
+ret rc
+end
+rc = mm_verify_hdr_fields false
+if ne rc MM_OK
+cf = fclose int fd
+ret rc
+end
+olen = mm_hdr_get_u64 false 88
+rc = mm_read_body_val int fd olen
+if ne rc MM_OK
+cf = fclose int fd
+ret rc
+end
+rc = mm_check_eof int fd
+cf = fclose int fd
+if ne rc MM_OK
+ret rc
+end
+note Verify output_sha256 over output_bytes[0..olen)
+for i ulong olen bound 4194304
+put sh_dat i get mm_val_buf i
+end
+sh_all olen
+if not mm_sh_eq_hdr false 96
+put mm_stats 6 add get mm_stats 6 1
+put mm_val_len 0 0
+ret MM_ERR_TAMPER
+end
+note Verify entry_sha256 over header[0..192) (protects tier, err_bound, keys, provenance, output_sha256)
+if not mm_verify_entry_digest false
+put mm_stats 6 add get mm_stats 6 1
+put mm_val_len 0 0
+ret MM_ERR_TAMPER
+end
+put mm_val_len 0 olen
+for i ulong 32
+put mm_val_sha i get mm_hdr add 96 i
+put mm_hit_ir_sha i get mm_hdr add 160 i
+put mm_hit_entry_sha i get mm_hdr add 192 i
+end
+put mm_hit_meta 0 ulong get mm_hdr 8
+put mm_hit_meta 1 ulong get mm_hdr 9
+put mm_hit_meta 2 mm_hdr_get_u64 false 16
+put mm_hit_meta 3 ulong get mm_hdr 10
+put mm_hit_meta 4 mm_hdr_get_u64 false 128
+put mm_hit_meta 5 mm_hdr_get_u64 false 136
+put mm_hit_meta 6 mm_hdr_get_u64 false 144
+put mm_hit_meta 7 mm_hdr_get_u64 false 152
+ret MM_OK
+end
+
+note Peek & verify existing file on disk WITHOUT touching mm_val_buf (used by mm_store)
+fn mm_peek_existing to ulong
+fd = fopen mm_file_path 0 get mm_file_plen 0 MM_O_RDONLY 0
+if lt fd 0
+if eq fd neg long 2
+ret MM_MISS
+end
+ret MM_ERR_IO
+end
+rc = mm_read_hdr int fd true
+if ne rc MM_OK
+cf = fclose int fd
+ret rc
+end
+rc = mm_verify_hdr_fields true
+if ne rc MM_OK
+cf = fclose int fd
+ret rc
+end
+olen = mm_hdr_get_u64 true 88
+rc = mm_read_body_sh int fd olen
+if ne rc MM_OK
+cf = fclose int fd
+ret rc
+end
+rc = mm_check_eof int fd
+cf = fclose int fd
+if ne rc MM_OK
+ret rc
+end
+sh_all olen
+if not mm_sh_eq_hdr true 96
+put mm_stats 6 add get mm_stats 6 1
+ret MM_ERR_TAMPER
+end
+if not mm_verify_entry_digest true
+put mm_stats 6 add get mm_stats 6 1
+ret MM_ERR_TAMPER
+end
+ret MM_OK
+end
+
+note ---- Public Lookup, Store, and Prune API ----
+
+fn mm_sync_policy_sid to void
+for i ulong 32
+put mp_q_sid i get mm_req_fid i
+end
+end
+
+fn mm_lookup to ulong
+put mm_stats 0 add get mm_stats 0 1
+put mm_val_len 0 0
+arc = mm_check_admission
+if ne arc MM_OK
+ret arc
+end
+mm_sync_policy_sid
+pdec = mp_precheck
+if or eq pdec MP_DEC_SKIP_TRIVIAL eq pdec MP_DEC_DISABLED
+put mm_stats 10 add get mm_stats 10 1
+ret MM_SKIP_UNPROFITABLE
+end
+drc = mm_derive_paths
+if ne drc MM_OK
+ret drc
+end
+rrc = mm_read_and_verify
+if eq rrc MM_MISS
+put mm_stats 3 add get mm_stats 3 1
+ret MM_MISS
+end
+if ne rrc MM_OK
+ret rrc
+end
+c_tier = get mm_hit_meta 1
+c_err = get mm_hit_meta 2
+r_tier = get mm_req_contract 2
+r_err = get mm_req_contract 3
+if not mm_dominates c_tier c_err r_tier r_err
+put mm_val_len 0 0
+put mm_stats 4 add get mm_stats 4 1
+ret MM_ERR_PRECISION_MISS
+end
+put mm_stats 1 add get mm_stats 1 1
+if mm_strictly_tighter c_tier c_err r_tier r_err
+put mm_stats 2 add get mm_stats 2 1
+end
+mp_record_hit
+ret MM_OK
+end
+
+fn mm_atomic_rename_tmp to ulong
+tl = get mm_tmp_plen 0
+fl = get mm_file_plen 0
+tot = add add add 6 tl fl 0
+if gt tot 4096
+ret MM_ERR_IO
+end
+put mm_ren_pkt 0 2
+put mm_ren_pkt 1 0
+put mm_ren_pkt 2 uchar and tl 255
+put mm_ren_pkt 3 uchar and shr tl 8 255
+for i ulong tl bound 2048
+put mm_ren_pkt add 4 i get mm_tmp_path i
+end
+p = add 4 tl
+put mm_ren_pkt p uchar and fl 255
+put mm_ren_pkt add p 1 uchar and shr fl 8 255
+p = add p 2
+for i ulong fl bound 2048
+put mm_ren_pkt add p i get mm_file_path i
+end
+p = add p fl
+rr = renames mm_ren_pkt 0 p 0
+if ne rr 0
+u = unlink mm_tmp_path 0 tl
+ret MM_ERR_IO
+end
+ret MM_OK
+end
+
+fn mm_chk_sha_eq_existing to bool
+for i ulong 32
+if ne get mm_chk_sha i get mm_chk_hdr add 96 i
+ret false
+end
+end
+ret true
+end
+
+note Build canonical 224-byte OMEM v1 header into mm_hdr
+fn mm_store_build_hdr n_tier ulong n_err ulong olen ulong compute_ns ulong to void
+put mm_hdr 0 uchar MM_MAGIC_0
+put mm_hdr 1 uchar MM_MAGIC_1
+put mm_hdr 2 uchar MM_MAGIC_2
+put mm_hdr 3 uchar MM_MAGIC_3
+mm_hdr_put_u32 4 MM_VERSION
+put mm_hdr 8 1
+put mm_hdr 9 uchar n_tier
+pf = or MM_PROV_CK_PURE and get mm_req_contract 6 2
+put mm_hdr 10 uchar pf
+put mm_hdr 11 0
+mm_hdr_put_u32 12 0
+mm_hdr_put_u64 16 n_err
+for i ulong 32
+put mm_hdr add 24 i get mm_req_fid i
+put mm_hdr add 56 i get mm_req_in_sha i
+put mm_hdr add 96 i get mm_chk_sha i
+put mm_hdr add 160 i get mm_req_ir_sha i
+end
+mm_hdr_put_u64 88 olen
+rns = realns
+now_ns = ulong 0
+if gt rns 0
+now_ns = ulong rns
+end
+mm_hdr_put_u64 128 now_ns
+mm_hdr_put_u64 136 compute_ns
+mm_hdr_put_u64 144 ulong getpid
+mm_hdr_put_u64 152 get mm_req_contract 5
+for i ulong 192
+put sh_dat i get mm_hdr i
+end
+sh_all 192
+for i ulong 32
+put mm_hdr add 192 i get sh_dig i
+put mm_val_sha i get mm_chk_sha i
+end
+end
+
+fn mm_store_write_atomic olen ulong to ulong
+mm_build_tmp_path
+tfd = fopen mm_tmp_path 0 get mm_tmp_plen 0 MM_O_WRNEW 420
+if lt tfd 0
+ret MM_ERR_IO
+end
+rc = mm_write_hdr int tfd
+if ne rc MM_OK
+cf = fclose int tfd
+u = unlink mm_tmp_path 0 get mm_tmp_plen 0
+ret rc
+end
+rc = mm_write_val int tfd olen
+cf = fclose int tfd
+if ne rc MM_OK
+u = unlink mm_tmp_path 0 get mm_tmp_plen 0
+ret rc
+end
+ret mm_atomic_rename_tmp
+end
+
+note Returns: 100=write-new, 101=write-upgrade, MM_OK=idempotent, MM_OK_DOMINATED, or error
+fn mm_store_check_existing n_tier ulong n_err ulong to ulong
+prc = mm_peek_existing
+if eq prc MM_MISS
+ret 100
+end
+if ne prc MM_OK
+ret prc
+end
+c_tier = ulong get mm_chk_hdr 9
+c_err = mm_hdr_get_u64 true 16
+if mm_strictly_tighter c_tier c_err n_tier n_err
+put mm_stats 9 add get mm_stats 9 1
+ret MM_OK_DOMINATED
+end
+if and eq c_tier n_tier eq c_err n_err
+if and eq n_tier MM_TIER_EXACT not mm_chk_sha_eq_existing
+ret MM_ERR_NONDET
+end
+ret MM_OK
+end
+ret 101
+end
+
+fn mm_store compute_ns ulong overhead_ns ulong to ulong
+rc = mm_check_admission
+if ne rc MM_OK
+ret rc
+end
+olen = get mm_val_len 0
+if gt olen MM_MAX_VAL_LEN
+ret MM_ERR_FORMAT
+end
+mm_sync_policy_sid
+rc = mp_should_memoize compute_ns overhead_ns
+if or eq rc MP_DEC_SKIP_TRIVIAL eq rc MP_DEC_DISABLED
+put mm_stats 10 add get mm_stats 10 1
+ret MM_SKIP_UNPROFITABLE
+end
+rc = mm_derive_paths
+if ne rc MM_OK
+ret rc
+end
+rc = mm_mkdir_p
+if ne rc MM_OK
+ret rc
+end
+sr = makedir mm_shard_path 0 get mm_shard_plen 0 493
+if and ne sr 0 ne sr neg long 17
+ret MM_ERR_IO
+end
+for i ulong olen bound 4194304
+put sh_dat i get mm_val_buf i
+end
+sh_all olen
+for i ulong 32
+put mm_chk_sha i get sh_dig i
+end
+n_tier = get mm_req_contract 2
+n_err = get mm_req_contract 3
+rc = mm_store_check_existing n_tier n_err
+if and ne rc 100 ne rc 101
+ret rc
+end
+is_upg = eq rc 101
+mm_store_build_hdr n_tier n_err olen compute_ns
+rc = mm_store_write_atomic olen
+if ne rc MM_OK
+ret rc
+end
+put mm_stats 7 add get mm_stats 7 1
+if is_upg
+put mm_stats 8 add get mm_stats 8 1
+end
+mm_sync_policy_root
+if eq mp_check_disk_floor MP_ALARM_DISK_FLOOR
+put mm_stats 11 add get mm_stats 11 1
+ret MM_OK_ALARM
+end
+ret MM_OK
+end
+
+fn mm_prune target_bytes ulong to ulong
+mm_sync_policy_root
+prc = mp_memo_prune target_bytes
+if ne prc MP_DISK_OK
+ret MM_ERR_IO
+end
+ret MM_OK
+end
