@@ -8,17 +8,18 @@ note Modes:
 note   strand7_warden eval <node_id> <temp_mc> <power_mw> <free_ram_mib> <free_disk_mib> <gpu_lease_sec> <proof_mask> <rogue_kmod>
 note     node_id: 1=SPARK_GB10, 2=PI5, 3=MACBOOK_AIR
 note   strand7_warden live-spark
-note     reads live /proc/modules, /proc/meminfo, and /sys/class/thermal/thermal_zone0..4/temp (hw_writes=0)
+note     dynamically scans /proc/modules, /proc/meminfo, and ALL /sys/class/thermal/thermal_zone*/temp (hw_writes=0)
 note
 note Fail-closed refusal codes:
-note   151 HS_ERR_THERMAL_CBF     temperature exceeds node CBF barrier ceiling
+note   151 HS_ERR_THERMAL_CBF     temperature exceeds node CBF barrier ceiling (or 0 sensors readable)
 note   152 HS_ERR_POWER_CBF       power exceeds node WattCBF ceiling
-note   153 HS_ERR_RAM_FLOOR       available RAM below node safety floor
+note   153 HS_ERR_RAM_FLOOR       available RAM below node safety floor (or /proc/meminfo unreadable/truncated)
 note   154 HS_ERR_DISK_FLOOR      available disk below node safety floor
-note   155 HS_ERR_ROGUE_LIVE_KMOD uncertified aien_gpu kernel module detected loaded
+note   155 HS_ERR_ROGUE_LIVE_KMOD uncertified aien_gpu kernel module detected loaded (or /proc/modules unreadable)
 note   156 HS_ERR_GPU_LEASE       GPU exclusive lease exceeds hardware window ceiling
 note   157 HS_ERR_PROOF_MASK      3-bit proof mask (Contract|EGP3|Monk+Immune) != 7
 
+const S7_O_DIR int 49152
 const S7_NODE_SPARK ulong 1
 const S7_NODE_PI5 ulong 2
 const S7_NODE_MACBOOK ulong 3
@@ -34,9 +35,14 @@ const S7_ERR_PROOF ulong 157
 global s7_arg uchar 256
 global s7_buf uchar 65536
 global s7_buflen ulong 1
+global s7_probe uchar 4
+global s7_dents uchar 16384
+global s7_tzpath uchar 512
 global s7_dig uchar 24
 note Limits: [0]=max_temp_mc [1]=max_power_mw [2]=min_ram_mib [3]=min_disk_mib [4]=max_lease_s
 global s7_lim ulong 8
+note Live scan state: [0]=peak_mc [1]=zones_read
+global s7_live ulong 4
 
 text s7_use "usage: strand7_warden eval <node> <temp_mc> <pwr_mw> <ram_mib> <disk_mib> <lease_s> <pmask> <kmod> | live-spark\n"
 text s7_c_eval "eval"
@@ -45,9 +51,10 @@ text s7_p_ev "STRAND7_WARDEN EVAL PASS node="
 text s7_p_ht " h_temp_mc="
 text s7_p_hp " h_pwr_mw="
 text s7_p_hw " hw_writes=0\n"
-text s7_p_lv1 "STRAND7_WARDEN LIVE_SPARK PASS hw_writes=0 peak_temp_mc="
-text s7_p_lv2 " avail_ram_mib="
-text s7_p_lv3 " aien_gpu_loaded=0 h_temp_mc="
+text s7_p_lv1 "STRAND7_WARDEN LIVE_SPARK PASS hw_writes=0 zones="
+text s7_p_lv2 " peak_temp_mc="
+text s7_p_lv3 " avail_ram_mib="
+text s7_p_lv4 " aien_gpu_loaded=0 h_temp_mc="
 text s7_f_pfx "STRAND7_WARDEN REFUSED code="
 text s7_f_rsn " reason="
 text s7_nl "\n"
@@ -62,12 +69,10 @@ text s7_r_157 "INCOMPLETE_PROOF_MASK"
 
 text s7_path_mod "/proc/modules"
 text s7_path_mem "/proc/meminfo"
-text s7_path_tz0 "/sys/class/thermal/thermal_zone0/temp"
-text s7_path_tz1 "/sys/class/thermal/thermal_zone1/temp"
-text s7_path_tz2 "/sys/class/thermal/thermal_zone2/temp"
-text s7_path_tz3 "/sys/class/thermal/thermal_zone3/temp"
-text s7_path_tz4 "/sys/class/thermal/thermal_zone4/temp"
-text s7_pat_kmod "aien_gpu "
+text s7_path_thdir "/sys/class/thermal"
+text s7_pfx_tz "thermal_zone"
+text s7_suf_temp "/temp"
+text s7_pat_kmod "aien_gpu"
 text s7_pat_mema "MemAvailable:"
 
 fn s7_wrt fd int s view uchar * to void
@@ -129,25 +134,36 @@ end
 ret true
 end
 
+note Overflow-safe unsigned decimal CLI arg parser (rejects >= 2^64 and >20 digits)
 fn s7_parse_arg idx ulong to ulong
-al = argread idx s7_arg 0 64
+bad = not ulong 0
+al = argread idx s7_arg 0 32
 if lt al 1
-ret not ulong 0
+ret bad
 end
 n = ulong al
 if gt n 20
-ret not ulong 0
+ret bad
 end
 v = ulong 0
 for i ulong n bound 20
 c = ulong get s7_arg i
 if lt c 48
-ret not ulong 0
+ret bad
 end
 if gt c 57
-ret not ulong 0
+ret bad
 end
-v = add mul v 10 sub c 48
+if gt v 1844674407370955161
+ret bad
+end
+p10 = mul v 10
+d = sub c 48
+nxt = add p10 d
+if lt nxt p10
+ret bad
+end
+v = nxt
 end
 ret v
 end
@@ -180,13 +196,10 @@ end
 ret false
 end
 
-fn s7_read_ro path view uchar * to bool
-fd = fopen path 0 len path 0 0
-if lt fd 0
-put s7_buflen 0 0
-ret false
-end
+note Fail-closed read-only file reader: refuses files > 65536 B (never silently truncates /proc/modules)
+fn s7_read_ro_fd fd long to bool
 n = ulong 0
+eof = false
 while lt n 65536 bound 1024
 k = read int fd s7_buf n sub 65536 n
 if lt k 0
@@ -195,13 +208,40 @@ put s7_buflen 0 0
 ret false
 end
 if eq k 0
+eof = true
 break
 end
 n = add n ulong k
 end
+if not eof
+ex = read int fd s7_probe 0 1
+if ne ex 0
+c3 = fclose int fd
+put s7_buflen 0 0
+ret false
+end
+end
 c2 = fclose int fd
 put s7_buflen 0 n
 ret gt n 0
+end
+
+fn s7_read_ro path view uchar * to bool
+fd = fopen path 0 len path 0 0
+if lt fd 0
+put s7_buflen 0 0
+ret false
+end
+ret s7_read_ro_fd fd
+end
+
+fn s7_read_tz_file plen ulong to bool
+fd = fopen s7_tzpath 0 plen 0 0
+if lt fd 0
+put s7_buflen 0 0
+ret false
+end
+ret s7_read_ro_fd fd
 end
 
 fn s7_buf_find pat view uchar * to ulong
@@ -229,18 +269,31 @@ end
 ret not ulong 0
 end
 
+note Overflow-safe unsigned integer parser starting at start (skips spaces/tabs only; rejects '-' negative values!)
 fn s7_parse_buf_u start ulong to ulong
+bad = not ulong 0
 bl = get s7_buflen 0
 p = start
 while lt p bl bound 128
 c = ulong get s7_buf p
-if and ge c 48 le c 57
+if or eq c 32 eq c 9
+p = add p 1
+continue
+end
 break
 end
-p = add p 1
+if ge p bl
+ret bad
+end
+c0 = ulong get s7_buf p
+if lt c0 48
+ret bad
+end
+if gt c0 57
+ret bad
 end
 v = ulong 0
-got = false
+cnt = ulong 0
 while lt p bl bound 24
 c2 = ulong get s7_buf p
 if lt c2 48
@@ -249,41 +302,121 @@ end
 if gt c2 57
 break
 end
-v = add mul v 10 sub c2 48
-got = true
+if ge cnt 20
+ret bad
+end
+if gt v 1844674407370955161
+ret bad
+end
+p10 = mul v 10
+d = sub c2 48
+nxt = add p10 d
+if lt nxt p10
+ret bad
+end
+v = nxt
+cnt = add cnt 1
 p = add p 1
 end
-if not got
-ret not ulong 0
+if eq cnt 0
+ret bad
 end
 ret v
 end
 
-fn s7_read_tz idx ulong to ulong
-ok = false
-if eq idx 0
-ok = s7_read_ro s7_path_tz0
+fn s7_recl o ulong to ulong
+b0 = ulong get s7_dents add o 16
+b1 = shl ulong get s7_dents add o 17 8
+ret or b0 b1
 end
-if eq idx 1
-ok = s7_read_ro s7_path_tz1
+
+fn s7_nlen o ulong lim ulong to ulong
+base = add o 19
+n = ulong 0
+while lt add base n lim bound 256
+if eq get s7_dents add base n 0
+break
 end
-if eq idx 2
-ok = s7_read_ro s7_path_tz2
+n = add n 1
 end
-if eq idx 3
-ok = s7_read_ro s7_path_tz3
+ret n
 end
-if eq idx 4
-ok = s7_read_ro s7_path_tz4
+
+fn s7_starts_tz base ulong nl ulong to bool
+pl = len s7_pfx_tz
+if le nl pl
+ret false
 end
-if not ok
-ret 0
+for i ulong pl bound 16
+if ne get s7_dents add base i get s7_pfx_tz i
+ret false
 end
-v = s7_parse_buf_u 0
-if eq v not ulong 0
-ret 0
 end
-ret v
+ret true
+end
+
+fn s7_poll_tz_entry base ulong nl ulong to void
+dl = len s7_path_thdir
+sl = len s7_suf_temp
+tot = add add add dl 1 nl sl
+if ge tot 500
+ret
+end
+for i ulong dl bound 64
+put s7_tzpath i get s7_path_thdir i
+end
+put s7_tzpath dl 47
+for j ulong nl bound 128
+put s7_tzpath add add dl 1 j get s7_dents add base j
+end
+off = add add dl 1 nl
+for k ulong sl bound 16
+put s7_tzpath add off k get s7_suf_temp k
+end
+if not s7_read_tz_file tot
+ret
+end
+tv = s7_parse_buf_u 0
+if eq tv not ulong 0
+ret
+end
+put s7_live 1 add get s7_live 1 1
+if gt tv get s7_live 0
+put s7_live 0 tv
+end
+end
+
+fn s7_scan_all_tz to bool
+put s7_live 0 0
+put s7_live 1 0
+dfd = fopen s7_path_thdir 0 len s7_path_thdir S7_O_DIR 0
+if lt dfd 0
+ret false
+end
+going = true
+while going bound 256
+nr = getdnts int dfd s7_dents 0 16384
+if le nr 0
+going = false
+else
+lim = ulong nr
+o = ulong 0
+while lt o lim bound 16384
+rl = s7_recl o
+if eq rl 0
+break
+end
+nl = s7_nlen o lim
+base = add o 19
+if s7_starts_tz base nl
+s7_poll_tz_entry base nl
+end
+o = add o rl
+end
+end
+end
+ign = fclose int dfd
+ret gt get s7_live 1 0
 end
 
 fn s7_cmd_eval to int
@@ -380,13 +513,10 @@ avail_mib = div avail_kib 1024
 if lt avail_mib get s7_lim 2
 ret s7_refuse S7_ERR_RAM
 end
-peak = ulong 0
-for tz ulong 5
-tv = s7_read_tz tz
-if gt tv peak
-peak = tv
+if not s7_scan_all_tz
+ret s7_refuse S7_ERR_THERMAL
 end
-end
+peak = get s7_live 0
 if eq peak 0
 ret s7_refuse S7_ERR_THERMAL
 end
@@ -394,10 +524,12 @@ if gt peak get s7_lim 0
 ret s7_refuse S7_ERR_THERMAL
 end
 s7_wrt 1 s7_p_lv1
-s7_num 1 peak
+s7_num 1 get s7_live 1
 s7_wrt 1 s7_p_lv2
-s7_num 1 avail_mib
+s7_num 1 peak
 s7_wrt 1 s7_p_lv3
+s7_num 1 avail_mib
+s7_wrt 1 s7_p_lv4
 s7_num 1 sub get s7_lim 0 peak
 s7_wrt 1 s7_nl
 ret 0

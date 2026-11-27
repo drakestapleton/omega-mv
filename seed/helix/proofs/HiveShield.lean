@@ -183,7 +183,26 @@ theorem hive_7_2_quorum_admit : hiveDecide 7 2 5 0 = .admit := by decide
 /-- Concrete f=3 simultaneous faults on N=7 -> fail-closed haltNoQuorum. -/
 theorem hive_7_2_triple_fault_halt : hiveDecide 7 2 4 0 = .haltNoQuorum := by decide
 
+/-- 64-bit BFT arithmetic overflow guard (mirrors S8_MAX_F = 6148914691236517204 in strand8_notary.om):
+    guarantees `3 * fMax + 1` NEVER overflows u64. -/
+theorem hive_bft_overflow_guard_sound (fMax : Nat) (h : fMax ≤ 6148914691236517204) :
+    3 * fMax + 1 < 2 ^ 64 := by
+  omega
+
 -- ==================== STRAND 9 (ARBITER): ZERO-TRUST MESH GUARD ====================
+
+/-- Concrete IPv4 octet ownership predicate (exact 1:1 mirror of `s9_ipv4_is_owned` in strand9_arbiter.om). -/
+def ipv4Owned (o0 o1 o2 o3 : Nat) : Bool :=
+  o0 ≤ 255 && o1 ≤ 255 && o2 ≤ 255 && o3 ≤ 255 &&
+  (o0 == 127 || (o0 == 192 && o1 == 168 && o2 == 1) || (o0 == 100 && 64 ≤ o1 && o1 ≤ 127))
+
+theorem ipv4Owned_excludes_wildcard : ipv4Owned 0 0 0 0 = false := by decide
+theorem ipv4Owned_excludes_public_dns : ipv4Owned 8 8 8 8 = false := by decide
+theorem ipv4Owned_excludes_outside_cgnat : ipv4Owned 100 128 0 1 = false := by decide
+theorem ipv4Owned_excludes_octal_spoof_87 : ipv4Owned 87 0 0 1 = false := by decide
+theorem ipv4Owned_excludes_octal_spoof_64 : ipv4Owned 64 64 0 2 = false := by decide
+theorem ipv4Owned_allows_spark_lan : ipv4Owned 192 168 1 108 = true := by decide
+theorem ipv4Owned_allows_spark_ts : ipv4Owned 100 64 0 2 = true := by decide
 
 inductive EndpointClass where
   | wildcard
@@ -240,4 +259,6 @@ end HiveShield
 #print axioms HiveShield.warden_pass_guarantees_cbf_envelope
 #print axioms HiveShield.safety_veto_overrides_unanimous_compilers
 #print axioms HiveShield.hive_admit_sound
+#print axioms HiveShield.hive_bft_overflow_guard_sound
+#print axioms HiveShield.ipv4Owned_excludes_wildcard
 #print axioms HiveShield.arbiter_cmd_pass_sound

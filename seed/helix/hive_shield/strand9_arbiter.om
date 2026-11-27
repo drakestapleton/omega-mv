@@ -9,8 +9,8 @@ note   strand9_arbiter check-cmd <cmd_file> <concurrent_ssh> <signed_cap>
 note
 note Fail-closed refusal codes:
 note   171 HS_ERR_WILDCARD_BIND    wildcard 0.0.0.0 or :: listener refused (matches omega-mesh rc=12)
-note   172 HS_ERR_UNOWNED_HOST     address outside owned Hive prefixes (127., 192.168.1., 100.64..127., ::1, l2:0x88b5)
-note   173 HS_ERR_UNSAFE_CMD       dangerous remote command (pkill -f, rm -rf /, UEFI/SPI, rogue insmod)
+note   172 HS_ERR_UNOWNED_HOST     address outside owned Hive prefixes (strict decimal IPv4, ::1, l2:0x88b5)
+note   173 HS_ERR_UNSAFE_CMD       dangerous remote command (pkill -f/-9 -f, rm -rf/-fr /, UEFI/SPI, kmod, >64 KiB)
 note   174 HS_ERR_SSH_STORM        concurrent SSH sessions > 4 (prevents Spark sshd MaxStartups storm)
 note   175 HS_ERR_UNSIGNED_RPC     cross-node command lacks Ed25519 / capability signature
 
@@ -28,8 +28,12 @@ global s9_addr uchar 256
 global s9_alen ulong 1
 global s9_buf uchar 65536
 global s9_blen ulong 1
+global s9_probe uchar 4
+global s9_tok uchar 128
 global s9_dig uchar 24
 global s9_oct ulong 4
+note Command-segment parser state: [0]=saw_pkill [1]=saw_rm [2]=saw_rec [3]=saw_root
+global s9_cst ulong 4
 
 text s9_use "usage: strand9_arbiter check-bind <addr> | check-cmd <cmd_file> <concurrent_ssh> <signed_cap>\n"
 text s9_c_bind "check-bind"
@@ -51,23 +55,30 @@ text s9_r_175 "UNSIGNED_CROSS_NODE_RPC"
 
 text s9_w_v4 "0.0.0.0"
 text s9_w_v6 "::"
-text s9_ok_lo "127."
-text s9_ok_lan "192.168.1."
-text s9_ok_ts "100."
 text s9_ok_v6 "::1"
 text s9_ok_l2 "l2:0x88b5"
 
+text s9_t_pkill "pkill"
+text s9_t_full "--full"
+text s9_t_rm "rm"
+text s9_t_rec "--recursive"
+
 note Dangerous remote command signatures
-text s9_d0 "pkill -f"
-text s9_d1 "rm -rf /"
-text s9_d2 "efibootmgr"
-text s9_d3 "efivars"
-text s9_d4 "flashrom"
-text s9_d5 "fwupdmgr"
-text s9_d6 "/dev/mtd"
-text s9_d7 "/dev/spidev"
-text s9_d8 "insmod"
-text s9_d9 "mkfs."
+text s9_d0 "efibootmgr"
+text s9_d1 "efivars"
+text s9_d2 "/boot/efi/EFI"
+text s9_d3 "flashrom"
+text s9_d4 "fwupdmgr"
+text s9_d5 "/dev/mtd"
+text s9_d6 "/dev/spidev"
+text s9_d7 "insmod"
+text s9_d8 "modprobe"
+text s9_d9 "finit_module"
+text s9_d10 "init_module"
+text s9_d11 "mkfs."
+text s9_d12 "wipefs"
+text s9_d13 "blkdiscard"
+text s9_d14 "of=/dev/"
 
 fn s9_wrt fd int s view uchar * to void
 r = write fd s 0 len s
@@ -122,25 +133,36 @@ end
 ret true
 end
 
+note Overflow-safe unsigned decimal CLI arg parser (rejects >= 2^64 and >20 digits)
 fn s9_parse_arg_u idx ulong to ulong
-al = argread idx s9_arg 0 64
+bad = not ulong 0
+al = argread idx s9_arg 0 32
 if lt al 1
-ret not ulong 0
+ret bad
 end
 n = ulong al
 if gt n 20
-ret not ulong 0
+ret bad
 end
 v = ulong 0
 for i ulong n bound 20
 c = ulong get s9_arg i
 if lt c 48
-ret not ulong 0
+ret bad
 end
 if gt c 57
-ret not ulong 0
+ret bad
 end
-v = add mul v 10 sub c 48
+if gt v 1844674407370955161
+ret bad
+end
+p10 = mul v 10
+d = sub c 48
+nxt = add p10 d
+if lt nxt p10
+ret bad
+end
+v = nxt
 end
 ret v
 end
@@ -158,21 +180,10 @@ end
 ret true
 end
 
-fn s9_addr_pfx s view uchar * to bool
-n = get s9_alen 0
-pl = len s
-if lt n pl
-ret false
-end
-for i ulong pl bound 64
-if ne get s9_addr i get s i
-ret false
-end
-end
-ret true
-end
-
-note Strictly parse s9_addr[0..s9_alen) as a.b.c.d with 4 decimal octets in 0..255 and zero trailing chars
+note Strictly parse s9_addr[0..s9_alen) as canonical decimal a.b.c.d:
+note   - 4 decimal octets in 0..255
+note   - NO leading zeros (rejects octal spoofing like 0127.0.0.1 or 100.064.0.2!)
+note   - zero trailing characters, zero trap-4 crashes
 fn s9_parse_ipv4 to bool
 n = get s9_alen 0
 if lt n 7
@@ -188,7 +199,8 @@ ret false
 end
 v = ulong 0
 d = ulong 0
-while lt p n bound 4
+first_zero = false
+while lt p n bound 16
 c = ulong get s9_addr p
 if eq c 46
 break
@@ -199,11 +211,22 @@ end
 if gt c 57
 ret false
 end
+if eq d 0
+if eq c 48
+first_zero = true
+end
+end
+if ge d 3
+ret false
+end
 v = add mul v 10 sub c 48
 d = add d 1
 p = add p 1
 end
 if eq d 0
+ret false
+end
+if and first_zero gt d 1
 ret false
 end
 if gt v 255
@@ -255,10 +278,13 @@ if ne argcnt 3
 s9_wrt 2 s9_use
 ret 2
 end
-al = argread 2 s9_addr 0 250
+al = argread 2 s9_addr 0 251
 if lt al 1
 s9_wrt 2 s9_use
 ret 2
+end
+if gt al 250
+ret s9_refuse S9_ERR_UNOWNED
 end
 put s9_alen 0 ulong al
 if s9_addr_eq s9_w_v4
@@ -311,6 +337,137 @@ end
 ret false
 end
 
+fn s9_tok_eq s view uchar * tl ulong to bool
+if ne tl len s
+ret false
+end
+for i ulong tl bound 128
+if ne get s9_tok i get s i
+ret false
+end
+end
+ret true
+end
+
+fn s9_tok_has_char tl ulong ch uchar to bool
+for i ulong tl bound 128
+if eq get s9_tok i ch
+ret true
+end
+end
+ret false
+end
+
+fn s9_is_sep c ulong to bool
+if or eq c 10 or eq c 59 or eq c 38 eq c 124
+ret true
+end
+ret false
+end
+
+fn s9_is_sp c ulong to bool
+if or eq c 32 or eq c 9 eq c 13
+ret true
+end
+ret false
+end
+
+fn s9_reset_seg to void
+put s9_cst 0 0
+put s9_cst 1 0
+put s9_cst 2 0
+put s9_cst 3 0
+end
+
+note Process one command token for pkill -...f and rm -r/-f / attacks
+fn s9_check_tok tl ulong to bool
+if eq tl 0
+ret false
+end
+if s9_tok_eq s9_t_pkill tl
+put s9_cst 0 1
+ret false
+end
+if s9_tok_eq s9_t_rm tl
+put s9_cst 1 1
+ret false
+end
+if eq get s9_cst 0 1
+if s9_tok_eq s9_t_full tl
+ret true
+end
+if and ge tl 2 eq get s9_tok 0 45
+if ne get s9_tok 1 45
+if s9_tok_has_char tl 102
+ret true
+end
+end
+end
+end
+if eq get s9_cst 1 1
+if and ge tl 2 eq get s9_tok 0 45
+if ne get s9_tok 1 45
+if or s9_tok_has_char tl 114 s9_tok_has_char tl 82
+put s9_cst 2 1
+end
+else
+if s9_tok_eq s9_t_rec tl
+put s9_cst 2 1
+end
+end
+end
+if and eq tl 1 eq get s9_tok 0 47
+put s9_cst 3 1
+end
+if and eq tl 2 and eq get s9_tok 0 47 eq get s9_tok 1 42
+put s9_cst 3 1
+end
+if and eq tl 3 eq get s9_tok 1 47
+if or and eq get s9_tok 0 34 eq get s9_tok 2 34 and eq get s9_tok 0 39 eq get s9_tok 2 39
+put s9_cst 3 1
+end
+end
+if and eq get s9_cst 2 1 eq get s9_cst 3 1
+ret true
+end
+end
+ret false
+end
+
+fn s9_check_cmd_tokens to bool
+s9_reset_seg
+bl = get s9_blen 0
+p = ulong 0
+while lt p bl bound 65536
+c = ulong get s9_buf p
+if s9_is_sep c
+s9_reset_seg
+p = add p 1
+continue
+end
+if s9_is_sp c
+p = add p 1
+continue
+end
+tl = ulong 0
+while lt p bl bound 65536
+ch = get s9_buf p
+if or s9_is_sep ulong ch s9_is_sp ulong ch
+break
+end
+if lt tl 128
+put s9_tok tl ch
+tl = add tl 1
+end
+p = add p 1
+end
+if s9_check_tok tl
+ret true
+end
+end
+ret false
+end
+
 fn s9_check_bad_cmd_a to bool
 if s9_buf_has s9_d0
 ret true
@@ -330,10 +487,7 @@ end
 ret false
 end
 
-fn s9_check_bad_cmd to bool
-if s9_check_bad_cmd_a
-ret true
-end
+fn s9_check_bad_cmd_b to bool
 if s9_buf_has s9_d5
 ret true
 end
@@ -352,6 +506,32 @@ end
 ret false
 end
 
+fn s9_check_bad_cmd to bool
+if s9_check_bad_cmd_a
+ret true
+end
+if s9_check_bad_cmd_b
+ret true
+end
+if s9_buf_has s9_d10
+ret true
+end
+if s9_buf_has s9_d11
+ret true
+end
+if s9_buf_has s9_d12
+ret true
+end
+if s9_buf_has s9_d13
+ret true
+end
+if s9_buf_has s9_d14
+ret true
+end
+ret s9_check_cmd_tokens
+end
+
+note Fail-closed remote command guard: refuses files > 65536 B instead of silently truncating
 fn s9_cmd_check_cmd to int
 bad = not ulong 0
 if ne argcnt 5
@@ -381,6 +561,7 @@ if lt fd 0
 ret 2
 end
 n = ulong 0
+eof = false
 while lt n S9_MAX_CMD bound 1024
 k = read int fd s9_buf n sub S9_MAX_CMD n
 if lt k 0
@@ -388,9 +569,17 @@ c1 = fclose int fd
 ret 2
 end
 if eq k 0
+eof = true
 break
 end
 n = add n ulong k
+end
+if not eof
+ex = read int fd s9_probe 0 1
+if ne ex 0
+c3 = fclose int fd
+ret s9_refuse S9_ERR_UNSAFE
+end
 end
 c2 = fclose int fd
 put s9_blen 0 n
