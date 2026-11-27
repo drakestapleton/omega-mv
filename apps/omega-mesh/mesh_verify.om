@@ -1,0 +1,1299 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-mesh/mesh_verify.om
+note Sovereign Intelligence 2.0 Stage 5 (Pillar 5: Zero-Trust Personal Silicon Mesh, DRA-1073)
+note
+note Pure seeded OM-2 two-tier execution verification engine & fail-closed OMEGA-MEMO admission:
+note   - Tier A (Owner Sovereign Mesh): 32B RFC 8032 Ed25519 peer allowlist + signed OMRC0001
+note     execution receipts binding (ompk_sem_id, func_sem_id, inputs_sha256, target_tid,
+note     precision_tier, err_bound, output_sha256, nonce, epoch) + configurable spot-check
+note     re-execution with automatic peer quarantine on corruption.
+note   - Tier B (Zero-Trust Mode): Freivalds O(n^2) multi-round randomized matmul verifier,
+note     Merkle intermediate-state checkpoint verifier + O(log2 M) binary bisection, and
+note     dual-peer BFT quorum verifier (with Sybil same-peer refusal & quarantine alarm).
+note   - Fail-closed OMEGA-MEMO admission: one-shot verified token + TOCTOU re-hash guard
+note     gating every write into seed/ng/memo/memo_store.om.
+note
+note Library unit (no om2 header, no fn main; prefix mv_ / MV_).
+note Link after: si/directives/om2.om, apps/omega-wattd/watt_sense.om, apps/omega-wattd/watt_cbf.om,
+note             seed/ng/sha256.om, protocol/omnet/om/sha512/sha512.om,
+note             protocol/omnet/om/ed25519/ed25519.om, protocol/uor-gpu/ed_sign.om,
+note             seed/ng/target/target_desc.om, seed/ng/pack/sem_pack.om,
+note             seed/ng/memo/memo_policy.om, seed/ng/memo/memo_store.om.
+
+note Verification tiers
+const MV_TIER_A_SOVEREIGN ulong 1
+const MV_TIER_B_ZEROTRUST ulong 2
+
+note Capacities & format sizes
+const MV_PEER_CAP ulong 16
+const MV_NONCE_CAP ulong 64
+const MV_NONE ulong 999999
+const MV_RCPT_BODY_LEN ulong 192
+const MV_RCPT_LEN ulong 288
+const MV_MAX_OUT_B ulong 65536
+const MV_MAT_MAX_N ulong 64
+const MV_MAT_CAP ulong 4096
+const MV_MK_MAX_LEAVES ulong 64
+const MV_MK_NODES ulong 128
+
+note Verification proof bitmask
+const MV_VBIT_ALLOWLIST ulong 1
+const MV_VBIT_ED25519 ulong 2
+const MV_VBIT_BINDING ulong 4
+const MV_VBIT_SPOTCHECK ulong 8
+const MV_VBIT_FREIVALDS ulong 16
+const MV_VBIT_MERKLE ulong 32
+const MV_VBIT_QUORUM ulong 64
+
+note Status and fail-closed refusal codes
+const MV_OK ulong 0
+const MV_ERR_FORMAT ulong 10
+const MV_ERR_UNKNOWN_PEER ulong 11
+const MV_ERR_QUARANTINED ulong 12
+const MV_ERR_BAD_SIG ulong 13
+const MV_ERR_BINDING_MISMATCH ulong 14
+const MV_ERR_REPLAY ulong 15
+const MV_ERR_PRECISION ulong 16
+const MV_ERR_OUTPUT_HASH ulong 17
+const MV_ERR_SPOTCHECK_FAIL ulong 18
+const MV_ERR_FREIVALDS_FAIL ulong 19
+const MV_ERR_MERKLE_MISMATCH ulong 20
+const MV_ERR_QUORUM_MISMATCH ulong 21
+const MV_ERR_QUORUM_SAME_PEER ulong 22
+const MV_ERR_UNVERIFIED ulong 23
+const MV_ERR_TOCTOU_TAMPER ulong 24
+const MV_ERR_MEMO_STORE ulong 25
+const MV_ERR_PEER_FULL ulong 26
+const MV_ERR_BAD_DIM ulong 27
+const MV_ERR_EPOCH ulong 28
+const MV_ERR_IMPURE ulong 29
+
+note Ed25519 bridge staging buffers
+global mv_ed_seed uchar 32
+global mv_ed_pk uchar 32
+global mv_ed_sig uchar 64
+global mv_ed_msg uchar 65536
+global mv_ed_mlen ulong 1
+
+note Owner Sovereign Mesh peer allowlist (16 peers keyed by 32B Ed25519 pubkey)
+global mv_peer_used ulong 16
+global mv_peer_id ulong 16
+global mv_peer_tier ulong 16
+global mv_peer_quar ulong 16
+global mv_peer_pk uchar 512
+global mv_peer_count ulong 1
+
+note Anti-replay nonce ring and monotonic epoch floor
+global mv_seen_used ulong 64
+global mv_seen_nonce ulong 64
+global mv_seen_head ulong 1
+global mv_min_epoch ulong 1
+
+note Receipt buffers (primary mv_rcpt and secondary mv_rcpt_b for dual-peer BFT quorum)
+global mv_rcpt uchar 288
+global mv_rcpt_b uchar 288
+global mv_out_b uchar 65536
+global mv_out_b_len ulong 1
+
+note Expected request bindings staged by caller before verify
+global mv_exp_ompk_sem uchar 32
+global mv_exp_fid uchar 32
+global mv_exp_in_sha uchar 32
+note [0]=req_prec_tier [1]=req_err_bound [2]=exp_nonce [3]=exp_min_epoch
+note [4]=req_verify_tier [5]=purity_flag [6]=ck_pure_ok [7]=target_tid_hint
+global mv_exp_meta ulong 8
+
+note Last parsed receipt metadata:
+note [0]=target_tid [1]=prec_tier [2]=verify_tier [3]=err_bound
+note [4]=nonce [5]=epoch [6]=out_len [7]=compute_ns [8]=peer_slot
+global mv_parsed ulong 10
+global mv_parsed_a ulong 10
+
+note Tier A configurable spot-check engine
+note [0]=rate_ppm (0..1000000) [1]=force_always (0/1) [2]=last_triggered [3]=total_checked
+global mv_spot_cfg ulong 4
+global mv_spot_local uchar 65536
+global mv_spot_llen ulong 1
+
+note Tier B1 Freivalds exact int64/u64 matmul buffers
+global mv_mat_a ulong 4096
+global mv_mat_b ulong 4096
+global mv_mat_c ulong 4096
+global mv_fv_r ulong 64
+global mv_fv_br ulong 64
+global mv_fv_abr ulong 64
+global mv_fv_cr ulong 64
+global mv_fv_rnd uchar 64
+note [0]=rounds_run [1]=fail_round [2]=fail_row [3]=used_os_random
+global mv_fv_stats ulong 4
+
+note Tier B2 Merkle checkpoint trees (128 nodes x 32B = 4096B; node 1 = root, M..2M-1 = leaves)
+global mv_mk_loc uchar 4096
+global mv_mk_rem uchar 4096
+global mv_mk_leaves ulong 1
+note [0]=root_match [1]=bisect_steps [2]=bad_chunk [3]=last_leaves
+global mv_mk_stats ulong 4
+global mv_mk_state uchar 32
+
+note One-shot verified admission token (strictly required by mv_admit_to_memo)
+global mv_ver_ok ulong 1
+global mv_ver_tier ulong 1
+global mv_ver_mask ulong 1
+note [0]=out_len [1]=prec_tier [2]=err_bound [3]=target_tid
+note [4]=compute_ns [5]=peer_slot [6]=nonce [7]=epoch
+global mv_ver_meta ulong 8
+global mv_ver_fid uchar 32
+global mv_ver_in_sha uchar 32
+global mv_ver_out_sha uchar 32
+global mv_ver_ompk_sem uchar 32
+
+note Structured alarm buffer & verification telemetry
+global mv_alarm_buf uchar 512
+global mv_alarm_len ulong 1
+global mv_ndig uchar 24
+note [0]=tierA_pass [1]=tierA_fail [2]=tierB_pass [3]=tierB_fail
+note [4]=spot_catches [5]=fv_pass [6]=fv_fail [7]=mk_pass
+note [8]=mk_fail [9]=q_pass [10]=q_fail [11]=memo_admits
+note [12]=memo_refusals [13]=sig_refusals [14]=replay_refusals [15]=unknown_peer_refusals
+global mv_stats ulong 16
+
+text mv_rcpt_magic "OMRC0001"
+text mv_tag_spot "OMSC:"
+text mv_tag_fv "OMFV:"
+text mv_tag_mk_leaf "OMMK-LEAF:"
+text mv_tag_mk_node "OMMK-NODE:"
+text mv_tag_mk_step "OMMK-STEP:"
+text mv_al_spot "OMEGA-MESH ALARM spotcheck_mismatch peer_slot="
+text mv_al_fv "OMEGA-MESH ALARM freivalds_corrupt round="
+text mv_al_mk "OMEGA-MESH ALARM merkle_diverged bad_chunk="
+text mv_al_mk2 " bisect_steps="
+text mv_al_quorum "OMEGA-MESH ALARM quorum_mismatch action=REFUSE_AND_QUARANTINE\n"
+text mv_al_quar " action=QUARANTINE_AND_REFUSE\n"
+
+note ---- Reset & Little-Endian Helpers ----
+
+fn mv_clear_verified to void
+put mv_ver_ok 0 0
+put mv_ver_tier 0 0
+put mv_ver_mask 0 0
+for i ulong 8
+put mv_ver_meta i 0
+end
+for i ulong 32
+put mv_ver_fid i 0
+put mv_ver_in_sha i 0
+put mv_ver_out_sha i 0
+put mv_ver_ompk_sem i 0
+end
+end
+
+fn mv_init to void
+mv_clear_verified
+put mv_peer_count 0 0
+for i ulong MV_PEER_CAP
+put mv_peer_used i 0
+put mv_peer_id i 0
+put mv_peer_tier i 0
+put mv_peer_quar i 0
+end
+for i ulong MV_NONCE_CAP
+put mv_seen_used i 0
+put mv_seen_nonce i 0
+end
+put mv_seen_head 0 0
+put mv_min_epoch 0 1
+for i ulong 8
+put mv_exp_meta i 0
+end
+for i ulong 4
+put mv_spot_cfg i 0
+put mv_fv_stats i 0
+put mv_mk_stats i 0
+end
+put mv_mk_stats 2 MV_NONE
+put mv_spot_llen 0 0
+put mv_out_b_len 0 0
+put mv_alarm_len 0 0
+for i ulong 16
+put mv_stats i 0
+end
+end
+
+fn mv_rcpt_put_u32 off ulong v ulong to void
+put mv_rcpt off uchar and v 255
+put mv_rcpt add off 1 uchar and shr v 8 255
+put mv_rcpt add off 2 uchar and shr v 16 255
+put mv_rcpt add off 3 uchar and shr v 24 255
+end
+
+fn mv_rcpt_put_u64 off ulong v ulong to void
+mv_rcpt_put_u32 off and v 4294967295
+mv_rcpt_put_u32 add off 4 shr v 32
+end
+
+fn mv_rcpt_byte use_b bool off ulong to uchar
+if use_b
+ret get mv_rcpt_b off
+end
+ret get mv_rcpt off
+end
+
+fn mv_rcpt_get_u32 use_b bool off ulong to ulong
+b0 = ulong mv_rcpt_byte use_b off
+b1 = shl ulong mv_rcpt_byte use_b add off 1 8
+b2 = shl ulong mv_rcpt_byte use_b add off 2 16
+b3 = shl ulong mv_rcpt_byte use_b add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn mv_rcpt_get_u64 use_b bool off ulong to ulong
+lo = mv_rcpt_get_u32 use_b off
+hi = mv_rcpt_get_u32 use_b add off 4
+ret or lo shl hi 32
+end
+
+fn mv_sh_put_u64 off ulong v ulong to void
+for j ulong 8
+put sh_dat add off j uchar and shr v mul j 8 255
+end
+end
+
+note ---- Alarm Formatting Helpers ----
+
+fn mv_al_push_b ch uchar to void
+p = get mv_alarm_len 0
+if lt p 508
+put mv_alarm_buf p ch
+put mv_alarm_len 0 add p 1
+end
+end
+
+fn mv_al_push_tx s view uchar * to void
+n = len s
+if gt n 256
+n = ulong 256
+end
+for i ulong n bound 256
+mv_al_push_b get s i
+end
+end
+
+fn mv_al_push_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put mv_ndig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+cnt = sub 24 p
+for j ulong cnt bound 24
+mv_al_push_b get mv_ndig add p j
+end
+end
+
+fn mv_alarm_spot slot ulong to void
+put mv_alarm_len 0 0
+mv_al_push_tx mv_al_spot
+mv_al_push_num slot
+mv_al_push_tx mv_al_quar
+end
+
+fn mv_alarm_fv rnd ulong to void
+put mv_alarm_len 0 0
+mv_al_push_tx mv_al_fv
+mv_al_push_num rnd
+mv_al_push_tx mv_al_quar
+end
+
+fn mv_alarm_mk bad_c ulong steps ulong to void
+put mv_alarm_len 0 0
+mv_al_push_tx mv_al_mk
+mv_al_push_num bad_c
+mv_al_push_tx mv_al_mk2
+mv_al_push_num steps
+mv_al_push_tx mv_al_quar
+end
+
+fn mv_alarm_quorum to void
+put mv_alarm_len 0 0
+mv_al_push_tx mv_al_quorum
+end
+
+note ---- Pure-Omega RFC 8032 Ed25519 Wrappers (reusing ed25519.om + ed_sign.om) ----
+
+fn mv_ed_derive_seed tag view uchar * idx ulong to void
+tl = len tag
+if gt tl 128
+tl = ulong 128
+end
+for i ulong tl bound 128
+put sh_dat i get tag i
+end
+mv_sh_put_u64 tl idx
+sh_all add tl 8
+for i ulong 32
+put mv_ed_seed i get sh_dig i
+end
+end
+
+fn mv_ed_pubkey_from_seed to void
+sd = new uchar 32 0
+pk = new uchar 32 0
+for i ulong 32
+put sd i get mv_ed_seed i
+end
+ues_pubkey sd pk
+for i ulong 32
+put mv_ed_pk i get pk i
+end
+end
+
+fn mv_ed_sign_buf n ulong to ulong
+if gt n 65504
+ret MV_ERR_FORMAT
+end
+sd = new uchar 32 0
+m = new uchar 65536 0
+sg = new uchar 64 0
+for i ulong 32
+put sd i get mv_ed_seed i
+end
+for i ulong n bound 65504
+put m i get mv_ed_msg i
+end
+ues_sign sd m n sg
+for i ulong 64
+put mv_ed_sig i get sg i
+end
+ret MV_OK
+end
+
+fn mv_ed_verify_buf n ulong to bool
+if gt n 65536
+ret false
+end
+pk = new uchar 32 0
+m = new uchar 65536 0
+sg = new uchar 64 0
+for i ulong 32
+put pk i get mv_ed_pk i
+end
+for i ulong n bound 65536
+put m i get mv_ed_msg i
+end
+for i ulong 64
+put sg i get mv_ed_sig i
+end
+ok = edverify pk m n sg 0
+ret eq ok 1
+end
+
+note ---- Peer Allowlist & Anti-Replay Registry ----
+
+fn mv_peer_pk_eq slot ulong to bool
+if eq get mv_peer_used slot 0
+ret false
+end
+base = mul slot 32
+for i ulong 32
+if ne get mv_peer_pk add base i get mv_ed_pk i
+ret false
+end
+end
+ret true
+end
+
+fn mv_peer_find_pk to ulong
+for s ulong MV_PEER_CAP
+if mv_peer_pk_eq s
+ret s
+end
+end
+ret MV_NONE
+end
+
+fn mv_peer_register peer_id ulong tier ulong to ulong
+ex = mv_peer_find_pk
+if ne ex MV_NONE
+put mv_peer_id ex peer_id
+put mv_peer_tier ex tier
+ret ex
+end
+for s ulong MV_PEER_CAP
+if eq get mv_peer_used s 0
+put mv_peer_used s 1
+put mv_peer_id s peer_id
+put mv_peer_tier s tier
+put mv_peer_quar s 0
+base = mul s 32
+for i ulong 32
+put mv_peer_pk add base i get mv_ed_pk i
+end
+put mv_peer_count 0 add get mv_peer_count 0 1
+ret s
+end
+end
+ret MV_NONE
+end
+
+fn mv_peer_quarantine slot ulong to void
+if lt slot MV_PEER_CAP
+if eq get mv_peer_used slot 1
+put mv_peer_quar slot 1
+end
+end
+end
+
+fn mv_peer_unquarantine slot ulong to void
+if lt slot MV_PEER_CAP
+if eq get mv_peer_used slot 1
+put mv_peer_quar slot 0
+end
+end
+end
+
+fn mv_nonce_is_seen nonce ulong to bool
+for i ulong MV_NONCE_CAP
+if eq get mv_seen_used i 1
+if eq get mv_seen_nonce i nonce
+ret true
+end
+end
+end
+ret false
+end
+
+fn mv_nonce_record nonce ulong to void
+h = rem get mv_seen_head 0 MV_NONCE_CAP
+put mv_seen_used h 1
+put mv_seen_nonce h nonce
+put mv_seen_head 0 add h 1
+end
+
+note ---- Request Context Staging & Receipt Signing ----
+
+fn mv_set_expected_meta prec_tier ulong err_b ulong nonce ulong min_ep ulong ver_tier ulong to void
+put mv_exp_meta 0 prec_tier
+put mv_exp_meta 1 err_b
+put mv_exp_meta 2 nonce
+put mv_exp_meta 3 min_ep
+put mv_exp_meta 4 ver_tier
+end
+
+fn mv_set_expected_purity pur ulong ckp ulong tid_hint ulong to void
+put mv_exp_meta 5 pur
+put mv_exp_meta 6 ckp
+put mv_exp_meta 7 tid_hint
+end
+
+fn mv_set_spot_config rate_ppm ulong force_always ulong to void
+put mv_spot_cfg 0 rate_ppm
+put mv_spot_cfg 1 force_always
+end
+
+note Copy primary mv_rcpt -> mv_rcpt_b and mm_val_buf -> mv_out_b (for dual-peer BFT quorum)
+fn mv_copy_primary_to_b olen ulong to ulong
+if gt olen MV_MAX_OUT_B
+ret MV_ERR_FORMAT
+end
+for i ulong MV_RCPT_LEN
+put mv_rcpt_b i get mv_rcpt i
+end
+for i ulong olen bound 65536
+put mv_out_b i get mm_val_buf i
+end
+put mv_out_b_len 0 olen
+ret MV_OK
+end
+
+note Sign a canonical 288-byte OMRC0001 execution receipt into mv_rcpt using mv_ed_seed.
+note Uses staged mv_exp_ompk_sem, mv_exp_fid, mv_exp_in_sha, mm_val_buf[0..olen),
+note mv_exp_meta[2] (nonce), and mv_exp_meta[3] (epoch).
+fn mv_rcpt_sign target_tid ulong prec_tier ulong verify_tier ulong err_b ulong compute_ns ulong to ulong
+olen = get mm_val_len 0
+if gt olen MM_MAX_VAL_LEN
+ret MV_ERR_FORMAT
+end
+for i ulong olen bound 4194304
+put sh_dat i get mm_val_buf i
+end
+sh_all olen
+for i ulong 8
+put mv_rcpt i get mv_rcpt_magic i
+end
+for i ulong 32
+put mv_rcpt add 8 i get mv_exp_ompk_sem i
+put mv_rcpt add 40 i get mv_exp_fid i
+put mv_rcpt add 72 i get mv_exp_in_sha i
+put mv_rcpt add 104 i get sh_dig i
+end
+mv_rcpt_put_u64 136 target_tid
+mv_rcpt_put_u32 144 prec_tier
+mv_rcpt_put_u32 148 verify_tier
+mv_rcpt_put_u64 152 err_b
+mv_rcpt_put_u64 160 get mv_exp_meta 2
+mv_rcpt_put_u64 168 get mv_exp_meta 3
+mv_rcpt_put_u64 176 olen
+mv_rcpt_put_u64 184 compute_ns
+mv_ed_pubkey_from_seed
+for i ulong 32
+put mv_rcpt add 192 i get mv_ed_pk i
+end
+for i ulong MV_RCPT_BODY_LEN
+put mv_ed_msg i get mv_rcpt i
+end
+src = mv_ed_sign_buf MV_RCPT_BODY_LEN
+if ne src MV_OK
+ret src
+end
+for i ulong 64
+put mv_rcpt add 224 i get mv_ed_sig i
+end
+ret MV_OK
+end
+
+note ---- Fail-Closed Receipt Verification Core ----
+
+fn mv_check_rcpt_magic use_b bool to bool
+for i ulong 8
+if ne mv_rcpt_byte use_b i get mv_rcpt_magic i
+ret false
+end
+end
+ret true
+end
+
+fn mv_check_rcpt_bindings use_b bool to bool
+for i ulong 32
+if ne mv_rcpt_byte use_b add 8 i get mv_exp_ompk_sem i
+ret false
+end
+if ne mv_rcpt_byte use_b add 40 i get mv_exp_fid i
+ret false
+end
+if ne mv_rcpt_byte use_b add 72 i get mv_exp_in_sha i
+ret false
+end
+end
+ret true
+end
+
+fn mv_check_output_digest use_b bool olen ulong to bool
+if use_b
+if gt olen MV_MAX_OUT_B
+ret false
+end
+for i ulong olen bound 65536
+put sh_dat i get mv_out_b i
+end
+else
+if gt olen MM_MAX_VAL_LEN
+ret false
+end
+for i ulong olen bound 4194304
+put sh_dat i get mm_val_buf i
+end
+end
+sh_all olen
+diff = ulong 0
+for i ulong 32
+if ne get sh_dig i mv_rcpt_byte use_b add 104 i
+diff = add diff 1
+end
+end
+ret eq diff 0
+end
+
+fn mv_verify_rcpt_ed25519 use_b bool to bool
+for i ulong 32
+put mv_ed_pk i mv_rcpt_byte use_b add 192 i
+end
+for i ulong MV_RCPT_BODY_LEN
+put mv_ed_msg i mv_rcpt_byte use_b i
+end
+for i ulong 64
+put mv_ed_sig i mv_rcpt_byte use_b add 224 i
+end
+ret mv_ed_verify_buf MV_RCPT_BODY_LEN
+end
+
+fn mv_parse_rcpt_fields use_b bool pslot ulong to void
+put mv_parsed 0 mv_rcpt_get_u64 use_b 136
+put mv_parsed 1 mv_rcpt_get_u32 use_b 144
+put mv_parsed 2 mv_rcpt_get_u32 use_b 148
+put mv_parsed 3 mv_rcpt_get_u64 use_b 152
+put mv_parsed 4 mv_rcpt_get_u64 use_b 160
+put mv_parsed 5 mv_rcpt_get_u64 use_b 168
+put mv_parsed 6 mv_rcpt_get_u64 use_b 176
+put mv_parsed 7 mv_rcpt_get_u64 use_b 184
+put mv_parsed 8 pslot
+end
+
+note Core receipt verifier (does NOT record replay nonce yet; caller records after tier check)
+fn mv_verify_receipt_core use_b bool req_allowlist bool out_len ulong to ulong
+if not mv_check_rcpt_magic use_b
+ret MV_ERR_FORMAT
+end
+for i ulong 32
+put mv_ed_pk i mv_rcpt_byte use_b add 192 i
+end
+pslot = mv_peer_find_pk
+if req_allowlist
+if eq pslot MV_NONE
+put mv_stats 15 add get mv_stats 15 1
+ret MV_ERR_UNKNOWN_PEER
+end
+end
+if ne pslot MV_NONE
+if ne get mv_peer_quar pslot 0
+ret MV_ERR_QUARANTINED
+end
+end
+if not mv_check_rcpt_bindings use_b
+ret MV_ERR_BINDING_MISMATCH
+end
+mv_parse_rcpt_fields use_b pslot
+if ne get mv_parsed 4 get mv_exp_meta 2
+ret MV_ERR_REPLAY
+end
+if mv_nonce_is_seen get mv_parsed 4
+put mv_stats 14 add get mv_stats 14 1
+ret MV_ERR_REPLAY
+end
+if lt get mv_parsed 5 get mv_exp_meta 3
+ret MV_ERR_EPOCH
+end
+if lt get mv_parsed 5 get mv_min_epoch 0
+ret MV_ERR_EPOCH
+end
+if not mm_dominates get mv_parsed 1 get mv_parsed 3 get mv_exp_meta 0 get mv_exp_meta 1
+ret MV_ERR_PRECISION
+end
+if ne get mv_parsed 6 out_len
+ret MV_ERR_OUTPUT_HASH
+end
+if not mv_check_output_digest use_b out_len
+ret MV_ERR_OUTPUT_HASH
+end
+if not mv_verify_rcpt_ed25519 use_b
+put mv_stats 13 add get mv_stats 13 1
+ret MV_ERR_BAD_SIG
+end
+ret MV_OK
+end
+
+note Populate one-shot verified admission token from mv_parsed + primary mv_rcpt
+fn mv_set_verified_token vtier ulong vmask ulong to void
+put mv_ver_ok 0 1
+put mv_ver_tier 0 vtier
+put mv_ver_mask 0 vmask
+put mv_ver_meta 0 get mv_parsed 6
+put mv_ver_meta 1 get mv_parsed 1
+put mv_ver_meta 2 get mv_parsed 3
+put mv_ver_meta 3 get mv_parsed 0
+put mv_ver_meta 4 get mv_parsed 7
+put mv_ver_meta 5 get mv_parsed 8
+put mv_ver_meta 6 get mv_parsed 4
+put mv_ver_meta 7 get mv_parsed 5
+for i ulong 32
+put mv_ver_ompk_sem i get mv_rcpt add 8 i
+put mv_ver_fid i get mv_rcpt add 40 i
+put mv_ver_in_sha i get mv_rcpt add 72 i
+put mv_ver_out_sha i get mv_rcpt add 104 i
+end
+end
+
+note ---- Tier A: Owner Sovereign Mesh Verification + Configurable Spot-Check ----
+
+fn mv_should_spot_check nonce ulong to bool
+if ne get mv_spot_cfg 1 0
+ret true
+end
+rate = get mv_spot_cfg 0
+if eq rate 0
+ret false
+end
+if ge rate 1000000
+ret true
+end
+tl = len mv_tag_spot
+for i ulong tl bound 16
+put sh_dat i get mv_tag_spot i
+end
+for i ulong 32
+put sh_dat add tl i get mv_exp_in_sha i
+end
+mv_sh_put_u64 add tl 32 nonce
+sh_all add tl 40
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get sh_dig j mul j 8
+end
+ret lt rem v 1000000 rate
+end
+
+fn mv_spot_compare_output olen ulong to bool
+if ne get mv_spot_llen 0 olen
+ret false
+end
+if gt olen MV_MAX_OUT_B
+ret false
+end
+for i ulong olen bound 65536
+if ne get mm_val_buf i get mv_spot_local i
+ret false
+end
+end
+ret true
+end
+
+note Tier A verification: allowlist + strict Ed25519 + binding + optional spot-check re-exec
+fn mv_tier_a_verify out_len ulong has_local_spot bool to ulong
+mv_clear_verified
+put mv_spot_cfg 2 0
+rc = mv_verify_receipt_core false true out_len
+if ne rc MV_OK
+put mv_stats 1 add get mv_stats 1 1
+ret rc
+end
+vmask = or or MV_VBIT_ALLOWLIST MV_VBIT_ED25519 MV_VBIT_BINDING
+nonce = get mv_parsed 4
+pslot = get mv_parsed 8
+if mv_should_spot_check nonce
+put mv_spot_cfg 2 1
+put mv_spot_cfg 3 add get mv_spot_cfg 3 1
+if not has_local_spot
+put mv_stats 1 add get mv_stats 1 1
+ret MV_ERR_SPOTCHECK_FAIL
+end
+if not mv_spot_compare_output out_len
+mv_peer_quarantine pslot
+mv_alarm_spot pslot
+put mv_stats 4 add get mv_stats 4 1
+put mv_stats 1 add get mv_stats 1 1
+ret MV_ERR_SPOTCHECK_FAIL
+end
+vmask = or vmask MV_VBIT_SPOTCHECK
+end
+mv_nonce_record nonce
+mv_set_verified_token MV_TIER_A_SOVEREIGN vmask
+put mv_stats 0 add get mv_stats 0 1
+ret MV_OK
+end
+
+note ---- Tier B1: Freivalds Randomized Matmul Verification (O(R * N^2) vs O(N^3)) ----
+
+fn mv_matmul_compute n ulong to ulong
+if or eq n 0 gt n MV_MAT_MAX_N
+ret MV_ERR_BAD_DIM
+end
+for i ulong n bound 64
+row = mul i n
+for j ulong n bound 64
+acc = ulong 0
+for k ulong n bound 64
+av = get mv_mat_a add row k
+bv = get mv_mat_b add mul k n j
+acc = add acc mul av bv
+end
+put mv_mat_c add row j acc
+end
+end
+ret MV_OK
+end
+
+fn mv_mat_c_encode_to_valbuf n ulong to ulong
+if or eq n 0 gt n MV_MAT_MAX_N
+ret MV_ERR_BAD_DIM
+end
+elems = mul n n
+for idx ulong elems bound 4096
+v = get mv_mat_c idx
+off = mul idx 8
+for j ulong 8
+put mm_val_buf add off j uchar and shr v mul j 8 255
+end
+end
+put mm_val_len 0 mul elems 8
+ret MV_OK
+end
+
+fn mv_mat_c_decode_from_valbuf n ulong to ulong
+if or eq n 0 gt n MV_MAT_MAX_N
+ret MV_ERR_BAD_DIM
+end
+elems = mul n n
+need = mul elems 8
+if ne get mm_val_len 0 need
+ret MV_ERR_FORMAT
+end
+for idx ulong elems bound 4096
+off = mul idx 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mm_val_buf add off j mul j 8
+end
+put mv_mat_c idx v
+end
+ret MV_OK
+end
+
+fn mv_fv_gen_vec n ulong rnd_idx ulong seed ulong to bool
+if eq seed 0
+gr = random mv_fv_rnd 0 16 0
+if ne gr 16
+ret false
+end
+put mv_fv_stats 3 1
+else
+tl = len mv_tag_fv
+for i ulong tl bound 16
+put sh_dat i get mv_tag_fv i
+end
+mv_sh_put_u64 tl seed
+mv_sh_put_u64 add tl 8 rnd_idx
+mv_sh_put_u64 add tl 16 n
+sh_all add tl 24
+for i ulong 32
+put mv_fv_rnd i get sh_dig i
+end
+end
+for j ulong n bound 64
+bi = shr j 3
+bit = and shr ulong get mv_fv_rnd bi and j 7 1
+put mv_fv_r j bit
+end
+ret true
+end
+
+fn mv_fv_compute_br n ulong to void
+for i ulong n bound 64
+row = mul i n
+s = ulong 0
+for j ulong n bound 64
+if eq get mv_fv_r j 1
+s = add s get mv_mat_b add row j
+end
+end
+put mv_fv_br i s
+end
+end
+
+fn mv_fv_check_row n ulong i ulong to bool
+row = mul i n
+sa = ulong 0
+sc = ulong 0
+for j ulong n bound 64
+idx = add row j
+sa = add sa mul get mv_mat_a idx get mv_fv_br j
+if eq get mv_fv_r j 1
+sc = add sc get mv_mat_c idx
+end
+end
+put mv_fv_abr i sa
+put mv_fv_cr i sc
+ret eq sa sc
+end
+
+note Freivalds O(R * N^2) check over Z / 2^64 Z (exact for int64 two's-complement matmul).
+note Each round detects ANY non-zero entry in (A*B - C) with probability >= 1/2 (<= 2^-R FP).
+fn mv_freivalds_verify n ulong rounds ulong seed ulong to ulong
+if or eq n 0 gt n MV_MAT_MAX_N
+ret MV_ERR_BAD_DIM
+end
+if or eq rounds 0 gt rounds 64
+ret MV_ERR_BAD_DIM
+end
+put mv_fv_stats 0 0
+put mv_fv_stats 1 MV_NONE
+put mv_fv_stats 2 MV_NONE
+put mv_fv_stats 3 0
+for t ulong rounds bound 64
+if not mv_fv_gen_vec n t seed
+put mv_stats 6 add get mv_stats 6 1
+ret MV_ERR_FREIVALDS_FAIL
+end
+mv_fv_compute_br n
+for i ulong n bound 64
+if not mv_fv_check_row n i
+put mv_fv_stats 0 add t 1
+put mv_fv_stats 1 t
+put mv_fv_stats 2 i
+put mv_stats 6 add get mv_stats 6 1
+mv_alarm_fv t
+ret MV_ERR_FREIVALDS_FAIL
+end
+end
+end
+put mv_fv_stats 0 rounds
+put mv_stats 5 add get mv_stats 5 1
+ret MV_OK
+end
+
+fn mv_tier_b_verify_freivalds n ulong rounds ulong seed ulong to ulong
+mv_clear_verified
+need = mul mul n n 8
+if ne get mm_val_len 0 need
+put mv_stats 3 add get mv_stats 3 1
+ret MV_ERR_FORMAT
+end
+rc = mv_verify_receipt_core false false need
+if ne rc MV_OK
+put mv_stats 3 add get mv_stats 3 1
+ret rc
+end
+drc = mv_mat_c_decode_from_valbuf n
+if ne drc MV_OK
+put mv_stats 3 add get mv_stats 3 1
+ret drc
+end
+frc = mv_freivalds_verify n rounds seed
+if ne frc MV_OK
+put mv_stats 3 add get mv_stats 3 1
+ret frc
+end
+mv_nonce_record get mv_parsed 4
+vmask = or or MV_VBIT_ED25519 MV_VBIT_BINDING MV_VBIT_FREIVALDS
+mv_set_verified_token MV_TIER_B_ZEROTRUST vmask
+put mv_stats 2 add get mv_stats 2 1
+ret MV_OK
+end
+
+note ---- Tier B2: Merkle Intermediate-State Checkpoint Verification + Binary Bisection ----
+
+fn mv_is_pow2_leaves m ulong to bool
+if eq m 2
+ret true
+end
+if eq m 4
+ret true
+end
+if eq m 8
+ret true
+end
+if eq m 16
+ret true
+end
+if eq m 32
+ret true
+end
+if eq m 64
+ret true
+end
+ret false
+end
+
+fn mv_mk_store_node use_rem bool node ulong to void
+base = mul node 32
+for i ulong 32
+if use_rem
+put mv_mk_rem add base i get sh_dig i
+else
+put mv_mk_loc add base i get sh_dig i
+end
+end
+end
+
+fn mv_mk_hash_node use_rem bool left ulong right ulong to void
+tl = len mv_tag_mk_node
+for i ulong tl bound 16
+put sh_dat i get mv_tag_mk_node i
+end
+lb = mul left 32
+rb = mul right 32
+for i ulong 32
+if use_rem
+put sh_dat add tl i get mv_mk_rem add lb i
+put sh_dat add add tl 32 i get mv_mk_rem add rb i
+else
+put sh_dat add tl i get mv_mk_loc add lb i
+put sh_dat add add tl 32 i get mv_mk_loc add rb i
+end
+end
+sh_all add tl 64
+end
+
+note Fold leaves[M..2M-1] upward into root at node 1
+fn mv_mk_fold use_rem bool m ulong to void
+k = sub m 1
+while gt k 0 bound 64
+mv_mk_hash_node use_rem mul k 2 add mul k 2 1
+mv_mk_store_node use_rem k
+k = sub k 1
+end
+end
+
+note Compute M-chunk deterministic state trace & Merkle checkpoint tree.
+note bad_chunk == MV_NONE -> honest trace; bad_chunk < M -> flips 1 bit in step bad_chunk.
+note Writes final 32-byte state digest into mv_mk_state[0..32).
+fn mv_merkle_run_trace use_rem bool m ulong state_seed ulong bad_chunk ulong to ulong
+if not mv_is_pow2_leaves m
+ret MV_ERR_BAD_DIM
+end
+tl = len mv_tag_mk_step
+for i ulong tl bound 16
+put sh_dat i get mv_tag_mk_step i
+end
+mv_sh_put_u64 tl state_seed
+sh_all add tl 8
+for i ulong 32
+put mv_mk_state i get sh_dig i
+end
+ltl = len mv_tag_mk_leaf
+for step ulong m bound 64
+for i ulong tl bound 16
+put sh_dat i get mv_tag_mk_step i
+end
+mv_sh_put_u64 tl step
+for i ulong 32
+put sh_dat add add tl 8 i get mv_mk_state i
+end
+sh_all add tl 40
+for i ulong 32
+put mv_mk_state i get sh_dig i
+end
+if eq step bad_chunk
+put mv_mk_state 0 xor get mv_mk_state 0 uchar 1
+end
+for i ulong ltl bound 16
+put sh_dat i get mv_tag_mk_leaf i
+end
+mv_sh_put_u64 ltl step
+for i ulong 32
+put sh_dat add add ltl 8 i get mv_mk_state i
+end
+sh_all add ltl 40
+mv_mk_store_node use_rem add m step
+end
+mv_mk_fold use_rem m
+put mv_mk_leaves 0 m
+ret MV_OK
+end
+
+fn mv_mk_node_eq node ulong to bool
+base = mul node 32
+for i ulong 32
+if ne get mv_mk_loc add base i get mv_mk_rem add base i
+ret false
+end
+end
+ret true
+end
+
+note Verify remote Merkle root against local root; on mismatch bisect in log2(M) steps
+note to pinpoint the exact first divergent chunk index in mv_mk_stats[2].
+fn mv_merkle_verify_and_bisect m ulong to ulong
+if not mv_is_pow2_leaves m
+ret MV_ERR_BAD_DIM
+end
+put mv_mk_stats 3 m
+if mv_mk_node_eq 1
+put mv_mk_stats 0 1
+put mv_mk_stats 1 0
+put mv_mk_stats 2 MV_NONE
+put mv_stats 7 add get mv_stats 7 1
+ret MV_OK
+end
+cur = ulong 1
+steps = ulong 0
+while lt cur m bound 16
+steps = add steps 1
+left = mul cur 2
+if not mv_mk_node_eq left
+cur = left
+else
+cur = add left 1
+end
+end
+bad = sub cur m
+put mv_mk_stats 0 0
+put mv_mk_stats 1 steps
+put mv_mk_stats 2 bad
+put mv_stats 8 add get mv_stats 8 1
+mv_alarm_mk bad steps
+ret MV_ERR_MERKLE_MISMATCH
+end
+
+fn mv_tier_b_verify_merkle out_len ulong m_leaves ulong to ulong
+mv_clear_verified
+rc = mv_verify_receipt_core false false out_len
+if ne rc MV_OK
+put mv_stats 3 add get mv_stats 3 1
+ret rc
+end
+mrc = mv_merkle_verify_and_bisect m_leaves
+if ne mrc MV_OK
+put mv_stats 3 add get mv_stats 3 1
+ret mrc
+end
+mv_nonce_record get mv_parsed 4
+vmask = or or MV_VBIT_ED25519 MV_VBIT_BINDING MV_VBIT_MERKLE
+mv_set_verified_token MV_TIER_B_ZEROTRUST vmask
+put mv_stats 2 add get mv_stats 2 1
+ret MV_OK
+end
+
+note ---- Tier B3: Dual-Peer BFT Quorum Verification ----
+
+fn mv_quorum_same_pubkey to bool
+for i ulong 32
+if ne get mv_rcpt add 192 i get mv_rcpt_b add 192 i
+ret false
+end
+end
+ret true
+end
+
+fn mv_quorum_outputs_equal olen ulong to bool
+if gt olen MV_MAX_OUT_B
+ret false
+end
+for i ulong 32
+if ne get mv_rcpt add 104 i get mv_rcpt_b add 104 i
+ret false
+end
+end
+for i ulong olen bound 65536
+if ne get mm_val_buf i get mv_out_b i
+ret false
+end
+end
+ret true
+end
+
+note Verify two independent remote executions (primary in mv_rcpt + mm_val_buf, secondary in
+note mv_rcpt_b + mv_out_b). Refuses same-peer Sybil, bad signatures, or any output divergence!
+fn mv_tier_b_verify_quorum len_a ulong len_b ulong nonce_a ulong nonce_b ulong to ulong
+mv_clear_verified
+if mv_quorum_same_pubkey
+put mv_stats 10 add get mv_stats 10 1
+put mv_stats 3 add get mv_stats 3 1
+ret MV_ERR_QUORUM_SAME_PEER
+end
+put mv_exp_meta 2 nonce_a
+rc = mv_verify_receipt_core false false len_a
+if ne rc MV_OK
+put mv_stats 10 add get mv_stats 10 1
+put mv_stats 3 add get mv_stats 3 1
+ret rc
+end
+for i ulong 10
+put mv_parsed_a i get mv_parsed i
+end
+put mv_exp_meta 2 nonce_b
+rc = mv_verify_receipt_core true false len_b
+if ne rc MV_OK
+put mv_stats 10 add get mv_stats 10 1
+put mv_stats 3 add get mv_stats 3 1
+ret rc
+end
+slot_b = get mv_parsed 8
+if or ne len_a len_b not mv_quorum_outputs_equal len_a
+mv_peer_quarantine get mv_parsed_a 8
+mv_peer_quarantine slot_b
+mv_alarm_quorum
+put mv_stats 10 add get mv_stats 10 1
+put mv_stats 3 add get mv_stats 3 1
+ret MV_ERR_QUORUM_MISMATCH
+end
+mv_nonce_record nonce_a
+mv_nonce_record nonce_b
+for i ulong 10
+put mv_parsed i get mv_parsed_a i
+end
+vmask = or or MV_VBIT_ED25519 MV_VBIT_BINDING MV_VBIT_QUORUM
+mv_set_verified_token MV_TIER_B_ZEROTRUST vmask
+put mv_stats 9 add get mv_stats 9 1
+put mv_stats 2 add get mv_stats 2 1
+ret MV_OK
+end
+
+note ---- Fail-Closed OMEGA-MEMO Admission Gate (TOCTOU-proof one-shot token) ----
+
+fn mv_check_ver_mask vtier ulong vmask ulong to bool
+if eq vtier MV_TIER_A_SOVEREIGN
+ret eq and vmask 7 7
+end
+if eq vtier MV_TIER_B_ZEROTRUST
+if ne and vmask 6 6
+ret false
+end
+tb = or or MV_VBIT_FREIVALDS MV_VBIT_MERKLE MV_VBIT_QUORUM
+ret ne and vmask tb 0
+end
+ret false
+end
+
+fn mv_check_toctou to bool
+olen = get mm_val_len 0
+if ne olen get mv_ver_meta 0
+ret false
+end
+if gt olen MM_MAX_VAL_LEN
+ret false
+end
+for i ulong 32
+if ne get mm_req_fid i get mv_ver_fid i
+ret false
+end
+if ne get mm_req_in_sha i get mv_ver_in_sha i
+ret false
+end
+end
+for i ulong olen bound 4194304
+put sh_dat i get mm_val_buf i
+end
+sh_all olen
+for i ulong 32
+if ne get sh_dig i get mv_ver_out_sha i
+ret false
+end
+end
+ret true
+end
+
+note Remote outputs enter seed/ng/memo/memo_store.om ONLY through this fail-closed gate!
+fn mv_admit_to_memo compute_ns ulong overhead_ns ulong to ulong
+if ne get mv_ver_ok 0 1
+mv_clear_verified
+put mv_stats 12 add get mv_stats 12 1
+ret MV_ERR_UNVERIFIED
+end
+vtier = get mv_ver_tier 0
+vmask = get mv_ver_mask 0
+if not mv_check_ver_mask vtier vmask
+mv_clear_verified
+put mv_stats 12 add get mv_stats 12 1
+ret MV_ERR_UNVERIFIED
+end
+if not mv_check_toctou
+mv_clear_verified
+put mv_stats 12 add get mv_stats 12 1
+ret MV_ERR_TOCTOU_TAMPER
+end
+if or ne get mm_req_contract 0 1 ne get mm_req_contract 1 1
+mv_clear_verified
+put mv_stats 12 add get mv_stats 12 1
+ret MV_ERR_IMPURE
+end
+pt = get mv_ver_meta 1
+eb = get mv_ver_meta 2
+tid = get mv_ver_meta 3
+for i ulong 32
+put mm_req_ir_sha i get mv_ver_ompk_sem i
+end
+mm_set_contract 1 1 pt eb
+mm_set_provenance tid MM_PROV_OMPK_V2
+mv_clear_verified
+src = mm_store compute_ns overhead_ns
+if or eq src MM_OK or eq src MM_OK_DOMINATED eq src MM_OK_ALARM
+put mv_stats 11 add get mv_stats 11 1
+ret MV_OK
+end
+put mv_stats 12 add get mv_stats 12 1
+ret MV_ERR_MEMO_STORE
+end
