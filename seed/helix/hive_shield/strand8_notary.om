@@ -1,0 +1,550 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/hive_shield/strand8_notary.om: Strand 8 (The Notary)
+note Pure Seeded OM-2 Cryptographic Receipt Verifier, Dual-Law Hive Consensus Engine
+note (1-of-K Safety Veto + N >= 3f+1 Compiler BFT Quorum), and OMEGA-MEMO Attestation Chain.
+note
+note Link order (program mode; prefix om2\n at line 1):
+note   (printf 'om2\n'; cat seed/ng/sha256.om seed/ng/memo/memo_policy.om \
+note    seed/ng/memo/memo_store.om seed/helix/hive_shield/strand8_notary.om) | seed/out/omc > strand8_notary
+note
+note Modes:
+note   strand8_notary verify-sums <base_dir> <sha256sums_file>
+note   strand8_notary hive-quorum <n_comp> <f_max> <c_ok> <safety_veto_mask> <memo_root> <omc_sha64>
+note
+note Fail-closed refusal codes:
+note   161 HS_ERR_HASH_TAMPER     SHA-256 mismatch on manifest file (1-bit tamper caught)
+note   162 HS_ERR_MISSING_FILE    file named in SHA256SUMS missing or unreadable
+note   163 HS_ERR_BAD_MANIFEST    empty or malformed SHA256SUMS manifest
+note   164 HS_ERR_SAFETY_VETO     at least one defense strand vetoed (1-of-K Veto Law)
+note   165 HS_ERR_BFT_NO_QUORUM   compiler strand quorum failed (n < 3f+1 or ok < n-f)
+note   166 HS_ERR_MEMO_TAMPER     OMEGA-MEMO attestation entry tampered or corrupt
+
+const S8_MAX_MAN ulong 65536
+const S8_MAX_OBJ ulong 16777216
+
+const S8_ERR_TAMPER ulong 161
+const S8_ERR_MISSING ulong 162
+const S8_ERR_BADMAN ulong 163
+const S8_ERR_VETO ulong 164
+const S8_ERR_NOQUORUM ulong 165
+const S8_ERR_MEMO ulong 166
+
+global s8_arg uchar 1024
+global s8_base uchar 1024
+global s8_blen ulong 1
+global s8_man uchar 65536
+global s8_mlen ulong 1
+global s8_path uchar 2048
+global s8_plen ulong 1
+global s8_exp uchar 32
+global s8_msha uchar 32
+global s8_hex uchar 64
+global s8_omc uchar 64
+global s8_fid uchar 32
+global s8_insha uchar 32
+global s8_dig uchar 24
+global s8_probe uchar 4
+
+text s8_use "usage: strand8_notary verify-sums <base_dir> <sums_file> | hive-quorum <n> <f> <ok> <veto> <memo_root> <omc_sha64>\n"
+text s8_c_sums "verify-sums"
+text s8_c_quor "hive-quorum"
+text s8_tag_att "omega.hive.notary.attest.v1"
+
+text s8_p_s1 "STRAND8_NOTARY VERIFY_SUMS PASS verified_files="
+text s8_p_s2 " manifest_sha256="
+text s8_p_q1 "STRAND8_NOTARY HIVE_QUORUM PASS mode="
+text s8_p_cold "COLD_SEALED"
+text s8_p_hit "MEMO_VERIFIED"
+text s8_p_q2 " compiler_ok="
+text s8_p_q3 " safety_veto=0 omc_sha256="
+text s8_f_pfx "STRAND8_NOTARY REFUSED code="
+text s8_f_rsn " reason="
+text s8_nl "\n"
+
+text s8_r_161 "RECEIPT_SHA256_TAMPER"
+text s8_r_162 "RECEIPT_FILE_MISSING"
+text s8_r_163 "MALFORMED_SHA256SUMS"
+text s8_r_164 "DEFENSE_STRAND_SAFETY_VETO"
+text s8_r_165 "COMPILER_BFT_NO_QUORUM"
+text s8_r_166 "OMEGA_MEMO_ATTESTATION_TAMPER"
+
+fn s8_wrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn s8_num fd int v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put s8_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd s8_dig p sub 24 p
+ret
+end
+end
+end
+
+fn s8_hexch v ulong to uchar
+if lt v 10
+ret uchar add 48 v
+end
+ret uchar add 87 v
+end
+
+fn s8_wrhex_msha fd int to void
+for i ulong 32
+b = ulong get s8_msha i
+put s8_hex mul i 2 s8_hexch shr b 4
+put s8_hex add mul i 2 1 s8_hexch and b 15
+end
+r = write fd s8_hex 0 64
+end
+
+fn s8_refuse code ulong to int
+s8_wrt 2 s8_f_pfx
+s8_num 2 code
+s8_wrt 2 s8_f_rsn
+if eq code S8_ERR_TAMPER
+s8_wrt 2 s8_r_161
+end
+if eq code S8_ERR_MISSING
+s8_wrt 2 s8_r_162
+end
+if eq code S8_ERR_BADMAN
+s8_wrt 2 s8_r_163
+end
+if eq code S8_ERR_VETO
+s8_wrt 2 s8_r_164
+end
+if eq code S8_ERR_NOQUORUM
+s8_wrt 2 s8_r_165
+end
+if eq code S8_ERR_MEMO
+s8_wrt 2 s8_r_166
+end
+s8_wrt 2 s8_nl
+ret int code
+end
+
+fn s8_eq_arg s view uchar * n ulong to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get s8_arg i get s i
+ret false
+end
+end
+ret true
+end
+
+fn s8_parse_arg_u idx ulong to ulong
+al = argread idx s8_arg 0 64
+if lt al 1
+ret not ulong 0
+end
+n = ulong al
+if gt n 20
+ret not ulong 0
+end
+v = ulong 0
+for i ulong n bound 20
+c = ulong get s8_arg i
+if lt c 48
+ret not ulong 0
+end
+if gt c 57
+ret not ulong 0
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+fn s8_hexval ch ulong to ulong
+if and ge ch 48 le ch 57
+ret sub ch 48
+end
+if and ge ch 97 le ch 102
+ret add 10 sub ch 97
+end
+if and ge ch 65 le ch 70
+ret add 10 sub ch 65
+end
+ret 99
+end
+
+fn s8_parse_hex64 off ulong to bool
+for i ulong 32
+hi = s8_hexval ulong get s8_man add off mul i 2
+lo = s8_hexval ulong get s8_man add add off mul i 2 1
+if ge hi 16
+ret false
+end
+if ge lo 16
+ret false
+end
+put s8_exp i uchar or shl hi 4 lo
+end
+ret true
+end
+
+fn s8_rel_is_safe rel_off ulong rel_len ulong to bool
+if eq rel_len 0
+ret false
+end
+if eq get s8_man rel_off 47
+ret false
+end
+for i ulong rel_len bound 1024
+if lt add i 1 rel_len
+if eq get s8_man add rel_off i 46
+if eq get s8_man add add rel_off i 1 46
+ret false
+end
+end
+end
+end
+ret true
+end
+
+fn s8_build_path rel_off ulong rel_len ulong to bool
+bl = get s8_blen 0
+if not s8_rel_is_safe rel_off rel_len
+ret false
+end
+if gt add add bl 1 rel_len 2040
+ret false
+end
+for i ulong bl bound 1024
+put s8_path i get s8_base i
+end
+put s8_path bl 47
+for j ulong rel_len bound 1024
+put s8_path add add bl 1 j get s8_man add rel_off j
+end
+put s8_plen 0 add add bl 1 rel_len
+ret true
+end
+
+fn s8_hash_and_check_path to ulong
+fd = fopen s8_path 0 get s8_plen 0 0 0
+if lt fd 0
+ret S8_ERR_MISSING
+end
+n = ulong 0
+while lt n S8_MAX_OBJ bound 262144
+want = sub S8_MAX_OBJ n
+if gt want 65536
+want = ulong 65536
+end
+k = read int fd sh_dat n want
+if lt k 0
+c1 = fclose int fd
+ret S8_ERR_MISSING
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+if eq n S8_MAX_OBJ
+extra = read int fd s8_probe 0 1
+if gt extra 0
+c3 = fclose int fd
+ret S8_ERR_BADMAN
+end
+end
+c2 = fclose int fd
+sh_all n
+diff = ulong 0
+for i ulong 32
+if ne get sh_dig i get s8_exp i
+diff = add diff 1
+end
+end
+if ne diff 0
+ret S8_ERR_TAMPER
+end
+ret 0
+end
+
+fn s8_verify_line loff ulong llen ulong to ulong
+if lt llen 67
+ret S8_ERR_BADMAN
+end
+if not s8_parse_hex64 loff
+ret S8_ERR_BADMAN
+end
+c64 = ulong get s8_man add loff 64
+c65 = ulong get s8_man add loff 65
+if ne c64 32
+ret S8_ERR_BADMAN
+end
+if ne c65 32
+if ne c65 42
+ret S8_ERR_BADMAN
+end
+end
+roff = add loff 66
+rlen = sub llen 66
+if eq rlen 0
+ret S8_ERR_BADMAN
+end
+if eq get s8_man add roff sub rlen 1 13
+rlen = sub rlen 1
+end
+if not s8_build_path roff rlen
+ret S8_ERR_BADMAN
+end
+ret s8_hash_and_check_path
+end
+
+fn s8_cmd_verify_sums to int
+if ne argcnt 4
+s8_wrt 2 s8_use
+ret 2
+end
+bl = argread 2 s8_base 0 1000
+if lt bl 1
+ret 2
+end
+put s8_blen 0 ulong bl
+ml = argread 3 s8_arg 0 1000
+if lt ml 1
+ret 2
+end
+fd = fopen s8_arg 0 ulong ml 0 0
+if lt fd 0
+ret s8_refuse S8_ERR_MISSING
+end
+n = ulong 0
+while lt n S8_MAX_MAN bound 1024
+k = read int fd s8_man n sub S8_MAX_MAN n
+if lt k 0
+c1 = fclose int fd
+ret s8_refuse S8_ERR_MISSING
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+c2 = fclose int fd
+if eq n 0
+ret s8_refuse S8_ERR_BADMAN
+end
+put s8_mlen 0 n
+for i ulong n bound 65536
+put sh_dat i get s8_man i
+end
+sh_all n
+for i ulong 32
+put s8_msha i get sh_dig i
+end
+pos = ulong 0
+vcnt = ulong 0
+while lt pos n bound 4096
+lstart = pos
+while lt pos n bound 1024
+if eq get s8_man pos 10
+break
+end
+pos = add pos 1
+end
+llen = sub pos lstart
+if lt pos n
+pos = add pos 1
+end
+if eq llen 0
+continue
+end
+rc = s8_verify_line lstart llen
+if ne rc 0
+ret s8_refuse rc
+end
+vcnt = add vcnt 1
+end
+if eq vcnt 0
+ret s8_refuse S8_ERR_BADMAN
+end
+s8_wrt 1 s8_p_s1
+s8_num 1 vcnt
+s8_wrt 1 s8_p_s2
+s8_wrhex_msha 1
+s8_wrt 1 s8_nl
+ret 0
+end
+
+fn s8_is_memo_corrupt rc ulong to bool
+if eq rc MM_ERR_TAMPER
+ret true
+end
+if eq rc MM_ERR_MAGIC
+ret true
+end
+if eq rc MM_ERR_VERSION
+ret true
+end
+if eq rc MM_ERR_TRUNCATED
+ret true
+end
+if eq rc MM_ERR_TRAILING
+ret true
+end
+if eq rc MM_ERR_KEY_MISMATCH
+ret true
+end
+if eq rc MM_ERR_FORMAT
+ret true
+end
+if eq rc MM_ERR_IMPURE
+ret true
+end
+if eq rc MM_ERR_CONTRACT
+ret true
+end
+ret false
+end
+
+fn s8_seal_attest n_comp ulong c_ok ulong to int
+tl = len s8_tag_att
+for i ulong tl bound 64
+put sh_dat i get s8_tag_att i
+end
+for i ulong 64
+put sh_dat add tl i get s8_omc i
+end
+sh_all add tl 64
+for i ulong 32
+put s8_fid i get sh_dig i
+end
+put sh_dat 0 uchar and n_comp 255
+put sh_dat 1 uchar and c_ok 255
+for i ulong 64
+put sh_dat add 2 i get s8_omc i
+end
+sh_all 66
+for i ulong 32
+put s8_insha i get sh_dig i
+end
+mm_reset_req
+for i ulong 32
+put mm_req_fid i get s8_fid i
+put mm_req_in_sha i get s8_insha i
+put mm_req_ir_sha i get s8_insha i
+end
+put mm_req_contract 0 1
+put mm_req_contract 1 1
+put mm_req_contract 2 MM_TIER_EXACT
+put mm_req_contract 3 0
+put mm_req_contract 5 8
+lrc = mm_lookup
+if s8_is_memo_corrupt lrc
+ret s8_refuse S8_ERR_MEMO
+end
+isHit = false
+if eq lrc MM_OK
+isHit = true
+else
+for i ulong 64
+put mm_val_buf i get s8_omc i
+end
+put mm_val_len 0 64
+src = mm_store 50000 1000
+if ne src MM_OK
+if ne src MM_OK_ALARM
+ret s8_refuse S8_ERR_MEMO
+end
+end
+end
+s8_wrt 1 s8_p_q1
+if isHit
+s8_wrt 1 s8_p_hit
+else
+s8_wrt 1 s8_p_cold
+end
+s8_wrt 1 s8_p_q2
+s8_num 1 c_ok
+s8_wrt 1 s8_p_q3
+r = write 1 s8_omc 0 64
+s8_wrt 1 s8_nl
+ret 0
+end
+
+fn s8_cmd_hive_quorum to int
+bad = not ulong 0
+if ne argcnt 8
+s8_wrt 2 s8_use
+ret 2
+end
+n_comp = s8_parse_arg_u 2
+f_max = s8_parse_arg_u 3
+c_ok = s8_parse_arg_u 4
+veto = s8_parse_arg_u 5
+if eq n_comp bad
+ret 2
+end
+if eq f_max bad
+ret 2
+end
+if eq c_ok bad
+ret 2
+end
+if eq veto bad
+ret 2
+end
+note Law 1: 1-of-K Safety Veto Law (ANY defense strand veto halts execution immediately)
+if ne veto 0
+ret s8_refuse S8_ERR_VETO
+end
+note Law 2: Compiler BFT Quorum Law (n >= 3f + 1 and ok >= n - f and ok <= n)
+min_n = add mul 3 f_max 1
+if lt n_comp min_n
+ret s8_refuse S8_ERR_NOQUORUM
+end
+if gt c_ok n_comp
+ret s8_refuse S8_ERR_NOQUORUM
+end
+thresh = sub n_comp f_max
+if lt c_ok thresh
+ret s8_refuse S8_ERR_NOQUORUM
+end
+ol = argread 7 s8_omc 0 64
+if ne ol 64
+ret 2
+end
+mp_init
+put mp_cfg 0 MP_OVR_FORCE
+rl = argread 6 mm_env_buf 0 1800
+if lt rl 1
+ret 2
+end
+rc = mm_set_root_from_envbuf ulong rl
+if ne rc MM_OK
+ret s8_refuse S8_ERR_MEMO
+end
+ret s8_seal_attest n_comp c_ok
+end
+
+fn main to int
+if lt argcnt 2
+s8_wrt 2 s8_use
+ret 2
+end
+cl = argread 1 s8_arg 0 64
+if lt cl 1
+s8_wrt 2 s8_use
+ret 2
+end
+if s8_eq_arg s8_c_sums ulong cl
+ret s8_cmd_verify_sums
+end
+if s8_eq_arg s8_c_quor ulong cl
+ret s8_cmd_hive_quorum
+end
+s8_wrt 2 s8_use
+ret 2
+end

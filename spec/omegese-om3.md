@@ -43,3 +43,43 @@ not stated here.
   view (and, for the device words, the ioctl and mapping view) of its own process, so the omega-bridge refuses a unit that names one unless the caller opts in.
 - Gate: `seed/omc/om2/fnhost/fnhost.cases` with the mutants in `seed/omc/om2/fnhost/mutants.cases`,
   run by `seed/host/check.sh`.
+
+## 2. Zero-Pointer Linear Silicon Capability & Hardware-Fence Profile (`om3`, Strand 5 Aegis)
+
+Added 2026-11-26 in response to RCCA `evidence/RCCA-SPARK-DMA-UAF-20261126/` (unified-memory GB10
+GPU DMA use-after-free in legacy C `aien_gpu.ko` that overwrote Linux VFS `inode_cache` slab memory
+with raw IEEE-754 `f32` tensor data).
+
+- **Opt-in header:** A unit whose first line is `om3` opts into the Zero-Pointer Linear Silicon
+  Capability & Hardware-Fence profile. `seed/out/omc` (`om2`, SHA-256
+  `85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134`) stays byte-for-bit frozen and
+  untouched; Strand 5 (`seed/helix/strand5_aegis/om3_aegis.om`, built on `@ng` + `ΩIR v2` +
+  `OMEGA-MEMO`) verifies every `om3` unit statically, memoizes the cryptographic proof certificate
+  in `OMEGA-MEMO` (`OMEM` v1), and erases all capability directives into zero-runtime-overhead `om2`
+  for `@ng front-ir -> @ng opt -> @ng a64` or `seed/out/omc` compilation.
+- **Four Compile-Time Silicon Safety Laws (0 runtime instructions on hot paths):**
+  1. `NO_RAW_PTR` (`OM3_ERR_RAW_PTR = 101`): Raw pointer casts, untyped address arithmetic, and
+     raw load/store escape hatches (`fwld`, `fwst`, `rawptr`, `unsafe_ptr`, `ptr_cast`, `dma_addr`)
+     are statically refused.
+  2. `DISJOINT_DOMAINS` (`OM3_ERR_VA_OVERLAP = 102`, `OM3_ERR_DOMAIN_ALIEN = 110`): Every `@region`
+     belongs to a single exclusive hardware domain (`1=CPU_HOST`, `2=CPU_KERNEL_SLAB`,
+     `3=GPU_DEVICE_DMA`, `4=GPU_PT_GMMU`, `5=MMIO_BAR0`, `6=SHARED_UNCACHED`). Physical ranges
+     across distinct domains and GPU virtual-address mappings across ALL user and kernel buffers
+     (`@map`) MUST be pairwise disjoint; `DOM_CPU_KERNEL_SLAB` can never be GPU-mapped or targeted
+     by GPU DMA.
+  3. `DMA_FENCE_LINEAR` (`OM3_ERR_MISSING_UNMAP = 104`, `OM3_ERR_MISSING_TLB = 105`,
+     `OM3_ERR_UNFENCED_DMA = 106`, `OM3_ERR_VMA_LEAK = 107`, `OM3_ERR_USE_AFTER_RECLAIM = 108`,
+     `OM3_ERR_DOUBLE_RECLAIM = 109`): Reclaiming a GPU-mapped region back to host memory (`@reclaim`)
+     statically requires the complete linear hardware transition sequence:
+     `@unmap` (PTEs cleared) -> `@tlbinval` (GMMU TLB invalidated) -> `@fence_drain EPOCH` (in-flight
+     GPU compute/copy epoch drained) -> `@vma_revoke` (userspace VMA pins == 0) -> `@reclaim`.
+     Skipping any step is a compile-time refusal.
+  4. `SPEED_LIMIT_ZERO_RT` (`OM3_ERR_OOB_STATIC = 103`): Every `@access NAME OFF LEN` proves
+     `LEN > 0`, `OFF + LEN` non-wrapping, and `OFF + LEN <= SIZE` at compile time, then erases all
+     metadata before codegen so the emitted AArch64 / SM121 machine code runs at 100% hardware speed
+     with zero runtime capability tags, reference counts, or bounds branches.
+- **Machine-checked soundness:** `seed/helix/proofs/Om3MemorySafety.lean` (Lean 4.36.0, 0 `sorry`,
+  standard axioms only) proves global domain disjointness, GPU/kernel VA non-overlap, full 4-step
+  fence necessity, and explicit negative-control counterexamples reproducing the 2026-11-26 Spark
+  `aien_gpu.ko` crash bug.
+- **Gate:** `sh seed/helix/strand5_aegis/strand5_verify.sh` and `sh seed/helix/hive_shield/hive_shield_gate.sh`.
