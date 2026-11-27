@@ -1,0 +1,459 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-mesh/mesh_daemon.om
+note Sovereign Intelligence 2.0 Stage 5 (Pillar 5: Zero-Trust Personal Silicon Mesh, DRA-1073)
+note
+note Pure seeded OM-2 Mesh Daemon & CLI (omega-mesh).
+note Real native TCP loopback worker/client protocol (socknew/bind/listen/accept/connect)
+note demonstrating Compile-on-Arrive remote dispatch -> Ed25519 receipt verification ->
+note fail-closed OMEGA-MEMO admission -> instant 0-recompute follow-up memo hit.
+note
+note HARD SAFETY RULE: Strictly refuses wildcard 0.0.0.0 bind (loopback 127.0.0.1 only).
+note
+note Build (DGX Spark AArch64, pinned omc 85b84c6d...):
+note   cat si/directives/om2.om apps/omega-wattd/watt_sense.om apps/omega-wattd/watt_cbf.om \
+note       seed/ng/sha256.om protocol/omnet/om/sha512/sha512.om \
+note       protocol/omnet/om/ed25519/ed25519.om protocol/uor-gpu/ed_sign.om \
+note       seed/ng/target/target_desc.om seed/ng/pack/sem_pack.om \
+note       seed/ng/memo/memo_policy.om seed/ng/memo/memo_store.om \
+note       apps/omega-mesh/mesh_verify.om apps/omega-mesh/mesh_route.om \
+note       apps/omega-mesh/mesh_daemon.om | seed/out/omc > omega-mesh
+note
+note Usage:
+note   omega-mesh demo [memo_dir]          - Fork TCP loopback peer, dispatch -> verify -> memo -> hit
+note   omega-mesh route                    - Show heterogeneous TargetDesc + WattCBF routing matrix
+note   omega-mesh serve <port> [max_reqs]  - Listen on 127.0.0.1:<port> and serve OMSH v1 requests
+note   omega-mesh dispatch <port> <dir>    - Dispatch OMPK v2 to 127.0.0.1:<port>, verify & memoize
+note   omega-mesh check-bind <ipv4_u32>    - Test endpoint bind safety guard (0 => refused)
+
+global md_arg uchar 512
+global md_st uchar 4
+global md_out1 uchar 32
+global md_out2 uchar 32
+
+text md_use "usage: omega-mesh demo [memo_dir] | route | serve <port> [max_reqs] | dispatch <port> <memo_dir> | check-bind <ipv4_u32>\n"
+text md_def_dir "/tmp/omega-mesh-demo"
+text md_tag_cli "OM-MESH-DAEMON-CLI-V1"
+text md_tag_wrk "OM-MESH-DAEMON-WRK-V1"
+text md_ir_src "omega.ng.ir.v2.pure.poly.mesh.demo"
+text md_in_demo "mesh-input-vector-alpha-2026"
+text md_cmd_demo "demo"
+text md_cmd_route "route"
+text md_cmd_serve "serve"
+text md_cmd_disp "dispatch"
+text md_cmd_chk "check-bind"
+text md_bind_0 "0.0.0.0"
+text md_m_hdr "OMEGA-MESH DAEMON (pure seeded OM-2, loopback 127.0.0.1 only, hw_writes=0)\n"
+text md_m_listen "LISTEN addr=127.0.0.1 port="
+text md_m_reqs " max_reqs="
+text md_m_served "SERVED req="
+text md_m_rc " rc="
+text md_m_demo1 "DEMO_CALL1 decision=REMOTE_OFFLOAD port="
+text md_m_demo2 " verify=TIER_A_ED25519_PASS memo_admit=OK net_calls="
+text md_m_demo3 "DEMO_CALL2 decision=OMEGA_MEMO_HIT recompute=0 net_calls="
+text md_m_demo4 " byte_exact=1\n"
+text md_m_r1 "ROUTE_CONSTRAINED_MACBOOK decision="
+text md_m_r2 " sel_node="
+text md_m_r3 " sel_tid="
+text md_m_r4 " local_wc="
+text md_m_r5 " remote_us="
+text md_m_rl "ROUTE_TINY_HIGH_RTT decision="
+text md_m_rl2 " local_us="
+text md_m_ref_wc "REFUSED wildcard bind 0.0.0.0 (MR_ERR_WILDCARD_BIND)\n"
+text md_m_ok_bind "ALLOWED safe loopback/WireGuard bind ipv4="
+text md_m_fail "OMEGA-MESH FAIL code="
+text md_nl "\n"
+
+fn md_arg_eq idx ulong want view uchar * to bool
+rn = argread idx md_arg 0 510
+if ne rn long len want
+ret false
+end
+for i ulong len want bound 64
+if ne get md_arg i get want i
+ret false
+end
+end
+ret true
+end
+
+fn md_arg_u64 idx ulong to ulong
+rn = argread idx md_arg 0 64
+if le rn 0
+ret 0
+end
+v = ulong 0
+for i ulong ulong rn bound 32
+ch = get md_arg i
+if or lt ch 48 gt ch 57
+break
+end
+v = add mul v 10 ulong sub ch 48
+end
+ret v
+end
+
+fn md_stage_demo_keys to void
+mv_ed_derive_seed md_tag_cli 1
+mv_ed_pubkey_from_seed
+for i ulong 32
+put mr_cli_seed i get mv_ed_seed i
+put mr_cli_pk i get mv_ed_pk i
+end
+cs = mv_peer_register 100 MV_TIER_A_SOVEREIGN
+mv_ed_derive_seed md_tag_wrk 2
+mv_ed_pubkey_from_seed
+for i ulong 32
+put mr_wrk_seed i get mv_ed_seed i
+put mr_wrk_pk i get mv_ed_pk i
+end
+ws = mv_peer_register 200 MV_TIER_A_SOVEREIGN
+end
+
+fn md_build_demo_ompk to ulong
+pk_reset_builder
+n = len md_ir_src
+for i ulong n bound 128
+rc = pk_ir_push get md_ir_src i
+end
+pk_set_req EXEC_SCALAR_SIMD 0 16 0 0 0
+pk_set_contract 1 MM_TIER_EXACT 0 0 50000 0
+pk_compute_poly_func_id 64 7 13 29
+ret pk_pack
+end
+
+fn md_stage_demo_input to void
+n = len md_in_demo
+for i ulong n bound 128
+put mr_in_buf i get md_in_demo i
+end
+put mr_in_len 0 n
+end
+
+fn md_set_memo_root_arg idx ulong to ulong
+if gt argcnt long idx
+rn = argread idx md_arg 0 500
+if gt rn 0
+for i ulong ulong rn bound 512
+put mm_env_buf i get md_arg i
+end
+ret mm_set_root_from_envbuf ulong rn
+end
+end
+n = len md_def_dir
+for i ulong n bound 128
+put mm_env_buf i get md_def_dir i
+end
+ret mm_set_root_from_envbuf n
+end
+
+fn md_do_route to int
+mr_init
+mv_init
+md_stage_demo_keys
+if ne md_build_demo_ompk PK_OK
+wd_puts md_m_fail
+wd_put_u64 1
+wd_puts md_nl
+wd_flush
+ret 1
+end
+md_stage_demo_input
+note Node 0: MacBook thermally warm (76C / 78C ceil, 28W budget)
+for i ulong 32
+put mv_ed_pk i get mr_cli_pk i
+end
+mr_stage_node_id 0 MR_TID_MACBOOK 399 MR_ROLE_MACBOOK MV_TIER_A_SOVEREIGN
+mr_stage_node_net MR_IPV4_LOOPBACK 0 0 10000 40 1
+mr_stage_node_therm 76000 72000 25000 12000 4000
+mr_stage_node_policy 28000 0 78000 2
+r0 = mr_commit_node
+note Node 1: DGX Spark (a64linux X925 cool 44C, 120W budget, 200us LAN RTT)
+for i ulong 32
+put mv_ed_pk i get mr_wrk_pk i
+end
+mr_stage_node_id 1 TID_X925 399 MR_ROLE_SPARK_CPU MV_TIER_A_SOVEREIGN
+mr_stage_node_net MR_IPV4_LOOPBACK 18550 200 1000 200 1
+mr_stage_node_therm 44000 40000 25000 10000 5000
+mr_stage_node_policy 120000 80000 85000 2
+r1 = mr_commit_node
+d1 = mr_route_select 200000 22000 32 false
+wd_puts md_m_hdr
+wd_puts md_m_r1
+wd_put_u64 d1
+wd_puts md_m_r2
+wd_put_u64 get mr_route_out 1
+wd_puts md_m_r3
+wd_put_u64 get mr_route_out 2
+wd_puts md_m_r4
+wd_put_u64 get mr_route_out 7
+wd_puts md_m_r5
+wd_put_u64 get mr_route_out 4
+wd_puts md_nl
+note Cool MacBook, tiny op where LAN RTT (2500us) > local compute (50us) -> LOCAL
+put mr_n_tdie 0 42000
+put mr_n_tsink 0 38000
+put mr_n_rtt_us 1 2500
+d2 = mr_route_select 2000 5000 32 false
+wd_puts md_m_rl
+wd_put_u64 d2
+wd_puts md_m_r2
+wd_put_u64 get mr_route_out 1
+wd_puts md_m_rl2
+wd_put_u64 get mr_route_out 3
+wd_puts md_m_r5
+wd_put_u64 get mr_route_out 4
+wd_puts md_nl
+wd_flush
+if or ne d1 MR_DEC_REMOTE ne d2 MR_DEC_LOCAL
+ret 1
+end
+ret 0
+end
+
+fn md_do_serve to int
+if lt argcnt 3
+wd_puts md_use
+wd_flush
+ret 2
+end
+if md_arg_eq 2 md_bind_0
+wd_puts md_m_ref_wc
+wd_flush
+ret 12
+end
+port = md_arg_u64 2
+maxr = ulong 1
+if ge argcnt 4
+maxr = md_arg_u64 3
+if eq maxr 0
+maxr = ulong 1
+end
+end
+mr_init
+mv_init
+md_stage_demo_keys
+lfd = mr_tcp_listen MR_IPV4_LOOPBACK port
+if lt lfd 0
+wd_puts md_m_fail
+wd_put_u64 MR_ERR_SOCK
+wd_puts md_nl
+wd_flush
+ret 1
+end
+wd_puts md_m_hdr
+wd_puts md_m_listen
+wd_put_u64 get mr_net_stats 7
+wd_puts md_m_reqs
+wd_put_u64 maxr
+wd_puts md_nl
+wd_flush
+for i ulong maxr bound 1024
+rc = mr_worker_serve_one int lfd TID_X925 399 MR_FAULT_NONE true
+wd_puts md_m_served
+wd_put_u64 add i 1
+wd_puts md_m_rc
+wd_put_u64 rc
+wd_puts md_nl
+wd_flush
+end
+cf = fclose int lfd
+ret 0
+end
+
+fn md_do_dispatch to int
+if lt argcnt 4
+wd_puts md_use
+wd_flush
+ret 2
+end
+port = md_arg_u64 2
+mr_init
+mv_init
+mp_init
+mp_set_override MP_OVR_FORCE
+md_stage_demo_keys
+if ne md_set_memo_root_arg 3 MM_OK
+ret 1
+end
+if ne md_build_demo_ompk PK_OK
+ret 1
+end
+md_stage_demo_input
+for i ulong 32
+put mv_ed_pk i get mr_wrk_pk i
+end
+mr_stage_node_id 1 TID_X925 399 MR_ROLE_SPARK_CPU MV_TIER_A_SOVEREIGN
+mr_stage_node_net MR_IPV4_LOOPBACK port 100 1000 200 1
+mr_stage_node_therm 44000 40000 25000 10000 5000
+mr_stage_node_policy 120000 80000 85000 2
+c1 = mr_commit_node
+put mr_req_meta 1 9001
+put mr_req_meta 2 1
+d1 = mr_client_dispatch_and_memo 1 MR_WORK_POLY_PURE MM_TIER_EXACT 0 MV_TIER_A_SOVEREIGN 0
+if or ne d1 MR_DEC_REMOTE ne get mm_val_len 0 32
+wd_puts md_m_fail
+wd_put_u64 d1
+wd_puts md_nl
+wd_flush
+ret 1
+end
+for i ulong 32
+put md_out1 i get mm_val_buf i
+end
+net1 = get mr_net_stats 0
+put mr_req_meta 1 9002
+d2 = mr_client_dispatch_and_memo 1 MR_WORK_POLY_PURE MM_TIER_EXACT 0 MV_TIER_A_SOVEREIGN 0
+if or ne d2 MR_DEC_MEMO_HIT ne get mr_net_stats 0 net1
+wd_puts md_m_fail
+wd_put_u64 d2
+wd_puts md_nl
+wd_flush
+ret 1
+end
+for i ulong 32
+if ne get mm_val_buf i get md_out1 i
+ret 1
+end
+end
+wd_puts md_m_hdr
+wd_puts md_m_demo1
+wd_put_u64 port
+wd_puts md_m_demo2
+wd_put_u64 net1
+wd_puts md_nl
+wd_puts md_m_demo3
+wd_put_u64 get mr_net_stats 0
+wd_puts md_m_demo4
+wd_flush
+ret 0
+end
+
+fn md_do_demo to int
+mr_init
+mv_init
+mp_init
+mp_set_override MP_OVR_FORCE
+md_stage_demo_keys
+if ne md_set_memo_root_arg 2 MM_OK
+ret 1
+end
+if ne md_build_demo_ompk PK_OK
+ret 1
+end
+md_stage_demo_input
+lfd = mr_tcp_listen MR_IPV4_LOOPBACK 0
+if lt lfd 0
+ret 1
+end
+port = get mr_net_stats 7
+pid = fork
+if lt pid 0
+cf = fclose int lfd
+ret 1
+end
+if eq pid 0
+wrc = mr_worker_serve_one int lfd TID_X925 399 MR_FAULT_NONE true
+cf = fclose int lfd
+ret int wrc
+end
+cf = fclose int lfd
+for i ulong 32
+put mv_ed_pk i get mr_wrk_pk i
+end
+mr_stage_node_id 1 TID_X925 399 MR_ROLE_SPARK_CPU MV_TIER_A_SOVEREIGN
+mr_stage_node_net MR_IPV4_LOOPBACK port 100 1000 200 1
+mr_stage_node_therm 44000 40000 25000 10000 5000
+mr_stage_node_policy 120000 80000 85000 2
+rc = mr_commit_node
+put mr_req_meta 1 5001
+put mr_req_meta 2 1
+rc = mr_client_dispatch_and_memo 1 MR_WORK_POLY_PURE MM_TIER_EXACT 0 MV_TIER_A_SOVEREIGN 0
+cf = waitpid int pid md_st 0 4 0
+if or ne rc MR_DEC_REMOTE ne get md_st 1 0
+wd_puts md_m_fail
+wd_put_u64 rc
+wd_puts md_nl
+wd_flush
+ret 1
+end
+for i ulong 32
+put md_out1 i get mm_val_buf i
+end
+net1 = get mr_net_stats 0
+note Second call with worker already exited -> MUST be instant 0-recompute OMEGA-MEMO hit!
+put mr_req_meta 1 5002
+rc = mr_client_dispatch_and_memo 1 MR_WORK_POLY_PURE MM_TIER_EXACT 0 MV_TIER_A_SOVEREIGN 0
+if or ne rc MR_DEC_MEMO_HIT ne get mr_net_stats 0 net1
+wd_puts md_m_fail
+wd_put_u64 rc
+wd_puts md_nl
+wd_flush
+ret 1
+end
+for i ulong 32
+if ne get mm_val_buf i get md_out1 i
+ret 1
+end
+end
+wd_puts md_m_hdr
+wd_puts md_m_demo1
+wd_put_u64 port
+wd_puts md_m_demo2
+wd_put_u64 net1
+wd_puts md_nl
+wd_puts md_m_demo3
+wd_put_u64 get mr_net_stats 0
+wd_puts md_m_demo4
+wd_flush
+ret 0
+end
+
+fn md_do_check_bind to int
+if lt argcnt 3
+wd_puts md_use
+wd_flush
+ret 2
+end
+if md_arg_eq 2 md_bind_0
+wd_puts md_m_ref_wc
+wd_flush
+ret 12
+end
+ip = md_arg_u64 2
+if not mr_ip_is_safe_bind ip
+wd_puts md_m_ref_wc
+wd_flush
+ret 12
+end
+wd_puts md_m_ok_bind
+wd_put_u64 ip
+wd_puts md_nl
+wd_flush
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+wd_puts md_use
+wd_flush
+ret 2
+end
+if md_arg_eq 1 md_cmd_demo
+ret md_do_demo
+end
+if md_arg_eq 1 md_cmd_route
+ret md_do_route
+end
+if md_arg_eq 1 md_cmd_serve
+ret md_do_serve
+end
+if md_arg_eq 1 md_cmd_disp
+ret md_do_dispatch
+end
+if md_arg_eq 1 md_cmd_chk
+ret md_do_check_bind
+end
+wd_puts md_use
+wd_flush
+ret 2
+end
