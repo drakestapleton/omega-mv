@@ -1,0 +1,920 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/memo/memo_policy.om: Profitability policy, disk-floor alarm, and explicit oldest-first
+note memo_prune for Stage 1 OMEGA-MEMO (Sovereign Intelligence 2.0 Pillar 2).
+note
+note Pure seeded OM-2-compatible library unit (no om2 header, no fn main; prefix mp_ / MP_).
+note Zero C/Python/Rust. Zero arbitrary hard entry cap on disk: walks sharded <root>/<2hex>/*.ome
+note directly via Linux AArch64 fopen/getdnts/stat/unlink.
+
+note Profitability decisions
+const MP_DEC_ADMIT ulong 1
+const MP_DEC_SKIP_TRIVIAL ulong 2
+const MP_DEC_FORCE_ADMIT ulong 3
+const MP_DEC_DISABLED ulong 4
+
+note Policy override modes
+const MP_OVR_AUTO ulong 0
+const MP_OVR_FORCE ulong 1
+const MP_OVR_DISABLE ulong 2
+
+note Disk-floor check status codes
+const MP_DISK_OK ulong 0
+const MP_ALARM_DISK_FLOOR ulong 1
+const MP_DISK_ERR_IO ulong 2
+
+note Default policy thresholds
+const MP_DEF_MIN_COMPUTE_NS ulong 5000
+const MP_DEF_RATIO_NUM ulong 2
+const MP_DEF_RATIO_DEN ulong 1
+const MP_DEF_WARMUP ulong 1
+const MP_DEF_MAX_STORE_BYTES ulong 1073741824
+const MP_DEF_FREE_FLOOR_BYTES ulong 67108864
+const MP_DEF_FS_CAP_BYTES ulong 2147483648
+
+note In-memory per-SEMANTIC_ID profitability telemetry cache (LRU-recycled; NEVER caps disk entries)
+const MP_PROF_SLOTS ulong 256
+const MP_PRUNE_WIN ulong 16
+const MP_PATH_STRIDE ulong 4096
+
+note Linux ARM64 O_RDONLY | O_DIRECTORY | O_NOFOLLOW = 0 | 16384 | 32768 = 49152
+const MP_O_DIR int 49152
+
+note Policy config:
+note [0]=override [1]=min_compute_ns [2]=ratio_num [3]=ratio_den [4]=warmup
+note [5]=max_store_bytes [6]=free_floor_bytes [7]=fs_cap_bytes [8]=has_ext_free
+note [9]=ext_free_bytes [10]=initialized [11]=alarm_silent
+global mp_cfg ulong 16
+
+note Scan, alarm, prune, and profitability telemetry:
+note [0]=total_entries [1]=total_store_bytes [2]=computed_free_bytes [3]=alarm_active
+note [4]=alarm_count [5]=prune_removed_entries [6]=prune_reclaimed_bytes
+note [7]=total_skips [8]=total_admits [9]=total_force_admits
+global mp_stat ulong 16
+
+note Structured alarm buffer (always populated on alarm; also written to stderr unless silent)
+global mp_alarm_buf uchar 1024
+global mp_alarm_len ulong 1
+
+note Per-SEMANTIC_ID profitability profiler tables
+global mp_p_used uchar 256
+global mp_p_sid uchar 8192
+global mp_p_calls ulong 256
+global mp_p_cns ulong 256
+global mp_p_ons ulong 256
+global mp_p_skips ulong 256
+global mp_p_hits ulong 256
+global mp_p_last ulong 256
+global mp_tick ulong 1
+global mp_q_sid uchar 32
+
+note Store root & streaming directory walk scratch buffers
+global mp_root uchar 4096
+global mp_root_len ulong 1
+global mp_dir_path uchar 4096
+global mp_dir_plen ulong 1
+global mp_file_path uchar 4096
+global mp_file_plen ulong 1
+global mp_dents uchar 65536
+global mp_sdents uchar 65536
+global mp_stbuf uchar 128
+global mp_ndig uchar 24
+
+note Streaming oldest-K candidate window for explicit memo_prune (no cap on total store size)
+global mp_cw_used uchar 16
+global mp_cw_sec ulong 16
+global mp_cw_nsec ulong 16
+global mp_cw_size ulong 16
+global mp_cw_plen ulong 16
+global mp_cw_path uchar 65536
+global mp_cw_cnt ulong 1
+global mp_cw_ord ulong 16
+
+text mp_al_pfx "OMEGA-MEMO ALARM disk_floor root="
+text mp_al_ent " entries="
+text mp_al_stb " store_bytes="
+text mp_al_max " max_bytes="
+text mp_al_fre " free_bytes="
+text mp_al_flr " floor_bytes="
+text mp_al_act " action=EXPLICIT_PRUNE_REQUIRED\n"
+
+note ---- Initialization & Configuration ----
+
+fn mp_init to void
+put mp_cfg 0 MP_OVR_AUTO
+put mp_cfg 1 MP_DEF_MIN_COMPUTE_NS
+put mp_cfg 2 MP_DEF_RATIO_NUM
+put mp_cfg 3 MP_DEF_RATIO_DEN
+put mp_cfg 4 MP_DEF_WARMUP
+put mp_cfg 5 MP_DEF_MAX_STORE_BYTES
+put mp_cfg 6 MP_DEF_FREE_FLOOR_BYTES
+put mp_cfg 7 MP_DEF_FS_CAP_BYTES
+put mp_cfg 8 0
+put mp_cfg 9 0
+put mp_cfg 10 1
+put mp_cfg 11 0
+for i ulong 16
+put mp_stat i 0
+end
+put mp_alarm_len 0 0
+put mp_tick 0 0
+for s ulong 256
+put mp_p_used s 0
+put mp_p_calls s 0
+put mp_p_cns s 0
+put mp_p_ons s 0
+put mp_p_skips s 0
+put mp_p_hits s 0
+put mp_p_last s 0
+end
+end
+
+fn mp_ensure_init to void
+if eq get mp_cfg 10 0
+mp_init
+end
+end
+
+fn mp_set_override ovr ulong to void
+mp_ensure_init
+put mp_cfg 0 ovr
+end
+
+fn mp_set_thresholds min_cns ulong rnum ulong rden ulong to void
+mp_ensure_init
+put mp_cfg 1 min_cns
+put mp_cfg 2 rnum
+if eq rden 0
+put mp_cfg 3 1
+else
+put mp_cfg 3 rden
+end
+end
+
+fn mp_set_disk_limits max_bytes ulong floor_bytes ulong cap_bytes ulong to void
+mp_ensure_init
+put mp_cfg 5 max_bytes
+put mp_cfg 6 floor_bytes
+put mp_cfg 7 cap_bytes
+end
+
+fn mp_set_ext_free enabled ulong free_bytes ulong to void
+mp_ensure_init
+put mp_cfg 8 enabled
+put mp_cfg 9 free_bytes
+end
+
+fn mp_set_alarm_silent silent ulong to void
+mp_ensure_init
+put mp_cfg 11 silent
+end
+
+note ---- Per-SEMANTIC_ID Profitability Policy ----
+
+fn mp_sid_match slot ulong to bool
+if eq get mp_p_used slot 0
+ret false
+end
+base = mul slot 32
+for i ulong 32
+if ne get mp_p_sid add base i get mp_q_sid i
+ret false
+end
+end
+ret true
+end
+
+fn mp_find_prof to ulong
+for s ulong 256
+if mp_sid_match s
+ret s
+end
+end
+ret 999999
+end
+
+fn mp_alloc_prof to ulong
+for s ulong 256
+if eq get mp_p_used s 0
+ret s
+end
+end
+best = ulong 0
+btick = get mp_p_last 0
+for s ulong 256
+tk = get mp_p_last s
+if lt tk btick
+btick = tk
+best = s
+end
+end
+ret best
+end
+
+fn mp_get_or_create_prof to ulong
+ex = mp_find_prof
+if ne ex 999999
+ret ex
+end
+sl = mp_alloc_prof
+put mp_p_used sl 1
+base = mul sl 32
+for i ulong 32
+put mp_p_sid add base i get mp_q_sid i
+end
+put mp_p_calls sl 0
+put mp_p_cns sl 0
+put mp_p_ons sl 0
+put mp_p_skips sl 0
+put mp_p_hits sl 0
+put mp_p_last sl 0
+ret sl
+end
+
+fn mp_is_profitable avg_cns ulong avg_ons ulong to bool
+min_c = get mp_cfg 1
+if lt avg_cns min_c
+ret false
+end
+if eq avg_ons 0
+ret true
+end
+rnum = get mp_cfg 2
+rden = get mp_cfg 3
+if eq rden 0
+rden = ulong 1
+end
+lhs = mul avg_cns rden
+rhs = mul avg_ons rnum
+ret ge lhs rhs
+end
+
+fn mp_precheck to ulong
+mp_ensure_init
+ovr = get mp_cfg 0
+if eq ovr MP_OVR_FORCE
+ret MP_DEC_FORCE_ADMIT
+end
+if eq ovr MP_OVR_DISABLE
+ret MP_DEC_DISABLED
+end
+sl = mp_find_prof
+if eq sl 999999
+ret MP_DEC_ADMIT
+end
+calls = get mp_p_calls sl
+if lt calls get mp_cfg 4
+ret MP_DEC_ADMIT
+end
+avg_c = div get mp_p_cns sl calls
+avg_o = div get mp_p_ons sl calls
+if not mp_is_profitable avg_c avg_o
+put mp_p_skips sl add get mp_p_skips sl 1
+put mp_stat 7 add get mp_stat 7 1
+ret MP_DEC_SKIP_TRIVIAL
+end
+ret MP_DEC_ADMIT
+end
+
+fn mp_should_memoize cns ulong ons ulong to ulong
+mp_ensure_init
+sl = mp_get_or_create_prof
+tk = add get mp_tick 0 1
+put mp_tick 0 tk
+put mp_p_last sl tk
+calls = add get mp_p_calls sl 1
+tot_c = add get mp_p_cns sl cns
+tot_o = add get mp_p_ons sl ons
+put mp_p_calls sl calls
+put mp_p_cns sl tot_c
+put mp_p_ons sl tot_o
+ovr = get mp_cfg 0
+if eq ovr MP_OVR_FORCE
+put mp_stat 9 add get mp_stat 9 1
+ret MP_DEC_FORCE_ADMIT
+end
+if eq ovr MP_OVR_DISABLE
+put mp_p_skips sl add get mp_p_skips sl 1
+put mp_stat 7 add get mp_stat 7 1
+ret MP_DEC_DISABLED
+end
+avg_c = div tot_c calls
+avg_o = div tot_o calls
+if not mp_is_profitable avg_c avg_o
+put mp_p_skips sl add get mp_p_skips sl 1
+put mp_stat 7 add get mp_stat 7 1
+ret MP_DEC_SKIP_TRIVIAL
+end
+put mp_stat 8 add get mp_stat 8 1
+ret MP_DEC_ADMIT
+end
+
+fn mp_record_hit to void
+mp_ensure_init
+sl = mp_get_or_create_prof
+tk = add get mp_tick 0 1
+put mp_tick 0 tk
+put mp_p_last sl tk
+put mp_p_hits sl add get mp_p_hits sl 1
+end
+
+note ---- Alarm Line Formatting ----
+
+fn mp_al_push_b ch uchar to void
+p = get mp_alarm_len 0
+if lt p 1020
+put mp_alarm_buf p ch
+put mp_alarm_len 0 add p 1
+end
+end
+
+fn mp_al_push_tx id ulong to void
+if eq id 0
+for i ulong len mp_al_pfx bound 64
+mp_al_push_b get mp_al_pfx i
+end
+ret
+end
+if eq id 1
+for i ulong len mp_al_ent bound 32
+mp_al_push_b get mp_al_ent i
+end
+ret
+end
+if eq id 2
+for i ulong len mp_al_stb bound 32
+mp_al_push_b get mp_al_stb i
+end
+ret
+end
+if eq id 3
+for i ulong len mp_al_max bound 32
+mp_al_push_b get mp_al_max i
+end
+ret
+end
+if eq id 4
+for i ulong len mp_al_fre bound 32
+mp_al_push_b get mp_al_fre i
+end
+ret
+end
+if eq id 5
+for i ulong len mp_al_flr bound 32
+mp_al_push_b get mp_al_flr i
+end
+ret
+end
+for i ulong len mp_al_act bound 64
+mp_al_push_b get mp_al_act i
+end
+end
+
+fn mp_al_push_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put mp_ndig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+cnt = sub 24 p
+for j ulong cnt bound 24
+mp_al_push_b get mp_ndig add p j
+end
+end
+
+fn mp_emit_alarm entries ulong sbytes ulong maxb ulong freeb ulong flrb ulong to void
+put mp_alarm_len 0 0
+mp_al_push_tx 0
+rlen = get mp_root_len 0
+if gt rlen 256
+rlen = ulong 256
+end
+for i ulong rlen bound 256
+mp_al_push_b get mp_root i
+end
+mp_al_push_tx 1
+mp_al_push_num entries
+mp_al_push_tx 2
+mp_al_push_num sbytes
+mp_al_push_tx 3
+mp_al_push_num maxb
+mp_al_push_tx 4
+mp_al_push_num freeb
+mp_al_push_tx 5
+mp_al_push_num flrb
+mp_al_push_tx 6
+if eq get mp_cfg 11 0
+w = write 2 mp_alarm_buf 0 get mp_alarm_len 0
+end
+end
+
+note ---- ARM64 struct stat & getdents64 Helpers ----
+
+fn mp_st_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+b = ulong get mp_stbuf add off j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+fn mp_is_lhex ch uchar to bool
+if and ge ch 48 le ch 57
+ret true
+end
+ret and ge ch 97 le ch 102
+end
+
+note Check whether mp_dents[off..] has a 2-lowercase-hex shard name
+fn mp_dent_is_hex2 off ulong lim ulong to bool
+p = add off 19
+if gt add p 3 lim
+ret false
+end
+c0 = get mp_dents p
+c1 = get mp_dents add p 1
+c2 = get mp_dents add p 2
+if ne c2 0
+ret false
+end
+if not mp_is_lhex c0
+ret false
+end
+ret mp_is_lhex c1
+end
+
+note Return name length of sdent at off (0 if not ending with ".ome" or too long)
+fn mp_sdent_ome_len off ulong lim ulong to ulong
+p = add off 19
+n = ulong 0
+while lt add p n lim bound 512
+ch = get mp_sdents add p n
+if eq ch 0
+break
+end
+n = add n 1
+end
+if lt n 5
+ret 0
+end
+e0 = get mp_sdents add p sub n 4
+e1 = get mp_sdents add p sub n 3
+e2 = get mp_sdents add p sub n 2
+e3 = get mp_sdents add p sub n 1
+if or ne e0 46 ne e1 111
+ret 0
+end
+if or ne e2 109 ne e3 101
+ret 0
+end
+ret n
+end
+
+note Build mp_dir_path = <mp_root>/<c0><c1>
+fn mp_build_shard_dir c0 uchar c1 uchar to bool
+rl = get mp_root_len 0
+if or eq rl 0 gt add rl 4 4090
+ret false
+end
+for i ulong rl bound 4090
+put mp_dir_path i get mp_root i
+end
+put mp_dir_path rl 47
+put mp_dir_path add rl 1 c0
+put mp_dir_path add rl 2 c1
+put mp_dir_plen 0 add rl 3
+ret true
+end
+
+note Build mp_file_path = <mp_dir_path>/<mp_sdents[off+19 .. +nlen)>
+fn mp_build_file_path off ulong nlen ulong to bool
+dl = get mp_dir_plen 0
+if gt add add dl 1 nlen 4094
+ret false
+end
+for i ulong dl bound 4094
+put mp_file_path i get mp_dir_path i
+end
+put mp_file_path dl 47
+base = add off 19
+for j ulong nlen bound 512
+put mp_file_path add add dl 1 j get mp_sdents add base j
+end
+put mp_file_plen 0 add add dl 1 nlen
+ret true
+end
+
+note ---- Oldest-K Candidate Window Helpers for Uncapped Streaming memo_prune ----
+
+fn mp_cw_reset to void
+put mp_cw_cnt 0 0
+for i ulong 16
+put mp_cw_used i 0
+put mp_cw_sec i 0
+put mp_cw_nsec i 0
+put mp_cw_size i 0
+put mp_cw_plen i 0
+end
+end
+
+note Compare mp_file_path against candidate slot s lexicographically (<0 if file_path < slot)
+fn mp_cmp_path_slot s ulong to int
+pl1 = get mp_file_plen 0
+pl2 = get mp_cw_plen s
+m = pl1
+if lt pl2 m
+m = pl2
+end
+base = mul s MP_PATH_STRIDE
+for i ulong m bound 4096
+b1 = get mp_file_path i
+b2 = get mp_cw_path add base i
+if lt b1 b2
+ret neg int 1
+end
+if gt b1 b2
+ret int 1
+end
+end
+if lt pl1 pl2
+ret neg int 1
+end
+if gt pl1 pl2
+ret int 1
+end
+ret int 0
+end
+
+note Compare two candidate slot paths lexicographically: true if slot a < slot b
+fn mp_slot_path_lt a ulong b ulong to bool
+la = get mp_cw_plen a
+lb = get mp_cw_plen b
+m = la
+if lt lb m
+m = lb
+end
+ba = mul a MP_PATH_STRIDE
+bb = mul b MP_PATH_STRIDE
+for i ulong m bound 4096
+ca = get mp_cw_path add ba i
+cb = get mp_cw_path add bb i
+if lt ca cb
+ret true
+end
+if gt ca cb
+ret false
+end
+end
+ret lt la lb
+end
+
+note Compare two candidate slots a and b: true if slot a is older than slot b
+fn mp_slot_older a ulong b ulong to bool
+x = get mp_cw_sec a
+y = get mp_cw_sec b
+if lt x y
+ret true
+end
+if gt x y
+ret false
+end
+x = get mp_cw_nsec a
+y = get mp_cw_nsec b
+if lt x y
+ret true
+end
+if gt x y
+ret false
+end
+ret mp_slot_path_lt a b
+end
+
+note True if current mp_file_path with (sec, nsec) is strictly older than slot s
+fn mp_cur_older_than_slot sec ulong nsec ulong s ulong to bool
+ss = get mp_cw_sec s
+if lt sec ss
+ret true
+end
+if gt sec ss
+ret false
+end
+sn = get mp_cw_nsec s
+if lt nsec sn
+ret true
+end
+if gt nsec sn
+ret false
+end
+ret lt mp_cmp_path_slot s 0
+end
+
+fn mp_cw_store_cur s ulong sec ulong nsec ulong sz ulong to void
+put mp_cw_used s 1
+put mp_cw_sec s sec
+put mp_cw_nsec s nsec
+put mp_cw_size s sz
+pl = get mp_file_plen 0
+put mp_cw_plen s pl
+base = mul s MP_PATH_STRIDE
+for i ulong pl bound 4096
+put mp_cw_path add base i get mp_file_path i
+end
+end
+
+fn mp_cw_consider sec ulong nsec ulong sz ulong to void
+cnt = get mp_cw_cnt 0
+if lt cnt MP_PRUNE_WIN
+mp_cw_store_cur cnt sec nsec sz
+put mp_cw_cnt 0 add cnt 1
+ret
+end
+newest = ulong 0
+for s ulong 16
+if mp_slot_older newest s
+newest = s
+end
+end
+if mp_cur_older_than_slot sec nsec newest
+mp_cw_store_cur newest sec nsec sz
+end
+end
+
+note ---- Uncapped Store Scanner & Disk-Floor Alarm ----
+
+fn mp_scan_one_ome o ulong lim ulong collect_prune bool to void
+nlen = mp_sdent_ome_len o lim
+if eq nlen 0
+ret
+end
+if not mp_build_file_path o nlen
+ret
+end
+sr = stat mp_file_path 0 get mp_file_plen 0 mp_stbuf 0 128
+if ne sr 0
+ret
+end
+sz = mp_st_u64 48
+put mp_stat 0 add get mp_stat 0 1
+put mp_stat 1 add get mp_stat 1 sz
+if collect_prune
+mp_cw_consider mp_st_u64 88 mp_st_u64 96 sz
+end
+end
+
+fn mp_sdent_recl o ulong to ulong
+b0 = ulong get mp_sdents add o 16
+b1 = shl ulong get mp_sdents add o 17 8
+ret or b0 b1
+end
+
+fn mp_dent_recl o ulong to ulong
+b0 = ulong get mp_dents add o 16
+b1 = shl ulong get mp_dents add o 17 8
+ret or b0 b1
+end
+
+fn mp_scan_shard_buf lim ulong collect_prune bool to void
+o = ulong 0
+while lt o lim bound 1000000
+rl = mp_sdent_recl o
+if eq rl 0
+break
+end
+mp_scan_one_ome o lim collect_prune
+o = add o rl
+end
+end
+
+fn mp_scan_shard collect_prune bool to void
+dfd = fopen mp_dir_path 0 get mp_dir_plen 0 MP_O_DIR 0
+if lt dfd 0
+ret
+end
+going = true
+while going bound 1000000
+nr = getdnts int dfd mp_sdents 0 65536
+if le nr 0
+going = false
+else
+mp_scan_shard_buf ulong nr collect_prune
+end
+end
+rc = fclose int dfd
+end
+
+fn mp_walk_one_dent o ulong lim ulong collect_prune bool to void
+if not mp_dent_is_hex2 o lim
+ret
+end
+c0 = get mp_dents add o 19
+c1 = get mp_dents add o 20
+if mp_build_shard_dir c0 c1
+mp_scan_shard collect_prune
+end
+end
+
+fn mp_walk_buf lim ulong collect_prune bool to void
+o = ulong 0
+while lt o lim bound 100000
+recl = mp_dent_recl o
+if eq recl 0
+break
+end
+mp_walk_one_dent o lim collect_prune
+o = add o recl
+end
+end
+
+fn mp_walk_store collect_prune bool to ulong
+mp_ensure_init
+put mp_stat 0 0
+put mp_stat 1 0
+if collect_prune
+mp_cw_reset
+end
+rl = get mp_root_len 0
+if eq rl 0
+ret MP_DISK_ERR_IO
+end
+rfd = fopen mp_root 0 rl MP_O_DIR 0
+if lt rfd 0
+if eq rfd neg long 2
+ret MP_DISK_OK
+end
+ret MP_DISK_ERR_IO
+end
+going = true
+while going bound 100000
+nr = getdnts int rfd mp_dents 0 65536
+if le nr 0
+going = false
+else
+mp_walk_buf ulong nr collect_prune
+end
+end
+rc = fclose int rfd
+ret MP_DISK_OK
+end
+
+fn mp_scan_store to ulong
+ret mp_walk_store false
+end
+
+fn mp_compute_free sbytes ulong to ulong
+if ne get mp_cfg 8 0
+ret get mp_cfg 9
+end
+cap = get mp_cfg 7
+if ge sbytes cap
+ret 0
+end
+ret sub cap sbytes
+end
+
+fn mp_check_disk_floor to ulong
+mp_ensure_init
+wrc = mp_scan_store
+if ne wrc MP_DISK_OK
+ret wrc
+end
+ent = get mp_stat 0
+sbytes = get mp_stat 1
+freeb = mp_compute_free sbytes
+put mp_stat 2 freeb
+maxb = get mp_cfg 5
+flrb = get mp_cfg 6
+breach = false
+if and gt maxb 0 gt sbytes maxb
+breach = true
+end
+if and gt flrb 0 lt freeb flrb
+breach = true
+end
+if breach
+put mp_stat 3 1
+put mp_stat 4 add get mp_stat 4 1
+mp_emit_alarm ent sbytes maxb freeb flrb
+ret MP_ALARM_DISK_FLOOR
+end
+put mp_stat 3 0
+ret MP_DISK_OK
+end
+
+fn mp_cw_find_oldest start ulong cnt ulong to ulong
+best = start
+j = add start 1
+while lt j cnt bound 16
+if mp_slot_older get mp_cw_ord j get mp_cw_ord best
+best = j
+end
+j = add j 1
+end
+ret best
+end
+
+note Sort mp_cw_ord[0..cnt) oldest-first (selection sort over <= 16 entries)
+fn mp_cw_sort to void
+cnt = get mp_cw_cnt 0
+for i ulong cnt bound 16
+put mp_cw_ord i i
+end
+for i ulong cnt bound 16
+best = mp_cw_find_oldest i cnt
+if ne best i
+tmp = get mp_cw_ord i
+put mp_cw_ord i get mp_cw_ord best
+put mp_cw_ord best tmp
+end
+end
+end
+
+fn mp_unlink_cw_slot s ulong to bool
+pl = get mp_cw_plen s
+base = mul s MP_PATH_STRIDE
+for i ulong pl bound 4096
+put mp_file_path i get mp_cw_path add base i
+end
+ur = unlink mp_file_path 0 pl
+ret eq ur 0
+end
+
+fn mp_prune_batch cur_bytes ulong target_bytes ulong to ulong
+mp_cw_sort
+cnt = get mp_cw_cnt 0
+rem_cnt = ulong 0
+cur = cur_bytes
+for i ulong cnt bound 16
+if le cur target_bytes
+break
+end
+s = get mp_cw_ord i
+sz = get mp_cw_size s
+if mp_unlink_cw_slot s
+rem_cnt = add rem_cnt 1
+put mp_stat 5 add get mp_stat 5 1
+put mp_stat 6 add get mp_stat 6 sz
+if ge cur sz
+cur = sub cur sz
+else
+cur = ulong 0
+end
+end
+end
+ret rem_cnt
+end
+
+fn mp_refresh_alarm_state to ulong
+rc = mp_scan_store
+if ne rc MP_DISK_OK
+ret rc
+end
+sbytes = get mp_stat 1
+freeb = mp_compute_free sbytes
+put mp_stat 2 freeb
+maxb = get mp_cfg 5
+flrb = get mp_cfg 6
+breach = false
+if and gt maxb 0 gt sbytes maxb
+breach = true
+end
+if and gt flrb 0 lt freeb flrb
+breach = true
+end
+if breach
+put mp_stat 3 1
+else
+put mp_stat 3 0
+end
+ret MP_DISK_OK
+end
+
+note Explicit oldest-first memo_prune down to target_bytes (no hard entry cap; never silent)
+fn mp_memo_prune target_bytes ulong to ulong
+mp_ensure_init
+put mp_stat 5 0
+put mp_stat 6 0
+pass = ulong 0
+while lt pass 1000000 bound 1000000
+rc = mp_walk_store true
+if ne rc MP_DISK_OK
+ret rc
+end
+cur_bytes = get mp_stat 1
+if le cur_bytes target_bytes
+break
+end
+if eq get mp_cw_cnt 0 0
+break
+end
+if eq mp_prune_batch cur_bytes target_bytes 0
+break
+end
+pass = add pass 1
+end
+ret mp_refresh_alarm_state
+end

@@ -1,0 +1,1831 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/memo/gate_memo.om: Standalone Pure-OM-2 Verification Gate for Stage 1 OMEGA-MEMO
+note (Sovereign Intelligence 2.0 Pillar 2: Universal Content-Addressed Memoization).
+note
+note Link order (program mode; ir.om provides om2 at line 1):
+note   cat seed/ng/src/ir.om seed/ng/sha256.om seed/ng/target/target_desc.om \
+note       seed/ng/pack/sem_pack.om seed/ng/memo/memo_policy.om \
+note       seed/ng/memo/memo_store.om seed/ng/memo/gate_memo.om | seed/out/omc > gate_memo
+note
+note Usage:
+note   ./gate_memo [SCRATCH_DIR [NG_BIN NGCHECK_BIN]]
+note
+note Stages verified:
+note   Stage 1: Default root resolution (OMEGA_MEMO_DIR, $HOME/.local/share/omega-memo, empty-env refusal)
+note   Stage 2: ΩIR v2 SEMANTIC_ID + OMPK v2 purity admission & fail-closed impure/contract refusals
+note   Stage 3: Cross-process persistence via fork + execprog (/proc/self/exe): Process A stores,
+note            fresh Process B hits with 0 recompute & exact output bytes + cross-PID provenance
+note   Stage 4: One-way precision dominance (@exact->@tol PASS, @tol(100)->@tol(1000) PASS,
+note            @tol->@exact REFUSED in-proc & cross-proc, looser->tighter REFUSED, monotonic upgrade,
+note            downgrade refusal, conflicting @exact nondeterminism refusal)
+note   Stage 5: Fail-closed tamper & corruption controls (1-bit output flip, 1-bit header/tier forge,
+note            truncated body, truncated header, trailing byte, bad magic/version, key substitution)
+note   Stage 6: Profitability policy (monons-timed trivial op skip, precheck skip, heavy op admit,
+note            explicit MP_OVR_FORCE test override)
+note   Stage 7: Uncapped scaling (128+ entries > 32-slot cap), loud disk-floor alarm without silent
+note            truncation (both store_bytes and free_bytes thresholds), and explicit oldest-first mm_prune
+note   Stage 8 (optional with NG_BIN NGCHECK_BIN): live ng @ng front-ir / @ng sem-id + ngcheck ck_pure
+
+global gm_dig uchar 24
+global gm_chk ulong 1
+global gm_neg ulong 1
+global gm_xproc ulong 1
+global gm_ent ulong 1
+global gm_cli_chk ulong 1
+global gm_cli_neg ulong 1
+
+global gm_scp uchar 1024
+global gm_scl ulong 1
+global gm_ngp uchar 1024
+global gm_ngl ulong 1
+global gm_ckp uchar 1024
+global gm_ckl ulong 1
+
+global gm_root_a uchar 1024
+global gm_root_al ulong 1
+global gm_pa uchar 2048
+global gm_pl ulong 1
+global gm_pb uchar 2048
+global gm_pbl ulong 1
+
+global gm_fid_ex uchar 32
+global gm_fid_t1 uchar 32
+global gm_fid_trv uchar 32
+global gm_fid_hvy uchar 32
+global gm_fid_cli uchar 32
+
+global gm_av uchar 4096
+global gm_an ulong 1
+global gm_ev uchar 4096
+global gm_en ulong 1
+global gm_st uchar 4
+global gm_arg uchar 1024
+global gm_io uchar 65536
+global gm_io2 uchar 65536
+global gm_bkp uchar 4096
+global gm_bkpl ulong 1
+
+text gm_m_hdr "=== OMEGA NG STAGE 1 (OMEGA-MEMO) VERIFICATION GATE ===\n"
+text gm_m_pass "GATE-MEMO PASS checks="
+text gm_m_neg " neg_controls="
+text gm_m_xp " xproc="
+text gm_m_ent " entries="
+text gm_m_cli " cli_checks="
+text gm_m_cneg " cli_neg="
+text gm_m_nl "\n"
+text gm_m_fail "GATE-MEMO FAIL check="
+
+text gm_self "/proc/self/exe"
+text gm_def_pfx "/tmp/omega-memo-gate-"
+text gm_w_store "--worker-store"
+text gm_w_look "--worker-lookup"
+text gm_w_ref "--worker-refuse"
+text gm_w_env "--worker-env"
+
+text gm_s_env1 "/env-explicit"
+text gm_s_env2 "/env-home"
+text gm_s_home_suf "/.local/share/omega-memo"
+text gm_s_main "/cas-main"
+text gm_s_scale "/cas-scale"
+text gm_s_cli "/cas-cli"
+text gm_e_dir "OMEGA_MEMO_DIR="
+text gm_e_home "HOME="
+text gm_e_other "UNRELATED_VAR=1"
+
+text gm_al_want "OMEGA-MEMO ALARM disk_floor "
+text gm_f_in "/in.bin"
+text gm_f_out "/out.bin"
+text gm_f_err "/err.bin"
+text gm_h_fi "@ng front-ir\n"
+text gm_h_sd "@ng sem-id\n"
+text gm_pfx_acc "ACCEPT "
+text gm_pfx_fn0 "fn 0 "
+
+text gm_src_pure "om2\n@pure\n@exact\nfn calc x ulong to ulong\nret add mul x 7 13\nend\nfn main to int\nret int and calc 5 255\nend\n"
+text gm_src_imp "om2\nglobal g_bad ulong 4\n@pure\nfn bad x ulong to ulong\nput g_bad 0 x\nret x\nend\nfn main to int\nret int and bad 5 255\nend\n"
+
+note ---- Output & Counting Helpers ----
+
+fn gm_wrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn gm_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put gm_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 gm_dig p sub 24 p
+ret
+end
+end
+end
+
+fn gm_fail code ulong to int
+gm_wrt gm_m_fail
+gm_num code
+gm_wrt gm_m_nl
+ret int add 1 rem code 95
+end
+
+fn gm_add_chk n ulong to void
+put gm_chk 0 add get gm_chk 0 n
+end
+
+fn gm_add_neg to void
+put gm_neg 0 add get gm_neg 0 1
+end
+
+fn gm_put_u64_val v ulong to void
+for j ulong 8
+put mm_val_buf j uchar and shr v mul j 8 255
+end
+put mm_val_len 0 8
+end
+
+fn gm_get_u64_val to ulong
+v = ulong 0
+for j ulong 8
+b = ulong get mm_val_buf j
+v = or v shl b mul j 8
+end
+ret v
+end
+
+note Heavy deterministic pure computation for real monons & cross-process persistence
+fn gm_heavy_compute x ulong iters ulong to ulong
+acc = xor x 11400714819323198485
+for i ulong iters bound 200000
+acc = xor mul acc 6364136223846793005 add i 1442695040888963407
+acc = xor acc shr acc 29
+end
+ret acc
+end
+
+note Trivial pure computation (sub-threshold for profitability filter)
+fn gm_trivial_compute x ulong to ulong
+ret add x 1
+end
+
+note ---- Path, Decimal, and Subprocess Argv/Env Packet Builders ----
+
+fn gm_parse_u64 n ulong to ulong
+v = ulong 0
+for i ulong n bound 32
+ch = get gm_arg i
+if or lt ch 48 gt ch 57
+break
+end
+v = add mul v 10 ulong sub ch 48
+end
+ret v
+end
+
+fn gm_arg_eq idx ulong want view uchar * to bool
+rn = argread idx gm_arg 0 1023
+if ne rn long len want
+ret false
+end
+for i ulong len want bound 64
+if ne get gm_arg i get want i
+ret false
+end
+end
+ret true
+end
+
+fn gm_spath suf view uchar * to void
+n = get gm_scl 0
+for i ulong n bound 1024
+put gm_pa i get gm_scp i
+end
+m = len suf
+for j ulong m bound 128
+put gm_pa add n j get suf j
+end
+put gm_pl 0 add n m
+end
+
+fn gm_set_root_pa to ulong
+n = get gm_pl 0
+for i ulong n bound 2048
+put mm_env_buf i get gm_pa i
+end
+ret mm_set_root_from_envbuf n
+end
+
+fn gm_av_reset to void
+put gm_av 0 0
+put gm_av 1 0
+put gm_an 0 2
+end
+
+fn gm_av_inc_cnt to void
+c = or ulong get gm_av 0 shl ulong get gm_av 1 8
+c = add c 1
+put gm_av 0 uchar and c 255
+put gm_av 1 uchar and shr c 8 255
+end
+
+fn gm_av_push_txt s view uchar * to void
+p = get gm_an 0
+m = len s
+put gm_av p uchar and m 255
+put gm_av add p 1 uchar and shr m 8 255
+p = add p 2
+for i ulong m bound 256
+put gm_av add p i get s i
+end
+put gm_an 0 add p m
+gm_av_inc_cnt
+end
+
+fn gm_av_push_pa to void
+p = get gm_an 0
+m = get gm_pl 0
+put gm_av p uchar and m 255
+put gm_av add p 1 uchar and shr m 8 255
+p = add p 2
+for i ulong m bound 2048
+put gm_av add p i get gm_pa i
+end
+put gm_an 0 add p m
+gm_av_inc_cnt
+end
+
+fn gm_av_push_u64 v ulong to void
+x = v
+q = ulong 24
+for i ulong 21
+q = sub q 1
+put gm_dig q uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+m = sub 24 q
+p = get gm_an 0
+put gm_av p uchar and m 255
+put gm_av add p 1 uchar and shr m 8 255
+p = add p 2
+for j ulong m bound 24
+put gm_av add p j get gm_dig add q j
+end
+put gm_an 0 add p m
+gm_av_inc_cnt
+end
+
+fn gm_ev_reset to void
+put gm_ev 0 0
+put gm_ev 1 0
+put gm_en 0 2
+end
+
+fn gm_ev_inc_cnt to void
+c = or ulong get gm_ev 0 shl ulong get gm_ev 1 8
+c = add c 1
+put gm_ev 0 uchar and c 255
+put gm_ev 1 uchar and shr c 8 255
+end
+
+fn gm_ev_push_kv pfx view uchar * use_pa bool to void
+p = get gm_en 0
+m1 = len pfx
+m2 = ulong 0
+if use_pa
+m2 = get gm_pl 0
+end
+m = add m1 m2
+put gm_ev p uchar and m 255
+put gm_ev add p 1 uchar and shr m 8 255
+p = add p 2
+for i ulong m1 bound 128
+put gm_ev add p i get pfx i
+end
+p = add p m1
+if use_pa
+for j ulong m2 bound 2048
+put gm_ev add p j get gm_pa j
+end
+p = add p m2
+end
+put gm_en 0 p
+gm_ev_inc_cnt
+end
+
+fn gm_spawn_self use_env bool to ulong
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+if use_env
+r = execenv gm_av 0 get gm_an 0 gm_ev 0 get gm_en 0
+else
+r = execprog gm_av 0 get gm_an 0
+end
+exit 127
+end
+w = waitpid int pid gm_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get gm_st 0 0
+ret add 256 ulong get gm_st 0
+end
+ret ulong get gm_st 1
+end
+
+note ---- Real ΩIR v2 Module Builder for Canonical Per-Function SEMANTIC_IDs ----
+
+fn gm_hash_fn_to_fid f uint which ulong to void
+m = ir_wfn_sem f
+for i ulong m bound 65536
+put sh_dat i ar_bg 1 i
+end
+sh_all m
+for i ulong 32
+b = get sh_dig i
+if eq which 0
+put gm_fid_ex i b
+else
+if eq which 1
+put gm_fid_t1 i b
+else
+if eq which 2
+put gm_fid_trv i b
+else
+put gm_fid_hvy i b
+end
+end
+end
+end
+end
+
+fn gm_build_f1 to uint
+f = ir_fnew 0 0 5
+ir_fset_mode f 1 1 0
+ir_fset_phys f 0 1000 10000
+p = ir_fpar f 5
+b = ir_blk f
+c = ir_res ir_op b 1 5 17 0
+om = ir_op b 12 5 0 2
+ir_set om 0 p
+ir_set om 1 p
+oa = ir_op b 10 5 0 2
+ir_set oa 0 ir_res om
+ir_set oa 1 c
+r = ir_op b 63 0 0 2
+ir_set r 0 ir_ftok f
+ir_set r 1 ir_res oa
+ret f
+end
+
+fn gm_build_f2 to uint
+f = ir_fnew 0 0 5
+ir_fset_mode f 1 2 0
+ir_fset_phys f 100 500 5000
+p = ir_fpar f 5
+b = ir_blk f
+c3 = ir_res ir_op b 1 5 3 0
+c5 = ir_res ir_op b 1 5 5 0
+om = ir_op b 12 5 0 2
+ir_set om 0 p
+ir_set om 1 c3
+oa = ir_op b 10 5 0 2
+ir_set oa 0 ir_res om
+ir_set oa 1 c5
+r = ir_op b 63 0 0 2
+ir_set r 0 ir_ftok f
+ir_set r 1 ir_res oa
+ret f
+end
+
+fn gm_build_f3 to uint
+f = ir_fnew 0 0 5
+ir_fset_mode f 1 1 0
+ir_fset_phys f 0 0 0
+p = ir_fpar f 5
+b = ir_blk f
+c1 = ir_res ir_op b 1 5 1 0
+oa = ir_op b 10 5 0 2
+ir_set oa 0 p
+ir_set oa 1 c1
+r = ir_op b 63 0 0 2
+ir_set r 0 ir_ftok f
+ir_set r 1 ir_res oa
+ret f
+end
+
+fn gm_build_f4 to uint
+f = ir_fnew 0 0 5
+ir_fset_mode f 1 1 0
+ir_fset_phys f 0 0 0
+p = ir_fpar f 5
+b = ir_blk f
+c99 = ir_res ir_op b 1 5 99 0
+ox = ir_op b 18 5 0 2
+ir_set ox 0 p
+ir_set ox 1 c99
+r = ir_op b 63 0 0 2
+ir_set r 0 ir_ftok f
+ir_set r 1 ir_res ox
+ret f
+end
+
+fn gm_build_fm to void
+fm = ir_fnew 2 0 8
+bm = ir_blk fm
+cz = ir_res ir_op bm 1 8 0 0
+rm = ir_op bm 63 0 0 2
+ir_set rm 0 ir_ftok fm
+ir_set rm 1 cz
+end
+
+fn gm_build_ir_fids to bool
+ir_init
+f1 = gm_build_f1
+f2 = gm_build_f2
+f3 = gm_build_f3
+f4 = gm_build_f4
+gm_build_fm
+gm_hash_fn_to_fid f1 0
+gm_hash_fn_to_fid f2 1
+gm_hash_fn_to_fid f3 2
+gm_hash_fn_to_fid f4 3
+ret true
+end
+
+fn gm_load_fid which ulong to void
+for i ulong 32
+if eq which 0
+put mm_req_fid i get gm_fid_ex i
+else
+if eq which 1
+put mm_req_fid i get gm_fid_t1 i
+else
+if eq which 2
+put mm_req_fid i get gm_fid_trv i
+else
+if eq which 3
+put mm_req_fid i get gm_fid_hvy i
+else
+put mm_req_fid i get gm_fid_cli i
+end
+end
+end
+end
+end
+end
+
+note ---- Cross-Process Child Worker Entrypoints ----
+
+fn gm_worker_store to int
+if lt argcnt 6
+ret 2
+end
+rl = argread 2 mm_env_buf 0 1900
+if lt rl 1
+ret 3
+end
+if ne mm_set_root_from_envbuf ulong rl MM_OK
+ret 4
+end
+an = argread 3 gm_arg 0 64
+inp = gm_parse_u64 ulong an
+an = argread 4 gm_arg 0 64
+tier = gm_parse_u64 ulong an
+an = argread 5 gm_arg 0 64
+err_b = gm_parse_u64 ulong an
+ok = gm_build_ir_fids
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 inp
+mm_set_contract 1 1 tier err_b
+mm_set_provenance 1 0
+t0 = monons
+val = gm_heavy_compute inp 50000
+t1 = monons
+cns = ulong 10000
+if gt t1 t0
+cns = ulong sub t1 t0
+end
+gm_put_u64_val val
+src = mm_store cns 500
+if ne src MM_OK
+ret int add 30 src
+end
+ret 0
+end
+
+fn gm_worker_lookup to int
+if lt argcnt 7
+ret 2
+end
+rl = argread 2 mm_env_buf 0 1900
+if lt rl 1
+ret 3
+end
+if ne mm_set_root_from_envbuf ulong rl MM_OK
+ret 4
+end
+an = argread 3 gm_arg 0 64
+inp = gm_parse_u64 ulong an
+an = argread 4 gm_arg 0 64
+tier = gm_parse_u64 ulong an
+an = argread 5 gm_arg 0 64
+err_b = gm_parse_u64 ulong an
+an = argread 6 gm_arg 0 64
+want_val = gm_parse_u64 ulong an
+ok = gm_build_ir_fids
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 inp
+mm_set_contract 1 1 tier err_b
+note Zero recompute: MUST hit directly from disk written by Process A!
+lrc = mm_lookup
+if ne lrc MM_OK
+ret int add 40 lrc
+end
+if ne get mm_val_len 0 8
+ret 41
+end
+got = gm_get_u64_val
+if ne got want_val
+ret 42
+end
+note Verify cross-process provenance: creator_pid != my own pid!
+mypid = ulong getpid
+if eq get mm_hit_meta 6 mypid
+ret 43
+end
+ret 0
+end
+
+fn gm_worker_refuse to int
+if lt argcnt 7
+ret 2
+end
+rl = argread 2 mm_env_buf 0 1900
+if lt rl 1
+ret 3
+end
+if ne mm_set_root_from_envbuf ulong rl MM_OK
+ret 4
+end
+an = argread 3 gm_arg 0 64
+inp = gm_parse_u64 ulong an
+an = argread 4 gm_arg 0 64
+tier = gm_parse_u64 ulong an
+an = argread 5 gm_arg 0 64
+err_b = gm_parse_u64 ulong an
+an = argread 6 gm_arg 0 64
+want_rc = gm_parse_u64 ulong an
+ok = gm_build_ir_fids
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 inp
+mm_set_contract 1 1 tier err_b
+lrc = mm_lookup
+if ne lrc want_rc
+ret int add 50 lrc
+end
+if ne get mm_val_len 0 0
+ret 59
+end
+ret 0
+end
+
+fn gm_worker_env to int
+if lt argcnt 3
+ret 2
+end
+want_n = argread 2 gm_arg 0 1023
+if lt want_n 0
+ret 3
+end
+rc = mm_init_default_root
+if eq want_n 0
+if ne rc MM_ERR_NO_ROOT
+ret 60
+end
+ret 0
+end
+if ne rc MM_OK
+ret int add 61 rc
+end
+if ne get mm_root_len 0 ulong want_n
+ret 68
+end
+for i ulong ulong want_n bound 1024
+if ne get mm_root i get gm_arg i
+ret 69
+end
+end
+ret 0
+end
+
+note ---- Stage 1: Default Root Resolution (OMEGA_MEMO_DIR, $HOME, Empty-Env Refusal) ----
+
+fn gm_stage1_env_root to int
+note 1a. OMEGA_MEMO_DIR env variable takes precedence
+gm_spath gm_s_env1
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_env
+gm_av_push_pa
+gm_ev_reset
+gm_ev_push_kv gm_e_dir true
+if ne gm_spawn_self true 0
+ret gm_fail 10
+end
+
+note 1b. HOME fallback resolves to <HOME>/.local/share/omega-memo
+gm_spath gm_s_env2
+gm_ev_reset
+gm_ev_push_kv gm_e_home true
+n0 = get gm_pl 0
+sl = len gm_s_home_suf
+for j ulong sl bound 64
+put gm_pa add n0 j get gm_s_home_suf j
+end
+put gm_pl 0 add n0 sl
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_env
+gm_av_push_pa
+if ne gm_spawn_self true 0
+ret gm_fail 11
+end
+
+note 1c. Neither OMEGA_MEMO_DIR nor HOME set -> fail-closed MM_ERR_NO_ROOT
+put gm_pl 0 0
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_env
+gm_av_push_pa
+gm_ev_reset
+gm_ev_push_kv gm_e_other false
+if ne gm_spawn_self true 0
+ret gm_fail 12
+end
+gm_add_neg
+gm_add_chk 3
+ret 0
+end
+
+note ---- Stage 2: ΩIR v2 SEMANTIC_ID & OMPK v2 Purity Admission + Negative Controls ----
+
+fn gm_stage2_purity to int
+gm_spath gm_s_main
+if ne gm_set_root_pa MM_OK
+ret gm_fail 20
+end
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_stats
+
+note 2a. Build OMPK v2 package for @pure @exact function -> mm_admit_ompk_v2 MUST succeed
+tdInitAll
+tdCacheInit
+pk_reset_all
+n2 = ir_wr
+if lt n2 64
+ret gm_fail 21
+end
+pk_reset_builder
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+for i ulong 32
+put pk_fid_in i get gm_fid_ex i
+end
+pk_set_contract 1 1 0 0 1000 10000
+for i ulong n2 bound 4096
+rc = pk_ir_push ar_bg 1 i
+if ne rc PK_OK
+ret gm_fail 22
+end
+end
+if ne pk_pack PK_OK
+ret gm_fail 23
+end
+if ne pk_verify PK_OK
+ret gm_fail 24
+end
+plen = get pk_len 0
+for i ulong plen bound 8192
+put mm_val_buf i get pk_buf i
+end
+if ne mm_admit_ompk_v2 plen 1 MM_OK
+ret gm_fail 25
+end
+for i ulong 32
+if ne get mm_req_fid i get gm_fid_ex i
+ret gm_fail 26
+end
+end
+
+note 2b. NEG: OMPK v2 with purity_flag == 0 -> mm_admit_ompk_v2 REFUSED (MM_ERR_IMPURE)
+pk_reset_builder
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+pk_set_contract 0 1 0 0 1000 10000
+rc = pk_ir_push 97
+if ne pk_pack PK_OK
+ret gm_fail 27
+end
+plen2 = get pk_len 0
+for i ulong plen2 bound 8192
+put mm_val_buf i get pk_buf i
+end
+if ne mm_admit_ompk_v2 plen2 1 MM_ERR_IMPURE
+ret gm_fail 28
+end
+gm_add_neg
+
+note 2c. NEG: OMPK v1 (no v2 purity contract) -> mm_admit_ompk_v2 REFUSED (MM_ERR_IMPURE)
+pk_reset_builder
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+rc = pk_ir_push 98
+if ne pk_pack PK_OK
+ret gm_fail 29
+end
+plen1 = get pk_len 0
+for i ulong plen1 bound 8192
+put mm_val_buf i get pk_buf i
+end
+if ne mm_admit_ompk_v2 plen1 1 MM_ERR_IMPURE
+ret gm_fail 30
+end
+gm_add_neg
+
+note 2d. NEG: Direct mm_store & mm_lookup with purity_flag == 0 -> MM_ERR_IMPURE
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 777
+gm_put_u64_val 9999
+mm_set_contract 0 1 1 0
+if ne mm_store 50000 500 MM_ERR_IMPURE
+ret gm_fail 31
+end
+if ne mm_lookup MM_ERR_IMPURE
+ret gm_fail 32
+end
+gm_add_neg
+
+note 2e. NEG: purity_flag == 1 WITHOUT ck_pure structural verification (ck_pure_ok == 0) -> MM_ERR_IMPURE
+mm_set_contract 1 0 1 0
+if ne mm_store 50000 500 MM_ERR_IMPURE
+ret gm_fail 33
+end
+if ne mm_lookup MM_ERR_IMPURE
+ret gm_fail 34
+end
+gm_add_neg
+
+note 2f. NEG: Malformed precision contracts (tier=0, tier=3, @exact with err=5) -> MM_ERR_CONTRACT
+mm_set_contract 1 1 0 0
+if ne mm_store 50000 500 MM_ERR_CONTRACT
+ret gm_fail 35
+end
+mm_set_contract 1 1 3 0
+if ne mm_store 50000 500 MM_ERR_CONTRACT
+ret gm_fail 36
+end
+mm_set_contract 1 1 1 5
+if ne mm_store 50000 500 MM_ERR_CONTRACT
+ret gm_fail 37
+end
+gm_add_neg
+
+gm_add_chk 10
+ret 0
+end
+
+note ---- Stage 3: True Cross-Process Persistence (Process A -> Disk -> Fresh Process B) ----
+
+fn gm_stage3_xproc to int
+gm_spath gm_s_main
+if ne gm_set_root_pa MM_OK
+ret gm_fail 40
+end
+inp = ulong 123456789
+expect_val = gm_heavy_compute inp 50000
+
+note Spawn fresh Process A to compute & store @exact entry to disk
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_store
+gm_av_push_pa
+gm_av_push_u64 inp
+gm_av_push_u64 1
+gm_av_push_u64 0
+if ne gm_spawn_self false 0
+ret gm_fail 41
+end
+
+note Confirm exact sharded path <root>/<2hex>/<64hex>.ome exists with size 232 (224 hdr + 8 val)
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 inp
+if ne mm_derive_paths MM_OK
+ret gm_fail 42
+end
+sr = stat mm_file_path 0 get mm_file_plen 0 mp_stbuf 0 128
+if ne sr 0
+ret gm_fail 43
+end
+if ne mp_st_u64 48 232
+ret gm_fail 44
+end
+
+note Spawn fresh Process B to hit @exact with 0 recompute & verify exact bytes + cross-PID provenance
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_look
+gm_av_push_pa
+gm_av_push_u64 inp
+gm_av_push_u64 1
+gm_av_push_u64 0
+gm_av_push_u64 expect_val
+if ne gm_spawn_self false 0
+ret gm_fail 45
+end
+put gm_xproc 0 add get gm_xproc 0 1
+
+note Spawn fresh Process C to hit @tol(1000) from Process A's @exact entry (cross-process dominance!)
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_look
+gm_av_push_pa
+gm_av_push_u64 inp
+gm_av_push_u64 2
+gm_av_push_u64 1000
+gm_av_push_u64 expect_val
+if ne gm_spawn_self false 0
+ret gm_fail 46
+end
+put gm_xproc 0 add get gm_xproc 0 1
+
+gm_add_chk 6
+ret 0
+end
+
+note ---- Stage 4: One-Way Precision Dominance, Refusals, Upgrades, No-Downgrade, Exact Nondet ----
+
+fn gm_stage4_dominance to int
+gm_spath gm_s_main
+if ne gm_set_root_pa MM_OK
+ret gm_fail 50
+end
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_stats
+
+note 4a. @exact -> @tol(1000) and @exact -> @tol(0) PASS (using Stage 3 entry inp=123456789)
+inp_ex = ulong 123456789
+want_ex = gm_heavy_compute inp_ex 50000
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 inp_ex
+mm_set_contract 1 1 2 1000
+if ne mm_lookup MM_OK
+ret gm_fail 51
+end
+if ne gm_get_u64_val want_ex
+ret gm_fail 52
+end
+if ne get mm_stats 2 1
+ret gm_fail 53
+end
+mm_set_contract 1 1 2 0
+if ne mm_lookup MM_OK
+ret gm_fail 54
+end
+if ne gm_get_u64_val want_ex
+ret gm_fail 55
+end
+
+note 4b. Store @tol(100) via fresh Process A on inp=2002; test @tol(100)->@tol(1000) PASS
+inp_t1 = ulong 2002
+want_t1 = gm_heavy_compute inp_t1 50000
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_store
+gm_av_push_pa
+gm_av_push_u64 inp_t1
+gm_av_push_u64 2
+gm_av_push_u64 100
+if ne gm_spawn_self false 0
+ret gm_fail 56
+end
+
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 inp_t1
+mm_set_contract 1 1 2 1000
+if ne mm_lookup MM_OK
+ret gm_fail 57
+end
+if ne gm_get_u64_val want_t1
+ret gm_fail 58
+end
+mm_set_contract 1 1 2 100
+if ne mm_lookup MM_OK
+ret gm_fail 59
+end
+
+note 4c. NEG: @tol(100) -> @exact poisoning REFUSED (in-process AND fresh cross-process!)
+mm_set_contract 1 1 1 0
+if ne mm_lookup MM_ERR_PRECISION_MISS
+ret gm_fail 60
+end
+if ne get mm_val_len 0 0
+ret gm_fail 61
+end
+gm_av_reset
+gm_av_push_txt gm_self
+gm_av_push_txt gm_w_ref
+gm_av_push_pa
+gm_av_push_u64 inp_t1
+gm_av_push_u64 1
+gm_av_push_u64 0
+gm_av_push_u64 MM_ERR_PRECISION_MISS
+if ne gm_spawn_self false 0
+ret gm_fail 62
+end
+put gm_xproc 0 add get gm_xproc 0 1
+gm_add_neg
+
+note 4d. NEG: @tol(0) -> @exact poisoning STILL REFUSED (tier 2 NEVER satisfies tier 1!)
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 2003
+gm_put_u64_val 55555
+mm_set_contract 1 1 2 0
+if ne mm_store 50000 500 MM_OK
+ret gm_fail 63
+end
+mm_set_contract 1 1 1 0
+if ne mm_lookup MM_ERR_PRECISION_MISS
+ret gm_fail 64
+end
+gm_add_neg
+
+note 4e. NEG: looser @tol(1000) -> tighter @tol(100) REFUSED!
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 2004
+gm_put_u64_val 10040
+mm_set_contract 1 1 2 1000
+if ne mm_store 50000 500 MM_OK
+ret gm_fail 65
+end
+mm_set_contract 1 1 2 100
+if ne mm_lookup MM_ERR_PRECISION_MISS
+ret gm_fail 66
+end
+gm_add_neg
+
+note 4f. Monotonic upgrade: @tol(1000) -> @tol(100) -> @exact; then downgrade attempt REFUSED!
+gm_put_u64_val 10010
+mm_set_contract 1 1 2 100
+if ne mm_store 50000 500 MM_OK
+ret gm_fail 67
+end
+if ne get mm_stats 8 1
+ret gm_fail 68
+end
+if ne mm_lookup MM_OK
+ret gm_fail 69
+end
+if ne gm_get_u64_val 10010
+ret gm_fail 70
+end
+gm_put_u64_val 10000
+mm_set_contract 1 1 1 0
+if ne mm_store 50000 500 MM_OK
+ret gm_fail 71
+end
+if ne get mm_stats 8 2
+ret gm_fail 72
+end
+note Attempt downgrade @exact -> @tol(500) MUST return MM_OK_DOMINATED and keep @exact=10000!
+gm_put_u64_val 99999
+mm_set_contract 1 1 2 500
+if ne mm_store 50000 500 MM_OK_DOMINATED
+ret gm_fail 73
+end
+mm_set_contract 1 1 1 0
+if ne mm_lookup MM_OK
+ret gm_fail 74
+end
+if ne gm_get_u64_val 10000
+ret gm_fail 75
+end
+
+note 4g. NEG: Conflicting @exact output for identical (func_sem_id, inputs_sha256) -> MM_ERR_NONDET!
+gm_put_u64_val 10001
+mm_set_contract 1 1 1 0
+if ne mm_store 50000 500 MM_ERR_NONDET
+ret gm_fail 76
+end
+gm_add_neg
+
+gm_add_chk 16
+ret 0
+end
+
+note ---- Stage 5: Fail-Closed Tamper & Corruption Negative Controls ----
+
+fn gm_backup_cur_ome to bool
+fd = fopen mm_file_path 0 get mm_file_plen 0 0 0
+if lt fd 0
+ret false
+end
+n = read int fd gm_bkp 0 4096
+cf = fclose int fd
+if lt n 224
+ret false
+end
+put gm_bkpl 0 ulong n
+ret true
+end
+
+fn gm_write_raw_ome n ulong to bool
+fd = fopen mm_file_path 0 get mm_file_plen 0 577 420
+if lt fd 0
+ret false
+end
+w = write int fd gm_io 0 n
+cf = fclose int fd
+ret eq w long n
+end
+
+fn gm_copy_bkp_to_io to ulong
+n = get gm_bkpl 0
+for i ulong n bound 4096
+put gm_io i get gm_bkp i
+end
+ret n
+end
+
+fn gm_stage5_tamper to int
+gm_spath gm_s_main
+if ne gm_set_root_pa MM_OK
+ret gm_fail 80
+end
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 3001
+gm_put_u64_val 31415926535
+mm_set_contract 1 1 2 100
+if ne mm_store 50000 500 MM_OK
+ret gm_fail 81
+end
+if ne mm_derive_paths MM_OK
+ret gm_fail 82
+end
+if not gm_backup_cur_ome
+ret gm_fail 83
+end
+
+note 5a. NEG: 1-bit tamper in output_bytes[0] (offset 224) -> MM_ERR_TAMPER (14)
+n = gm_copy_bkp_to_io
+put gm_io 224 xor get gm_io 224 uchar 1
+if not gm_write_raw_ome n
+ret gm_fail 84
+end
+if ne mm_lookup MM_ERR_TAMPER
+ret gm_fail 85
+end
+if ne get mm_val_len 0 0
+ret gm_fail 86
+end
+gm_add_neg
+
+note 5b. NEG: 1-bit header tamper trying to forge @tol(100) into @exact (tier 2->1, err->0) -> MM_ERR_TAMPER (14)
+n = gm_copy_bkp_to_io
+put gm_io 9 uchar 1
+for j ulong 8
+put gm_io add 16 j uchar 0
+end
+if not gm_write_raw_ome n
+ret gm_fail 87
+end
+mm_set_contract 1 1 1 0
+if ne mm_lookup MM_ERR_TAMPER
+ret gm_fail 88
+end
+gm_add_neg
+mm_set_contract 1 1 2 100
+
+note 5c. NEG: Truncated .ome output (minus 1 byte) AND truncated header (100 bytes) -> MM_ERR_TRUNCATED (12)
+n = gm_copy_bkp_to_io
+if not gm_write_raw_ome sub n 1
+ret gm_fail 89
+end
+if ne mm_lookup MM_ERR_TRUNCATED
+ret gm_fail 90
+end
+if not gm_write_raw_ome 100
+ret gm_fail 91
+end
+if ne mm_lookup MM_ERR_TRUNCATED
+ret gm_fail 92
+end
+gm_add_neg
+
+note 5d. NEG: Trailing garbage byte appended -> MM_ERR_TRAILING (13)
+n = gm_copy_bkp_to_io
+put gm_io n uchar 65
+if not gm_write_raw_ome add n 1
+ret gm_fail 93
+end
+if ne mm_lookup MM_ERR_TRAILING
+ret gm_fail 94
+end
+gm_add_neg
+
+note 5e. NEG: Corrupt magic byte -> MM_ERR_MAGIC (10); corrupt version -> MM_ERR_VERSION (11)
+n = gm_copy_bkp_to_io
+put gm_io 0 uchar 88
+if not gm_write_raw_ome n
+ret gm_fail 95
+end
+if ne mm_lookup MM_ERR_MAGIC
+ret gm_fail 96
+end
+n = gm_copy_bkp_to_io
+put gm_io 4 uchar 9
+if not gm_write_raw_ome n
+ret gm_fail 97
+end
+if ne mm_lookup MM_ERR_VERSION
+ret gm_fail 98
+end
+gm_add_neg
+
+note 5f. Restore valid file for inp=3001, then copy it onto path of inp=3002 (key-substitution attack -> MM_ERR_KEY_MISMATCH)
+n = gm_copy_bkp_to_io
+if not gm_write_raw_ome n
+ret gm_fail 99
+end
+mm_hash_input_u64 3002
+if ne mm_derive_paths MM_OK
+ret gm_fail 100
+end
+sr = makedir mm_shard_path 0 get mm_shard_plen 0 493
+if not gm_write_raw_ome n
+ret gm_fail 101
+end
+if ne mm_lookup MM_ERR_KEY_MISMATCH
+ret gm_fail 102
+end
+u = unlink mm_file_path 0 get mm_file_plen 0
+gm_add_neg
+
+gm_add_chk 12
+ret 0
+end
+
+note ---- Stage 6: Profitability Policy (Trivial Skip, Precheck Skip, Heavy Admit, Test Override) ----
+
+fn gm_stage6_profitability to int
+gm_spath gm_s_main
+if ne gm_set_root_pa MM_OK
+ret gm_fail 110
+end
+mp_init
+mp_set_override MP_OVR_AUTO
+mp_set_thresholds 5000 2 1
+mm_reset_stats
+
+note 6a. Trivial sub-threshold op (real monons timing + explicit 150ns vs 4000ns) -> SKIPPED, no file created!
+mm_reset_req
+gm_load_fid 2
+mm_hash_input_u64 4001
+mm_set_contract 1 1 1 0
+t0 = monons
+tv = gm_trivial_compute 4001
+t1 = monons
+cns_trv = ulong 150
+if and gt t1 t0 lt sub t1 t0 4000
+cns_trv = ulong sub t1 t0
+end
+gm_put_u64_val tv
+if ne mm_store cns_trv 4000 MM_SKIP_UNPROFITABLE
+ret gm_fail 111
+end
+if ne mm_derive_paths MM_OK
+ret gm_fail 112
+end
+if eq stat mm_file_path 0 get mm_file_plen 0 mp_stbuf 0 128 0
+ret gm_fail 113
+end
+gm_add_neg
+
+note 6b. Subsequent mm_lookup on already-profiled trivial SEMANTIC_ID fast-skips via mp_precheck!
+if ne mm_lookup MM_SKIP_UNPROFITABLE
+ret gm_fail 114
+end
+
+note 6c. Heavy pure op (real monons timing >= 5000ns and >= 2x overhead) -> ADMITTED & HIT!
+mm_reset_req
+gm_load_fid 3
+mm_hash_input_u64 4002
+mm_set_contract 1 1 1 0
+h0 = monons
+hv = gm_heavy_compute 4002 60000
+h1 = monons
+cns_hvy = ulong 100000
+if gt h1 h0
+cns_hvy = ulong sub h1 h0
+end
+if lt cns_hvy 10000
+cns_hvy = ulong 100000
+end
+gm_put_u64_val hv
+if ne mm_store cns_hvy 2000 MM_OK
+ret gm_fail 115
+end
+if ne mm_lookup MM_OK
+ret gm_fail 116
+end
+if ne gm_get_u64_val hv
+ret gm_fail 117
+end
+
+note 6d. Explicit override MP_OVR_FORCE admits even trivial sub-threshold op for tests!
+mp_set_override MP_OVR_FORCE
+mm_reset_req
+gm_load_fid 2
+mm_hash_input_u64 4001
+mm_set_contract 1 1 1 0
+gm_put_u64_val tv
+if ne mm_store 100 4000 MM_OK
+ret gm_fail 118
+end
+if ne mm_lookup MM_OK
+ret gm_fail 119
+end
+if ne gm_get_u64_val tv
+ret gm_fail 120
+end
+
+gm_add_chk 9
+ret 0
+end
+
+note ---- Stage 7: Uncapped 128+ Entry Scaling (No 32-Slot Cap) + Disk-Floor Alarm + memo_prune ----
+
+fn gm_stage7_scale_alarm_prune to int
+gm_spath gm_s_scale
+if ne gm_set_root_pa MM_OK
+ret gm_fail 130
+end
+mp_init
+mp_set_override MP_OVR_FORCE
+mp_set_disk_limits 1048576 4096 2097152
+mm_reset_stats
+
+note 7a. Store 128 distinct content-addressed entries (4x past 32-slot cap!)
+for i ulong 128
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 add 50000 i
+mm_set_contract 1 1 1 0
+gm_put_u64_val add mul i 1000 7
+rc = mm_store 50000 500
+if ne rc MM_OK
+ret gm_fail 131
+end
+end
+if ne mp_scan_store MP_DISK_OK
+ret gm_fail 132
+end
+if ne get mp_stat 0 128
+ret gm_fail 133
+end
+if ne get mp_stat 1 29696
+ret gm_fail 134
+end
+put gm_ent 0 get mp_stat 0
+
+note Verify sample entries spanning well beyond slot 32 (0, 31, 32, 63, 64, 99, 127)
+for k ulong 7
+idx = ulong 0
+if eq k 1
+idx = ulong 31
+end
+if eq k 2
+idx = ulong 32
+end
+if eq k 3
+idx = ulong 63
+end
+if eq k 4
+idx = ulong 64
+end
+if eq k 5
+idx = ulong 99
+end
+if eq k 6
+idx = ulong 127
+end
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 add 50000 idx
+mm_set_contract 1 1 1 0
+if ne mm_lookup MM_OK
+ret gm_fail 135
+end
+if ne gm_get_u64_val add mul idx 1000 7
+ret gm_fail 136
+end
+end
+
+note 7b. Disk-floor alarm: set max_store_bytes = 20000 (< 29696), store entry #128 -> MUST fire loud ALARM without truncating ANY existing entry!
+mp_set_disk_limits 20000 4096 2097152
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 50128
+mm_set_contract 1 1 1 0
+gm_put_u64_val 128007
+if ne mm_store 50000 500 MM_OK_ALARM
+ret gm_fail 137
+end
+if or ne get mp_stat 3 1 lt get mp_stat 4 1
+ret gm_fail 138
+end
+note Confirm structured alarm message begins with "OMEGA-MEMO ALARM disk_floor "
+if lt get mp_alarm_len 0 len gm_al_want
+ret gm_fail 139
+end
+for i ulong len gm_al_want bound 64
+if ne get mp_alarm_buf i get gm_al_want i
+ret gm_fail 140
+end
+end
+note Confirm ZERO silent truncation: ALL 129 entries remain intact and verifiable on disk!
+if ne mp_scan_store MP_DISK_OK
+ret gm_fail 141
+end
+if ne get mp_stat 0 129
+ret gm_fail 142
+end
+put gm_ent 0 get mp_stat 0
+mm_reset_req
+gm_load_fid 0
+mm_hash_input_u64 50000
+mm_set_contract 1 1 1 0
+if ne mm_lookup MM_OK
+ret gm_fail 143
+end
+if ne gm_get_u64_val 7
+ret gm_fail 144
+end
+mm_hash_input_u64 50128
+if ne mm_lookup MM_OK
+ret gm_fail 145
+end
+if ne gm_get_u64_val 128007
+ret gm_fail 146
+end
+gm_add_neg
+
+note 7c. Also verify free_bytes < free_floor_bytes alarm triggers loudly
+mp_set_disk_limits 1048576 8192 2097152
+mp_set_ext_free 1 1024
+if ne mp_check_disk_floor MP_ALARM_DISK_FLOOR
+ret gm_fail 147
+end
+mp_set_ext_free 0 0
+gm_add_neg
+
+note 7d. Explicit oldest-first mm_prune down to 11600 bytes (50 entries x 232B) clears alarm cleanly!
+mp_set_disk_limits 12000 4096 2097152
+if ne mm_prune 11600 MM_OK
+ret gm_fail 148
+end
+if ne get mp_stat 5 79
+ret gm_fail 149
+end
+if ne get mp_stat 6 18328
+ret gm_fail 150
+end
+if ne get mp_stat 0 50
+ret gm_fail 151
+end
+if gt get mp_stat 1 11600
+ret gm_fail 152
+end
+if ne get mp_stat 3 0
+ret gm_fail 153
+end
+
+gm_add_chk 16
+ret 0
+end
+
+note ---- Stage 8 (Optional): Live ng + ngcheck ck_pure End-to-End Integration ----
+
+fn gm_cli_write_txt hdr view uchar * body view uchar * to bool
+gm_spath gm_f_in
+fd = fopen gm_pa 0 get gm_pl 0 577 420
+if lt fd 0
+ret false
+end
+if gt len hdr 0
+w1 = write int fd hdr 0 len hdr
+if ne w1 long len hdr
+cf = fclose int fd
+ret false
+end
+end
+w2 = write int fd body 0 len body
+cf2 = fclose int fd
+ret eq w2 long len body
+end
+
+fn gm_cli_write_bin hdr view uchar * n ulong to bool
+gm_spath gm_f_in
+fd = fopen gm_pa 0 get gm_pl 0 577 420
+if lt fd 0
+ret false
+end
+if gt len hdr 0
+w1 = write int fd hdr 0 len hdr
+if ne w1 long len hdr
+cf = fclose int fd
+ret false
+end
+end
+w2 = write int fd gm_io2 0 n
+cf2 = fclose int fd
+ret eq w2 long n
+end
+
+fn gm_cli_read_out to long
+gm_spath gm_f_out
+fd = fopen gm_pa 0 get gm_pl 0 0 0
+if lt fd 0
+ret neg long 1
+end
+n = ulong 0
+while lt n 65536 bound 1024
+k = read int fd gm_io n sub 65536 n
+if lt k 0
+cf = fclose int fd
+ret neg long 1
+end
+if eq k 0
+cf = fclose int fd
+ret long n
+end
+n = add n ulong k
+end
+cf = fclose int fd
+ret long n
+end
+
+fn gm_cli_exec use_ng bool to ulong
+put gm_av 0 1
+put gm_av 1 0
+n = ulong 0
+if use_ng
+n = get gm_ngl 0
+put gm_av 2 uchar and n 255
+put gm_av 3 uchar and shr n 8 255
+for i ulong n bound 1024
+put gm_av add 4 i get gm_ngp i
+end
+else
+n = get gm_ckl 0
+put gm_av 2 uchar and n 255
+put gm_av 3 uchar and shr n 8 255
+for i ulong n bound 1024
+put gm_av add 4 i get gm_ckp i
+end
+end
+put gm_an 0 add 4 n
+gm_spath gm_f_in
+fi = fopen gm_pa 0 get gm_pl 0 0 0
+gm_spath gm_f_out
+fo = fopen gm_pa 0 get gm_pl 0 577 420
+gm_spath gm_f_err
+fe = fopen gm_pa 0 get gm_pl 0 577 420
+if or lt fi 0 or lt fo 0 lt fe 0
+ret 255
+end
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fe 2 0
+r = execprog gm_av 0 get gm_an 0
+exit 127
+end
+r = fclose int fi
+r = fclose int fo
+r = fclose int fe
+w = waitpid int pid gm_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get gm_st 0 0
+ret add 256 ulong get gm_st 0
+end
+ret ulong get gm_st 1
+end
+
+fn gm_hex_nib ch uchar to ulong
+if and ge ch 48 le ch 57
+ret ulong sub ch 48
+end
+if and ge ch 97 le ch 102
+ret add 10 ulong sub ch 97
+end
+ret 255
+end
+
+fn gm_parse_semid_hex to bool
+for i ulong 32
+hi = gm_hex_nib get gm_io add 5 mul i 2
+lo = gm_hex_nib get gm_io add 6 mul i 2
+if or gt hi 15 gt lo 15
+ret false
+end
+put gm_fid_cli i uchar or shl hi 4 lo
+end
+ret true
+end
+
+fn gm_stage8_pure to int
+if not gm_cli_write_txt gm_h_fi gm_src_pure
+ret gm_fail 161
+end
+if ne gm_cli_exec true 0
+ret gm_fail 162
+end
+irn = gm_cli_read_out
+if lt irn 64
+ret gm_fail 163
+end
+for i ulong ulong irn bound 65536
+put gm_io2 i get gm_io i
+end
+gm_spath gm_f_in
+fd = fopen gm_pa 0 get gm_pl 0 577 420
+if lt fd 0
+ret gm_fail 164
+end
+kw = write int fd gm_io2 0 ulong irn
+cf = fclose int fd
+if ne kw irn
+ret gm_fail 164
+end
+if ne gm_cli_exec false 0
+ret gm_fail 165
+end
+acn = gm_cli_read_out
+if lt acn long len gm_pfx_acc
+ret gm_fail 166
+end
+for i ulong len gm_pfx_acc bound 16
+if ne get gm_io i get gm_pfx_acc i
+ret gm_fail 167
+end
+end
+if not gm_cli_write_bin gm_h_sd ulong irn
+ret gm_fail 168
+end
+if ne gm_cli_exec true 0
+ret gm_fail 169
+end
+sdn = gm_cli_read_out
+if lt sdn 70
+ret gm_fail 170
+end
+for i ulong len gm_pfx_fn0 bound 16
+if ne get gm_io i get gm_pfx_fn0 i
+ret gm_fail 171
+end
+end
+if not gm_parse_semid_hex
+ret gm_fail 172
+end
+gm_spath gm_s_cli
+if ne gm_set_root_pa MM_OK
+ret gm_fail 173
+end
+mp_init
+mp_set_override MP_OVR_FORCE
+mm_reset_req
+gm_load_fid 4
+mm_hash_input_u64 5
+mm_set_contract 1 1 1 0
+gm_put_u64_val 48
+if ne mm_store 50000 500 MM_OK
+ret gm_fail 174
+end
+if ne mm_lookup MM_OK
+ret gm_fail 175
+end
+if ne gm_get_u64_val 48
+ret gm_fail 176
+end
+put gm_cli_chk 0 add get gm_cli_chk 0 5
+ret 0
+end
+
+fn gm_stage8_impure to int
+if not gm_cli_write_txt gm_h_fi gm_src_imp
+ret gm_fail 177
+end
+if ne gm_cli_exec true 0
+ret gm_fail 178
+end
+irn = gm_cli_read_out
+if lt irn 64
+ret gm_fail 179
+end
+for i ulong ulong irn bound 65536
+put gm_io2 i get gm_io i
+end
+gm_spath gm_f_in
+fd = fopen gm_pa 0 get gm_pl 0 577 420
+if lt fd 0
+ret gm_fail 180
+end
+kw = write int fd gm_io2 0 ulong irn
+cf = fclose int fd
+ckrc = gm_cli_exec false
+if ne ckrc 22
+ret gm_fail 181
+end
+ckp = ulong 0
+if eq ckrc 0
+ckp = ulong 1
+end
+mm_reset_req
+gm_load_fid 4
+mm_hash_input_u64 99
+mm_set_contract 1 ckp 1 0
+gm_put_u64_val 99
+if ne mm_store 50000 500 MM_ERR_IMPURE
+ret gm_fail 182
+end
+put gm_cli_neg 0 add get gm_cli_neg 0 1
+ret 0
+end
+
+fn gm_stage8_live_ng to int
+nl = argread 2 gm_ngp 0 1023
+cl = argread 3 gm_ckp 0 1023
+if or lt nl 1 lt cl 1
+ret gm_fail 160
+end
+put gm_ngl 0 ulong nl
+put gm_ckl 0 ulong cl
+rc = gm_stage8_pure
+if ne rc 0
+ret rc
+end
+ret gm_stage8_impure
+end
+
+note ---- Setup Scratch Root & Main ----
+
+fn gm_init_scratch to bool
+if ge argcnt 2
+sl = argread 1 gm_scp 0 1023
+if lt sl 1
+ret false
+end
+put gm_scl 0 ulong sl
+else
+pl = len gm_def_pfx
+for i ulong pl bound 64
+put gm_scp i get gm_def_pfx i
+end
+pid = ulong getpid
+x = pid
+q = ulong 24
+for i ulong 21
+q = sub q 1
+put gm_dig q uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+dc = sub 24 q
+for j ulong dc bound 24
+put gm_scp add pl j get gm_dig add q j
+end
+put gm_scl 0 add pl dc
+end
+r = makedir gm_scp 0 get gm_scl 0 493
+if and ne r 0 ne r neg long 17
+ret false
+end
+ret true
+end
+
+fn main to int
+z = ar_need 0 65536
+ar_init
+note Check internal cross-process worker subcommands first
+if ge argcnt 2
+if gm_arg_eq 1 gm_w_store
+ret gm_worker_store
+end
+if gm_arg_eq 1 gm_w_look
+ret gm_worker_lookup
+end
+if gm_arg_eq 1 gm_w_ref
+ret gm_worker_refuse
+end
+if gm_arg_eq 1 gm_w_env
+ret gm_worker_env
+end
+end
+
+put gm_chk 0 0
+put gm_neg 0 0
+put gm_xproc 0 0
+put gm_ent 0 0
+put gm_cli_chk 0 0
+put gm_cli_neg 0 0
+
+gm_wrt gm_m_hdr
+if not gm_init_scratch
+ret gm_fail 1
+end
+ok = gm_build_ir_fids
+
+rc = gm_stage1_env_root
+if ne rc 0
+ret rc
+end
+rc = gm_stage2_purity
+if ne rc 0
+ret rc
+end
+rc = gm_stage3_xproc
+if ne rc 0
+ret rc
+end
+rc = gm_stage4_dominance
+if ne rc 0
+ret rc
+end
+rc = gm_stage5_tamper
+if ne rc 0
+ret rc
+end
+rc = gm_stage6_profitability
+if ne rc 0
+ret rc
+end
+rc = gm_stage7_scale_alarm_prune
+if ne rc 0
+ret rc
+end
+
+if ge argcnt 4
+rc = gm_stage8_live_ng
+if ne rc 0
+ret rc
+end
+end
+
+gm_wrt gm_m_pass
+gm_num get gm_chk 0
+gm_wrt gm_m_neg
+gm_num get gm_neg 0
+gm_wrt gm_m_xp
+gm_num get gm_xproc 0
+gm_wrt gm_m_ent
+gm_num get gm_ent 0
+gm_wrt gm_m_cli
+gm_num get gm_cli_chk 0
+gm_wrt gm_m_cneg
+gm_num get gm_cli_neg 0
+gm_wrt gm_m_nl
+ret 0
+end
