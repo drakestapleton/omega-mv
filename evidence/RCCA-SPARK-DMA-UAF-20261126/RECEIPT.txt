@@ -1,0 +1,135 @@
+================================================================================
+IMMUTABLE EVIDENCE RECEIPT: RCCA-SPARK-DMA-UAF-20261126
+================================================================================
+Date (CST):         2026-11-26
+Host:               DGX Spark (spark-b87b, Linux 7.0.0-1019-nvidia aarch64)
+Code Commit:        61d0eb19cc9bd6cdca78274e6e988894fc6f8233
+Prior Base Commit:  2db0ef400e8e3558c42937a86eb56c2ca1a858e1
+Pinned OM-2 omc:    85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134
+Lean 4 Version:     4.36.0 (aarch64-unknown-linux-gnu, 0 warnings, 0 sorry)
+Qualification Class: HOST-VERIFIED (hw_writes=0, DRY_RUN_READONLY on live /proc & /sys;
+                     NOT a live GB10 /dev/nvidia* kernel run)
+
+--------------------------------------------------------------------------------
+1. INCIDENT TIMELINE & VERIFIED FORENSIC ROOT CAUSE (journalctl -b -2 & -b -1)
+--------------------------------------------------------------------------------
+Two DGX Spark kernel crashes occurred on 2026-11-26 (19:11 CST and 20:17-20:42 CST):
+  - Boot -2 (6de4c9db5c54492a8b8ec5330f6007bd, 06:37:48 .. 19:11:09 CST):
+      06:39:15 sudo insmod /home/drakestapleton/work/claude-fresh-4c9fe76/kmod/aien_gpu.ko
+               allow_bind=1 arena_mib=96 heap_mib=512
+      19:10:34 kernel: BUG: Bad rss-counter state mm:00000000e27cc1f7 type:MM_ANONPAGES val:242
+      19:10:54 kernel: aien-gpu 000f:01:00.0: sc_pdb0 patched / chan_alloc / post-promote
+      19:11:09 hard crash & reboot.
+  - Boot -1 (bbf6e5a9441c46ca87e7aa37e8afbc26, 19:12:38 .. 20:23:06 CST; rebooted 20:42:02):
+      20:12:57 sudo insmod kmod/aien_gpu.ko allow_bind=1 arena_mib=96 heap_mib=512
+               (PWD=/home/drakestapleton/work/claude-fresh-4c9fe76)
+      20:17:23 kernel: aien-gpu 000f:01:00.0: sc_pdb0 patched / chan_alloc / post-promote
+      20:17:30..20:20:06 kernel: 19 Internal Error Oopses (#1..#19) in find_inode_fast+0x54/0x150
+               dereferencing raw IEEE-754 f32 tensor payloads written into VFS inode_cache slab:
+               0x3e933f5b3e20be2c, 0x3ee03da03e54bdf5, 0xbebfbd413d9fbdbc,
+               0x0017be273f973df1, 0x002dbe49bd55bee4.
+      20:19:21..20:23:06 kernel: VFS spinlock soft-lockups (CPU#9 stuck 127s [du:3356108],
+               CPU#17 stuck 89s [du:3403347], CPU#12 stuck 22s [kworker/12:3]), freezing
+               SSH/nginx until hard reboot at 20:42:02 CST.
+
+Root Causes in Legacy C kmod (`aien_gpu.ko`, SHA-256 6105c3cfe4da3330d9d8f75734117576489d64e991afe9f0e7be2d487d8e2d1c):
+  RC-1: Unified-memory DMA Use-After-Free — `agpu_mem_free` / `agpu_vas_destroy` returned
+        order-0 DMA pages to Linux slab via `put_page`/`dma_unmap_page` without draining
+        in-flight GPU compute DMA, without clearing PTEs (`unmap_pages`) in `agpu_vas_destroy`,
+        without GMMU TLB invalidation, and without revoking `vm_insert_pages` user VMAs.
+  RC-2: GPU VA Aliasing — `agpu_vas_map_kbuf` mapped kernel buffers at >=8 GiB without
+        registering them in `m->ranges`, allowing user GPU VAs to overlap kernel buffers.
+
+--------------------------------------------------------------------------------
+2. IMMEDIATE CONTAINMENT (NON-DESTRUCTIVE QUARANTINE)
+--------------------------------------------------------------------------------
+  - Quarantined binary: /home/drakestapleton/work/claude-fresh-4c9fe76/kmod/aien_gpu.ko
+                     -> aien_gpu.ko.QUARANTINED-RCCA-20261126 (mode 0000, chmod 000)
+  - SHA-256 recorded:   6105c3cfe4da3330d9d8f75734117576489d64e991afe9f0e7be2d487d8e2d1c
+  - Notice written:     /home/drakestapleton/work/claude-fresh-4c9fe76/kmod/RCCA-QUARANTINE.txt
+  - Forensic source files in claude-fresh-4c9fe76 untouched; UEFI/NVRAM/SPI untouched.
+  - Verified live on Spark boot 0 (0e4262df...): `lsmod | grep aien` empty (`aien_gpu_loaded=0`),
+    Strand 6 Sentinel `scan-dir` confirms `live_ko=0 quarantined_ko=1` (mode 0000 verified).
+
+--------------------------------------------------------------------------------
+3. PERMANENT PURE-OMEGA COMPILER & HIVE SHIELD FIX (COMMIT 61d0eb19c, ZERO C)
+--------------------------------------------------------------------------------
+Verified on DGX Spark from clean `git archive 61d0eb19cc9bd6cdca78274e6e988894fc6f8233`:
+
+  [Strand 5 — The Aegis (`seed/helix/strand5_aegis/om3_aegis.om`, `spec/omegese-om3.md` §2)]
+    - Compiled with pinned OM-2 `seed/out/omc`: 73,252 bytes,
+      sha256=d900a77d563caa073d1346e9ba9f1696dcc7b9bc1203e93c8be2a3c52c422952
+    - Positive 1 (OM-3 4-step GPU DMA lifecycle -> zero-overhead OM-2 -> native ELF):
+      COLD_PROVED == MEMO_HIT (regions=2 maps=1 bounds_erased=1 fences=1 reclaims=1 contracts=0);
+      zero `@` capability instructions emitted; native AArch64 ELF executed exit=42.
+    - Positive 2 (Unified OM-3 + OIR v2 `@pure/@exact/@deadline 500/@power 15000` -> `@ng` + `ngcheck`):
+      `ngcheck: ACCEPT 3b3c46c0d365f397d973d1c33cbc065da665eab125c1b07c46bd276af8472313 fns=2 blocks=2 ops=12`
+      `@ng sem-id`: fn 0 `476d9dd0...` (`pure=1 tier=1 err=0 deadline=500 hard=0 power=15000`)
+      `@ng opt -> @ng a64` native AArch64 ELF executed exit=73.
+    - OM-2 Self-Rebuild & Strand 5 `@ng` DDC Fixpoint Convergence:
+      Seed0 -> Hex1 -> Asm2 -> Om4 -> Omc:  85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134
+      Strand 5 `@ng A_fast(omc.om)`:        85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134
+      OMEGA-MEMO DDC receipt: COLD_PROVED -> MEMO_HIT (bit-exact match).
+    - Negative Controls: 21/21 KILLED (101 NO_RAW_PTR x2, 102 DISJOINT_VA_OVERLAP, 103 OOB_STATIC
+      + u64 wrap, 104 MISSING_PTE_UNMAP + unmapped GPU access, 105 MISSING_TLB_INVAL,
+      106 UNFENCED_GPU_DMA_UAF + EOF leak, 107 UNREVOKED_VMA_PIN_LEAK, 108 USE_AFTER_RECLAIM_UAF,
+      109 DOUBLE_RECLAIM, 110 CROSS_DOMAIN_VIOLATION slab map + phys overlap, 111 MALFORMED_OM3_SYNTAX
+      header + directive + 520B overlong line + 2^64 hex overflow, 120 OMEGA_MEMO_PROOF_TAMPER,
+      130 DDC_MISMATCH).
+
+  [Strand 6 — The Sentinel (`seed/helix/hive_shield/strand6_sentinel.om`)]
+    - Pure-OM-2 directory scanner (256-slot fail-closed stack) + source auditor.
+    - Verified `seed/helix/hive_shield` (files=5 om=4 c_h=0 live_ko=0 quarantined_ko=0) and
+      Spark `/home/drakestapleton/work/claude-fresh-4c9fe76/kmod` (live_ko=0 quarantined_ko=1).
+    - Negative Controls: 7/7 KILLED (141 live `.ko`, 141 readable `0644` `.QUARANTINED` `.ko`,
+      142 C contamination > ratchet, 143 `efibootmgr`, 143 `efivars`, 141 `insmod aien_gpu.ko`,
+      144 `vm_insert_pages`).
+
+  [Strand 7 — The Warden (`seed/helix/hive_shield/strand7_warden.om`)]
+    - Multi-node CBF barriers verified for Spark GB10 (node=1), Pi 5 (node=2), MacBook Air (node=3).
+    - Live read-only Spark audit (`hw_writes=0`):
+      `peak_temp_mc=55600 avail_ram_mib=111106 aien_gpu_loaded=0 h_temp_mc=26400`.
+    - Negative Controls: 7/7 KILLED (151 thermal 85C, 152 power 180W, 153 RAM 4 GiB, 154 disk 8 GiB,
+      155 rogue live kmod, 156 GPU lease 1800s, 157 incomplete proof mask 5).
+
+  [Strand 8 — The Notary (`seed/helix/hive_shield/strand8_notary.om`)]
+    - Pure-OM-2 FIPS 180-4 `SHA256SUMS.txt` verifier + Dual-Law Hive Consensus
+      (1-of-K Defense Safety Veto + N >= 3f+1 Compiler BFT Quorum) + `OMEGA-MEMO` sealing.
+    - Negative Controls: 6/6 KILLED (161 1-byte tamper, 162 missing file, 163 `../` traversal,
+      164 safety veto overriding 7/7 unanimous compilers, 165 f=3 no quorum, 166 OMEGA-MEMO tamper).
+
+  [Strand 9 — The Arbiter (`seed/helix/hive_shield/strand9_arbiter.om`)]
+    - Zero-trust endpoint guard (strict 4-octet IPv4 parser; permits 127.*, 192.168.1.*,
+      100.64..127.*, ::1, l2:0x88b5) + remote command & SSH-storm guard.
+    - Negative Controls: 12/12 KILLED (171 `0.0.0.0`/`::`, 172 `8.8.8.8`/`100.128.0.1`/
+      `127.0.0.1;id`/`127.999.0.1`, 173 `pkill -f`/`efibootmgr`/`rm -rf /`/`insmod`,
+      174 SSH storm 8, 175 unsigned RPC).
+
+  [Machine-Checked Lean 4.36.0 Proofs]
+    - `seed/helix/proofs/Om3MemorySafety.lean`: PASS (0 warnings, 0 sorry, standard axioms only)
+    - `seed/helix/proofs/HiveShield.lean`:      PASS (0 warnings, 0 sorry, standard axioms only)
+
+  [Aggregate Gate Result]
+    HIVE_SHIELD PASS strands=5,6,7,8,9 omc=85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134 total_neg_controls=53
+
+--------------------------------------------------------------------------------
+4. SAFE C-CODE PURGE (STAGE 1 WAVE S1-8d) & EXACT REMAINING C INVENTORY
+--------------------------------------------------------------------------------
+  - Retired 2 C/H files: `tests/runtime/rx_r13_cortex_episode.c` (20,895 B; cut over `Makefile`
+    `test-r13-cortex-episode` to pure seeded OM-2 `$(TRT5_R13E_BIN)`) and orphaned
+    `tests/runtime/cx_config_freestanding.h` (1,185 B; 0 remaining callers).
+  - Verified on Spark from clean archive:
+      `make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-r13-cortex-episode test-tests-rt-5-om`
+      -> RX_R13_CORTEX_EPISODE_OM: PASS + all 10/10 pure OM-2 runtime suites PASS.
+  - Verified `PARITY_BASE=2db0ef400e8e3558c42937a86eb56c2ca1a858e1 sh tools/migration/parity_check.sh`:
+      PARITY_CHECK PASS required=1 rows=418 functions=2564 covered=2216 excluded=348 retired-C-checks=0
+  - Verified `bash tests/gates/run.sh zero-disk-secrets`:
+      windows-paths: 0 findings (32283 paths), Zero plaintext .env files verified.
+  - Exact remaining tracked C/H count in `omega-mv`: 693 total (492 .c + 201 .h):
+      164 immutable `evidence/`
+      100 cross-language baselines (`bench/` 52, `research/` 48)
+       30 SHA-256-pinned manifests/receipts/Turing ASan oracle
+       40 seed/FFI parity oracles & macOS host `quietlock`
+        2 AMD KFD probe helpers (`tests/kfd/`)
+      357 Stage 2 GB10 silicon / R13-R15 silicon / freestanding C oracle files awaiting Stage 2 cutover.
+================================================================================
