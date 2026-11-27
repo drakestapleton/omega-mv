@@ -1,0 +1,297 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/physics/pareto_bank.om
+note Sovereign Intelligence 2.0 Stage 3 (Pillar 3: Physics-Typed Computing)
+note Pareto Realization Bank: registers multiple proof-bounded realizations per SEMANTIC_ID
+note across precisions and targets (FP64, FP32, BF16, FP8, NVFP4, CPU_X925, CPU_A725, SM121,
+note ARBORIS_SHORTCUT). Enforces proof_mask == 7 (Contract | EGP3 | Antibody) before admission.
+note
+note Compose after:
+note   si/directives/om2.om
+note   apps/omega-wattd/watt_sense.om
+note   apps/omega-wattd/watt_cbf.om
+note   seed/ng/target/target_desc.om
+note   seed/ng/target/isel.om
+note   seed/ng/target/sm121_pe.om
+note   seed/ng/target/fabric.om
+
+const PB_CAP ulong 64
+const PB_NONE ulong 999999
+
+note Proof-gate bitmask: bit0=Contract, bit1=EGP3, bit2=Antibody; ALL 3 bits required (== 7)
+const PB_PROOF_CONTRACT ulong 1
+const PB_PROOF_EGP3 ulong 2
+const PB_PROOF_ANTIBODY ulong 4
+const PB_PROOF_REQUIRED ulong 7
+
+note Precision / realization profile IDs
+const PB_PREC_FP64 ulong 1
+const PB_PREC_FP32 ulong 2
+const PB_PREC_BF16 ulong 3
+const PB_PREC_FP8 ulong 4
+const PB_PREC_NVFP4 ulong 5
+const PB_PREC_CPU_X925 ulong 6
+const PB_PREC_CPU_A725 ulong 7
+const PB_PREC_SM121 ulong 8
+const PB_PREC_ARBORIS_SHORTCUT ulong 9
+
+note Registration status / refusal codes
+const PB_OK ulong 0
+const PB_ERR_PROOF_MASK ulong 1
+const PB_ERR_BAD_SEM ulong 2
+const PB_ERR_BAD_TARGET ulong 3
+const PB_ERR_BAD_PREC ulong 4
+const PB_ERR_BAD_METRICS ulong 5
+const PB_ERR_BAD_PTR ulong 6
+const PB_ERR_FULL ulong 7
+
+note Bank storage (struct-of-arrays, 64 proof-bounded realizations)
+global pb_used ulong 64
+global pb_sem ulong 64
+global pb_tid ulong 64
+global pb_prec ulong 64
+global pb_power_mw long 64
+global pb_lat_us long 64
+global pb_joules_uj long 64
+global pb_err_bound long 64
+global pb_proof ulong 64
+global pb_code_ptr ulong 64
+global pb_work_bits long 64
+global pb_count ulong 1
+global pb_rej_proof ulong 1
+
+note Staging area for registering a realization (avoids >6 parameter slots)
+note u64 staging: [0]=sem_id [1]=target_tid [2]=precision_id [3]=proof_mask [4]=code_ptr
+global pb_st_u ulong 8
+note i64 staging: [0]=est_power_mw [1]=est_latency_us [2]=est_joules_uj [3]=proven_err_bound [4]=work_bits
+global pb_st_i long 8
+global pb_last_idx ulong 1
+
+fn pb_init to void
+for i ulong PB_CAP
+put pb_used i 0
+put pb_sem i 0
+put pb_tid i 0
+put pb_prec i 0
+put pb_power_mw i 0
+put pb_lat_us i 0
+put pb_joules_uj i 0
+put pb_err_bound i 0
+put pb_proof i 0
+put pb_code_ptr i 0
+put pb_work_bits i 0
+end
+put pb_count 0 0
+put pb_rej_proof 0 0
+put pb_last_idx 0 PB_NONE
+end
+
+note Derive 64-bit bank SEMANTIC_ID key from the first 8 LE bytes of a 32-byte SHA-256 SEMANTIC_ID
+fn pb_sem_key_from_sha256 dig view uchar * to ulong
+if lt len dig 8
+ret 0
+end
+v = ulong 0
+for i ulong 8
+b = ulong get dig i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+note True iff target_tid executes on the GPU power rail (SM121 / coherent GB10 GPU / Spark Ring)
+fn pb_is_gpu_target tid ulong to bool
+if eq tid TID_SM121
+ret true
+end
+if eq tid TID_APU_GB10
+ret true
+end
+if eq tid TID_SPARK_RING
+ret true
+end
+ret false
+end
+
+note Map (target_tid, precision_id) to fabric.om dispatch mode
+fn pb_mode_for_realization tid ulong prec ulong to ulong
+if eq prec PB_PREC_ARBORIS_SHORTCUT
+ret FAB_MODE_CRYSTALLIZED
+end
+if pb_is_gpu_target tid
+ret FAB_MODE_GPU_NATIVE
+end
+ret FAB_MODE_CPU_NATIVE
+end
+
+note Conservative microjoule estimate from mW and us: ceil(power_mw * lat_us / 1000)
+note 1 mW * 1 us = 1 nJ = 1/1000 uJ
+fn pb_calc_joules_uj power_mw long lat_us long to long
+if or le power_mw 0 le lat_us 0
+ret 0
+end
+if gt power_mw 1000000000
+ret 0
+end
+if gt lat_us 1000000000
+ret 0
+end
+nj = mul power_mw lat_us
+ret wc_ceil_div nj 1000
+end
+
+note Stage identity & proof fields for pb_commit
+fn pb_stage_id sem_id ulong tid ulong prec ulong proof_mask ulong code_ptr ulong to void
+put pb_st_u 0 sem_id
+put pb_st_u 1 tid
+put pb_st_u 2 prec
+put pb_st_u 3 proof_mask
+put pb_st_u 4 code_ptr
+end
+
+note Stage physical & accuracy metrics for pb_commit
+fn pb_stage_phys power_mw long lat_us long joules_uj long err_bound long work_bits long to void
+put pb_st_i 0 power_mw
+put pb_st_i 1 lat_us
+put pb_st_i 2 joules_uj
+put pb_st_i 3 err_bound
+put pb_st_i 4 work_bits
+end
+
+note Admit the staged realization into the bank; strictly enforces proof_mask == 7!
+fn pb_commit to ulong
+put pb_last_idx 0 PB_NONE
+if ne get pb_st_u 3 PB_PROOF_REQUIRED
+put pb_rej_proof 0 add get pb_rej_proof 0 1
+ret PB_ERR_PROOF_MASK
+end
+if eq get pb_st_u 0 0
+ret PB_ERR_BAD_SEM
+end
+if ge get pb_st_u 1 TD_MAX_TARGETS
+ret PB_ERR_BAD_TARGET
+end
+prec = get pb_st_u 2
+if lt prec PB_PREC_FP64
+ret PB_ERR_BAD_PREC
+end
+if gt prec PB_PREC_ARBORIS_SHORTCUT
+ret PB_ERR_BAD_PREC
+end
+if eq get pb_st_u 4 0
+ret PB_ERR_BAD_PTR
+end
+if lt get pb_st_i 0 0
+ret PB_ERR_BAD_METRICS
+end
+if le get pb_st_i 1 0
+ret PB_ERR_BAD_METRICS
+end
+if lt get pb_st_i 2 0
+ret PB_ERR_BAD_METRICS
+end
+if lt get pb_st_i 3 0
+ret PB_ERR_BAD_METRICS
+end
+if lt get pb_st_i 4 0
+ret PB_ERR_BAD_METRICS
+end
+for i ulong PB_CAP
+if eq get pb_used i 0
+put pb_used i 1
+put pb_sem i get pb_st_u 0
+put pb_tid i get pb_st_u 1
+put pb_prec i prec
+put pb_proof i get pb_st_u 3
+put pb_code_ptr i get pb_st_u 4
+put pb_power_mw i get pb_st_i 0
+put pb_lat_us i get pb_st_i 1
+put pb_joules_uj i get pb_st_i 2
+put pb_err_bound i get pb_st_i 3
+wb = get pb_st_i 4
+if eq wb 0
+put pb_work_bits i 1000000
+else
+put pb_work_bits i wb
+end
+put pb_count 0 add get pb_count 0 1
+put pb_last_idx 0 i
+ret PB_OK
+end
+end
+ret PB_ERR_FULL
+end
+
+note Count realizations currently admitted for sem_id
+fn pb_count_for_sem sem_id ulong to ulong
+n = ulong 0
+for i ulong PB_CAP
+if eq get pb_used i 1
+if eq get pb_sem i sem_id
+n = add n 1
+end
+end
+end
+ret n
+end
+
+note True iff realization a strictly Pareto-dominates b on (power_mw, lat_us, err_bound)
+fn pb_dominates a ulong b ulong to bool
+if ge a PB_CAP
+ret false
+end
+if ge b PB_CAP
+ret false
+end
+if ne get pb_used a 1
+ret false
+end
+if ne get pb_used b 1
+ret false
+end
+if ne get pb_sem a get pb_sem b
+ret false
+end
+if gt get pb_power_mw a get pb_power_mw b
+ret false
+end
+if gt get pb_lat_us a get pb_lat_us b
+ret false
+end
+if gt get pb_err_bound a get pb_err_bound b
+ret false
+end
+if lt get pb_power_mw a get pb_power_mw b
+ret true
+end
+if lt get pb_lat_us a get pb_lat_us b
+ret true
+end
+if lt get pb_err_bound a get pb_err_bound b
+ret true
+end
+ret false
+end
+
+note Count non-dominated Pareto-frontier realizations for sem_id
+fn pb_frontier_count sem_id ulong to ulong
+f = ulong 0
+for i ulong PB_CAP
+if eq get pb_used i 1
+if eq get pb_sem i sem_id
+dom = false
+for j ulong PB_CAP
+if ne j i
+if pb_dominates j i
+dom = true
+break
+end
+end
+end
+if not dom
+f = add f 1
+end
+end
+end
+end
+ret f
+end

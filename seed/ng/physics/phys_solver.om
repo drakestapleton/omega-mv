@@ -1,0 +1,660 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/physics/phys_solver.om
+note Sovereign Intelligence 2.0 Stage 3 (Pillar 3: Physics-Typed Computing)
+note Real-Time Physics Dispatch Solver + ΩIR v2 Contract Reader + Error-Composition Tracker
+note + Direct fabHotSwap (seed/ng/target/fabric.om) Wiring.
+note
+note Exact 1:1 fixed-point mirror of seed/helix/proofs/PhysicsDispatch.lean.
+note Queries apps/omega-wattd/watt_cbf.om UNCHANGED (strictly DRY_RUN_READONLY, hw_writes=0).
+note
+note LOCKED strict priority hierarchy:
+note   1. Hardware WattCBF thermal/power safety ceiling is INVIOLABLE
+note      (P_gpu <= 80,000 mW, P_total <= min(P_budget, 140,000 mW), CBF h >= 0, fail_closed == 0,
+note       plus @power contract cap when > 0).
+note   2. Declared @err bound is NEVER silently broken (proven_err_bound <= @err).
+note   3. Minimize latency / honor @deadline inside (1) & (2):
+note      - If no safe realization meets @deadline:
+note        * @hard_deadline == 1 -> fail closed with PHYS_ERR_HARD_DEADLINE (never dispatches!)
+note        * @hard_deadline == 0 -> select fastest safe realization inside (1) & (2) AND emit
+note          explicit structured ALARM_DEADLINE_SLIP (never silent!).
+
+note Dispatch & refusal status codes
+const PHYS_OK ulong 0
+const PHYS_OK_DEADLINE_SLIP ulong 1
+const PHYS_ERR_BAD_SLOT ulong 10
+const PHYS_ERR_BAD_CONTRACT ulong 11
+const PHYS_ERR_BAD_BASELINE ulong 12
+const PHYS_ERR_WATTCBF_FAIL_CLOSED ulong 13
+const PHYS_ERR_NO_REALIZATION ulong 14
+const PHYS_ERR_WATTCBF_UNSAFE ulong 15
+const PHYS_ERR_ERR_BOUND ulong 16
+const PHYS_ERR_HARD_DEADLINE ulong 17
+const PHYS_ERR_FAB_SWAP ulong 18
+const PHYS_ERR_HW_WRITE_GUARD ulong 19
+const PHYS_ERR_CHAIN_ERR_OVERFLOW ulong 20
+const PHYS_ERR_CHAIN_BAD_STAGE ulong 21
+
+note Structured alarm codes (0 = none)
+const PHYS_ALARM_NONE ulong 0
+const PHYS_ALARM_DEADLINE_SLIP ulong 1
+
+note Actuator mode (strictly READ-ONLY / DRY-RUN)
+const PHYS_ACTUATOR_DRY_RUN_READONLY ulong 0
+
+note ΩIR v2 precision tiers (exact mirror of seed/ng/IR.md §16.1)
+const PHYS_TIER_UNSPEC ulong 0
+const PHYS_TIER_EXACT ulong 1
+const PHYS_TIER_TOL ulong 2
+
+note Contract staging array ps_ctr[0..6]:
+note [0]=purity_flag [1]=precision_tier [2]=hard_deadline [3]=err_bound
+note [4]=deadline_us [5]=power_mw [6]=reserved_byte
+global ps_ctr long 8
+
+note Baseline non-kernel rail loads ps_base[0..2]:
+note [0]=base_cpu_mw [1]=base_unc_mw [2]=fan_req_pct
+global ps_base long 4
+
+note Dispatch telemetry array ps_tel[0..19]:
+const PS_TEL_STATUS ulong 0
+const PS_TEL_BANK_IDX ulong 1
+const PS_TEL_TID ulong 2
+const PS_TEL_PREC ulong 3
+const PS_TEL_POWER_MW ulong 4
+const PS_TEL_LAT_US ulong 5
+const PS_TEL_JOULES_UJ ulong 6
+const PS_TEL_ERR_BOUND ulong 7
+const PS_TEL_DL_MARGIN_US ulong 8
+const PS_TEL_ALARM_CODE ulong 9
+const PS_TEL_ALARM_COUNT ulong 10
+const PS_TEL_TURING_YIELD ulong 11
+const PS_TEL_FAN_PCT ulong 12
+const PS_TEL_BARRIER_H ulong 13
+const PS_TEL_P_SAFE_GPU ulong 14
+const PS_TEL_P_SAFE_CPU ulong 15
+const PS_TEL_HW_WRITES ulong 16
+const PS_TEL_ACTUATOR_MODE ulong 17
+const PS_TEL_REJ_WATTCBF ulong 18
+const PS_TEL_REJ_ERR ulong 19
+global ps_tel long 20
+
+note Cumulative structured alarm log (up to 64 deadline-slip events; never silent)
+const PS_ALARM_CAP ulong 64
+global ps_alm_count ulong 1
+global ps_alm_code ulong 64
+global ps_alm_sem ulong 64
+global ps_alm_dl long 64
+global ps_alm_lat long 64
+global ps_alm_slip long 64
+global ps_alm_prec ulong 64
+global ps_alm_tid ulong 64
+
+note Cumulative dispatch statistics: [0]=dispatches [1]=refusals [2]=swaps [3]=hard_dl_refusals
+global ps_stats ulong 8
+
+note Sequential call-chain error-composition tracker (up to 64 stages)
+const PS_CHAIN_CAP ulong 64
+global ps_ch_active ulong 1
+global ps_ch_refused ulong 1
+global ps_ch_outer_err long 1
+global ps_ch_outer_tier long 1
+global ps_ch_total_err long 1
+global ps_ch_len ulong 1
+global ps_ch_sem ulong 64
+global ps_ch_err long 64
+
+fn ps_init to void
+for i ulong 8
+put ps_ctr i 0
+put ps_stats i 0
+end
+put ps_base 0 10000
+put ps_base 1 5000
+put ps_base 2 40
+for j ulong 20
+put ps_tel j 0
+end
+put ps_tel PS_TEL_BANK_IDX long PB_NONE
+put ps_tel PS_TEL_HW_WRITES 0
+put ps_tel PS_TEL_ACTUATOR_MODE long PHYS_ACTUATOR_DRY_RUN_READONLY
+put ps_alm_count 0 0
+put ps_ch_active 0 0
+put ps_ch_refused 0 0
+put ps_ch_outer_err 0 0
+put ps_ch_outer_tier 0 0
+put ps_ch_total_err 0 0
+put ps_ch_len 0 0
+note Ensure watt_sense hw_writes counter starts at 0 (strictly read-only)
+put g_wmeta 12 0
+end
+
+fn ps_set_baseline base_cpu_mw long base_unc_mw long fan_req long to void
+put ps_base 0 base_cpu_mw
+put ps_base 1 base_unc_mw
+put ps_base 2 fan_req
+end
+
+fn ps_set_contract purity long tier long hard_dl long err_b long dl_us long pwr_mw long to void
+put ps_ctr 0 purity
+put ps_ctr 1 tier
+put ps_ctr 2 hard_dl
+put ps_ctr 3 err_b
+put ps_ctr 4 dl_us
+put ps_ctr 5 pwr_mw
+put ps_ctr 6 0
+end
+
+note Decode little-endian u64 from byte slice at offset off (checked bounds)
+fn ps_le_u64 buf view uchar * off ulong to ulong
+if gt add off 8 len buf
+ret 0
+end
+v = ulong 0
+for k ulong 8
+b = ulong get buf add off k
+v = or v shl b mul k 8
+end
+ret v
+end
+
+note Canonical ΩIR v2 contract validation (exact mirror of seed/ng/IR.md §16.1 & PhysicsDispatch.lean)
+fn ps_contract_valid to bool
+if ne get ps_ctr 6 0
+ret false
+end
+pur = get ps_ctr 0
+if or lt pur 0 gt pur 1
+ret false
+end
+tier = get ps_ctr 1
+if or lt tier 0 gt tier 2
+ret false
+end
+hdl = get ps_ctr 2
+if or lt hdl 0 gt hdl 1
+ret false
+end
+eb = get ps_ctr 3
+if lt eb 0
+ret false
+end
+dl = get ps_ctr 4
+if lt dl 0
+ret false
+end
+if lt get ps_ctr 5 0
+ret false
+end
+if ne tier long PHYS_TIER_TOL
+if ne eb 0
+ret false
+end
+end
+if eq hdl 1
+if le dl 0
+ret false
+end
+end
+ret true
+end
+
+note Parse a live 28-byte ΩIR v2 wire contract record (IR.md §16.1) into ps_ctr and validate
+note Wire layout: [0]=purity u8, [1]=precision_tier u8, [2]=hard_deadline u8, [3]=reserved u8,
+note              [4..11]=err_bound u64 LE, [12..19]=deadline_us u64 LE, [20..27]=power_mw u64 LE
+fn ps_parse_oir_v2_contract rec view uchar * to ulong
+if lt len rec 28
+ret PHYS_ERR_BAD_CONTRACT
+end
+put ps_ctr 0 long get rec 0
+put ps_ctr 1 long get rec 1
+put ps_ctr 2 long get rec 2
+put ps_ctr 6 long get rec 3
+v = ps_le_u64 rec 4
+if gt v 9000000000000000000
+ret PHYS_ERR_BAD_CONTRACT
+end
+put ps_ctr 3 long v
+v = ps_le_u64 rec 12
+if gt v 9000000000000000000
+ret PHYS_ERR_BAD_CONTRACT
+end
+put ps_ctr 4 long v
+v = ps_le_u64 rec 20
+if gt v 9000000000000000000
+ret PHYS_ERR_BAD_CONTRACT
+end
+put ps_ctr 5 long v
+if not ps_contract_valid
+ret PHYS_ERR_BAD_CONTRACT
+end
+ret PHYS_OK
+end
+
+note Build WattProp for bank realization idx using baseline CPU/Uncore loads
+fn ps_make_prop idx ulong prop edit WattProp to void
+tid = get pb_tid idx
+pw = get pb_power_mw idx
+bcpu = get ps_base 0
+bunc = get ps_base 1
+fan = get ps_base 2
+if pb_is_gpu_target tid
+put prop p_gpu pw
+put prop p_cpu bcpu
+put prop p_unc bunc
+put prop fan_pct fan
+else
+put prop p_gpu 0
+put prop p_cpu add bcpu pw
+put prop p_unc bunc
+put prop fan_pct fan
+end
+end
+
+note Query watt_cbf.om instantaneous safe power headroom (P_safe_gpu, P_safe_cpu_extra)
+fn ps_query_envelope st view WattThermal pol view WattPolicy to void
+bcpu = get ps_base 0
+bunc = get ps_base 1
+fan = get ps_base 2
+pg_probe = new WattProp WATT_P_GPU_HARD_MAX bcpu bunc fan
+cg = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pg_probe cg
+if eq get cg fail_closed 1
+put ps_tel PS_TEL_P_SAFE_GPU 0
+put ps_tel PS_TEL_P_SAFE_CPU 0
+ret
+end
+put ps_tel PS_TEL_P_SAFE_GPU get cg p_gpu
+pc_probe = new WattProp 0 WATT_P_TOTAL_HARD_MAX bunc fan
+cc = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pc_probe cc
+cpu_tot = get cc p_cpu
+cpu_extra = sub cpu_tot bcpu
+if lt cpu_extra 0
+cpu_extra = long 0
+end
+put ps_tel PS_TEL_P_SAFE_CPU cpu_extra
+end
+
+note Priority 1 (INVIOLABLE): verify proof_mask == 7, WattCBF un-clamped admission, and @power cap
+fn ps_check_wattcbf idx ulong st view WattThermal pol view WattPolicy to bool
+if ne get pb_proof idx PB_PROOF_REQUIRED
+ret false
+end
+pw = get pb_power_mw idx
+if lt pw 0
+ret false
+end
+if gt pw WATT_P_TOTAL_HARD_MAX
+ret false
+end
+if le get pb_lat_us idx 0
+ret false
+end
+if lt get pb_joules_uj idx 0
+ret false
+end
+if lt get pb_err_bound idx 0
+ret false
+end
+cpw = get ps_ctr 5
+if gt cpw 0
+if gt pw cpw
+ret false
+end
+end
+pr = new WattProp 0 0 0 0
+cmd = new WattCmd 0 0 0 0 0 0
+ps_make_prop idx pr
+wc_cbf_filter st pol pr cmd
+if ne get cmd fail_closed 0
+ret false
+end
+if ne get cmd p_gpu get pr p_gpu
+ret false
+end
+if ne get cmd p_cpu get pr p_cpu
+ret false
+end
+if ne get cmd p_unc get pr p_unc
+ret false
+end
+ret true
+end
+
+note Priority 2 (INVIOLABLE): declared @err bound is NEVER silently broken
+fn ps_check_err idx ulong to bool
+ret le get pb_err_bound idx get ps_ctr 3
+end
+
+note Exact deterministic preference order inside (1) & (2):
+note minimize est_latency_us, tie-break by lower err_bound, lower est_joules_uj, lower est_power_mw
+fn ps_better a ulong b ulong to bool
+la = get pb_lat_us a
+lb = get pb_lat_us b
+if lt la lb
+ret true
+end
+if gt la lb
+ret false
+end
+ea = get pb_err_bound a
+eb = get pb_err_bound b
+if lt ea eb
+ret true
+end
+if gt ea eb
+ret false
+end
+ua = get pb_joules_uj a
+ub = get pb_joules_uj b
+if lt ua ub
+ret true
+end
+if gt ua ub
+ret false
+end
+ret lt get pb_power_mw a get pb_power_mw b
+end
+
+note Compute exact TuringYield_J (bits/Joule) via watt_cbf.om's overflow-free wc_turing_yield_bpj
+fn ps_turing_yield_uj work_bits long joules_uj long to long
+if or le work_bits 0 le joules_uj 0
+ret 0
+end
+if le work_bits 9000000000000000
+ret wc_turing_yield_bpj mul work_bits 1000 joules_uj
+end
+mj = wc_ceil_div joules_uj 1000
+ret wc_turing_yield_bpj work_bits mj
+end
+
+note Emit structured ALARM_DEADLINE_SLIP event for bank entry idx (never silent!)
+fn ps_emit_alarm idx ulong dl long to void
+cnt = get ps_alm_count 0
+lat = get pb_lat_us idx
+if lt cnt PS_ALARM_CAP
+put ps_alm_code cnt PHYS_ALARM_DEADLINE_SLIP
+put ps_alm_sem cnt get pb_sem idx
+put ps_alm_dl cnt dl
+put ps_alm_lat cnt lat
+put ps_alm_slip cnt sub lat dl
+put ps_alm_prec cnt get pb_prec idx
+put ps_alm_tid cnt get pb_tid idx
+end
+ncnt = add cnt 1
+put ps_alm_count 0 ncnt
+put ps_tel PS_TEL_ALARM_CODE long PHYS_ALARM_DEADLINE_SLIP
+put ps_tel PS_TEL_ALARM_COUNT long ncnt
+end
+
+note Record structured refusal telemetry (fabWtbl untouched!)
+fn ps_record_refusal code ulong to ulong
+put ps_tel PS_TEL_STATUS long code
+put ps_tel PS_TEL_BANK_IDX long PB_NONE
+put ps_tel PS_TEL_TID 0
+put ps_tel PS_TEL_PREC 0
+put ps_tel PS_TEL_POWER_MW 0
+put ps_tel PS_TEL_LAT_US 0
+put ps_tel PS_TEL_JOULES_UJ 0
+put ps_tel PS_TEL_ERR_BOUND 0
+put ps_tel PS_TEL_DL_MARGIN_US 0
+put ps_tel PS_TEL_ALARM_CODE long PHYS_ALARM_NONE
+put ps_tel PS_TEL_ALARM_COUNT long get ps_alm_count 0
+put ps_tel PS_TEL_TURING_YIELD 0
+put ps_tel PS_TEL_HW_WRITES get g_wmeta 12
+put ps_tel PS_TEL_ACTUATOR_MODE long PHYS_ACTUATOR_DRY_RUN_READONLY
+put ps_stats 1 add get ps_stats 1 1
+if eq code PHYS_ERR_HARD_DEADLINE
+put ps_stats 3 add get ps_stats 3 1
+end
+ret code
+end
+
+note Record WattCBF fan and barrier-h telemetry for admitted bank entry idx
+fn ps_record_cbf_tel idx ulong st view WattThermal pol view WattPolicy to void
+pr = new WattProp 0 0 0 0
+cmd = new WattCmd 0 0 0 0 0 0
+ps_make_prop idx pr
+wc_cbf_filter st pol pr cmd
+dt = wc_next_die_delta st get cmd p_gpu get cmd p_cpu get cmd p_unc
+bh = wc_barrier_h get pol t_ceil get st t_die get pol tau dt
+put ps_tel PS_TEL_FAN_PCT get cmd fan_pct
+put ps_tel PS_TEL_BARRIER_H bh
+end
+
+note Record telemetry for an admitted, hot-swapped realization
+fn ps_record_win idx ulong st view WattThermal pol view WattPolicy slipped bool to ulong
+ps_record_cbf_tel idx st pol
+dl = get ps_ctr 4
+lat = get pb_lat_us idx
+margin = long 0
+if gt dl 0
+margin = sub dl lat
+end
+put ps_tel PS_TEL_DL_MARGIN_US margin
+put ps_tel PS_TEL_LAT_US lat
+put ps_tel PS_TEL_BANK_IDX long idx
+put ps_tel PS_TEL_TID long get pb_tid idx
+put ps_tel PS_TEL_PREC long get pb_prec idx
+put ps_tel PS_TEL_POWER_MW get pb_power_mw idx
+put ps_tel PS_TEL_JOULES_UJ get pb_joules_uj idx
+put ps_tel PS_TEL_ERR_BOUND get pb_err_bound idx
+put ps_tel PS_TEL_TURING_YIELD ps_turing_yield_uj get pb_work_bits idx get pb_joules_uj idx
+put ps_tel PS_TEL_HW_WRITES get g_wmeta 12
+put ps_tel PS_TEL_ACTUATOR_MODE long PHYS_ACTUATOR_DRY_RUN_READONLY
+put ps_stats 0 add get ps_stats 0 1
+put ps_stats 2 add get ps_stats 2 1
+if slipped
+ps_emit_alarm idx dl
+put ps_tel PS_TEL_STATUS long PHYS_OK_DEADLINE_SLIP
+ret PHYS_OK_DEADLINE_SLIP
+end
+put ps_tel PS_TEL_ALARM_CODE long PHYS_ALARM_NONE
+put ps_tel PS_TEL_ALARM_COUNT long get ps_alm_count 0
+put ps_tel PS_TEL_STATUS long PHYS_OK
+ret PHYS_OK
+end
+
+note Scan bank for minimum-latency safe candidate inside Priorities (1) & (2).
+note Sets ps_tel[PS_TEL_REJ_WATTCBF] and ps_tel[PS_TEL_REJ_ERR]; returns bank idx or PB_NONE.
+note Uses ps_stats[4] temporarily for found count.
+fn ps_select_best sem_id ulong st view WattThermal pol view WattPolicy to ulong
+best = PB_NONE
+found = ulong 0
+rej_wc = long 0
+rej_err = long 0
+for i ulong PB_CAP
+if eq get pb_used i 1
+if eq get pb_sem i sem_id
+found = add found 1
+if not ps_check_wattcbf i st pol
+rej_wc = add rej_wc 1
+else
+if not ps_check_err i
+rej_err = add rej_err 1
+else
+if eq best PB_NONE
+best = i
+else
+if ps_better i best
+best = i
+end
+end
+end
+end
+end
+end
+end
+put ps_stats 4 found
+put ps_tel PS_TEL_REJ_WATTCBF rej_wc
+put ps_tel PS_TEL_REJ_ERR rej_err
+ret best
+end
+
+note Primary Real-Time Physics Dispatch Solver:
+note Queries watt_cbf.om + ΩIR v2 contract, enforces WattCBF > @err > @deadline,
+note wires winner into fabHotSwap (seed/ng/target/fabric.om), records telemetry.
+fn ps_dispatch sem_id ulong wtbl_slot ulong st view WattThermal pol view WattPolicy to ulong
+if ne get g_wmeta 12 0
+ret ps_record_refusal PHYS_ERR_HW_WRITE_GUARD
+end
+if ge wtbl_slot FAB_SLOTS
+ret ps_record_refusal PHYS_ERR_BAD_SLOT
+end
+if not ps_contract_valid
+ret ps_record_refusal PHYS_ERR_BAD_CONTRACT
+end
+if lt get ps_base 0 0
+ret ps_record_refusal PHYS_ERR_BAD_BASELINE
+end
+if lt get ps_base 1 0
+ret ps_record_refusal PHYS_ERR_BAD_BASELINE
+end
+ps_query_envelope st pol
+if wc_must_fail_closed st pol
+put ps_tel PS_TEL_FAN_PCT WATT_FAN_MAX
+put ps_tel PS_TEL_BARRIER_H 0
+ret ps_record_refusal PHYS_ERR_WATTCBF_FAIL_CLOSED
+end
+best = ps_select_best sem_id st pol
+if eq best PB_NONE
+if eq get ps_stats 4 0
+ret ps_record_refusal PHYS_ERR_NO_REALIZATION
+end
+if gt get ps_tel PS_TEL_REJ_ERR 0
+ret ps_record_refusal PHYS_ERR_ERR_BOUND
+end
+ret ps_record_refusal PHYS_ERR_WATTCBF_UNSAFE
+end
+dl = get ps_ctr 4
+slipped = false
+if gt dl 0
+if gt get pb_lat_us best dl
+slipped = true
+end
+end
+if slipped
+if eq get ps_ctr 2 1
+ret ps_record_refusal PHYS_ERR_HARD_DEADLINE
+end
+end
+tid = get pb_tid best
+mode = pb_mode_for_realization tid get pb_prec best
+if not fabHotSwap wtbl_slot sem_id get pb_code_ptr best tid mode get pb_proof best
+ret ps_record_refusal PHYS_ERR_FAB_SWAP
+end
+ret ps_record_win best st pol slipped
+end
+
+note ---- Sequential Call-Chain Error-Composition Tracker ----
+
+note Begin a sequential call chain bounded by outer_err (and outer precision tier)
+fn ps_chain_begin outer_err long outer_tier long to ulong
+put ps_ch_active 0 0
+put ps_ch_refused 0 0
+put ps_ch_total_err 0 0
+put ps_ch_len 0 0
+if or lt outer_err 0 or lt outer_tier 0 gt outer_tier 2
+ret PHYS_ERR_BAD_CONTRACT
+end
+if ne outer_tier long PHYS_TIER_TOL
+if ne outer_err 0
+ret PHYS_ERR_BAD_CONTRACT
+end
+end
+put ps_ch_outer_err 0 outer_err
+put ps_ch_outer_tier 0 outer_tier
+put ps_ch_active 0 1
+ret PHYS_OK
+end
+
+note Compose one additive stage error bound into the active call chain (overflow-safe)
+fn ps_chain_add_stage sem_id ulong stage_err long to ulong
+if eq get ps_ch_active 0 0
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+if eq get ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+if lt stage_err 0
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+n = get ps_ch_len 0
+if ge n PS_CHAIN_CAP
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+tot = get ps_ch_total_err 0
+outer = get ps_ch_outer_err 0
+rem_bud = sub outer tot
+if gt stage_err rem_bud
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+put ps_ch_sem n sem_id
+put ps_ch_err n stage_err
+put ps_ch_total_err 0 add tot stage_err
+put ps_ch_len 0 add n 1
+ret PHYS_OK
+end
+
+note Compose one interval/Lipschitz stage: outward-rounded ceil(total_err * amp_num / amp_den) + stage_err
+fn ps_chain_add_stage_amp sem_id ulong stage_err long amp_num long amp_den long to ulong
+if eq get ps_ch_active 0 0
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+if eq get ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+if or lt stage_err 0 or le amp_den 0 lt amp_num amp_den
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+n = get ps_ch_len 0
+if ge n PS_CHAIN_CAP
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+tot = get ps_ch_total_err 0
+outer = get ps_ch_outer_err 0
+if gt tot 1000000000
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+if gt amp_num 1000000000
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+scaled = wc_ceil_div mul tot amp_num amp_den
+if gt scaled outer
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+rem_bud = sub outer scaled
+if gt stage_err rem_bud
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+put ps_ch_sem n sem_id
+put ps_ch_err n stage_err
+put ps_ch_total_err 0 add scaled stage_err
+put ps_ch_len 0 add n 1
+ret PHYS_OK
+end
+
+note Commit the active call chain; refuses if any stage overflowed outer @err
+fn ps_chain_commit to ulong
+if eq get ps_ch_active 0 0
+ret PHYS_ERR_CHAIN_BAD_STAGE
+end
+if ne get ps_ch_refused 0 0
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+if gt get ps_ch_total_err 0 get ps_ch_outer_err 0
+put ps_ch_refused 0 1
+ret PHYS_ERR_CHAIN_ERR_OVERFLOW
+end
+put ps_ch_active 0 0
+ret PHYS_OK
+end
