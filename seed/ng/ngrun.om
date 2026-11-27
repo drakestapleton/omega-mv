@@ -47,6 +47,7 @@ global r_tv ulong 64
 global r_tw ulong 64
 global r_dg uchar 24
 global r_pa uchar 4096
+global rp_cfg ulong 8
 text r_msg "ngrun: unsupported op \n at \nngrun: unsupported host word \nngrun: refused class \nngrun: usage: ngrun FILE.ir [STEPS]\nngrun: cannot read input\nngrun: step limit at \nngrun: access outside storage at \n"
 note ---- messages ---------------------------------------------------------------------------------
 fn rn_say a ulong b ulong to void
@@ -892,6 +893,9 @@ ret or gt b n gt x sub n b
 end
 fn rn_check o uint to void
 if rn_ckfail o uint get i_oop o
+if ne get rp_cfg 0 0
+rp_on_trap o get i_oim o
+end
 exit int add 100 get i_oim o
 end
 end
@@ -1163,6 +1167,9 @@ end
 fn rn_ret x ulong y ulong to uint
 d = get r_s 3
 if eq d 0
+if ne get rp_cfg 0 0
+rp_on_exit 0 x
+end
 exit int bitcast long x
 end
 d = sub d 1
@@ -1200,9 +1207,15 @@ if eq op 64
 ret rn_call o
 end
 if eq op 65
+if ne get rp_cfg 0 0
+rp_on_trap o get i_oim o
+end
 exit int add 100 get i_oim o
 end
 if eq op 66
+if ne get rp_cfg 0 0
+rp_on_exit 1 rn_a o 1
+end
 exit int bitcast long rn_a o 1
 end
 rn_uns o
@@ -1360,13 +1373,22 @@ end
 rn_setup
 rn_globs
 o = rn_enter f 0
+if ne get rp_cfg 0 0
+rp_init
+end
 while true bound 9223372036854775807
 if ge get r_s 6 get r_s 5
 rn_lim 141 162 o
 exit 124
 end
+if ne get rp_cfg 0 0
+rp_before_step o
+end
 put r_s 6 add get r_s 6 1
 o = rn_step o
+if ne get rp_cfg 0 0
+rp_after_step
+end
 end
 ret 0
 end
@@ -1445,10 +1467,15 @@ rn_usage
 end
 put r_cfg 0 i
 else
+nxt = rp_opt i
+if ne nxt 0
+i = nxt
+else
 if ne i 2
 rn_usage
 end
 put r_s 5 rn_steps
+end
 end
 i = add i 1
 end
@@ -2247,4 +2274,1292 @@ for j ulong sz bound 8
 v = or v shl ulong get r_pm add p j mul j 8
 end
 ret v
+end
+
+note ---- Stage 2 gated tok-journal & trap-to-cause backwards rewind hook ------------------------------
+note Zero overhead / zero pool allocations when --journal and --rewind are not passed (rp_cfg[0] == 0).
+text rp_opt_j "--journal"
+text rp_opt_r "--rewind"
+text rp_opt_c "--ckpt-every"
+text rp_jmag "OTKJ"
+text rp_jdom "OTKJ1"
+text rp_sh_kiv "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+
+text rp_msg0 "ngrun-rewind: trap="
+text rp_msg1 " trap_step="
+text rp_msg2 " trap_op="
+text rp_msg3 " trap_blk="
+text rp_msg4 " trap_opidx="
+text rp_msg5 " trap_off="
+text rp_msg6 " ckpt_step="
+text rp_msg7 " ckpt_jumps="
+text rp_msg8 " replay_parity="
+text rp_msg9 "EXACT"
+text rp_msg10 "MISMATCH"
+text rp_msg11 " cause_step="
+text rp_msg12 " cause_tok_seq="
+text rp_msg13 " cause_op="
+text rp_msg14 " cause_blk="
+text rp_msg15 " cause_opidx="
+text rp_msg16 " cause_off="
+text rp_msg17 " cause_val="
+text rp_msg18 " journal_entries="
+
+global rp_sh_k uint 72
+global rp_sh_w uint 64
+global rp_sh_v uint 8
+global rp_sh_h uint 8
+global rp_sh_pad uchar 128
+global rp_sh_dig uchar 32
+global rp_sh_st ulong 2
+global rp_sh_dat uchar 4096
+
+note Live journal state (growable run-time pool, zero cap)
+global rp_jbuf uchar *
+global rp_j_st ulong 4
+global rp_j_lasth uchar 32
+global rp_j_io uchar 4096
+
+note Periodic VM+SLAB checkpoints (growable run-time pools, zero cap)
+global rp_ck_hdr ulong *
+global rp_ck_v ulong *
+global rp_ck_w ulong *
+global rp_ck_m uchar *
+global rp_ck_pm uchar *
+global rp_ck_c ulong *
+global rp_ck_g ulong *
+note rp_ck_st: 0 ck_cnt, 1 v_used, 2 m_used, 3 pm_used, 4 c_used, 5 g_used
+global rp_ck_st ulong 8
+
+note Replay trace window (growable run-time pools)
+global rp_tr_step ulong *
+global rp_tr_op uint *
+global rp_tr_dep ulong *
+global rp_tr_tok ulong *
+global rp_tr_res ulong *
+global rp_tr_mkind uchar *
+global rp_tr_mpool uchar *
+global rp_tr_maddr ulong *
+global rp_tr_msz ulong *
+global rp_tr_mval ulong *
+note rp_tr_st: 0 win_len, 1 cur_tok_seq, 2 parity_ok, 3 ckpt_jumps, 4 first_ck_step,
+note           5 cause_found, 6 cause_step, 7 cause_tok, 8 cause_op, 9 cause_blk,
+note           10 cause_opidx, 11 cause_off, 12 cause_val, 13 trap_vh, 14 trap_val, 15 trap_depth
+global rp_tr_st ulong 16
+note rp_walk: 0 mode(0=ssa,1=mem), 1 cur_vh, 2 cur_dep, 3 tgt_addr, 4 tgt_sz, 5 tgt_pool, 6 done
+global rp_walk ulong 8
+
+note ---- inline FIPS 180-4 SHA-256 (mirrors seed/ng/sha256.om) ----
+fn rp_sh_init to void
+if ne get rp_sh_st 1 0
+ret
+end
+put rp_sh_st 1 1
+p = ulong 0
+for i ulong 72
+v = ulong 0
+while lt get rp_sh_kiv p 48 bound 4
+p = add p 1
+end
+while ge get rp_sh_kiv p 48 bound 11
+v = add mul v 10 ulong sub get rp_sh_kiv p 48
+p = add p 1
+if ge p len rp_sh_kiv
+put rp_sh_k i uint v
+ret
+end
+end
+put rp_sh_k i uint v
+end
+end
+
+fn rp_sh_rr x uint n uint to uint
+ret or shr x n shl x sub 32 n
+end
+
+fn rp_sh_be src ulong o ulong to uint
+v = uint 0
+for j ulong 4
+b = uint 0
+if eq src 0
+b = uint get rp_sh_dat add o j
+else
+b = uint get rp_sh_pad add o j
+end
+v = or shl v 8 b
+end
+ret v
+end
+
+fn rp_sh_s0 a uint to uint
+ret xor xor rp_sh_rr a 2 rp_sh_rr a 13 rp_sh_rr a 22
+end
+
+fn rp_sh_s1 e uint to uint
+ret xor xor rp_sh_rr e 6 rp_sh_rr e 11 rp_sh_rr e 25
+end
+
+fn rp_sh_g0 x uint to uint
+ret xor xor rp_sh_rr x 7 rp_sh_rr x 18 shr x 3
+end
+
+fn rp_sh_g1 x uint to uint
+ret xor xor rp_sh_rr x 17 rp_sh_rr x 19 shr x 10
+end
+
+fn rp_sh_maj a uint b uint c uint to uint
+ret xor xor and a b and a c and b c
+end
+
+fn rp_sh_rnd i ulong to void
+e = get rp_sh_v 4
+t1 = add get rp_sh_v 7 rp_sh_s1 e
+t1 = add t1 xor and e get rp_sh_v 5 and not e get rp_sh_v 6
+t1 = add t1 add get rp_sh_k i get rp_sh_w i
+a = get rp_sh_v 0
+t2 = add rp_sh_s0 a rp_sh_maj a get rp_sh_v 1 get rp_sh_v 2
+put rp_sh_v 7 get rp_sh_v 6
+put rp_sh_v 6 get rp_sh_v 5
+put rp_sh_v 5 e
+put rp_sh_v 4 add get rp_sh_v 3 t1
+put rp_sh_v 3 get rp_sh_v 2
+put rp_sh_v 2 get rp_sh_v 1
+put rp_sh_v 1 a
+put rp_sh_v 0 add t1 t2
+end
+
+fn rp_sh_blk src ulong o ulong to void
+for t ulong 16
+put rp_sh_w t rp_sh_be src add o mul t 4
+end
+for t ulong 48
+u = add t 16
+x = add rp_sh_g1 get rp_sh_w sub u 2 get rp_sh_w sub u 7
+put rp_sh_w u add x add rp_sh_g0 get rp_sh_w sub u 15 get rp_sh_w sub u 16
+end
+for j ulong 8
+put rp_sh_v j get rp_sh_h j
+end
+for i ulong 64
+rp_sh_rnd i
+end
+for j ulong 8
+put rp_sh_h j add get rp_sh_h j get rp_sh_v j
+end
+end
+
+fn rp_sh_out to void
+for j ulong 8
+v = get rp_sh_h j
+for q ulong 4
+s = uint mul sub 3 q 8
+put rp_sh_dig add mul j 4 q uchar and shr v s 255
+end
+end
+end
+
+fn rp_sh_all n ulong to void
+rp_sh_init
+for j ulong 8
+put rp_sh_h j get rp_sh_k add j 64
+end
+nb = div n 64
+for b ulong nb bound 64
+rp_sh_blk 0 mul b 64
+end
+r = rem n 64
+o = mul nb 64
+for j ulong 128
+put rp_sh_pad j 0
+end
+for j ulong r bound 64
+put rp_sh_pad j get rp_sh_dat add o j
+end
+put rp_sh_pad r 128
+e = ulong 64
+if ge r 56
+e = ulong 128
+end
+bits = mul n 8
+for j ulong 8
+put rp_sh_pad sub sub e 1 j uchar and shr bits mul j 8 255
+end
+rp_sh_blk 1 0
+if eq e 128
+rp_sh_blk 1 64
+end
+rp_sh_out
+end
+
+note ---- CLI options parser for --journal, --rewind, --ckpt-every ----
+fn rp_parse_dec idx ulong to ulong
+m = argread idx r_pa 0 4096
+if or le m 0 gt m 10
+rn_usage
+end
+x = ulong 0
+for j ulong ulong m bound 10
+c = ulong get r_pa j
+if or lt c 48 gt c 57
+rn_usage
+end
+x = add mul x 10 sub c 48
+end
+if or eq x 0 gt x 1000000
+rn_usage
+end
+ret x
+end
+
+fn rp_opt i ulong to ulong
+if rn_argis i rp_opt_r
+put rp_cfg 0 or get rp_cfg 0 2
+if eq get rp_cfg 2 0
+put rp_cfg 2 8
+end
+ret i
+end
+if rn_argis i rp_opt_j
+if ge add i 1 ulong argcnt
+rn_usage
+end
+put rp_cfg 0 or get rp_cfg 0 1
+put rp_cfg 1 add i 1
+ret add i 1
+end
+if rn_argis i rp_opt_c
+if ge add i 1 ulong argcnt
+rn_usage
+end
+put rp_cfg 2 rp_parse_dec add i 1
+ret add i 1
+end
+ret 0
+end
+
+note ---- OTKJ v1 live journal helpers ----
+fn rp_j_grow need ulong to bool
+cur = len rp_jbuf
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge rp_jbuf cap
+ret ge rc 0
+end
+
+fn rp_j_put32 off ulong v ulong to void
+for j ulong 4
+b = uchar and shr v mul j 8 255
+put rp_jbuf add off j b
+end
+end
+
+fn rp_j_put64 off ulong v ulong to void
+for j ulong 8
+b = uchar and shr v mul j 8 255
+put rp_jbuf add off j b
+end
+end
+
+fn rp_op_idx o uint to ulong
+b = get i_ob o
+cur = get i_bo1 b
+idx = ulong 0
+while ne cur 0 bound 1048576
+if eq cur o
+ret idx
+end
+cur = get i_onx cur
+idx = add idx 1
+end
+ret idx
+end
+
+fn rp_op_tok_kind op uint to ulong
+if and ge op 70 le op 82
+ret 1
+end
+if or eq op 43 or eq op 51 or eq op 56 eq op 59
+ret 2
+end
+if or eq op 47 eq op 48
+ret 3
+end
+if eq op 50
+ret 4
+end
+if eq op 64
+ret 5
+end
+if eq op 110
+ret 6
+end
+if or eq op 111 or eq op 114 or eq op 115 eq op 116
+ret 7
+end
+if eq op 65
+ret 8
+end
+if eq op 66
+ret 9
+end
+ret 0
+end
+
+fn rp_j_seal off ulong seq ulong to void
+for j ulong 32
+b = get rp_j_lasth j
+put rp_jbuf add add off 53 j b
+end
+for j ulong 5
+put rp_sh_dat j get rp_jdom j
+end
+put rp_sh_dat 5 0
+for j ulong 85
+b = get rp_jbuf add off j
+put rp_sh_dat add 6 j b
+end
+rp_sh_all 91
+for j ulong 32
+b = get rp_sh_dig j
+put rp_jbuf add add off 85 j b
+put rp_j_lasth j b
+end
+put rp_j_st 0 add off 117
+rp_j_put64 8 add seq 1
+end
+
+fn rp_j_w1 o uint to ulong
+if eq o 0
+ret 0
+end
+a = ulong get i_oop o
+b = shl ulong o 8
+c = shl ulong get i_oof o 32
+ret or a or b c
+end
+
+fn rp_j_emit kind ulong o uint w0 ulong w2 ulong w3 ulong to void
+seq = get rp_j_st 1
+put rp_j_st 1 add seq 1
+if eq and get rp_cfg 0 1 0
+ret
+end
+off = get rp_j_st 0
+if not rp_j_grow add off 117
+ret
+end
+blk = ulong 0
+opi = ulong 0
+if ne o 0
+blk = ulong get i_bix get i_ob o
+opi = rp_op_idx o
+end
+rp_j_put64 off seq
+put rp_jbuf add off 8 uchar kind
+rp_j_put32 add off 9 blk
+rp_j_put32 add off 13 opi
+rp_j_put32 add off 17 32
+rp_j_put64 add off 21 w0
+rp_j_put64 add off 29 rp_j_w1 o
+rp_j_put64 add off 37 w2
+rp_j_put64 add off 45 w3
+rp_j_seal off seq
+end
+
+fn rp_j_flush to void
+if eq and get rp_cfg 0 1 0
+ret
+end
+m = argread get rp_cfg 1 r_pa 0 4096
+if or le m 0 ge m 4096
+ret
+end
+fd = fopen r_pa 0 ulong m 577 420
+if lt fd 0
+ret
+end
+tot = get rp_j_st 0
+off = ulong 0
+while lt off tot bound 1048576
+n = sub tot off
+if gt n 4096
+n = ulong 4096
+end
+for j ulong n bound 4096
+b = get rp_jbuf add off j
+put rp_j_io j b
+end
+w = ulong 0
+while lt w n bound 4096
+k = write int fd rp_j_io w sub n w
+if le k 0
+r = fclose int fd
+ret
+end
+w = add w ulong k
+end
+off = add off n
+end
+r = fclose int fd
+end
+
+fn rp_init to void
+if eq get rp_cfg 2 0
+put rp_cfg 2 8
+end
+put rp_j_st 0 0
+put rp_j_st 1 0
+for j ulong 32
+put rp_j_lasth j 0
+end
+if ne and get rp_cfg 0 1 0
+if rp_j_grow 16
+for j ulong 4
+b = get rp_jmag j
+put rp_jbuf j b
+end
+put rp_jbuf 4 1
+put rp_jbuf 5 0
+put rp_jbuf 6 0
+put rp_jbuf 7 0
+rp_j_put64 8 0
+put rp_j_st 0 16
+end
+end
+for j ulong 8
+put rp_ck_st j 0
+end
+end
+
+note ---- Periodic VM + SLAB checkpointing ----
+fn rp_grow_ck_hdr need ulong to bool
+cur = len rp_ck_hdr
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 1024
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge rp_ck_hdr cap
+ret ge rc 0
+end
+
+fn rp_grow_ck_v need ulong to bool
+cur = len rp_ck_v
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+r0 = enlarge rp_ck_v cap
+if lt r0 0
+ret false
+end
+r1 = enlarge rp_ck_w cap
+ret ge r1 0
+end
+
+fn rp_grow_ck_m need ulong to bool
+cur = len rp_ck_m
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge rp_ck_m cap
+ret ge rc 0
+end
+
+fn rp_grow_ck_pm need ulong to bool
+cur = len rp_ck_pm
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 4096
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge rp_ck_pm cap
+ret ge rc 0
+end
+
+fn rp_grow_ck_c need ulong to bool
+cur = len rp_ck_c
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 256
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge rp_ck_c cap
+ret ge rc 0
+end
+
+fn rp_grow_ck_g need ulong to bool
+cur = len rp_ck_g
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 256
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+rc = enlarge rp_ck_g cap
+ret ge rc 0
+end
+
+fn rp_ck_save_frames coff ulong dep ulong to void
+for j ulong dep bound 65536
+p = add coff mul j 5
+put rp_ck_c p ulong get r_cf j
+put rp_ck_c add p 1 ulong get r_co j
+put rp_ck_c add p 2 get r_cs j
+put rp_ck_c add p 3 get r_cm j
+put rp_ck_c add p 4 get r_ct j
+end
+end
+
+fn rp_ck_save_pools pmoff ulong pmlen ulong goff ulong ng ulong to void
+for j ulong pmlen bound 16777216
+b = get r_pm j
+put rp_ck_pm add pmoff j b
+end
+for j ulong ng bound 65536
+h = add j 1
+p = add goff mul j 2
+put rp_ck_g p get r_pb h
+put rp_ck_g add p 1 get r_pl h
+end
+end
+
+fn rp_ck_save_vm voff ulong vlen ulong moff ulong mlen ulong to void
+for j ulong vlen bound 4194304
+put rp_ck_v add voff j get r_v j
+put rp_ck_w add voff j get r_w j
+end
+for j ulong mlen bound 16777216
+b = get r_m j
+put rp_ck_m add moff j b
+end
+end
+
+fn rp_ck_take_aux hb ulong to bool
+pmlen = get r_ps 0
+pmoff = get rp_ck_st 3
+ng = get i_n 2
+goff = get rp_ck_st 5
+if gt pmlen 0
+if not rp_grow_ck_pm add pmoff pmlen
+ret false
+end
+if not rp_grow_ck_g add goff mul ng 2
+ret false
+end
+rp_ck_save_pools pmoff pmlen goff ng
+put rp_ck_st 3 add pmoff pmlen
+put rp_ck_st 5 add goff mul ng 2
+end
+dep = get r_s 3
+coff = get rp_ck_st 4
+if gt dep 0
+if not rp_grow_ck_c add coff mul dep 5
+ret false
+end
+rp_ck_save_frames coff dep
+put rp_ck_st 4 add coff mul dep 5
+end
+put rp_ck_hdr add hb 11 pmoff
+put rp_ck_hdr add hb 12 pmlen
+put rp_ck_hdr add hb 13 coff
+put rp_ck_hdr add hb 14 dep
+put rp_ck_hdr add hb 15 goff
+ret true
+end
+
+fn rp_ck_take o uint to void
+cid = get rp_ck_st 0
+hb = mul cid 16
+if not rp_grow_ck_hdr add hb 16
+ret
+end
+vlen = get r_s 4
+voff = get rp_ck_st 1
+if not rp_grow_ck_v add voff vlen
+ret
+end
+mlen = get r_s 2
+moff = get rp_ck_st 2
+if not rp_grow_ck_m add moff mlen
+ret
+end
+if not rp_ck_take_aux hb
+ret
+end
+rp_ck_save_vm voff vlen moff mlen
+put rp_ck_hdr hb get r_s 6
+put rp_ck_hdr add hb 1 ulong o
+put rp_ck_hdr add hb 2 get r_s 0
+put rp_ck_hdr add hb 3 get r_s 1
+put rp_ck_hdr add hb 4 mlen
+put rp_ck_hdr add hb 5 get r_s 3
+put rp_ck_hdr add hb 6 vlen
+put rp_ck_hdr add hb 7 get r_s 6
+put rp_ck_hdr add hb 8 get rp_j_st 1
+put rp_ck_hdr add hb 9 voff
+put rp_ck_hdr add hb 10 moff
+put rp_ck_st 0 add cid 1
+put rp_ck_st 1 add voff vlen
+put rp_ck_st 2 add moff mlen
+end
+
+fn rp_ck_rest_frames coff ulong dep ulong to void
+for j ulong dep bound 65536
+p = add coff mul j 5
+put r_cf j uint get rp_ck_c p
+put r_co j uint get rp_ck_c add p 1
+put r_cs j get rp_ck_c add p 2
+put r_cm j get rp_ck_c add p 3
+put r_ct j get rp_ck_c add p 4
+end
+end
+
+fn rp_ck_rest_pools pmoff ulong pmlen ulong goff ulong ng ulong to void
+for j ulong pmlen bound 16777216
+b = get rp_ck_pm add pmoff j
+put r_pm j b
+end
+for j ulong ng bound 65536
+h = add j 1
+p = add goff mul j 2
+put r_pb h get rp_ck_g p
+put r_pl h get rp_ck_g add p 1
+end
+end
+
+fn rp_ck_rest_vm voff ulong vlen ulong moff ulong mlen ulong to void
+for j ulong vlen bound 4194304
+put r_v j get rp_ck_v add voff j
+put r_w j get rp_ck_w add voff j
+end
+for j ulong mlen bound 16777216
+b = get rp_ck_m add moff j
+put r_m j b
+end
+end
+
+fn rp_ck_restore cid ulong to uint
+hb = mul cid 16
+put r_s 0 get rp_ck_hdr add hb 2
+put r_s 1 get rp_ck_hdr add hb 3
+mlen = get rp_ck_hdr add hb 4
+dep = get rp_ck_hdr add hb 5
+vlen = get rp_ck_hdr add hb 6
+put r_s 2 mlen
+put r_s 3 dep
+put r_s 4 vlen
+put r_s 6 get rp_ck_hdr add hb 7
+put rp_tr_st 1 get rp_ck_hdr add hb 8
+rp_ck_rest_vm get rp_ck_hdr add hb 9 vlen get rp_ck_hdr add hb 10 mlen
+pmlen = get rp_ck_hdr add hb 12
+put r_ps 0 pmlen
+if gt pmlen 0
+rp_ck_rest_pools get rp_ck_hdr add hb 11 pmlen get rp_ck_hdr add hb 15 get i_n 2
+end
+if gt dep 0
+rp_ck_rest_frames get rp_ck_hdr add hb 13 dep
+end
+ret uint get rp_ck_hdr add hb 1
+end
+
+note ---- Step hooks during live execution ----
+fn rp_capture_mem o uint op uint to void
+put rp_cfg 5 0
+put rp_cfg 6 0
+put rp_cfg 7 0
+if eq op 43
+put rp_cfg 5 rn_eau o 1 rn_a o 2
+put rp_cfg 6 ir_tsize rn_elt rn_at o 1
+put rp_cfg 7 rn_a o 3
+ret
+end
+if eq op 56
+fx = rn_fld rn_at o 1 get i_oim o
+put rp_cfg 5 add rn_a o 1 ulong get i_xof fx
+put rp_cfg 6 ir_tsize get i_xty fx
+put rp_cfg 7 rn_a o 2
+ret
+end
+if eq op 51
+et = rn_elt rn_at o 1
+put rp_cfg 5 rn_eau o 1 0
+put rp_cfg 6 mul rn_len o 1 ir_tsize et
+put rp_cfg 7 rn_a o 2
+ret
+end
+if or eq op 47 eq op 48
+put rp_cfg 5 rn_eau o 1 rn_a o 2
+put rp_cfg 6 ir_tsize get i_oty o
+put rp_cfg 7 rn_a o 3
+ret
+end
+if eq op 114
+g = get i_oim o
+sz = ir_tsize ar_u 87 g
+put rp_cfg 5 add get r_pb g mul rn_a o 1 sz
+put rp_cfg 6 sz
+put rp_cfg 7 rn_a o 2
+ret
+end
+if eq op 42
+put rp_cfg 5 rn_eau o 1 rn_a o 2
+put rp_cfg 6 ir_tsize get i_oty o
+ret
+end
+if eq op 55
+fx = rn_fld rn_at o 1 get i_oim o
+put rp_cfg 5 add rn_a o 1 ulong get i_xof fx
+put rp_cfg 6 ir_tsize get i_xty fx
+ret
+end
+if eq op 113
+g = get i_oim o
+sz = ir_tsize ar_u 87 g
+put rp_cfg 5 add get r_pb g mul rn_a o 1 sz
+put rp_cfg 6 sz
+ret
+end
+if eq op 2
+put rp_cfg 7 rn_a o 0
+ret
+end
+if eq op 110
+put rp_cfg 5 get i_oim o
+if eq get i_oim o 53
+put rp_cfg 6 rn_a o 4
+put rp_cfg 7 rn_buf o 2
+end
+ret
+end
+if eq op 64
+put rp_cfg 5 ulong ir_arg o 1
+ret
+end
+if and ge op 70 le op 82
+put rp_cfg 5 rn_a o 1
+if gt get i_ona o 2
+put rp_cfg 6 rn_a o 2
+end
+end
+end
+
+fn rp_before_step o uint to void
+if ne get rp_cfg 3 0
+ret
+end
+put rp_cfg 4 ulong o
+if ne and get rp_cfg 0 2 0
+s = get r_s 6
+iv = get rp_cfg 2
+if eq rem s iv 0
+rp_ck_take o
+end
+end
+op = uint get i_oop o
+if ne rp_op_tok_kind op 0
+rp_capture_mem o op
+end
+end
+
+fn rp_after_step to void
+if ne get rp_cfg 3 0
+ret
+end
+o = uint get rp_cfg 4
+op = uint get i_oop o
+kind = rp_op_tok_kind op
+if or eq kind 0 or eq op 65 eq op 66
+ret
+end
+step = sub get r_s 6 1
+w2 = get rp_cfg 5
+w3 = get rp_cfg 7
+h = get i_ors o
+if ne h 0
+if or eq op 50 or eq op 110 or eq op 47 eq op 48
+w3 = rn_g h
+end
+end
+rp_j_emit kind o step w2 w3
+end
+
+fn rp_on_exit is_exit ulong val ulong to void
+if ne get rp_cfg 3 0
+ret
+end
+step = get r_s 6
+if gt step 0
+step = sub step 1
+end
+rp_j_emit 9 0 step is_exit val
+rp_j_flush
+end
+
+note ---- Trace buffer & backwards trap-to-cause stepper ----
+fn rp_grow_tr need ulong to bool
+cur = len rp_tr_step
+if le need cur
+ret true
+end
+cap = cur
+if eq cap 0
+cap = ulong 256
+end
+while lt cap need bound 64
+cap = shl cap 1
+end
+r0 = enlarge rp_tr_step cap
+if lt r0 0
+ret false
+end
+r1 = enlarge rp_tr_op cap
+if lt r1 0
+ret false
+end
+r2 = enlarge rp_tr_dep cap
+if lt r2 0
+ret false
+end
+r3 = enlarge rp_tr_tok cap
+if lt r3 0
+ret false
+end
+r4 = enlarge rp_tr_res cap
+if lt r4 0
+ret false
+end
+r5 = enlarge rp_tr_mkind cap
+if lt r5 0
+ret false
+end
+r6 = enlarge rp_tr_mpool cap
+if lt r6 0
+ret false
+end
+r7 = enlarge rp_tr_maddr cap
+if lt r7 0
+ret false
+end
+r8 = enlarge rp_tr_msz cap
+if lt r8 0
+ret false
+end
+r9 = enlarge rp_tr_mval cap
+ret ge r9 0
+end
+
+fn rp_tr_rec_pre idx ulong o uint to void
+op = uint get i_oop o
+put rp_tr_step idx get r_s 6
+put rp_tr_op idx o
+put rp_tr_dep idx get r_s 3
+put rp_tr_tok idx get rp_tr_st 1
+put rp_tr_mkind idx 0
+put rp_tr_mpool idx 0
+put rp_tr_maddr idx 0
+put rp_tr_msz idx 0
+put rp_tr_mval idx 0
+rp_capture_mem o op
+if or eq op 42 or eq op 55 eq op 113
+put rp_tr_mkind idx 1
+if eq op 113
+put rp_tr_mpool idx 1
+end
+put rp_tr_maddr idx get rp_cfg 5
+put rp_tr_msz idx get rp_cfg 6
+ret
+end
+if or eq op 43 or eq op 56 or eq op 51 or eq op 47 or eq op 48 eq op 114
+put rp_tr_mkind idx 2
+if eq op 114
+put rp_tr_mpool idx 1
+end
+put rp_tr_maddr idx get rp_cfg 5
+put rp_tr_msz idx get rp_cfg 6
+put rp_tr_mval idx get rp_cfg 7
+ret
+end
+if and eq op 110 eq get i_oim o 53
+put rp_tr_mkind idx 2
+put rp_tr_maddr idx get rp_cfg 7
+put rp_tr_msz idx get rp_cfg 6
+ret
+end
+if eq op 2
+put rp_tr_mval idx get rp_cfg 7
+end
+end
+
+fn rp_replay_window cid ulong stop_step ulong check_trap uint to void
+o = rp_ck_restore cid
+put rp_tr_st 3 add get rp_tr_st 3 1
+wlen = ulong 0
+while lt get r_s 6 stop_step bound 1048576
+if not rp_grow_tr add wlen 1
+break
+end
+rp_tr_rec_pre wlen o
+op = uint get i_oop o
+put r_s 6 add get r_s 6 1
+o = rn_step o
+h = get i_ors uint get rp_tr_op wlen
+rv = ulong 0
+if ne h 0
+rv = rn_g h
+end
+put rp_tr_res wlen rv
+if ne rp_op_tok_kind op 0
+put rp_tr_st 1 add get rp_tr_st 1 1
+end
+wlen = add wlen 1
+end
+put rp_tr_st 0 wlen
+if ne check_trap 0
+ok = ulong 0
+if eq o check_trap
+op = uint get i_oop o
+if eq op 65
+ok = ulong 1
+else
+if and ge op 70 le op 82
+if rn_ckfail o op
+vh = uint get rp_tr_st 13
+if or eq vh 0 eq rn_g vh get rp_tr_st 14
+ok = ulong 1
+end
+end
+end
+end
+end
+put rp_tr_st 2 ok
+end
+end
+
+fn rp_is_const_val h uint to bool
+if eq h 0
+ret true
+end
+if ne get i_vk h 4
+ret false
+end
+o = get i_vo h
+ret eq get i_oop o 1
+end
+
+fn rp_trap_offend_vh o uint to uint
+op = uint get i_oop o
+if eq op 79
+if eq rn_a o 3 0
+ret ir_arg o 3
+end
+ret ir_arg o 2
+end
+if eq op 80
+if gt rn_a o 2 rn_len o 1
+ret ir_arg o 2
+end
+ret ir_arg o 3
+end
+if or eq op 70 or eq op 71 or eq op 72 or eq op 75 eq op 76
+h1 = ir_arg o 1
+h2 = ir_arg o 2
+if and rp_is_const_val h1 not rp_is_const_val h2
+ret h2
+end
+ret h1
+end
+if and ge op 70 le op 82
+ret ir_arg o 1
+end
+ret 0
+end
+
+fn rp_pick_src_arg o uint to uint
+na = ulong get i_ona o
+if eq na 0
+ret 0
+end
+for k ulong na bound 8
+h = ir_arg o uint k
+if not rp_is_const_val h
+ret h
+end
+end
+ret ir_arg o 0
+end
+
+fn rp_par_index v0 uint target uint to ulong
+v = v0
+k = ulong 0
+while ne v 0 bound 65
+if eq v target
+ret k
+end
+v = get i_vnx v
+k = add k 1
+end
+ret 999
+end
+
+fn rp_set_cause idx ulong to void
+o = get rp_tr_op idx
+put rp_tr_st 5 1
+put rp_tr_st 6 get rp_tr_step idx
+put rp_tr_st 7 get rp_tr_tok idx
+put rp_tr_st 8 ulong get i_oop o
+put rp_tr_st 9 ulong get i_bix get i_ob o
+put rp_tr_st 10 rp_op_idx o
+put rp_tr_st 11 ulong get i_oof o
+mv = get rp_tr_mval idx
+if eq get rp_tr_mkind idx 2
+put rp_tr_st 12 mv
+else
+put rp_tr_st 12 get rp_tr_res idx
+end
+end
+
+fn rp_walk_ssa_step idx ulong to void
+o = get rp_tr_op idx
+op = uint get i_oop o
+td = get rp_tr_dep idx
+vh = uint get rp_walk 1
+cd = get rp_walk 2
+if and eq td cd eq get i_ors o vh
+rp_set_cause idx
+if eq get rp_tr_mkind idx 1
+put rp_walk 0 1
+put rp_walk 3 get rp_tr_maddr idx
+put rp_walk 4 get rp_tr_msz idx
+put rp_walk 5 ulong get rp_tr_mpool idx
+ret
+end
+if or eq op 110 or eq op 47 or eq op 48 eq op 1
+put rp_walk 6 1
+ret
+end
+if eq op 2
+if ne get rp_tr_mval idx 0
+put rp_walk 1 ulong ir_arg o 1
+else
+put rp_walk 1 ulong ir_arg o 2
+end
+ret
+end
+nxt = rp_pick_src_arg o
+if ne nxt 0
+put rp_walk 1 ulong nxt
+else
+put rp_walk 6 1
+end
+ret
+end
+vk = ulong get i_vk vh
+if and eq vk 2 and eq td cd eq op 60
+if eq ir_arg o 0 get i_vo vh
+k = rp_par_index get i_bp1 get i_vo vh vh
+if lt k 64
+put rp_walk 1 ulong ir_arg o uint add 1 k
+end
+end
+ret
+end
+if and eq vk 1 and eq add td 1 cd eq op 64
+if eq ir_arg o 1 get i_vo vh
+k = rp_par_index get i_fp1 get i_vo vh vh
+if lt k 64
+rp_set_cause idx
+put rp_walk 1 ulong ir_arg o uint add 2 k
+put rp_walk 2 td
+end
+end
+end
+end
+
+fn rp_walk_mem_step idx ulong to void
+mk = ulong get rp_tr_mkind idx
+if ne mk 2
+ret
+end
+mp = ulong get rp_tr_mpool idx
+if ne mp get rp_walk 5
+ret
+end
+wa = get rp_tr_maddr idx
+ws = get rp_tr_msz idx
+ta = get rp_walk 3
+ts = get rp_walk 4
+if and lt ta add wa ws lt wa add ta ts
+rp_set_cause idx
+put rp_walk 6 1
+end
+end
+
+fn rp_walk_window to void
+wlen = get rp_tr_st 0
+i = wlen
+while gt i 0 bound 1048576
+i = sub i 1
+if ne get rp_walk 6 0
+ret
+end
+if eq get rp_walk 1 0
+o = get rp_tr_op i
+if eq get i_oop o 61
+put rp_walk 1 ulong ir_arg o 1
+put rp_walk 2 get rp_tr_dep i
+end
+else
+if eq get rp_walk 0 0
+rp_walk_ssa_step i
+else
+rp_walk_mem_step i
+end
+end
+end
+end
+
+fn rp_say_s s view uchar * to void
+k = write 2 s 0 len s
+end
+
+fn rp_emit_report o_trap uint code ulong trap_step ulong to void
+rp_say_s rp_msg0
+rn_num code
+rp_say_s rp_msg1
+rn_num trap_step
+rp_say_s rp_msg2
+rn_num ulong get i_oop o_trap
+rp_say_s rp_msg3
+rn_num ulong get i_bix get i_ob o_trap
+rp_say_s rp_msg4
+rn_num rp_op_idx o_trap
+rp_say_s rp_msg5
+rn_num ulong get i_oof o_trap
+rp_say_s rp_msg6
+rn_num get rp_tr_st 4
+rp_say_s rp_msg7
+rn_num get rp_tr_st 3
+rp_say_s rp_msg8
+if ne get rp_tr_st 2 0
+rp_say_s rp_msg9
+else
+rp_say_s rp_msg10
+end
+rp_say_s rp_msg11
+rn_num get rp_tr_st 6
+rp_say_s rp_msg12
+rn_num get rp_tr_st 7
+rp_say_s rp_msg13
+rn_num get rp_tr_st 8
+rp_say_s rp_msg14
+rn_num get rp_tr_st 9
+rp_say_s rp_msg15
+rn_num get rp_tr_st 10
+rp_say_s rp_msg16
+rn_num get rp_tr_st 11
+rp_say_s rp_msg17
+rn_num get rp_tr_st 12
+rp_say_s rp_msg18
+rn_num get rp_j_st 1
+rn_nl
+end
+
+fn rp_on_trap o_trap uint code ulong to void
+if ne get rp_cfg 3 0
+ret
+end
+trap_step = get r_s 6
+if gt trap_step 0
+trap_step = sub trap_step 1
+end
+vh = rp_trap_offend_vh o_trap
+tval = ulong 0
+if ne vh 0
+tval = rn_g vh
+end
+rp_j_emit 8 o_trap trap_step code tval
+rp_j_flush
+if eq and get rp_cfg 0 2 0
+ret
+end
+for j ulong 16
+put rp_tr_st j 0
+end
+for j ulong 8
+put rp_walk j 0
+end
+put rp_tr_st 13 ulong vh
+put rp_tr_st 14 tval
+put rp_tr_st 15 get r_s 3
+ck_cnt = get rp_ck_st 0
+if eq ck_cnt 0
+rp_emit_report o_trap code trap_step
+ret
+end
+cid = ulong 0
+for i ulong ck_cnt bound 1048576
+st = get rp_ck_hdr mul i 16
+if lt st trap_step
+cid = i
+else
+break
+end
+end
+put rp_tr_st 4 get rp_ck_hdr mul cid 16
+put rp_cfg 3 1
+rp_replay_window cid trap_step o_trap
+put rp_walk 0 0
+put rp_walk 1 ulong vh
+put rp_walk 2 get rp_tr_st 15
+rp_walk_window
+cur_c = cid
+while and eq get rp_walk 6 0 gt cur_c 0 bound 65536
+next_stop = get rp_ck_hdr mul cur_c 16
+cur_c = sub cur_c 1
+rp_replay_window cur_c next_stop 0
+rp_walk_window
+end
+put rp_cfg 3 0
+rp_emit_report o_trap code trap_step
 end
