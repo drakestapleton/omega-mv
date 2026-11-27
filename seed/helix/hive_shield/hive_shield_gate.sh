@@ -72,6 +72,30 @@ printf 'sudo insmod kmod/aien_gpu.ko\n' > "$B/s6_clean/bad_insmod.sh"
 run_s6_neg "insmod_aien_gpu" 141 audit-file "$B/s6_clean/bad_insmod.sh"
 printf 'vm_insert_pages(vma, addr, pages, n);\n' > "$B/s6_clean/bad_impure.txt"
 run_s6_neg "impure_vm_insert" 144 audit-file "$B/s6_clean/bad_impure.txt"
+run_s6_neg "nonexistent_dir_fail" 145 scan-dir "$B/does_not_exist_999" 0
+mkdir -p "$B/s6_ext"
+printf 'x' > "$B/s6_ext/aien_gpu.ko.xz"
+run_s6_neg "compressed_ko_xz" 141 scan-dir "$B/s6_ext" 0
+mkdir -p "$B/s6_ext2"
+printf 'int x;\n' > "$B/s6_ext2/sneaky.C"
+run_s6_neg "uppercase_C_file" 142 scan-dir "$B/s6_ext2" 0
+{
+  i=0
+  while [ "$i" -lt 2700 ]; do
+    printf '# 01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567\n'
+    i=$((i + 1))
+  done
+  printf 'sudo insmod aien_gpu.ko\n'
+} > "$B/s6_clean/trunc_262k.sh"
+run_s6_neg "audit_gt_256k_trunc" 145 audit-file "$B/s6_clean/trunc_262k.sh"
+printf 'finit_module(fd, "", 0);\n' > "$B/s6_clean/bad_finit.txt"
+run_s6_neg "finit_module_kmod" 141 audit-file "$B/s6_clean/bad_finit.txt"
+mkdir -p "$B/s6_sym"
+printf 'x' > "$B/s6_locked_target"
+chmod 000 "$B/s6_locked_target"
+ln -s "$B/s6_locked_target" "$B/s6_sym/evil.ko.QUARANTINED"
+run_s6_neg "symlink_quarantine_spoof" 141 scan-dir "$B/s6_sym" 0
+chmod 600 "$B/s6_locked_target"
 
 printf '\n--- [STRAND 7: THE WARDEN (HIVE THERMAL/POWER/RAM/DISK/KMOD CBF)] ---\n'
 "$OMC" < seed/helix/hive_shield/strand7_warden.om > "$B/strand7_warden"
@@ -107,6 +131,7 @@ run_s7_neg "disk_floor_breach"   154 1 52000 45000 108000 8192 300 7 0
 run_s7_neg "rogue_live_kmod"     155 1 48000 30000 108000 500000 60 7 1
 run_s7_neg "gpu_lease_overrun"   156 1 52000 45000 108000 500000 1800 7 0
 run_s7_neg "incomplete_proof"    157 1 52000 45000 108000 500000 300 5 0
+run_s7_neg "u64_wrap_kmod_temp"  2   1 18446744073709551616 45000 108000 500000 300 7 18446744073709551616
 
 printf '\n--- [STRAND 8: THE NOTARY (RECEIPT SHA-256 + DUAL-LAW HIVE QUORUM + OMEGA-MEMO)] ---\n'
 (
@@ -160,6 +185,25 @@ cp -R "$B/s8_memo" "$B/s8_memo_bad"
 T8=$(find "$B/s8_memo_bad" -name '*.ome' | head -n 1)
 printf '\177' | dd of="$T8" bs=1 seek=230 count=1 conv=notrunc 2>/dev/null
 run_s8_neg "memo_attest_tamper"    166 hive-quorum 7 2 7 0 "$B/s8_memo_bad" "$PIN_SHA"
+# u64 wrap on safety veto (2^64 must NOT wrap to 0)
+run_s8_neg "u64_wrap_veto"         2   hive-quorum 7 2 7 18446744073709551616 "$B/s8_memo" "$PIN_SHA"
+# 3*f+1 multiplication overflow attack (invalid N < 3f+1)
+run_s8_neg "bft_3f_mul_overflow"   165 hive-quorum 18446744073709551614 6148914691236517206 12297829382473034408 0 "$B/s8_memo" "$PIN_SHA"
+# Non-hex omc_sha64 rejected
+run_s8_neg "nonhex_omc_sha"        2   hive-quorum 7 2 7 0 "$B/s8_memo" "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+# Manifest > 64 KiB rejected (no silent truncation)
+{
+  i=0
+  while [ "$i" -lt 950 ]; do
+    printf '0000000000000000000000000000000000000000000000000000000000000000  a.txt\n'
+    i=$((i + 1))
+  done
+} > "$B/s8_sums/HUGE_64K.txt"
+run_s8_neg "manifest_gt_64k"       163 verify-sums "$B/s8_sums" "$B/s8_sums/HUGE_64K.txt"
+# Embedded NUL byte in manifest filename rejected
+A_SHA=$(sha "$B/s8_sums/a.txt")
+printf '%s  a.txt\0ignored\n' "$A_SHA" > "$B/s8_sums/NUL_PATH.txt"
+run_s8_neg "manifest_nul_path"     163 verify-sums "$B/s8_sums" "$B/s8_sums/NUL_PATH.txt"
 
 printf '\n--- [STRAND 9: THE ARBITER (ZERO-TRUST MESH BIND + REMOTE COMMAND GUARD)] ---\n'
 "$OMC" < seed/helix/hive_shield/strand9_arbiter.om > "$B/strand9_arbiter"
@@ -201,6 +245,26 @@ printf 'sudo insmod kmod/aien_gpu.ko\n' > "$B/s9_cmds/bad_insmod.sh"
 run_s9_neg "remote_insmod"     173 check-cmd "$B/s9_cmds/bad_insmod.sh" 1 1
 run_s9_neg "ssh_storm_8"       174 check-cmd "$B/s9_cmds/safe.sh" 8 1
 run_s9_neg "unsigned_rpc"      175 check-cmd "$B/s9_cmds/safe.sh" 1 0
+run_s9_neg "octal_ip_0127"     172 check-bind "0127.0.0.1"
+run_s9_neg "octal_ip_100_064"  172 check-bind "100.064.0.2"
+run_s9_neg "u64_wrap_ssh_cap"  2   check-cmd "$B/s9_cmds/safe.sh" 18446744073709551616 18446744073709551617
+printf 'pkill -9 -f python3\n' > "$B/s9_cmds/bad_pkill9.sh"
+run_s9_neg "pkill_9_dash_f"    173 check-cmd "$B/s9_cmds/bad_pkill9.sh" 1 1
+printf 'rm -fr /\n' > "$B/s9_cmds/bad_rmfr.sh"
+run_s9_neg "rm_fr_root"        173 check-cmd "$B/s9_cmds/bad_rmfr.sh" 1 1
+{
+  i=0
+  while [ "$i" -lt 700 ]; do
+    printf '# 01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567\n'
+    i=$((i + 1))
+  done
+  printf 'sudo insmod aien_gpu.ko\n'
+} > "$B/s9_cmds/trunc_66k.sh"
+run_s9_neg "cmd_gt_64k_trunc"  173 check-cmd "$B/s9_cmds/trunc_66k.sh" 1 1
+printf 'pkill --full python3\n' > "$B/s9_cmds/bad_pkill_full.sh"
+run_s9_neg "pkill_double_full" 173 check-cmd "$B/s9_cmds/bad_pkill_full.sh" 1 1
+printf 'rm -rf "/"\n' > "$B/s9_cmds/bad_rm_qroot.sh"
+run_s9_neg "rm_quoted_root"    173 check-cmd "$B/s9_cmds/bad_rm_qroot.sh" 1 1
 
 printf '\n--- [LEAN 4.36.0 PROOFS: Om3MemorySafety.lean + HiveShield.lean] ---\n'
 LEAN_BIN=""
@@ -216,7 +280,7 @@ if [ -n "$LEAN_BIN" ]; then
   printf '  PASS Om3MemorySafety.lean + HiveShield.lean verified (0 warnings, 0 sorry, standard axioms only)\n'
 fi
 
-TOT_NEG=$((21 + s6_neg + s7_neg + s8_neg + s9_neg))
+TOT_NEG=$((34 + s6_neg + s7_neg + s8_neg + s9_neg))
 printf '\n=====================================================================\n'
 printf 'HIVE_SHIELD PASS strands=5,6,7,8,9 omc=%s total_neg_controls=%d\n' "$PIN_SHA" "$TOT_NEG"
 printf '=====================================================================\n'

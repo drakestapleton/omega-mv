@@ -57,9 +57,12 @@ with raw IEEE-754 `f32` tensor data).
   `OMEGA-MEMO`) verifies every `om3` unit statically, memoizes the cryptographic proof certificate
   in `OMEGA-MEMO` (`OMEM` v1), and erases all capability directives into zero-runtime-overhead `om2`
   for `@ng front-ir -> @ng opt -> @ng a64` or `seed/out/omc` compilation.
-- **Four Compile-Time Silicon Safety Laws (0 runtime instructions on hot paths):**
-  1. `NO_RAW_PTR` (`OM3_ERR_RAW_PTR = 101`): Raw pointer casts, untyped address arithmetic, and
-     raw load/store escape hatches (`fwld`, `fwst`, `rawptr`, `unsafe_ptr`, `ptr_cast`, `dma_addr`)
+- **Five Compile-Time Silicon Safety Laws (0 runtime instructions on hot paths):**
+  1. `NO_RAW_PTR` (`OM3_ERR_RAW_PTR = 101`): Raw pointer casts, untyped address arithmetic, firmware
+     accesses, device-mapping primitives, and kernel escape hatches (27 banned words: `fwld`, `fwst`,
+     `fwadr`, `fwcall`, `fwsys`, `efi`, `rawptr`, `unsafe_ptr`, `ptr_cast`, `dma_addr`, `put_page`,
+     `mapaddr`, `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `mapget`, `mapset`, `maphold`, `mapbind`,
+     `devctl`, `devcall`, `uvmctl`, `vm_insert_pages`, `kfree`, `execprog`, `execenv`, plus `target`)
      are statically refused.
   2. `DISJOINT_DOMAINS` (`OM3_ERR_VA_OVERLAP = 102`, `OM3_ERR_DOMAIN_ALIEN = 110`): Every `@region`
      belongs to a single exclusive hardware domain (`1=CPU_HOST`, `2=CPU_KERNEL_SLAB`,
@@ -73,13 +76,22 @@ with raw IEEE-754 `f32` tensor data).
      statically requires the complete linear hardware transition sequence:
      `@unmap` (PTEs cleared) -> `@tlbinval` (GMMU TLB invalidated) -> `@fence_drain EPOCH` (in-flight
      GPU compute/copy epoch drained) -> `@vma_revoke` (userspace VMA pins == 0) -> `@reclaim`.
-     Skipping any step is a compile-time refusal.
+     Skipping any step, or leaking a live mapped/TLB-flushed GPU VA at `ret`/`exit`/`trap`/EOF, is
+     a compile-time refusal.
   4. `SPEED_LIMIT_ZERO_RT` (`OM3_ERR_OOB_STATIC = 103`): Every `@access NAME OFF LEN` proves
-     `LEN > 0`, `OFF + LEN` non-wrapping, and `OFF + LEN <= SIZE` at compile time, then erases all
-     metadata before codegen so the emitted AArch64 / SM121 machine code runs at 100% hardware speed
-     with zero runtime capability tags, reference counts, or bounds branches.
+     `LEN > 0`, `OFF + LEN` non-wrapping, `OFF + LEN <= SIZE`, and (when GPU-mapped) `OFF + LEN <= VLEN`
+     at compile time, then erases all metadata before codegen so the emitted AArch64 / SM121 machine
+     code runs at 100% hardware speed with zero runtime capability tags, reference counts, or bounds
+     branches.
+  5. `CFG_LINEAR_SOUNDNESS` (`OM3_ERR_CFG_DIVERGE = 112`): Structured Omegese control flow (`fn`,
+     `if`/`else`, `while`/`for`, `ret`/`exit`/`trap`, `break`/`continue`, `end`) is checked with
+     exact linear-typestate block snapshots: conditional arms that fall through must converge to the
+     identical capability state, early returns/exits must pass full leak & fence checks, and loop
+     bodies/`break`/`continue` must preserve the loop-entry capability invariant.
 - **Machine-checked soundness:** `seed/helix/proofs/Om3MemorySafety.lean` (Lean 4.36.0, 0 `sorry`,
-  standard axioms only) proves global domain disjointness, GPU/kernel VA non-overlap, full 4-step
-  fence necessity, and explicit negative-control counterexamples reproducing the 2026-11-26 Spark
-  `aien_gpu.ko` crash bug.
+  standard axioms only) proves global multi-step inductive invariant preservation
+  (`step_preserves_wellFormed`, `runTrace_preserves_wellFormed`,
+  `trace_guarantees_kernel_slab_isolation`), 4-step fence necessity, static physical + GPU VA bounds
+  soundness, and 9 negative-control counterexamples reproducing the 2026-11-26 Spark `aien_gpu.ko`
+  crash bugs.
 - **Gate:** `sh seed/helix/strand5_aegis/strand5_verify.sh` and `sh seed/helix/hive_shield/hive_shield_gate.sh`.
