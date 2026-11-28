@@ -18,7 +18,7 @@ Rules:
 
 ## `apps/`
 
-User-facing Sovereign Intelligence applications, Forge, web generators, Lean proof DAG tooling and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, `aien-translate`, `apps/core/`, `apps/site_builder/`, and `apps/lean-opt/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 131 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
+User-facing Sovereign Intelligence applications, Forge, web generators, Lean proof DAG tooling, publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, `aien-translate`, `apps/core/`, `apps/site_builder/`, and `apps/lean-opt/`), and standalone pure-OM-2 frontiers (`si2-live`, `omega-morph` `OMMP01`, `omega-chrono`, `omega-symbiote` 20-core Grace NEON, `omega-vsa` `OMVSA1`, `omega-zk` Goldilocks STARK/FRI, `omega-ca` reversible Margolus CA, `omega-mindmesh` 6-stage closed loop + `mindmesh_gb10_run.om`, `omega-sat` CDCL+DRAT, and `omega-fhe` CRT-NTT Ring-LWE BFV), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 131 units) plus standalone per-app gates. Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
 
 ## `bridge/`
 
@@ -331,7 +331,7 @@ Seeded Omega exhaustive u8/u16 equivalence checker for OSC IR v1 scalar function
 
 ## `seed/helix/`
 
-Proof-Carrying Evolutionary Helix, 4-Strand BFT Stem-Cell Braid (`1,612 B` independent AArch64 seeds: Monk `408 B`, Predator `396 B`, Trickster `404 B`, Ascetic `404 B`), Four-Wall Loop-1 Helical RSI Containment Gate (`rsi-loop1.sh --lean`), in-process zero-CUDA SM121 Evolutionary JIT (`helix_jit.om`, `helix-build-jit.sh`), Arboris nervous system benchmarks, pure-Omega RFC 8032 Ed25519 DDC receipt signer, `EGP2` structural e-graph + dual-checker, 15 SM121/`uor-gpu` antibodies, Strand 5 Aegis (`seed/helix/strand5_aegis/`, OM-3 Zero-Pointer Linear Silicon Capabilities + ΩIR v2 + OMEGA-MEMO + `om2` DDC fixpoint), Multi-Strand Hive Shield (`seed/helix/hive_shield/`, Strands 6–9 Sentinel/Warden/Notary/Arbiter), Lean 4.36.0 proofs under `seed/helix/proofs/` (including `Om3MemorySafety.lean` & `HiveShield.lean`), and the 5-stage Omega LLM closed-loop verified RLVR & SM121 training JIT factory under `seed/helix/ollm_factory/`
+Proof-Carrying Evolutionary Helix, 4-Strand BFT Stem-Cell Braid (`1,612 B` independent AArch64 seeds: Monk `408 B`, Predator `396 B`, Trickster `404 B`, Ascetic `404 B`), Four-Wall Loop-1 Helical RSI Containment Gate (`rsi-loop1.sh --lean`), in-process zero-CUDA SM121 Evolutionary JIT (`helix_jit.om`, `helix-build-jit.sh`), Arboris nervous system benchmarks, pure-Omega RFC 8032 Ed25519 DDC receipt signer, 3-host Byzantine DDC quorum (`seed/helix/ddc_mesh/`), self-healing `OMDNA1` antibody evolution (`seed/helix/proof_dna/`), `EGP2` structural e-graph + dual-checker, 15 SM121/`uor-gpu` antibodies, Strand 5 Aegis (`seed/helix/strand5_aegis/`, OM-3 Zero-Pointer Linear Silicon Capabilities + ΩIR v2 + OMEGA-MEMO + `om2` DDC fixpoint), Multi-Strand Hive Shield (`seed/helix/hive_shield/`, Strands 6–9 Sentinel/Warden/Notary/Arbiter), Lean 4.36.0 proofs under `seed/helix/proofs/` (including `Om3MemorySafety.lean`, `HiveShield.lean`, `ChronoSoundness.lean`, `ProofDnaSoundness.lean`, `VsaSoundness.lean`, `ZkTranscriptSoundness.lean`, `CaReversibleSoundness.lean`, `OmegaSatSoundness.lean`, and `OmegaFheSoundness.lean`), and the 5-stage Omega LLM closed-loop verified RLVR & SM121 training JIT factory under `seed/helix/ollm_factory/`
 
 ## `seed/json/`
 
@@ -351,7 +351,7 @@ Rules:
 
 ## `seed/ng/`
 
-Omega NG: the next Omega compiler (Hive NG). Its intermediate form ΩIR (IR.md) with validator, text tools and gate; the ng compiler units (src/, ng.units, ngbuild)
+Omega NG: the next Omega compiler (Hive NG). Its intermediate form ΩIR (IR.md) with validator, text tools and gate; the ng compiler units (src/, ng.units, ngbuild); plus `seed/ng/formal_emit/` (per-binary Lean 4.36 auto-formalizer & W^X `0500 RX` / live GB10 enforcement).
 
 ## `seed/ng/front/`
 
