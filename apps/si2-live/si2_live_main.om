@@ -1,0 +1,1329 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/si2-live/si2_live_main.om
+note Sovereign Intelligence 2.0 Live 6-Stage End-to-End Integration Server & CLI (`si2_live`).
+note Pure seeded OM-2 (zero C, zero Python, zero Rust, zero gcc).
+note
+note HARD SAFETY INVARIANTS:
+note   - Zero GPU device opens, zero sysfs writes, zero UEFI/NVRAM/SPI/USB writes (hw_writes == 0 strictly).
+note   - Wildcard 0.0.0.0 bind/endpoint strictly REFUSED (MR_ERR_WILDCARD_BIND = 12).
+note   - --rwx W^X violation strictly REFUSED (rc = 2).
+note   - Remote and local outputs enter OMEGA-MEMO ONLY through mesh_verify.om's TOCTOU-proof gate.
+note   - OOD drift trips SLAB_MUTABLE_ALARMED (trap 14) -> Stage 2 checkpoint rewind + safe baseline
+note     without poisoning OMEGA-MEMO.
+note
+note Build on Spark AArch64 with pinned seeded omc (SHA-256 85b84c6d...):
+note   cat si/directives/om2.om apps/omega-wattd/watt_sense.om apps/omega-wattd/watt_cbf.om \
+note       <(tail -n +2 seed/ng/src/ir.om) seed/ng/sha256.om \
+note       protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om \
+note       protocol/uor-gpu/ed_sign.om seed/ng/target/target_desc.om \
+note       seed/ng/target/isel.om seed/ng/target/sm121_pe.om seed/ng/target/fabric.om \
+note       seed/ng/target/crystallize.om seed/ng/egraph/ir_egraph.om \
+note       seed/ng/verify/egp3_checker.om seed/ng/live/arboris_spec.om \
+note       seed/ng/pack/sem_pack.om seed/ng/memo/memo_policy.om seed/ng/memo/memo_store.om \
+note       seed/ng/replay/tok_journal.om seed/ng/replay/slab_ckpt.om \
+note       seed/ng/replay/cf_fork.om seed/ng/replay/state_stream.om \
+note       seed/ng/physics/pareto_bank.om seed/ng/physics/phys_solver.om \
+note       apps/omega-metabd/profile_ring.om apps/omega-metabd/general_pe.om \
+note       apps/omega-mesh/mesh_verify.om apps/omega-mesh/mesh_route.om \
+note       apps/si2-live/si2_live_main.om | /tmp/omc-pin > /tmp/si2_live
+
+const SI2_FLAG_SIM_OVERTEMP ulong 8
+const SI2_FLAG_FAULT_TAMPER_RCPT ulong 16
+
+const SI2_DEC_NONE ulong 0
+const SI2_DEC_MEMO_HIT ulong 1
+const SI2_DEC_SPEC_EXEC ulong 2
+const SI2_DEC_OOD_ROLLBACK ulong 3
+const SI2_DEC_WATTCBF_REFUSED ulong 4
+const SI2_DEC_AUTH_REFUSED ulong 5
+
+const SI2_AUX_BYTES ulong 96
+
+global sl_arg uchar 512
+global sl_memo_dir uchar 512
+global sl_memo_len ulong 1
+global sl_wx_dir uchar 512
+global sl_wx_len ulong 1
+global sl_jpath uchar 512
+global sl_jpath_len ulong 1
+global sl_srv_seed uchar 32
+global sl_srv_pk uchar 32
+global sl_cli_seed uchar 32
+global sl_cli_pk uchar 32
+global sl_rogue_seed uchar 32
+global sl_rogue_pk uchar 32
+global sl_hub_mode ulong 1
+global sl_affine_f uint 1
+global sl_step ulong 1
+global sl_last_safe_step ulong 1
+global sl_st uchar 4
+global sl_num uchar 32
+global sl_stats ulong 12
+note sl_stats: [0]=reqs [1]=memo_hits [2]=spec_execs [3]=ood_rollbacks [4]=wattcbf_refusals [5]=auth_refusals
+note           [6]=memo_admits [7]=tkj_verifies [8]=sst_verifies
+global sl_saved_call1 uchar 64
+note Staging context to stay well under omc 6-slot parameter limit:
+note sl_ctx: [0]=a0 [1]=a1 [2]=y_got [3]=y_ora [4]=pt [5]=eb [6]=flags
+global sl_ctx ulong 8
+note sl_tctx: [0]=tdie [1]=psafe [2]=b_h
+global sl_tctx long 4
+
+text sl_tag_srv "OM-SI2-SPARK-SRV-V1"
+text sl_tag_hub "OM-SI2-HUB-SRV-V1"
+text sl_tag_cli "OM-SI2-MAC-CLIENT-V1"
+text sl_tag_rogue "OM-SI2-ROGUE-CLIENT-V1"
+text sl_ir_src "omega.si2.pure.exact.affine_route.v1"
+
+text sl_cmd_status "status"
+text sl_cmd_check_bind "check-bind"
+text sl_cmd_serve "serve"
+text sl_cmd_dispatch "dispatch"
+text sl_cmd_demo "demo"
+text sl_fl_rwx "--rwx"
+text sl_fl_hub "--hub"
+text sl_def_memo "/tmp/si2-live-memo"
+text sl_def_wx "/tmp/si2-live-wx"
+text sl_def_jnl "/tmp/si2-live.otkj"
+
+text sl_m_hdr "SI2-LIVE STATUS node="
+text sl_m_spark "spark-aarch64"
+text sl_m_hub "hub-pi5-aarch64"
+text sl_m_z " zones_ok="
+text sl_m_tg " tgpu_mc="
+text sl_m_ts " tsoc_mc="
+text sl_m_tm " tmax_mc="
+text sl_m_ps " p_safe_mw="
+text sl_m_bh " barrier_h="
+text sl_m_hw " hw_writes="
+text sl_m_nl "\n"
+
+text sl_m_ref_rwx "SI2-LIVE REFUSED wx_rwx_forbidden rc=2\n"
+text sl_m_ref_bind "SI2-LIVE REFUSED unsafe_bind rc=12 ip="
+text sl_m_ok_bind "SI2-LIVE ALLOWED safe_bind ip="
+text sl_m_srv "SI2-LIVE SERVE ip="
+text sl_m_port " port="
+text sl_m_pk " srv_pk="
+text sl_m_req "SI2-LIVE REQ#"
+text sl_m_dec " decision="
+text sl_m_rec " recompute="
+text sl_m_y " y="
+text sl_m_rc " rc="
+text sl_m_demo_ok "SI2-LIVE DEMO PASS memo_hits="
+text sl_m_demo_fail "SI2-LIVE DEMO FAIL code="
+text sl_m_disp_ok "SI2-LIVE DISPATCH PASS peer_ip="
+text sl_m_disp_fail "SI2-LIVE DISPATCH FAIL code="
+text sl_hex_ch "0123456789abcdef"
+
+fn sl_wrt s view uchar * to void
+wd_puts s
+wd_flush
+end
+
+fn sl_num_u v ulong to void
+wd_put_u64 v
+wd_flush
+end
+
+fn sl_num_i v long to void
+wd_put_i64 v
+wd_flush
+end
+
+fn sl_put_hex_byte b uchar to void
+hi = shr ulong b 4
+lo = and ulong b 15
+wd_putb get sl_hex_ch hi
+wd_putb get sl_hex_ch lo
+end
+
+fn sl_print_srv_pk to void
+for i ulong 16
+sl_put_hex_byte get sl_srv_pk i
+end
+wd_flush
+end
+
+fn sl_copy_def which ulong src view uchar * to void
+n = len src
+for i ulong n bound 500
+b = get src i
+if eq which 0
+put sl_memo_dir i b
+end
+if eq which 1
+put sl_wx_dir i b
+end
+if eq which 2
+put sl_jpath i b
+end
+end
+if eq which 0
+put sl_memo_dir n 0
+put sl_memo_len 0 n
+end
+if eq which 1
+put sl_wx_dir n 0
+put sl_wx_len 0 n
+end
+if eq which 2
+put sl_jpath n 0
+put sl_jpath_len 0 n
+end
+end
+
+fn sl_arg_eq idx ulong want view uchar * to bool
+if le argcnt long idx
+ret false
+end
+rn = argread idx sl_arg 0 510
+if ne rn long len want
+ret false
+end
+for i ulong len want bound 64
+if ne get sl_arg i get want i
+ret false
+end
+end
+ret true
+end
+
+fn sl_has_flag want view uchar * to bool
+ac = argcnt
+for i long ac bound 32
+if gt i 0
+if sl_arg_eq ulong i want
+ret true
+end
+end
+end
+ret false
+end
+
+fn sl_arg_u64 idx ulong def_v ulong to ulong
+if le argcnt long idx
+ret def_v
+end
+rn = argread idx sl_arg 0 64
+if le rn 0
+ret def_v
+end
+v = ulong 0
+for i ulong ulong rn bound 32
+ch = get sl_arg i
+if or lt ch 48 gt ch 57
+break
+end
+v = add mul v 10 ulong sub ch 48
+end
+ret v
+end
+
+fn sl_arg_copy idx ulong which ulong def_s view uchar * to void
+if gt argcnt long idx
+rn = argread idx sl_arg 0 500
+if gt rn 0
+un = ulong rn
+for i ulong un bound 510
+b = get sl_arg i
+if eq which 0
+put sl_memo_dir i b
+end
+if eq which 1
+put sl_wx_dir i b
+end
+if eq which 2
+put sl_jpath i b
+end
+end
+if eq which 0
+put sl_memo_dir un 0
+put sl_memo_len 0 un
+end
+if eq which 1
+put sl_wx_dir un 0
+put sl_wx_len 0 un
+end
+if eq which 2
+put sl_jpath un 0
+put sl_jpath_len 0 un
+end
+ret
+end
+end
+sl_copy_def which def_s
+end
+
+fn sl_parse_ipv4_buf n ulong to ulong
+if eq n 0
+ret 0
+end
+dots = ulong 0
+for i ulong n bound 64
+if eq get sl_arg i 46
+dots = add dots 1
+end
+end
+if eq dots 0
+v = ulong 0
+for i ulong n bound 32
+ch = get sl_arg i
+if or lt ch 48 gt ch 57
+ret 0
+end
+v = add mul v 10 ulong sub ch 48
+end
+ret v
+end
+if ne dots 3
+ret 0
+end
+acc = ulong 0
+oct = ulong 0
+has_d = ulong 0
+ip = ulong 0
+for i ulong n bound 64
+ch = get sl_arg i
+if eq ch 46
+if or eq has_d 0 gt oct 255
+ret 0
+end
+ip = or shl ip 8 oct
+oct = 0
+has_d = 0
+acc = add acc 1
+else
+if or lt ch 48 gt ch 57
+ret 0
+end
+oct = add mul oct 10 ulong sub ch 48
+if gt oct 255
+ret 0
+end
+has_d = 1
+end
+end
+if or ne acc 3 or eq has_d 0 gt oct 255
+ret 0
+end
+ret or shl ip 8 oct
+end
+
+fn sl_parse_ipv4_arg idx ulong to ulong
+if le argcnt long idx
+ret 0
+end
+rn = argread idx sl_arg 0 64
+if le rn 0
+ret 0
+end
+ret sl_parse_ipv4_buf ulong rn
+end
+
+note Strict LAN/Loopback bind safety policy:
+note   - STRICTLY REFUSE 0.0.0.0 (wildcard), broadcast, .0/.255, multicast/public IPs.
+note   - ALLOW explicit 127.0.0.0/8 loopback and RFC1918 / RFC6598 private LAN unicast (Spark 192.168.1.108, Hub 192.168.1.192).
+fn si2_ip_is_safe_bind ip ulong to bool
+if eq ip 0
+ret false
+end
+if eq ip 0xffffffff
+ret false
+end
+o0 = and shr ip 24 255
+o1 = and shr ip 16 255
+o3 = and ip 255
+if or eq o3 0 eq o3 255
+ret false
+end
+if eq o0 127
+ret true
+end
+if eq o0 10
+ret true
+end
+if and eq o0 192 eq o1 168
+ret true
+end
+if and eq o0 172 and ge o1 16 le o1 31
+ret true
+end
+if and eq o0 100 and ge o1 64 le o1 127
+ret true
+end
+ret false
+end
+
+fn si2_tcp_listen ipv4 ulong port ulong to long
+if not si2_ip_is_safe_bind ipv4
+ret neg long MR_ERR_WILDCARD_BIND
+end
+fd = socknew 2 1 0
+if lt fd 0
+ret neg long MR_ERR_SOCK
+end
+put mr_sopt 0 1
+put mr_sopt 1 0
+put mr_sopt 2 0
+put mr_sopt 3 0
+sr = sockopt int fd 1 2 mr_sopt 0 4
+mr_fill_sockaddr ipv4 port
+br = bind int fd mr_sockaddr 0 16
+if ne br 0
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+snr = sockname int fd mr_sockaddr 0 16
+if ne snr 16
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+bport = or shl ulong get mr_sockaddr 2 8 ulong get mr_sockaddr 3
+put mr_net_stats 7 bport
+lr = listen int fd 8
+if ne lr 0
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+ret fd
+end
+
+fn si2_tcp_connect ipv4 ulong port ulong to long
+if not si2_ip_is_safe_bind ipv4
+ret neg long MR_ERR_WILDCARD_BIND
+end
+fd = socknew 2 1 0
+if lt fd 0
+ret neg long MR_ERR_SOCK
+end
+mr_fill_sockaddr ipv4 port
+cr = connect int fd mr_sockaddr 0 16
+if ne cr 0
+cf = fclose int fd
+ret neg long MR_ERR_SOCK
+end
+ret fd
+end
+
+fn sl_sense_thermal st edit WattThermal to bool
+ws_sense_all
+if eq get sl_hub_mode 0 0
+ret ws_fill_thermal_state st
+end
+if ne get g_tz_ok 0 1
+put st t_die 104800
+put st t_sink 104800
+put st t_amb 25000
+ret false
+end
+td = get g_tz_mc 0
+ts = sub td 2000
+ta = long 25000
+if lt ts ta
+ts = ta
+if gt ts td
+ts = td
+end
+end
+if lt td ta
+ta = td
+end
+put st t_die td
+put st t_sink ts
+put st t_amb ta
+ret true
+end
+
+fn sl_init_pol pol edit WattPolicy to void
+put pol p_budget 140000
+put pol p_gpu_budget 80000
+put pol t_ceil WATT_T_CEIL_DEFAULT
+put pol tau 2
+end
+
+fn sl_register_pareto to void
+pb_stage_id 7001 TID_X925 PB_PREC_CPU_X925 PB_PROOF_REQUIRED 0x100000
+pb_stage_phys 28000 180 6 0 128
+r0 = pb_commit
+pb_stage_id 7001 TID_A725 PB_PREC_CPU_A725 PB_PROOF_REQUIRED 0x110000
+pb_stage_phys 16000 320 6 0 128
+r1 = pb_commit
+ps_set_baseline 6000 4000 40
+end
+
+fn sl_register_keys to void
+mv_ed_derive_seed sl_tag_cli 1
+mv_ed_pubkey_from_seed
+for i ulong 32
+put sl_cli_seed i get mv_ed_seed i
+put sl_cli_pk i get mv_ed_pk i
+put mr_cli_seed i get mv_ed_seed i
+put mr_cli_pk i get mv_ed_pk i
+end
+cs = mv_peer_register 101 MV_TIER_A_SOVEREIGN
+if eq get sl_hub_mode 0 1
+mv_ed_derive_seed sl_tag_hub 2
+else
+mv_ed_derive_seed sl_tag_srv 1
+end
+mv_ed_pubkey_from_seed
+for i ulong 32
+put sl_srv_seed i get mv_ed_seed i
+put sl_srv_pk i get mv_ed_pk i
+put mr_wrk_seed i get mv_ed_seed i
+put mr_wrk_pk i get mv_ed_pk i
+end
+ws = mv_peer_register 201 MV_TIER_A_SOVEREIGN
+mv_ed_derive_seed sl_tag_rogue 9
+mv_ed_pubkey_from_seed
+for i ulong 32
+put sl_rogue_seed i get mv_ed_seed i
+put sl_rogue_pk i get mv_ed_pk i
+end
+end
+
+fn sl_init_all to ulong
+ml = get sl_memo_len 0
+wl = get sl_wx_len 0
+jl = get sl_jpath_len 0
+mr_init
+mv_init
+mp_init
+mp_set_override MP_OVR_FORCE
+for i ulong ml bound 510
+put mm_env_buf i get sl_memo_dir i
+end
+mrc = mm_set_root_from_envbuf ml
+if ne mrc MM_OK
+ret mrc
+end
+dm = makedir sl_wx_dir 0 wl 448
+for i ulong wl bound 510
+put wx_dir i get sl_wx_dir i
+end
+wx_set_dir_buf wl
+put sl_jpath jl 0
+pb_init
+ps_init
+sl_register_pareto
+ar_init
+ir_init
+mb_init
+f = gpe_build_affine_route
+put sl_affine_f 0 f
+rrc = mb_register_slot 0 7001 f GPE_WK_AFFINE
+if ne rrc MB_OK
+ret add 300 rrc
+end
+trc = tkj_reset
+if ne trc TKJ_OK
+ret add 400 trc
+end
+src = sck_init 16 4096 4 4
+if ne src SCK_OK
+ret add 500 src
+end
+erc = sst_enc_init 16 4096
+if ne erc SST_OK
+ret add 600 erc
+end
+put sl_step 0 0
+put sl_last_safe_step 0 0
+for i ulong 12
+put sl_stats i 0
+end
+sl_register_keys
+ret 0
+end
+
+fn sl_use_srv_seed to void
+for i ulong 32
+put mv_ed_seed i get sl_srv_seed i
+put mv_ed_pk i get sl_srv_pk i
+end
+end
+
+fn sl_use_cli_seed to void
+for i ulong 32
+put mv_ed_seed i get sl_cli_seed i
+put mv_ed_pk i get sl_cli_pk i
+end
+end
+
+fn sl_use_rogue_seed to void
+for i ulong 32
+put mv_ed_seed i get sl_rogue_seed i
+put mv_ed_pk i get sl_rogue_pk i
+end
+end
+
+fn sl_aux_put_u64 idx ulong v ulong to void
+off = mul idx 8
+for j ulong 8
+put mr_aux_buf add off j uchar and shr v mul j 8 255
+end
+end
+
+fn sl_val_put_u64 idx ulong v ulong to void
+off = mul idx 8
+for j ulong 8
+put mm_val_buf add off j uchar and shr v mul j 8 255
+end
+end
+
+fn sl_val_get_u64 idx ulong to ulong
+off = mul idx 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mm_val_buf add off j mul j 8
+end
+ret v
+end
+
+fn sl_in_get_u64 idx ulong to ulong
+off = mul idx 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mr_in_buf add off j mul j 8
+end
+ret v
+end
+
+fn sl_in_put_u64 idx ulong v ulong to void
+off = mul idx 8
+for j ulong 8
+put mr_in_buf add off j uchar and shr v mul j 8 255
+end
+end
+
+fn sl_fill_aux dec ulong recmp ulong alarm ulong rew ulong to void
+bh = get sl_tctx 2
+bh_u = ulong 0
+if gt bh 0
+bh_u = ulong bh
+end
+td = get sl_tctx 0
+td_u = ulong 0
+if gt td 0
+td_u = ulong td
+end
+ps = get sl_tctx 1
+ps_u = ulong 0
+if gt ps 0
+ps_u = ulong ps
+end
+sl_aux_put_u64 0 dec
+sl_aux_put_u64 1 recmp
+sl_aux_put_u64 2 td_u
+sl_aux_put_u64 3 ps_u
+sl_aux_put_u64 4 bh_u
+sl_aux_put_u64 5 MB_PROOF_ALL
+sl_aux_put_u64 6 320
+sl_aux_put_u64 7 get fabVer 0
+sl_aux_put_u64 8 tkj_count
+sl_aux_put_u64 9 alarm
+sl_aux_put_u64 10 rew
+sl_aux_put_u64 11 ulong get g_wmeta 12
+put mr_aux_len 0 SI2_AUX_BYTES
+end
+
+fn sl_sync_req_memo pt ulong eb ulong nonce ulong epoch ulong to void
+for i ulong 32
+put mv_exp_ompk_sem i get pk_buf add 8 i
+put mv_exp_fid i get pk_buf add 40 i
+put mv_exp_in_sha i get mr_req_in_sha i
+put mm_req_ir_sha i get pk_buf add 8 i
+put mm_req_fid i get pk_buf add 40 i
+put mm_req_in_sha i get mr_req_in_sha i
+end
+mm_set_contract 1 1 pt eb
+mm_set_provenance TID_X925 MM_PROV_OMPK_V2
+mv_set_expected_meta pt eb nonce epoch MV_TIER_A_SOVEREIGN
+mv_set_expected_purity 1 1 TID_X925
+end
+
+fn sl_specialize_if_needed to ulong
+if ne get mb_slot_spec_ptr 0 0
+ret MB_OK
+end
+rc = pr_shm_open_anon 16
+if ne rc PR_OK
+ret add 700 rc
+end
+po = pr_push_obs 7001 8 9800 0 1500 PR_KIND_CONST
+d = pr_drain
+h = pr_pick_hottest
+gpe_cfg_reset
+gpe_cfg_pin 1 8
+gpe_cfg_pin 2 0
+gpe_cfg_pin 3 0
+gpe_cfg_set_profile 9800 0 TID_X925
+ret mb_specialize_slot 0 TID_X925 WX_PROT_RX MB_PROOF_ALL
+end
+
+fn sl_journal_write_file to void
+jlen = get sl_jpath_len 0
+for ji ulong jlen bound 510
+put tj_path ji get sl_jpath ji
+end
+put tj_plen 0 jlen
+wrc = tkj_write_path
+end
+
+fn sl_journal_ostm_step st ulong to void
+crc = sck_take
+if eq crc SCK_OK
+put sl_last_safe_step 0 st
+end
+for j ulong 16
+put ss_cur_regs j get sc_regs j
+end
+frc = sst_emit_frame st
+if eq frc SST_OK
+drc = sst_decode_verify sst_stream_bytes
+if and eq drc SST_OK sst_verify_exact_match
+put sl_stats 8 add get sl_stats 8 1
+end
+end
+end
+
+fn sl_journal_step a0 ulong a1 ulong y_val ulong disp ulong to ulong
+st = add get sl_step 0 1
+put sl_step 0 st
+put sc_vm 0 st
+put sc_vm 3 tkj_count
+put sc_regs 0 a0
+put sc_regs 1 a1
+put sc_regs 2 y_val
+put sc_regs 3 disp
+tkj_pack_u64x4 a0 a1 y_val st
+opk = TKJ_OP_CHECK
+if eq disp MB_DISP_ROLLBACK
+opk = TKJ_OP_TRAP
+end
+if ne tkj_append opk 0 st 32 TKJ_OK
+ret 1
+end
+if ne tkj_verify_buf tkj_bytes TKJ_OK
+ret 2
+end
+put sl_stats 7 add get sl_stats 7 1
+sl_journal_write_file
+if eq disp MB_DISP_SPEC
+sl_journal_ostm_step st
+end
+ret TKJ_OK
+end
+
+fn sl_handle_ood_exec to ulong
+a0 = get sl_ctx 0
+a1 = get sl_ctx 1
+y_got = get sl_ctx 2
+y_ora = get sl_ctx 3
+pt = get sl_ctx 4
+eb = get sl_ctx 5
+jrc = sl_journal_step a0 a1 y_got MB_DISP_ROLLBACK
+rrc = sck_restore_nearest get sl_last_safe_step 0
+sl_val_put_u64 0 y_got
+sl_val_put_u64 1 y_ora
+sl_val_put_u64 2 a0
+sl_val_put_u64 3 MB_PROOF_ALL
+put mm_val_len 0 32
+sl_use_srv_seed
+src = mv_rcpt_sign TID_X925 pt MV_TIER_A_SOVEREIGN eb get wx_last_ns 0
+put sl_stats 3 add get sl_stats 3 1
+sl_fill_aux SI2_DEC_OOD_ROLLBACK 1 1 1
+ret 0
+end
+
+fn sl_handle_spec_exec to ulong
+a0 = get sl_ctx 0
+a1 = get sl_ctx 1
+y_got = get sl_ctx 2
+y_ora = get sl_ctx 3
+pt = get sl_ctx 4
+eb = get sl_ctx 5
+flags = get sl_ctx 6
+jrc = sl_journal_step a0 a1 y_got MB_DISP_SPEC
+if ne jrc TKJ_OK
+ret 24
+end
+sl_val_put_u64 0 y_got
+sl_val_put_u64 1 y_ora
+sl_val_put_u64 2 a0
+sl_val_put_u64 3 MB_PROOF_ALL
+put mm_val_len 0 32
+sl_use_srv_seed
+src = mv_rcpt_sign TID_X925 pt MV_TIER_A_SOVEREIGN eb get wx_last_ns 0
+if ne src MV_OK
+ret 25
+end
+if eq and flags SI2_FLAG_FAULT_TAMPER_RCPT 0
+vrc = mv_tier_a_verify 32 false
+if ne vrc MV_OK
+ret 26
+end
+arc = mv_admit_to_memo get wx_last_ns 0 1000
+if ne arc MV_OK
+ret 27
+end
+put sl_stats 6 add get sl_stats 6 1
+else
+b = get mv_rcpt 224
+put mv_rcpt 224 xor b 1
+end
+put sl_stats 2 add get sl_stats 2 1
+sl_fill_aux SI2_DEC_SPEC_EXEC 1 0 0
+ret 0
+end
+
+fn sl_handle_memo_hit to ulong
+pt = get sl_ctx 4
+eb = get sl_ctx 5
+flags = get sl_ctx 6
+put sl_stats 1 add get sl_stats 1 1
+sl_use_srv_seed
+src = mv_rcpt_sign TID_X925 pt MV_TIER_A_SOVEREIGN eb 50
+if ne src MV_OK
+ret 25
+end
+if ne and flags SI2_FLAG_FAULT_TAMPER_RCPT 0
+b = get mv_rcpt 224
+put mv_rcpt 224 xor b 1
+end
+sl_fill_aux SI2_DEC_MEMO_HIT 0 0 0
+ret 0
+end
+
+fn sl_dispatch_affine to ulong
+sprc = sl_specialize_if_needed
+if ne sprc MB_OK
+ret sprc
+end
+a0 = sl_in_get_u64 0
+a1 = sl_in_get_u64 1
+a2 = sl_in_get_u64 2
+a3 = sl_in_get_u64 3
+wx_set_args a0 a1 a2 a3 1
+y_got = mb_dispatch_slot 0 true
+y_ora = gpe_eval_fn get sl_affine_f 0 a0 a1 a2 a3
+if ne y_got y_ora
+ret 28
+end
+put sl_ctx 0 a0
+put sl_ctx 1 a1
+put sl_ctx 2 y_got
+put sl_ctx 3 y_ora
+if eq get mb_last_disp 0 MB_DISP_ROLLBACK
+ret sl_handle_ood_exec
+end
+ret sl_handle_spec_exec
+end
+
+fn sl_execute_request to ulong
+wt = new WattThermal 0 0 0
+pol = new WattPolicy 0 0 0 0
+sl_init_pol pol
+tok = sl_sense_thermal wt
+flags = get mr_req_meta 0
+if ne and flags SI2_FLAG_SIM_OVERTEMP 0
+put wt t_die 96000
+end
+tdie = get wt t_die
+pt = get mr_req_meta 6
+eb = get mr_req_meta 7
+ps_set_contract 1 long pt 1 long eb 5000 65000
+ps_rc = ps_dispatch 7001 1 wt pol
+b_h = wc_barrier_h get pol t_ceil tdie get pol tau 0
+put sl_tctx 0 tdie
+put sl_tctx 1 get ps_tel PS_TEL_P_SAFE_GPU
+put sl_tctx 2 b_h
+put sl_ctx 4 pt
+put sl_ctx 5 eb
+put sl_ctx 6 flags
+if ne ps_rc PHYS_OK
+put sl_stats 4 add get sl_stats 4 1
+sl_fill_aux SI2_DEC_WATTCBF_REFUSED 0 0 0
+put mm_val_len 0 0
+ret ps_rc
+end
+sl_sync_req_memo pt eb get mr_req_meta 1 get mr_req_meta 2
+if eq mm_lookup MM_OK
+ret sl_handle_memo_hit
+end
+ret sl_dispatch_affine
+end
+
+fn sl_serve_one lfd int to ulong
+cfd = accept lfd 0
+if lt cfd 0
+ret MR_ERR_IO
+end
+rrc = mr_tcp_recv_wire int cfd
+if ne rrc MR_OK
+z = fclose int cfd
+ret rrc
+end
+put sl_stats 0 add get sl_stats 0 1
+drc = mr_decode_req_frame true
+if ne drc MR_OK
+put sl_stats 5 add get sl_stats 5 1
+put mr_req_meta 0 mr_w_get_u32 12
+put mr_req_meta 1 mr_w_get_u64 16
+put mr_req_meta 2 mr_w_get_u64 24
+for i ulong MV_RCPT_LEN
+put mv_rcpt i 0
+end
+put mm_val_len 0 0
+put sl_tctx 0 0
+put sl_tctx 1 0
+put sl_tctx 2 0
+sl_fill_aux SI2_DEC_AUTH_REFUSED 0 0 0
+erc = mr_encode_resp_frame drc 0 SI2_AUX_BYTES
+if eq erc MR_OK
+src = mr_tcp_send_wire int cfd
+end
+z = fclose int cfd
+ret drc
+end
+erc = sl_execute_request
+olen = get mm_val_len 0
+if ne erc 0
+for i ulong MV_RCPT_LEN
+put mv_rcpt i 0
+end
+olen = 0
+end
+wrc = mr_encode_resp_frame erc olen SI2_AUX_BYTES
+if eq wrc MR_OK
+src = mr_tcp_send_wire int cfd
+end
+z = fclose int cfd
+ret erc
+end
+
+fn sl_print_req_log idx ulong rc ulong to void
+sl_wrt sl_m_req
+sl_num_u idx
+sl_wrt sl_m_rc
+sl_num_u rc
+sl_wrt sl_m_dec
+sl_num_u sl_aux_get_u64 0
+sl_wrt sl_m_nl
+end
+
+fn sl_cmd_status_run to int
+wt = new WattThermal 0 0 0
+pol = new WattPolicy 0 0 0 0
+sl_init_pol pol
+tok = sl_sense_thermal wt
+ps_init
+pb_init
+sl_register_pareto
+ps_set_contract 1 long PHYS_TIER_EXACT 1 0 5000 65000
+ps_rc = ps_dispatch 7001 1 wt pol
+b_h = wc_barrier_h get pol t_ceil get wt t_die get pol tau 0
+sl_wrt sl_m_hdr
+if eq get sl_hub_mode 0 1
+sl_wrt sl_m_hub
+else
+sl_wrt sl_m_spark
+end
+sl_wrt sl_m_z
+sl_num_i get g_wmeta 0
+sl_wrt sl_m_tg
+sl_num_i get g_wmeta 5
+sl_wrt sl_m_ts
+sl_num_i get g_wmeta 6
+sl_wrt sl_m_tm
+sl_num_i get wt t_die
+sl_wrt sl_m_ps
+sl_num_i get ps_tel PS_TEL_P_SAFE_CPU
+sl_wrt sl_m_bh
+sl_num_i b_h
+sl_wrt sl_m_hw
+sl_num_i get g_wmeta 12
+sl_wrt sl_m_nl
+if not tok
+ret 1
+end
+if ne get g_wmeta 12 0
+ret 1
+end
+ret 0
+end
+
+fn sl_cmd_bind_run to int
+ip = sl_parse_ipv4_arg 2
+if not si2_ip_is_safe_bind ip
+sl_wrt sl_m_ref_bind
+sl_num_u ip
+sl_wrt sl_m_nl
+ret int MR_ERR_WILDCARD_BIND
+end
+sl_wrt sl_m_ok_bind
+sl_num_u ip
+sl_wrt sl_m_nl
+ret 0
+end
+
+fn sl_cmd_serve_run to int
+ip = sl_parse_ipv4_arg 2
+if not si2_ip_is_safe_bind ip
+sl_wrt sl_m_ref_bind
+sl_num_u ip
+sl_wrt sl_m_nl
+ret int MR_ERR_WILDCARD_BIND
+end
+port = sl_arg_u64 3 18595
+sl_arg_copy 4 0 sl_def_memo
+sl_arg_copy 5 1 sl_def_wx
+sl_arg_copy 6 2 sl_def_jnl
+maxr = sl_arg_u64 7 0
+irc = sl_init_all
+if ne irc 0
+ret int irc
+end
+lfd = si2_tcp_listen ip port
+if lt lfd 0
+ret int sub 0 lfd
+end
+wt = new WattThermal 0 0 0
+pol = new WattPolicy 0 0 0 0
+sl_init_pol pol
+tok = sl_sense_thermal wt
+ps_set_contract 1 long PHYS_TIER_EXACT 1 0 5000 65000
+ps_rc = ps_dispatch 7001 1 wt pol
+b_h = wc_barrier_h get pol t_ceil get wt t_die get pol tau 0
+sl_wrt sl_m_srv
+sl_num_u ip
+sl_wrt sl_m_port
+sl_num_u get mr_net_stats 7
+sl_wrt sl_m_tm
+sl_num_i get wt t_die
+sl_wrt sl_m_bh
+sl_num_i b_h
+sl_wrt sl_m_hw
+sl_num_i get g_wmeta 12
+sl_wrt sl_m_pk
+sl_print_srv_pk
+sl_wrt sl_m_nl
+served = ulong 0
+while or eq maxr 0 lt served maxr bound 1000000
+rc = sl_serve_one int lfd
+served = add served 1
+sl_print_req_log served rc
+end
+z = fclose int lfd
+ret 0
+end
+
+fn sl_build_workload_ompk to ulong
+pk_reset_builder
+n = len sl_ir_src
+for i ulong n bound 128
+z = pk_ir_push get sl_ir_src i
+end
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+pk_set_contract 1 MM_TIER_EXACT 1 0 5000 65000
+pk_compute_poly_func_id 4 42 8 0
+ret pk_pack
+end
+
+fn sl_stage_inputs a0 ulong a1 ulong a2 ulong a3 ulong to void
+sl_in_put_u64 0 a0
+sl_in_put_u64 1 a1
+sl_in_put_u64 2 a2
+sl_in_put_u64 3 a3
+put mr_in_len 0 32
+end
+
+fn sl_cli_send_req ip ulong port ulong nonce ulong flags ulong corrupt_sig bool to ulong
+sl_use_cli_seed
+for i ulong 32
+put mr_cli_seed i get sl_cli_seed i
+put mr_cli_pk i get sl_cli_pk i
+end
+put mr_req_meta 0 flags
+put mr_req_meta 1 nonce
+put mr_req_meta 2 1
+rc = mr_encode_req_frame 1 MM_TIER_EXACT 0 TID_X925 flags
+if ne rc MR_OK
+ret rc
+end
+if corrupt_sig
+wl = get mr_wire_len 0
+b = get mr_wire sub wl 1
+put mr_wire sub wl 1 xor b 1
+end
+cfd = si2_tcp_connect ip port
+if lt cfd 0
+ret ulong sub 0 cfd
+end
+src = mr_tcp_send_wire int cfd
+if ne src MR_OK
+z = fclose int cfd
+ret src
+end
+rrc = mr_tcp_recv_wire int cfd
+z = fclose int cfd
+if ne rrc MR_OK
+ret rrc
+end
+ret mr_decode_resp_frame
+end
+
+fn sl_verify_resp nonce ulong to ulong
+for i ulong 32
+put mv_exp_ompk_sem i get pk_buf add 8 i
+put mv_exp_fid i get pk_buf add 40 i
+put sh_dat i get mr_in_buf i
+end
+sh_all 32
+for i ulong 32
+put mv_exp_in_sha i get sh_dig i
+end
+mv_set_expected_meta MM_TIER_EXACT 0 nonce 1 MV_TIER_A_SOVEREIGN
+mv_set_expected_purity 1 1 TID_X925
+ret mv_tier_a_verify get mm_val_len 0 false
+end
+
+fn sl_aux_get_u64 idx ulong to ulong
+off = mul idx 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mr_aux_buf add off j mul j 8
+end
+ret v
+end
+
+fn sl_demo_child lfd int to int
+for k ulong 6
+rc = sl_serve_one lfd
+end
+z = fclose lfd
+ret 0
+end
+
+fn sl_demo_parent port ulong to int
+sl_use_cli_seed
+pkrc = sl_build_workload_ompk
+if ne pkrc PK_OK
+ret 10
+end
+sl_stage_inputs 42 8 0 0
+if ne sl_cli_send_req MR_IPV4_LOOPBACK port 1 0 false MR_OK
+ret 11
+end
+if or ne get mr_req_meta 9 0 ne sl_val_get_u64 0 1008
+ret 12
+end
+if ne sl_aux_get_u64 0 SI2_DEC_SPEC_EXEC
+ret 13
+end
+if ne sl_verify_resp 1 MV_OK
+ret 14
+end
+for i ulong 32
+put sl_saved_call1 i get mm_val_buf i
+end
+if ne sl_cli_send_req MR_IPV4_LOOPBACK port 2 0 false MR_OK
+ret 15
+end
+if or ne get mr_req_meta 9 0 ne sl_aux_get_u64 0 SI2_DEC_MEMO_HIT
+ret 16
+end
+if ne sl_aux_get_u64 1 0
+ret 17
+end
+if ne sl_verify_resp 2 MV_OK
+ret 18
+end
+for i ulong 32
+if ne get mm_val_buf i get sl_saved_call1 i
+ret 19
+end
+end
+sl_stage_inputs 42 9 2 1
+if ne sl_cli_send_req MR_IPV4_LOOPBACK port 3 0 false MR_OK
+ret 20
+end
+if or ne get mr_req_meta 9 0 ne sl_val_get_u64 0 3335
+ret 21
+end
+if ne sl_aux_get_u64 0 SI2_DEC_OOD_ROLLBACK
+sl_wrt sl_m_dec
+sl_num_u sl_aux_get_u64 0
+sl_wrt sl_m_y
+sl_num_u sl_val_get_u64 0
+sl_wrt sl_m_nl
+ret 22
+end
+if ne sl_verify_resp 3 MV_OK
+ret 23
+end
+sl_stage_inputs 42 8 0 0
+rc4 = sl_cli_send_req MR_IPV4_LOOPBACK port 4 SI2_FLAG_SIM_OVERTEMP false
+if ne rc4 MR_OK
+sl_wrt sl_m_rc
+sl_num_u rc4
+sl_wrt sl_m_nl
+ret 24
+end
+if ne get mr_req_meta 9 PHYS_ERR_WATTCBF_FAIL_CLOSED
+ret 25
+end
+if ne sl_cli_send_req MR_IPV4_LOOPBACK port 5 0 true MR_OK
+ret 26
+end
+if ne get mr_req_meta 9 MR_ERR_FRAME_SIG
+ret 27
+end
+if ne sl_cli_send_req MR_IPV4_LOOPBACK port 6 SI2_FLAG_FAULT_TAMPER_RCPT false MR_OK
+ret 28
+end
+if ne sl_verify_resp 6 MV_ERR_BAD_SIG
+ret 29
+end
+pslot = mv_peer_find_pk
+mv_peer_quarantine pslot
+if ne sl_verify_resp 6 MV_ERR_QUARANTINED
+ret 30
+end
+ret 0
+end
+
+fn sl_cmd_demo_run to int
+sl_arg_copy 2 0 sl_def_memo
+sl_arg_copy 3 1 sl_def_wx
+sl_arg_copy 4 2 sl_def_jnl
+irc = sl_init_all
+if ne irc 0
+ret int irc
+end
+if ne wx_validate_prot WX_PROT_RWX WX_ERR_RWX_FORBIDDEN
+ret 40
+end
+if si2_ip_is_safe_bind 0
+ret 41
+end
+lfd = si2_tcp_listen MR_IPV4_LOOPBACK 0
+if lt lfd 0
+ret 42
+end
+port = get mr_net_stats 7
+pid = fork
+if lt pid 0
+z = fclose int lfd
+ret 43
+end
+if eq pid 0
+cr = sl_demo_child int lfd
+exit cr
+end
+z = fclose int lfd
+pr = sl_demo_parent port
+if ne pr 0
+k = killpid int pid 9
+end
+wp = waitpid int pid sl_st 0 4 0
+if ne pr 0
+sl_wrt sl_m_demo_fail
+sl_num_i long pr
+sl_wrt sl_m_nl
+ret pr
+end
+sl_wrt sl_m_demo_ok
+sl_num_u 1
+sl_wrt sl_m_hw
+sl_num_i get g_wmeta 12
+sl_wrt sl_m_nl
+ret 0
+end
+
+fn sl_cmd_dispatch_run to int
+ip = sl_parse_ipv4_arg 2
+if not si2_ip_is_safe_bind ip
+sl_wrt sl_m_ref_bind
+sl_num_u ip
+sl_wrt sl_m_nl
+ret int MR_ERR_WILDCARD_BIND
+end
+port = sl_arg_u64 3 18596
+sl_arg_copy 4 0 sl_def_memo
+sl_arg_copy 5 1 sl_def_wx
+sl_arg_copy 6 2 sl_def_jnl
+irc = sl_init_all
+if ne irc 0
+ret int irc
+end
+mv_ed_derive_seed sl_tag_srv 1
+mv_ed_pubkey_from_seed
+ss0 = mv_peer_register 201 MV_TIER_A_SOVEREIGN
+mv_ed_derive_seed sl_tag_hub 2
+mv_ed_pubkey_from_seed
+hs = mv_peer_register 202 MV_TIER_A_SOVEREIGN
+if ne sl_build_workload_ompk PK_OK
+ret 50
+end
+sl_stage_inputs 42 8 0 0
+if ne sl_cli_send_req ip port 101 0 false MR_OK
+sl_wrt sl_m_disp_fail
+sl_num_u 51
+sl_wrt sl_m_nl
+ret 51
+end
+if or ne get mr_req_meta 9 0 ne sl_val_get_u64 0 1008
+ret 52
+end
+if ne sl_verify_resp 101 MV_OK
+ret 53
+end
+if ne sl_cli_send_req ip port 102 0 false MR_OK
+ret 54
+end
+if or ne sl_aux_get_u64 0 SI2_DEC_MEMO_HIT ne sl_aux_get_u64 1 0
+ret 55
+end
+if ne sl_verify_resp 102 MV_OK
+ret 56
+end
+sl_wrt sl_m_disp_ok
+sl_num_u ip
+sl_wrt sl_m_y
+sl_num_u sl_val_get_u64 0
+sl_wrt sl_m_rec
+sl_num_u sl_aux_get_u64 1
+sl_wrt sl_m_nl
+ret 0
+end
+
+fn main to int
+if sl_has_flag sl_fl_rwx
+sl_wrt sl_m_ref_rwx
+ret 2
+end
+if sl_has_flag sl_fl_hub
+put sl_hub_mode 0 1
+else
+put sl_hub_mode 0 0
+end
+if le argcnt 1
+ret sl_cmd_status_run
+end
+if sl_arg_eq 1 sl_cmd_status
+ret sl_cmd_status_run
+end
+if sl_arg_eq 1 sl_cmd_check_bind
+ret sl_cmd_bind_run
+end
+if sl_arg_eq 1 sl_cmd_serve
+ret sl_cmd_serve_run
+end
+if sl_arg_eq 1 sl_cmd_dispatch
+ret sl_cmd_dispatch_run
+end
+if sl_arg_eq 1 sl_cmd_demo
+ret sl_cmd_demo_run
+end
+ret 1
+end
