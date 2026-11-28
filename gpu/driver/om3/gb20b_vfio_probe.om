@@ -1,0 +1,624 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note gpu/driver/om3/gb20b_vfio_probe.om: Strictly READ-ONLY (hw_writes=0) Spark GB20B VFIO & IORT Audit.
+note
+note CRITICAL HARDWARE SAFETY:
+note   - Zero hardware writes (hw_writes=0). Only O_RDONLY (0) and O_RDONLY|O_DIRECTORY|O_NOFOLLOW (49152) opens.
+note   - NEVER touches /sys/bus/pci/devices/000f:01:00.0/reset, driver_override, or /dev/vfio/20.
+note   - NEVER touches UEFI, NVRAM, SPI, USB, or kernel modules.
+note   - Gracefully handles EACCES (-13) or ENOENT (-2) on /sys/firmware/acpi/tables/IORT without faulting.
+note
+note Usage:
+note   gb20b_vfio_probe [--root <prefix>]
+note
+note Default prefix is "" (inspects live /sys/bus/pci/devices/000f:01:00.0, /sys/kernel/iommu_groups/20,
+note /dev/vfio, and /sys/firmware/acpi/tables/IORT). Optional --root allows hermetic fixture testing.
+
+const VP_O_RDONLY int 0
+const VP_O_DIR int 49152
+const VP_MAX_BUF ulong 65536
+
+global vp_root uchar 1024
+global vp_rootlen ulong 1
+global vp_path uchar 2048
+global vp_plen ulong 1
+global vp_buf uchar 65536
+global vp_buflen ulong 1
+global vp_probe uchar 4
+global vp_dents uchar 16384
+global vp_lnk uchar 512
+global vp_dig uchar 24
+global vp_hex uchar 20
+global vp_arg uchar 1024
+
+global vp_bar0_start ulong 1
+global vp_bar0_end ulong 1
+global vp_bar0_size ulong 1
+global vp_grp_cnt ulong 1
+global vp_grp_sole ulong 1
+global vp_drv_state ulong 1
+global vp_vfio_ro ulong 1
+global vp_vfio_g20 ulong 1
+global vp_iort_st ulong 1
+global vp_iort_rmr_flags ulong 1
+global vp_rmr_low_hit ulong 1
+global vp_rmr_hi_hit ulong 1
+global vp_has_dma_type ulong 1
+
+text vp_flag_root "--root"
+text vp_p_ven "/sys/bus/pci/devices/000f:01:00.0/vendor"
+text vp_p_dev "/sys/bus/pci/devices/000f:01:00.0/device"
+text vp_p_grp "/sys/bus/pci/devices/000f:01:00.0/iommu_group"
+text vp_p_drv "/sys/bus/pci/devices/000f:01:00.0/driver"
+text vp_p_res "/sys/bus/pci/devices/000f:01:00.0/resource"
+text vp_p_gdevs "/sys/kernel/iommu_groups/20/devices"
+text vp_p_gtype "/sys/kernel/iommu_groups/20/type"
+text vp_p_grsv "/sys/kernel/iommu_groups/20/reserved_regions"
+text vp_p_vdir "/dev/vfio"
+text vp_p_vdev "/dev/vfio/vfio"
+text vp_p_iort "/sys/firmware/acpi/tables/IORT"
+
+text vp_bdf "000f:01:00.0"
+text vp_s_vfio "vfio"
+text vp_s_20 "20"
+text vp_s_dma "DMA"
+text vp_s_direct "direct"
+text vp_s_rmr0 "a1600000"
+text vp_s_rmr1 "280000000"
+text vp_s_rmr2 "302ffffff"
+text vp_s_iort "IORT"
+
+text vp_m_use "usage: gb20b_vfio_probe [--root <prefix>]\n"
+text vp_m_p1 "GB20B_VFIO_PROBE PASS hw_writes=0 bdf=000f:01:00.0 vendor=0x10de device=0x2e12 iommu_group=20 sole_member=1"
+text vp_m_drv_u " driver=unbound"
+text vp_m_drv_b " driver=bound"
+text vp_m_bar " bar0="
+text vp_m_bsz " bar0_sz="
+text vp_m_vf1 " vfio_ro=1"
+text vp_m_vf0 " vfio_ro=0"
+text vp_m_io_ok " iort_sysfs=READ_VERIFIED"
+text vp_m_io_ac " iort_sysfs=EACCES"
+text vp_m_io_no " iort_sysfs=ABSENT"
+text vp_m_rmr " rmr_direct_hits="
+text vp_m_blk " VFIO_DEVICE_BIND=BLOCKED_HARDWARE (IORT RMR_NODE idx=50 remap_permitted=0)\n"
+text vp_m_fail "GB20B_VFIO_PROBE FAIL reason="
+text vp_f_ven "vendor_or_device_mismatch"
+text vp_f_grp "iommu_group_not_20"
+text vp_f_sole "iommu_group_20_not_sole"
+text vp_f_bar "bar0_resource_invalid"
+text vp_f_vfio "vfio_container_unavailable"
+text vp_f_rmr "expected_rmr_direct_region_missing"
+text vp_f_arg "invalid_arguments"
+text vp_nl "\n"
+
+fn vp_wrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn vp_num fd int v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put vp_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd vp_dig p sub 24 p
+ret
+end
+end
+end
+
+fn vp_wrhex fd int v ulong n ulong to void
+put vp_hex 0 48
+put vp_hex 1 120
+for i ulong n bound 16
+sh = mul sub sub n 1 i 4
+d = and shr v sh 15
+ch = uchar add 48 d
+if ge d 10
+ch = uchar add 87 d
+end
+put vp_hex add 2 i ch
+end
+r = write fd vp_hex 0 add 2 n
+end
+
+fn vp_fail rsn view uchar * to int
+vp_wrt 2 vp_m_fail
+vp_wrt 2 rsn
+vp_wrt 2 vp_nl
+ret 1
+end
+
+fn vp_eq_arg s view uchar * n ulong to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 64
+if ne get vp_arg i get s i
+ret false
+end
+end
+ret true
+end
+
+fn vp_build_path rel view uchar * to ulong
+rl = get vp_rootlen 0
+p = ulong 0
+for i ulong rl bound 1024
+put vp_path p get vp_root i
+p = add p 1
+end
+nl = len rel
+for j ulong nl bound 512
+put vp_path p get rel j
+p = add p 1
+end
+put vp_plen 0 p
+ret p
+end
+
+fn vp_read_file rel view uchar * to long
+plen = vp_build_path rel
+fd = fopen vp_path 0 plen VP_O_RDONLY 0
+if lt fd 0
+put vp_buflen 0 0
+ret fd
+end
+n = ulong 0
+eof = false
+while lt n VP_MAX_BUF bound 1024
+k = read int fd vp_buf n sub VP_MAX_BUF n
+if lt k 0
+c1 = fclose int fd
+put vp_buflen 0 0
+ret k
+end
+if eq k 0
+eof = true
+break
+end
+n = add n ulong k
+end
+if not eof
+ex = read int fd vp_probe 0 1
+if ne ex 0
+c3 = fclose int fd
+put vp_buflen 0 0
+ret -27
+end
+end
+c2 = fclose int fd
+put vp_buflen 0 n
+ret long n
+end
+
+fn vp_buf_has pat view uchar * to bool
+bl = get vp_buflen 0
+pl = len pat
+if lt bl pl
+ret false
+end
+lim = add sub bl pl 1
+for i ulong lim bound 65536
+ok = true
+for j ulong pl bound 64
+if ne get vp_buf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn vp_is_ws c ulong to bool
+if or eq c 32 or eq c 9 or eq c 10 eq c 13
+ret true
+end
+ret false
+end
+
+fn vp_parse_hex_at pos ulong to ulong
+bad = not ulong 0
+bl = get vp_buflen 0
+p = pos
+while lt p bl bound 1024
+if not vp_is_ws ulong get vp_buf p
+break
+end
+p = add p 1
+end
+if ge add p 2 bl
+ret bad
+end
+if or ne get vp_buf p 48 and ne get vp_buf add p 1 120 ne get vp_buf add p 1 88
+ret bad
+end
+p = add p 2
+v = ulong 0
+nd = ulong 0
+while lt p bl bound 20
+c = ulong get vp_buf p
+d = ulong 99
+if and ge c 48 le c 57
+d = sub c 48
+end
+if and ge c 97 le c 102
+d = add 10 sub c 97
+end
+if and ge c 65 le c 70
+d = add 10 sub c 65
+end
+if ge d 16
+break
+end
+if ge nd 16
+ret bad
+end
+v = or shl v 4 d
+nd = add nd 1
+p = add p 1
+end
+if eq nd 0
+ret bad
+end
+ret v
+end
+
+fn vp_parse_hex_line to ulong
+ret vp_parse_hex_at 0
+end
+
+fn vp_last_eq n ulong pat view uchar * to bool
+s = ulong 0
+for i ulong n bound 512
+if eq get vp_lnk i 47
+s = add i 1
+end
+end
+m = sub n s
+if ne m len pat
+ret false
+end
+for j ulong m bound 64
+if ne get vp_lnk add s j get pat j
+ret false
+end
+end
+ret true
+end
+
+fn vp_is_dot o ulong to bool
+if ne get vp_dents o 46
+ret false
+end
+if eq get vp_dents add o 1 0
+ret true
+end
+ret and eq get vp_dents add o 1 46 eq get vp_dents add o 2 0
+end
+
+fn vp_name_eq o ulong pat view uchar * to bool
+pl = len pat
+for i ulong pl bound 64
+if ne get vp_dents add o i get pat i
+ret false
+end
+end
+ret eq get vp_dents add o pl 0
+end
+
+fn vp_scan_iommu_20 to bool
+plen = vp_build_path vp_p_gdevs
+dfd = fopen vp_path 0 plen VP_O_DIR 0
+if lt dfd 0
+ret false
+end
+cnt = ulong 0
+sole = ulong 0
+while true bound 512
+r = getdnts int dfd vp_dents 0 16384
+if lt r 0
+c1 = fclose int dfd
+ret false
+end
+if eq r 0
+break
+end
+o = ulong 0
+while lt o ulong r bound 4096
+rl = ulong get vp_dents add o 17
+rl = or shl rl 8 ulong get vp_dents add o 16
+if eq rl 0
+c2 = fclose int dfd
+ret false
+end
+if not vp_is_dot add o 19
+cnt = add cnt 1
+if vp_name_eq add o 19 vp_bdf
+sole = add sole 1
+end
+end
+o = add o rl
+end
+end
+c3 = fclose int dfd
+put vp_grp_cnt 0 cnt
+put vp_grp_sole 0 sole
+ret and eq cnt 1 eq sole 1
+end
+
+fn vp_scan_dev_vfio to void
+put vp_vfio_ro 0 0
+put vp_vfio_g20 0 0
+plen = vp_build_path vp_p_vdir
+dfd = fopen vp_path 0 plen VP_O_DIR 0
+if lt dfd 0
+ret
+end
+has_v = ulong 0
+has_20 = ulong 0
+while true bound 256
+r = getdnts int dfd vp_dents 0 16384
+if le r 0
+break
+end
+o = ulong 0
+while lt o ulong r bound 4096
+rl = ulong get vp_dents add o 17
+rl = or shl rl 8 ulong get vp_dents add o 16
+if eq rl 0
+break
+end
+if not vp_is_dot add o 19
+if vp_name_eq add o 19 vp_s_vfio
+has_v = 1
+end
+if vp_name_eq add o 19 vp_s_20
+has_20 = 1
+end
+end
+o = add o rl
+end
+end
+c1 = fclose int dfd
+put vp_vfio_g20 0 has_20
+if eq has_v 1
+plen2 = vp_build_path vp_p_vdev
+vfd = fopen vp_path 0 plen2 VP_O_RDONLY 0
+if ge vfd 0
+put vp_vfio_ro 0 1
+c2 = fclose int vfd
+end
+end
+end
+
+fn vp_parse_bar0 to bool
+bad = not ulong 0
+rc = vp_read_file vp_p_res
+if le rc 0
+ret false
+end
+s0 = vp_parse_hex_at 0
+if eq s0 bad
+ret false
+end
+p = ulong 0
+bl = get vp_buflen 0
+while lt p bl bound 256
+if vp_is_ws ulong get vp_buf p
+break
+end
+p = add p 1
+end
+e0 = vp_parse_hex_at p
+if or eq e0 bad lt e0 s0
+ret false
+end
+sz = add sub e0 s0 1
+if lt sz 4096
+ret false
+end
+put vp_bar0_start 0 s0
+put vp_bar0_end 0 e0
+put vp_bar0_size 0 sz
+ret true
+end
+
+fn vp_rd32 off ulong to ulong
+b0 = ulong get vp_buf off
+b1 = ulong get vp_buf add off 1
+b2 = ulong get vp_buf add off 2
+b3 = ulong get vp_buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn vp_rd16 off ulong to ulong
+b0 = ulong get vp_buf off
+b1 = ulong get vp_buf add off 1
+ret or b0 shl b1 8
+end
+
+fn vp_inspect_iort to void
+put vp_iort_st 0 0
+put vp_iort_rmr_flags 0 0
+rc = vp_read_file vp_p_iort
+if lt rc 0
+if eq rc -13
+put vp_iort_st 0 1
+else
+put vp_iort_st 0 2
+end
+ret
+end
+n = get vp_buflen 0
+if lt n 48
+put vp_iort_st 0 2
+ret
+end
+for i ulong 4
+if ne get vp_buf i get vp_s_iort i
+put vp_iort_st 0 2
+ret
+end
+end
+tlen = vp_rd32 4
+if or lt tlen 48 gt tlen n
+put vp_iort_st 0 2
+ret
+end
+ncnt = vp_rd32 36
+off = vp_rd32 40
+i = ulong 0
+while lt i ncnt bound 256
+if or lt off 48 gt add off 16 tlen
+break
+end
+ntype = ulong get vp_buf off
+nlen = vp_rd16 add off 1
+if or lt nlen 16 gt add off nlen tlen
+break
+end
+if and eq ntype 6 ge nlen 28
+flags = vp_rd32 add off 16
+put vp_iort_rmr_flags 0 flags
+put vp_iort_st 0 3
+ret
+end
+off = add off nlen
+i = add i 1
+end
+put vp_iort_st 0 3
+end
+
+fn vp_parse_args to bool
+ac = argcnt
+if eq ac 1
+put vp_rootlen 0 0
+ret true
+end
+if ne ac 3
+ret false
+end
+al1 = argread 1 vp_arg 0 1020
+if lt al1 1
+ret false
+end
+if not vp_eq_arg vp_flag_root ulong al1
+ret false
+end
+al2 = argread 2 vp_root 0 1020
+if lt al2 1
+ret false
+end
+put vp_rootlen 0 ulong al2
+ret true
+end
+
+fn main to int
+if not vp_parse_args
+vp_wrt 2 vp_m_use
+ret vp_fail vp_f_arg
+end
+
+note 1. Read PCI vendor & device (000f:01:00.0 -> 0x10de:0x2e12)
+if le vp_read_file vp_p_ven 0
+ret vp_fail vp_f_ven
+end
+ven = vp_parse_hex_line
+if le vp_read_file vp_p_dev 0
+ret vp_fail vp_f_ven
+end
+dev = vp_parse_hex_line
+if or ne ven 0x10de ne dev 0x2e12
+ret vp_fail vp_f_ven
+end
+
+note 2. Read iommu_group symlink -> group 20 & verify sole device in /sys/kernel/iommu_groups/20/devices
+plen = vp_build_path vp_p_grp
+ln = readlnk vp_path 0 plen vp_lnk 0 512
+if le ln 0
+ret vp_fail vp_f_grp
+end
+if not vp_last_eq ulong ln vp_s_20
+ret vp_fail vp_f_grp
+end
+if not vp_scan_iommu_20
+ret vp_fail vp_f_sole
+end
+
+note 3. Read group type & reserved_regions (RMR direct ranges)
+put vp_has_dma_type 0 0
+if gt vp_read_file vp_p_gtype 0
+if vp_buf_has vp_s_dma
+put vp_has_dma_type 0 1
+end
+end
+put vp_rmr_low_hit 0 0
+put vp_rmr_hi_hit 0 0
+if gt vp_read_file vp_p_grsv 0
+if and vp_buf_has vp_s_direct vp_buf_has vp_s_rmr0
+put vp_rmr_low_hit 0 1
+end
+if and vp_buf_has vp_s_rmr1 vp_buf_has vp_s_rmr2
+put vp_rmr_hi_hit 0 1
+end
+end
+if or ne get vp_rmr_low_hit 0 1 ne get vp_rmr_hi_hit 0 1
+ret vp_fail vp_f_rmr
+end
+
+note 4. Read BAR0 resource & driver symlink (read-only)
+if not vp_parse_bar0
+ret vp_fail vp_f_bar
+end
+plen2 = vp_build_path vp_p_drv
+dln = readlnk vp_path 0 plen2 vp_lnk 0 512
+put vp_drv_state 0 0
+if gt dln 0
+put vp_drv_state 0 1
+end
+
+note 5. Inspect /dev/vfio read-only & /sys/firmware/acpi/tables/IORT read-only
+vp_scan_dev_vfio
+if ne get vp_vfio_ro 0 1
+ret vp_fail vp_f_vfio
+end
+vp_inspect_iort
+
+note 6. Emit strictly read-only audit report (hw_writes=0)
+vp_wrt 1 vp_m_p1
+if eq get vp_drv_state 0 0
+vp_wrt 1 vp_m_drv_u
+else
+vp_wrt 1 vp_m_drv_b
+end
+vp_wrt 1 vp_m_bar
+vp_wrhex 1 get vp_bar0_start 0 8
+vp_wrt 1 vp_m_bsz
+vp_wrhex 1 get vp_bar0_size 0 8
+if eq get vp_vfio_ro 0 1
+vp_wrt 1 vp_m_vf1
+else
+vp_wrt 1 vp_m_vf0
+end
+ist = get vp_iort_st 0
+if eq ist 3
+vp_wrt 1 vp_m_io_ok
+else
+if eq ist 1
+vp_wrt 1 vp_m_io_ac
+else
+vp_wrt 1 vp_m_io_no
+end
+end
+vp_wrt 1 vp_m_rmr
+vp_num 1 add get vp_rmr_low_hit 0 get vp_rmr_hi_hit 0
+vp_wrt 1 vp_m_blk
+ret 0
+end
