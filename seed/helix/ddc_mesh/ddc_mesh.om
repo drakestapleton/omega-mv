@@ -1,0 +1,1503 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/ddc_mesh/ddc_mesh.om
+note Wave 3 Alien Breakthrough: Cross-Host Physical Byzantine Diverse Double-Compiling (DDC-3HOST).
+note
+note Pure seeded OM-2 (zero C, zero GCC, zero Python, zero Rust, zero hardware/GPU writes).
+note Compiles identically on:
+note   - MacBook Apple Silicon (target a64macos via ~/.local/bin/omc + codesign)
+note   - DGX Spark Grace X925/A725 (aarch64 Linux via pinned seed/out/omc)
+note   - Raspberry Pi 5 Cortex-A76 hub (aarch64 Linux via pinned seed/out/omc)
+note
+note Compose after:
+note   si/directives/om2.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note   protocol/uor-gpu/ed_sign.om
+note
+note OMRC0001 Convergence Receipt Wire Layout (352 bytes, little-endian):
+note   [0..8)     magic               "OMRC0001"
+note   [8..32)    domain_tag          "OMEGA-DDC3-RECEIPT-V1" + 3 NUL bytes
+note   [32..36)   version             u32 LE = 1
+note   [36..40)   host_role_id        u32 LE (1=macbook-a64macos, 2=spark-grace, 3=pi5-hub)
+note   [40..48)   epoch               u64 LE (>= 1)
+note   [48..56)   compiled_bytes      u64 LE (> 0)
+note   [56..64)   exec_exit_code      u64 LE
+note   [64..96)   platform_abi_sha256 SHA-256(abi_tag)
+note   [96..128)  source_sha256       SHA-256(payload_source)
+note   [128..160) compiled_sha256     SHA-256(native_compiled_bin)
+note   [160..192) exec_digest         SHA-256(native_exec_stdout)
+note   [192..224) cross_elf_sha256    SHA-256(canonical_aarch64_elf)
+note   [224..256) semantic_digest     SHA-256("OMEGA-DDC3-SEMANTIC-V1\0" || source_sha256 || exec_digest || u64_le(exec_exit_code) || cross_elf_sha256)
+note   [256..288) node_pubkey         RFC 8032 Ed25519 public key (32 B)
+note   [288..352) ed25519_sig         RFC 8032 strict (mode=0) Ed25519 signature over [0..288)
+note
+note Usage:
+note   ddc_mesh emit-payload <out.om> [--macos]
+note   ddc_mesh attest --role <1|2|3> --abi <tag> --source <file> --compiled <file>
+note                   --cross-elf <file> --exec-out <file> --exec-rc <rc> --out <rcpt>
+note                   [--epoch <n>] [--seed-tag <tag>] [--seed-hex <64hex>]
+note   ddc_mesh verify-receipt <rcpt>
+note   ddc_mesh verify-quorum <rcpt1> <rcpt2> <rcpt3>
+note   ddc_mesh inspect <rcpt>
+note   ddc_mesh selftest
+
+const DM_RCPT_LEN ulong 352
+const DM_BODY_LEN ulong 288
+const DM_VERSION ulong 1
+const DM_MAX_FILE ulong 16777216
+
+const DM_OK int 0
+const DM_ERR_USAGE int 2
+const DM_ERR_IO int 101
+const DM_ERR_FORMAT int 102
+const DM_ERR_DOMAIN int 103
+const DM_ERR_ED25519 int 104
+const DM_ERR_SEMANTIC_BIND int 105
+const DM_ERR_SYBIL_PUBKEY int 106
+const DM_ERR_ROLE_OR_ABI_DUP int 107
+const DM_ERR_SOURCE_MISMATCH int 108
+const DM_ERR_THOMPSON_CROSS_ELF int 109
+const DM_ERR_THOMPSON_EXEC int 110
+const DM_ERR_SEMANTIC_DIVERGE int 111
+
+global dm_arg uchar 4096
+global dm_p_out uchar 4096
+global dm_p_out_n ulong 1
+global dm_p_src uchar 4096
+global dm_p_src_n ulong 1
+global dm_p_cmp uchar 4096
+global dm_p_cmp_n ulong 1
+global dm_p_xelf uchar 4096
+global dm_p_xelf_n ulong 1
+global dm_p_xout uchar 4096
+global dm_p_xout_n ulong 1
+global dm_p_r1 uchar 4096
+global dm_p_r1_n ulong 1
+global dm_p_r2 uchar 4096
+global dm_p_r2_n ulong 1
+global dm_p_r3 uchar 4096
+global dm_p_r3_n ulong 1
+
+global dm_abi uchar 128
+global dm_abi_n ulong 1
+global dm_stag uchar 128
+global dm_stag_n ulong 1
+global dm_seed uchar 32
+global dm_has_seed ulong 1
+global dm_pk uchar 32
+global dm_sig uchar 64
+
+note dm_cfg: [0]=role, [1]=epoch, [2]=exec_rc, [3]=compiled_bytes, [4]=macos_flag, [5]=cmd
+global dm_cfg ulong 8
+
+global dm_sha_abi uchar 32
+global dm_sha_src uchar 32
+global dm_sha_cmp uchar 32
+global dm_sha_xout uchar 32
+global dm_sha_xelf uchar 32
+global dm_sha_sem uchar 32
+
+global dm_rcpt uchar 352
+global dm_q0 uchar 352
+global dm_q1 uchar 352
+global dm_q2 uchar 352
+global dm_st_save uchar 1056
+
+global dm_probe uchar 4
+global dm_dig uchar 24
+global dm_hex uchar 128
+global dm_pay uchar 8192
+global dm_pay_n ulong 1
+global dm_dissent_mask ulong 1
+
+text dm_magic "OMRC0001"
+text dm_dom_rcpt "OMEGA-DDC3-RECEIPT-V1"
+text dm_dom_sem "OMEGA-DDC3-SEMANTIC-V1"
+text dm_dom_key "OMEGA-DDC3-NODE-KEY-V1"
+text dm_def_stag "OMEGA-DDC3-DEFAULT-NODE-SEED"
+
+text dm_c_emit "emit-payload"
+text dm_c_att "attest"
+text dm_c_vr "verify-receipt"
+text dm_c_vq "verify-quorum"
+text dm_c_insp "inspect"
+text dm_c_st "selftest"
+
+text dm_f_mac "--macos"
+text dm_f_role "--role"
+text dm_f_abi "--abi"
+text dm_f_src "--source"
+text dm_f_cmp "--compiled"
+text dm_f_xelf "--cross-elf"
+text dm_f_xout "--exec-out"
+text dm_f_xrc "--exec-rc"
+text dm_f_ep "--epoch"
+text dm_f_out "--out"
+text dm_f_stag "--seed-tag"
+text dm_f_shex "--seed-hex"
+
+text dm_pl_mac "target a64macos\n"
+text dm_pl_0 "om2\ntext dp_seed \"OMEGA-DDC3-SEED-2026\"\ntext dp_ok \"DDC_PAYLOAD_OK rounds=256 invariants=768 digest=\"\ntext dp_tail \" exit=53\\n\"\nfn dp_hex v ulong to uchar\n  if lt v 10\n    ret uchar add 48 v\n  end\n  ret uchar add 87 v\nend\n"
+text dm_pl_1 "fn dp_mix x uint y uint k uint r uint to uint\n  a = add x y\n  b = xor a k\n  ret rotr b r\nend\nfn dp_chk a uint b uint c uint to int\n  c1 = add c uint 1\n  lhs = mul add a b c1\n  rhs = add mul a c1 mul b c1\n  if ne lhs rhs\n    ret 99\n  end\n  if ne rotr rotr a 7 25 a\n    ret 98\n  end\n  if ne xor xor a b b a\n    ret 97\n  end\n  ret 0\nend\n"
+text dm_pl_2 "fn dp_round h edit uint 8 r ulong to int\n  a = get h and r 7\n  b = get h and add r 1 7\n  c = get h and add r 2 7\n  if ne dp_chk a b c 0\n    ret dp_chk a b c\n  end\n  k = add mul uint r uint 0x9e3779b9 uint 0x7f4a7c15\n  nv = dp_mix a b k uint add 1 and r 15\n  if true\n    t = and add r 3 7\n    mc = mul c uint 0x85ebca6b\n    put h t xor get h t add nv mc\n  end\n"
+text dm_pl_3 "  p = and add r 5 7\n  sh2 = uint add 3 and r 7\n  put h p add get h p rotr nv sh2\n  ret 0\nend\n"
+text dm_pl_4 "fn dp_print h view uint 8 to int\n  ob = new uchar 128 0\n  pos = ulong 0\n  for i ulong len dp_ok bound 64\n    put ob pos get dp_ok i\n    pos = add pos 1\n  end\n  for i ulong 8\n    w = get h i\n    for j ulong 8\n"
+text dm_pl_5 "      sh = uint mul sub 7 j 4\n      nib = ulong and shr w sh 15\n      put ob pos dp_hex nib\n      pos = add pos 1\n    end\n  end\n  for i ulong len dp_tail bound 16\n    put ob pos get dp_tail i\n    pos = add pos 1\n  end\n"
+text dm_pl_6 "  wr = write 1 ob 0 pos\n  if ne wr long pos\n    ret 96\n  end\n  ret 53\nend\nfn main to int\n  h = new uint 8 0\n  put h 0 uint 0x6a09e667\n  put h 1 uint 0xbb67ae85\n  put h 2 uint 0x3c6ef372\n"
+text dm_pl_7 "  put h 3 uint 0xa54ff53a\n  put h 4 uint 0x510e527f\n  put h 5 uint 0x9b05688c\n  put h 6 uint 0x1f83d9ab\n  put h 7 uint 0x5be0cd19\n  for i ulong len dp_seed bound 32\n    idx = and i 7\n    shb = uint mul and i 3 8\n    sb = shl uint get dp_seed i shb\n    put h idx xor get h idx sb\n  end\n"
+text dm_pl_8 "  for r ulong 256\n    rc = dp_round h r\n    if ne rc 0\n      ret rc\n    end\n  end\n  ret dp_print h\nend\n"
+
+text dm_m_use "usage: ddc_mesh emit-payload|attest|verify-receipt|verify-quorum|inspect|selftest ...\n"
+text dm_m_nl "\n"
+text dm_m_em1 "DDC_EMIT_PAYLOAD PASS bytes="
+text dm_m_em2 " macos="
+text dm_m_at1 "DDC_ATTEST PASS role="
+text dm_m_at2 " bytes=352 compiled_bytes="
+text dm_m_at3 " rc="
+text dm_m_at4 " pubkey="
+text dm_m_at5 " sem="
+text dm_m_at6 " cross_elf="
+text dm_m_at7 " compiled="
+text dm_m_at8 " exec="
+text dm_m_vr1 "DDC_RECEIPT PASS role="
+text dm_m_vq1 "DDC_QUORUM PASS votes=3/3 roles=1,2,3 sybil_guard=OK ed25519=3/3 source="
+text dm_m_in1 "OMRC0001 version=1 role="
+text dm_m_in2 " epoch="
+text dm_m_in3 " abi="
+text dm_m_in4 " pk="
+text dm_m_st1 "DDC_MESH SELFTEST PASS quorum=3/3 neg_controls=10 sybil_guard=OK thompson_guard=OK\n"
+
+text dm_ref_p "DDC_QUORUM REFUSED code="
+text dm_ref_r " reason="
+text dm_ref_d " dissent_role_mask="
+text dm_r_101 "IO_ERROR"
+text dm_r_102 "MALFORMED_OMRC0001"
+text dm_r_103 "WRONG_DOMAIN_TAG"
+text dm_r_104 "ED25519_SIG_INVALID"
+text dm_r_105 "SEMANTIC_BIND_MISMATCH"
+text dm_r_106 "SYBIL_DUPLICATE_PUBKEY"
+text dm_r_107 "ROLE_OR_ABI_DUPLICATE"
+text dm_r_108 "SOURCE_HASH_MISMATCH"
+text dm_r_109 "KEN_THOMPSON_CROSS_ELF_DIVERGENCE"
+text dm_r_110 "KEN_THOMPSON_EXEC_DIVERGENCE"
+text dm_r_111 "SEMANTIC_DIGEST_DIVERGENCE"
+
+note ---- Output & Formatting Helpers ----
+
+fn dm_wrt fd int s view uchar * to void
+  p = ulong 0
+  n = len s
+  while lt p n bound 4096
+    k = write fd s p sub n p
+    if le k 0
+      ret
+    end
+    p = add p ulong k
+  end
+end
+
+fn dm_num fd int v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put dm_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      w = write fd dm_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn dm_wr_hex32 fd int off ulong kind ulong cnt ulong to void
+  n = cnt
+  if gt n 32
+    n = ulong 32
+  end
+  for i ulong n bound 32
+    b = ulong 0
+    if eq kind 0
+      b = ulong get dm_rcpt add off i
+    end
+    if eq kind 1
+      b = ulong get dm_pk i
+    end
+    if eq kind 2
+      b = ulong get dm_sha_sem i
+    end
+    if eq kind 3
+      b = ulong get dm_sha_xelf i
+    end
+    if eq kind 4
+      b = ulong get dm_sha_cmp i
+    end
+    if eq kind 5
+      b = ulong get dm_sha_xout i
+    end
+    if eq kind 6
+      b = ulong get dm_q0 add off i
+    end
+    put dm_hex mul i 2 sh_hexd uint shr b 4
+    put dm_hex add mul i 2 1 sh_hexd uint and b 15
+  end
+  w = write fd dm_hex 0 mul n 2
+end
+
+fn dm_refuse code int to int
+  dm_wrt 2 dm_ref_p
+  dm_num 2 ulong code
+  dm_wrt 2 dm_ref_r
+  if eq code DM_ERR_IO
+    dm_wrt 2 dm_r_101
+  end
+  if eq code DM_ERR_FORMAT
+    dm_wrt 2 dm_r_102
+  end
+  if eq code DM_ERR_DOMAIN
+    dm_wrt 2 dm_r_103
+  end
+  if eq code DM_ERR_ED25519
+    dm_wrt 2 dm_r_104
+  end
+  if eq code DM_ERR_SEMANTIC_BIND
+    dm_wrt 2 dm_r_105
+  end
+  if eq code DM_ERR_SYBIL_PUBKEY
+    dm_wrt 2 dm_r_106
+  end
+  if eq code DM_ERR_ROLE_OR_ABI_DUP
+    dm_wrt 2 dm_r_107
+  end
+  if eq code DM_ERR_SOURCE_MISMATCH
+    dm_wrt 2 dm_r_108
+  end
+  if eq code DM_ERR_THOMPSON_CROSS_ELF
+    dm_wrt 2 dm_r_109
+  end
+  if eq code DM_ERR_THOMPSON_EXEC
+    dm_wrt 2 dm_r_110
+  end
+  if eq code DM_ERR_SEMANTIC_DIVERGE
+    dm_wrt 2 dm_r_111
+  end
+  if ne get dm_dissent_mask 0 0
+    dm_wrt 2 dm_m_nl
+    dm_wrt 2 dm_ref_d
+    dm_num 2 get dm_dissent_mask 0
+  end
+  dm_wrt 2 dm_m_nl
+  ret code
+end
+
+fn dm_fail_exit code int to void
+  rc = dm_refuse code
+  exit rc
+end
+
+note ---- Byte Order & CLI Helpers ----
+
+fn dm_rd_u32 arr view uchar 352 o ulong to ulong
+  b0 = ulong get arr o
+  b1 = shl ulong get arr add o 1 8
+  b2 = shl ulong get arr add o 2 16
+  b3 = shl ulong get arr add o 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn dm_rd_u64 arr view uchar 352 o ulong to ulong
+  lo = dm_rd_u32 arr o
+  hi = dm_rd_u32 arr add o 4
+  ret or lo shl hi 32
+end
+
+fn dm_wr_u32 o ulong v ulong to void
+  put dm_rcpt o uchar and v 255
+  put dm_rcpt add o 1 uchar and shr v 8 255
+  put dm_rcpt add o 2 uchar and shr v 16 255
+  put dm_rcpt add o 3 uchar and shr v 24 255
+end
+
+fn dm_wr_u64 o ulong v ulong to void
+  dm_wr_u32 o and v 4294967295
+  dm_wr_u32 add o 4 shr v 32
+end
+
+fn dm_sh_u64 o ulong v ulong to void
+  for j ulong 8
+    put sh_dat add o j uchar and shr v mul j 8 255
+  end
+end
+
+fn dm_arg_eq n ulong s view uchar * to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 256
+    if ne get dm_arg i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dm_read_arg idx ulong ac ulong to ulong
+  if ge idx ac
+    dm_wrt 2 dm_m_use
+    exit DM_ERR_USAGE
+  end
+  k = argread idx dm_arg 0 4095
+  if lt k 1
+    dm_wrt 2 dm_m_use
+    exit DM_ERR_USAGE
+  end
+  ret ulong k
+end
+
+fn dm_parse_dec n ulong to ulong
+  if or eq n 0 gt n 20
+    dm_wrt 2 dm_m_use
+    exit DM_ERR_USAGE
+  end
+  v = ulong 0
+  for i ulong n bound 20
+    c = ulong get dm_arg i
+    if or lt c 48 gt c 57
+      dm_wrt 2 dm_m_use
+      exit DM_ERR_USAGE
+    end
+    if gt v 1844674407370955161
+      dm_wrt 2 dm_m_use
+      exit DM_ERR_USAGE
+    end
+    p10 = mul v 10
+    nxt = add p10 sub c 48
+    if lt nxt p10
+      dm_wrt 2 dm_m_use
+      exit DM_ERR_USAGE
+    end
+    v = nxt
+  end
+  ret v
+end
+
+fn dm_parse_nib c ulong to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret long add 10 sub c 97
+  end
+  if and ge c 65 le c 70
+    ret long add 10 sub c 65
+  end
+  ret long -1
+end
+
+fn dm_parse_seed_hex n ulong to void
+  if ne n 64
+    dm_wrt 2 dm_m_use
+    exit DM_ERR_USAGE
+  end
+  for i ulong 32
+    hi = dm_parse_nib ulong get dm_arg mul i 2
+    lo = dm_parse_nib ulong get dm_arg add mul i 2 1
+    if or lt hi 0 lt lo 0
+      dm_wrt 2 dm_m_use
+      exit DM_ERR_USAGE
+    end
+    put dm_seed i uchar or shl ulong hi 4 ulong lo
+  end
+  put dm_has_seed 0 1
+end
+
+fn dm_store_path slot ulong n ulong to void
+  if gt n 4095
+    dm_wrt 2 dm_m_use
+    exit DM_ERR_USAGE
+  end
+  for i ulong n bound 4096
+    b = get dm_arg i
+    if eq slot 0
+      put dm_p_out i b
+    end
+    if eq slot 1
+      put dm_p_src i b
+    end
+    if eq slot 2
+      put dm_p_cmp i b
+    end
+    if eq slot 3
+      put dm_p_xelf i b
+    end
+    if eq slot 4
+      put dm_p_xout i b
+    end
+    if eq slot 5
+      put dm_p_r1 i b
+    end
+    if eq slot 6
+      put dm_p_r2 i b
+    end
+    if eq slot 7
+      put dm_p_r3 i b
+    end
+  end
+  if eq slot 0
+    put dm_p_out_n 0 n
+  end
+  if eq slot 1
+    put dm_p_src_n 0 n
+  end
+  if eq slot 2
+    put dm_p_cmp_n 0 n
+  end
+  if eq slot 3
+    put dm_p_xelf_n 0 n
+  end
+  if eq slot 4
+    put dm_p_xout_n 0 n
+  end
+  if eq slot 5
+    put dm_p_r1_n 0 n
+  end
+  if eq slot 6
+    put dm_p_r2_n 0 n
+  end
+  if eq slot 7
+    put dm_p_r3_n 0 n
+  end
+end
+
+fn dm_store_str kind ulong n ulong to void
+  if gt n 120
+    dm_wrt 2 dm_m_use
+    exit DM_ERR_USAGE
+  end
+  for i ulong n bound 128
+    b = get dm_arg i
+    if eq kind 0
+      put dm_abi i b
+    else
+      put dm_stag i b
+    end
+  end
+  if eq kind 0
+    put dm_abi_n 0 n
+  else
+    put dm_stag_n 0 n
+  end
+end
+
+note ---- File I/O Helpers (Fail-Closed EOF Probe) ----
+
+fn dm_open_read slot ulong to long
+  if eq slot 0
+    ret fopen dm_p_out 0 get dm_p_out_n 0 0 0
+  end
+  if eq slot 1
+    ret fopen dm_p_src 0 get dm_p_src_n 0 0 0
+  end
+  if eq slot 2
+    ret fopen dm_p_cmp 0 get dm_p_cmp_n 0 0 0
+  end
+  if eq slot 3
+    ret fopen dm_p_xelf 0 get dm_p_xelf_n 0 0 0
+  end
+  if eq slot 4
+    ret fopen dm_p_xout 0 get dm_p_xout_n 0 0 0
+  end
+  if eq slot 5
+    ret fopen dm_p_r1 0 get dm_p_r1_n 0 0 0
+  end
+  if eq slot 6
+    ret fopen dm_p_r2 0 get dm_p_r2_n 0 0 0
+  end
+  ret fopen dm_p_r3 0 get dm_p_r3_n 0 0 0
+end
+
+fn dm_hash_file slot ulong allow_empty bool dst_kind ulong out_bytes edit ulong 1 to bool
+  fd = dm_open_read slot
+  if lt fd 0
+    ret false
+  end
+  tot = ulong 0
+  eof = false
+  while lt tot DM_MAX_FILE bound 262144
+    remc = sub DM_MAX_FILE tot
+    if gt remc 65536
+      remc = ulong 65536
+    end
+    k = read int fd sh_dat tot remc
+    if lt k 0
+      c1 = fclose int fd
+      ret false
+    end
+    if eq k 0
+      eof = true
+      break
+    end
+    tot = add tot ulong k
+  end
+  if not eof
+    ex = read int fd dm_probe 0 1
+    if ne ex 0
+      c2 = fclose int fd
+      ret false
+    end
+  end
+  c3 = fclose int fd
+  if and not allow_empty eq tot 0
+    ret false
+  end
+  put out_bytes 0 tot
+  sh_all tot
+  for i ulong 32
+    d = get sh_dig i
+    if eq dst_kind 1
+      put dm_sha_src i d
+    end
+    if eq dst_kind 2
+      put dm_sha_cmp i d
+    end
+    if eq dst_kind 3
+      put dm_sha_xelf i d
+    end
+    if eq dst_kind 4
+      put dm_sha_xout i d
+    end
+  end
+  ret true
+end
+
+fn dm_read_rcpt_slot path_slot ulong qslot ulong to int
+  fd = dm_open_read path_slot
+  if lt fd 0
+    ret DM_ERR_IO
+  end
+  buf = new uchar 356 0
+  tot = ulong 0
+  while lt tot 353 bound 64
+    k = read int fd buf tot sub 353 tot
+    if lt k 0
+      c1 = fclose int fd
+      ret DM_ERR_IO
+    end
+    if eq k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  c2 = fclose int fd
+  if ne tot DM_RCPT_LEN
+    ret DM_ERR_FORMAT
+  end
+  for i ulong DM_RCPT_LEN
+    b = get buf i
+    if eq qslot 0
+      put dm_q0 i b
+    end
+    if eq qslot 1
+      put dm_q1 i b
+    end
+    if eq qslot 2
+      put dm_q2 i b
+    end
+    if eq qslot 9
+      put dm_rcpt i b
+    end
+  end
+  ret DM_OK
+end
+
+fn dm_write_out_buf kind ulong n ulong to bool
+  if eq get dm_p_out_n 0 0
+    ret false
+  end
+  fd = fopen dm_p_out 0 get dm_p_out_n 0 577 420
+  if lt fd 0
+    ret false
+  end
+  off = ulong 0
+  while lt off n bound 1024
+    want = sub n off
+    if gt want 4096
+      want = ulong 4096
+    end
+    w = long 0
+    if eq kind 0
+      w = write int fd dm_rcpt off want
+    else
+      w = write int fd dm_pay off want
+    end
+    if le w 0
+      c1 = fclose int fd
+      ret false
+    end
+    off = add off ulong w
+  end
+  fs = fsync int fd
+  c2 = fclose int fd
+  ret true
+end
+
+note ---- Crypto Core (Key Derivation, Semantic Binding & RFC 8032 Ed25519) ----
+
+fn dm_derive_host_seed role ulong to void
+  m = new uchar 65536 0
+  hd = new uchar 64 0
+  p = ulong 0
+  for i ulong len dm_dom_key bound 32
+    put m p get dm_dom_key i
+    p = add p 1
+  end
+  put m p 0
+  p = add p 1
+  for j ulong 8
+    put m p uchar and shr role mul j 8 255
+    p = add p 1
+  end
+  an = get dm_abi_n 0
+  for i ulong an bound 128
+    put m p get dm_abi i
+    p = add p 1
+  end
+  put m p 0
+  p = add p 1
+  sn = get dm_stag_n 0
+  for i ulong sn bound 128
+    put m p get dm_stag i
+    p = add p 1
+  end
+  s512hash m p hd
+  for i ulong 32
+    put dm_seed i get hd i
+  end
+end
+
+fn dm_compute_abi_hash to void
+  an = get dm_abi_n 0
+  for i ulong an bound 128
+    put sh_dat i get dm_abi i
+  end
+  sh_all an
+  for i ulong 32
+    put dm_sha_abi i get sh_dig i
+  end
+end
+
+fn dm_compute_sem_digest src_arr view uchar 352 to void
+  p = ulong 0
+  for i ulong len dm_dom_sem bound 32
+    put sh_dat p get dm_dom_sem i
+    p = add p 1
+  end
+  put sh_dat p 0
+  p = add p 1
+  for i ulong 32
+    put sh_dat p get src_arr add 96 i
+    p = add p 1
+  end
+  for i ulong 32
+    put sh_dat p get src_arr add 160 i
+    p = add p 1
+  end
+  xrc = dm_rd_u64 src_arr 56
+  dm_sh_u64 p xrc
+  p = add p 8
+  for i ulong 32
+    put sh_dat p get src_arr add 192 i
+    p = add p 1
+  end
+  sh_all p
+  for i ulong 32
+    put dm_sha_sem i get sh_dig i
+  end
+end
+
+fn dm_sign_rcpt to void
+  sd = new uchar 32 0
+  pk = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put sd i get dm_seed i
+  end
+  ues_pubkey sd pk
+  for i ulong 32
+    put dm_pk i get pk i
+    put dm_rcpt add 256 i get pk i
+  end
+  for i ulong DM_BODY_LEN
+    put m i get dm_rcpt i
+  end
+  ues_sign sd m DM_BODY_LEN sg
+  for i ulong 64
+    put dm_sig i get sg i
+    put dm_rcpt add 288 i get sg i
+  end
+end
+
+fn dm_verify_rcpt_sig arr view uchar 352 to bool
+  pk = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  nz = ulong 0
+  for i ulong 32
+    b = get arr add 256 i
+    if ne b 0
+      nz = add nz 1
+    end
+    put pk i b
+  end
+  if eq nz 0
+    ret false
+  end
+  for i ulong DM_BODY_LEN
+    put m i get arr i
+  end
+  for i ulong 64
+    put sg i get arr add 288 i
+  end
+  ret eq edverify pk m DM_BODY_LEN sg 0 1
+end
+
+fn dm_assemble_rcpt to void
+  for i ulong DM_RCPT_LEN
+    put dm_rcpt i 0
+  end
+  for i ulong len dm_magic bound 8
+    put dm_rcpt i get dm_magic i
+  end
+  for i ulong len dm_dom_rcpt bound 24
+    put dm_rcpt add 8 i get dm_dom_rcpt i
+  end
+  dm_wr_u32 32 DM_VERSION
+  dm_wr_u32 36 get dm_cfg 0
+  dm_wr_u64 40 get dm_cfg 1
+  dm_wr_u64 48 get dm_cfg 3
+  dm_wr_u64 56 get dm_cfg 2
+  for i ulong 32
+    put dm_rcpt add 64 i get dm_sha_abi i
+    put dm_rcpt add 96 i get dm_sha_src i
+    put dm_rcpt add 128 i get dm_sha_cmp i
+    put dm_rcpt add 160 i get dm_sha_xout i
+    put dm_rcpt add 192 i get dm_sha_xelf i
+  end
+  rview = new uchar 352 0
+  for i ulong DM_BODY_LEN
+    put rview i get dm_rcpt i
+  end
+  dm_compute_sem_digest rview
+  for i ulong 32
+    put dm_rcpt add 224 i get dm_sha_sem i
+  end
+  dm_sign_rcpt
+end
+
+note ---- Single-Receipt & 3-Host Byzantine Quorum Validators ----
+
+fn dm_slice_nz arr view uchar 352 off ulong n ulong to bool
+  for i ulong n bound 64
+    if ne get arr add off i 0
+      ret true
+    end
+  end
+  ret false
+end
+
+fn dm_slice_eq a view uchar 352 b view uchar 352 off ulong n ulong to bool
+  for i ulong n bound 64
+    if ne get a add off i get b add off i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dm_validate_rcpt_buf arr view uchar 352 to int
+  for i ulong 8
+    if ne get arr i get dm_magic i
+      ret DM_ERR_FORMAT
+    end
+  end
+  dl = len dm_dom_rcpt
+  for i ulong 24
+    exp = uchar 0
+    if lt i dl
+      exp = get dm_dom_rcpt i
+    end
+    if ne get arr add 8 i exp
+      ret DM_ERR_DOMAIN
+    end
+  end
+  if ne dm_rd_u32 arr 32 DM_VERSION
+    ret DM_ERR_FORMAT
+  end
+  role = dm_rd_u32 arr 36
+  if or lt role 1 gt role 3
+    ret DM_ERR_FORMAT
+  end
+  if eq dm_rd_u64 arr 40 0
+    ret DM_ERR_FORMAT
+  end
+  if eq dm_rd_u64 arr 48 0
+    ret DM_ERR_FORMAT
+  end
+  if not dm_slice_nz arr 64 32
+    ret DM_ERR_FORMAT
+  end
+  if not dm_slice_nz arr 256 32
+    ret DM_ERR_ED25519
+  end
+  dm_compute_sem_digest arr
+  for i ulong 32
+    if ne get arr add 224 i get dm_sha_sem i
+      ret DM_ERR_SEMANTIC_BIND
+    end
+  end
+  if not dm_verify_rcpt_sig arr
+    ret DM_ERR_ED25519
+  end
+  ret DM_OK
+end
+
+fn dm_copy_qslot qslot ulong dst edit uchar 352 to void
+  for i ulong DM_RCPT_LEN
+    if eq qslot 0
+      put dst i get dm_q0 i
+    end
+    if eq qslot 1
+      put dst i get dm_q1 i
+    end
+    if eq qslot 2
+      put dst i get dm_q2 i
+    end
+  end
+end
+
+fn dm_dissent_field r0 view uchar 352 r1 view uchar 352 r2 view uchar 352 off ulong n ulong to ulong
+  e01 = dm_slice_eq r0 r1 off n
+  e02 = dm_slice_eq r0 r2 off n
+  e12 = dm_slice_eq r1 r2 off n
+  if and e01 e02
+    ret 0
+  end
+  k0 = dm_rd_u32 r0 36
+  k1 = dm_rd_u32 r1 36
+  k2 = dm_rd_u32 r2 36
+  if e01
+    ret shl ulong 1 sub k2 1
+  end
+  if e02
+    ret shl ulong 1 sub k1 1
+  end
+  if e12
+    ret shl ulong 1 sub k0 1
+  end
+  ret 7
+end
+
+fn dm_verify_quorum_slots to int
+  put dm_dissent_mask 0 0
+  a = new uchar 352 0
+  b = new uchar 352 0
+  c = new uchar 352 0
+  dm_copy_qslot 0 a
+  dm_copy_qslot 1 b
+  dm_copy_qslot 2 c
+  rc = dm_validate_rcpt_buf a
+  if ne rc DM_OK
+    ret rc
+  end
+  rc = dm_validate_rcpt_buf b
+  if ne rc DM_OK
+    ret rc
+  end
+  rc = dm_validate_rcpt_buf c
+  if ne rc DM_OK
+    ret rc
+  end
+  if dm_slice_eq a b 256 32
+    ret DM_ERR_SYBIL_PUBKEY
+  end
+  if dm_slice_eq a c 256 32
+    ret DM_ERR_SYBIL_PUBKEY
+  end
+  if dm_slice_eq b c 256 32
+    ret DM_ERR_SYBIL_PUBKEY
+  end
+  rmask = shl ulong 1 sub dm_rd_u32 a 36 1
+  rmask = or rmask shl ulong 1 sub dm_rd_u32 b 36 1
+  rmask = or rmask shl ulong 1 sub dm_rd_u32 c 36 1
+  if ne rmask 7
+    ret DM_ERR_ROLE_OR_ABI_DUP
+  end
+  if dm_slice_eq a b 64 32
+    ret DM_ERR_ROLE_OR_ABI_DUP
+  end
+  if dm_slice_eq a c 64 32
+    ret DM_ERR_ROLE_OR_ABI_DUP
+  end
+  if dm_slice_eq b c 64 32
+    ret DM_ERR_ROLE_OR_ABI_DUP
+  end
+  dm = dm_dissent_field a b c 96 32
+  if ne dm 0
+    put dm_dissent_mask 0 dm
+    ret DM_ERR_SOURCE_MISMATCH
+  end
+  dm = dm_dissent_field a b c 192 32
+  if ne dm 0
+    put dm_dissent_mask 0 dm
+    ret DM_ERR_THOMPSON_CROSS_ELF
+  end
+  dm = dm_dissent_field a b c 56 8
+  if ne dm 0
+    put dm_dissent_mask 0 dm
+    ret DM_ERR_THOMPSON_EXEC
+  end
+  dm = dm_dissent_field a b c 160 32
+  if ne dm 0
+    put dm_dissent_mask 0 dm
+    ret DM_ERR_THOMPSON_EXEC
+  end
+  dm = dm_dissent_field a b c 224 32
+  if ne dm 0
+    put dm_dissent_mask 0 dm
+    ret DM_ERR_SEMANTIC_DIVERGE
+  end
+  ret DM_OK
+end
+
+note ---- Payload Source Assembly ----
+
+fn dm_pay_push s view uchar * to void
+  p = get dm_pay_n 0
+  n = len s
+  for i ulong n bound 2048
+    if lt add p i 8192
+      put dm_pay add p i get s i
+    end
+  end
+  put dm_pay_n 0 add p n
+end
+
+fn dm_build_payload_src with_macos bool to void
+  put dm_pay_n 0 0
+  if with_macos
+    dm_pay_push dm_pl_mac
+  end
+  dm_pay_push dm_pl_0
+  dm_pay_push dm_pl_1
+  dm_pay_push dm_pl_2
+  dm_pay_push dm_pl_3
+  dm_pay_push dm_pl_4
+  dm_pay_push dm_pl_5
+  dm_pay_push dm_pl_6
+  dm_pay_push dm_pl_7
+  dm_pay_push dm_pl_8
+end
+
+note ---- Subcommand Implementations ----
+
+fn dm_cmd_emit_payload to int
+  if eq get dm_p_out_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  is_mac = ne get dm_cfg 4 0
+  dm_build_payload_src is_mac
+  if not dm_write_out_buf 1 get dm_pay_n 0
+    ret dm_refuse DM_ERR_IO
+  end
+  dm_wrt 1 dm_m_em1
+  dm_num 1 get dm_pay_n 0
+  dm_wrt 1 dm_m_em2
+  dm_num 1 get dm_cfg 4
+  dm_wrt 1 dm_m_nl
+  ret DM_OK
+end
+
+fn dm_cmd_attest to int
+  role = get dm_cfg 0
+  if or lt role 1 gt role 3
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  if or eq get dm_abi_n 0 0 eq get dm_p_out_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  if or eq get dm_p_src_n 0 0 eq get dm_p_cmp_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  if or eq get dm_p_xelf_n 0 0 eq get dm_p_xout_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  if eq get dm_cfg 1 0
+    put dm_cfg 1 1
+  end
+  if eq get dm_stag_n 0 0
+    for i ulong len dm_def_stag bound 64
+      put dm_stag i get dm_def_stag i
+    end
+    put dm_stag_n 0 len dm_def_stag
+  end
+  dummy = new ulong 1 0
+  cbytes = new ulong 1 0
+  if not dm_hash_file 1 false 1 dummy
+    ret dm_refuse DM_ERR_IO
+  end
+  if not dm_hash_file 2 false 2 cbytes
+    ret dm_refuse DM_ERR_IO
+  end
+  put dm_cfg 3 get cbytes 0
+  if not dm_hash_file 3 false 3 dummy
+    ret dm_refuse DM_ERR_IO
+  end
+  if not dm_hash_file 4 true 4 dummy
+    ret dm_refuse DM_ERR_IO
+  end
+  dm_compute_abi_hash
+  if eq get dm_has_seed 0 0
+    dm_derive_host_seed role
+  end
+  dm_assemble_rcpt
+  rview = new uchar 352 0
+  for i ulong DM_RCPT_LEN
+    put rview i get dm_rcpt i
+  end
+  vrc = dm_validate_rcpt_buf rview
+  if ne vrc DM_OK
+    ret dm_refuse vrc
+  end
+  if not dm_write_out_buf 0 DM_RCPT_LEN
+    ret dm_refuse DM_ERR_IO
+  end
+  dm_wrt 1 dm_m_at1
+  dm_num 1 role
+  dm_wrt 1 dm_m_at2
+  dm_num 1 get dm_cfg 3
+  dm_wrt 1 dm_m_at3
+  dm_num 1 get dm_cfg 2
+  dm_wrt 1 dm_m_at4
+  dm_wr_hex32 1 0 1 8
+  dm_wrt 1 dm_m_at5
+  dm_wr_hex32 1 0 2 8
+  dm_wrt 1 dm_m_at6
+  dm_wr_hex32 1 0 3 8
+  dm_wrt 1 dm_m_at7
+  dm_wr_hex32 1 0 4 8
+  dm_wrt 1 dm_m_at8
+  dm_wr_hex32 1 0 5 8
+  dm_wrt 1 dm_m_nl
+  ret DM_OK
+end
+
+fn dm_cmd_verify_receipt to int
+  if eq get dm_p_r1_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  rc = dm_read_rcpt_slot 5 9
+  if ne rc DM_OK
+    ret dm_refuse rc
+  end
+  rv = new uchar 352 0
+  for i ulong DM_RCPT_LEN
+    put rv i get dm_rcpt i
+  end
+  vrc = dm_validate_rcpt_buf rv
+  if ne vrc DM_OK
+    ret dm_refuse vrc
+  end
+  dm_wrt 1 dm_m_vr1
+  dm_num 1 dm_rd_u32 rv 36
+  dm_wrt 1 dm_m_at4
+  dm_wr_hex32 1 256 0 8
+  dm_wrt 1 dm_m_at5
+  dm_wr_hex32 1 224 0 8
+  dm_wrt 1 dm_m_nl
+  ret DM_OK
+end
+
+fn dm_cmd_verify_quorum to int
+  if or eq get dm_p_r1_n 0 0 or eq get dm_p_r2_n 0 0 eq get dm_p_r3_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  rc = dm_read_rcpt_slot 5 0
+  if ne rc DM_OK
+    ret dm_refuse rc
+  end
+  rc = dm_read_rcpt_slot 6 1
+  if ne rc DM_OK
+    ret dm_refuse rc
+  end
+  rc = dm_read_rcpt_slot 7 2
+  if ne rc DM_OK
+    ret dm_refuse rc
+  end
+  vrc = dm_verify_quorum_slots
+  if ne vrc DM_OK
+    ret dm_refuse vrc
+  end
+  dm_wrt 1 dm_m_vq1
+  dm_wr_hex32 1 96 6 8
+  dm_wrt 1 dm_m_at6
+  dm_wr_hex32 1 192 6 8
+  dm_wrt 1 dm_m_at8
+  dm_wr_hex32 1 160 6 8
+  dm_wrt 1 dm_m_at5
+  dm_wr_hex32 1 224 6 8
+  dm_wrt 1 dm_m_nl
+  ret DM_OK
+end
+
+fn dm_cmd_inspect to int
+  if eq get dm_p_r1_n 0 0
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  rc = dm_read_rcpt_slot 5 9
+  if ne rc DM_OK
+    ret dm_refuse rc
+  end
+  rv = new uchar 352 0
+  for i ulong DM_RCPT_LEN
+    put rv i get dm_rcpt i
+  end
+  vrc = dm_validate_rcpt_buf rv
+  if ne vrc DM_OK
+    ret dm_refuse vrc
+  end
+  dm_wrt 1 dm_m_in1
+  dm_num 1 dm_rd_u32 rv 36
+  dm_wrt 1 dm_m_in2
+  dm_num 1 dm_rd_u64 rv 40
+  dm_wrt 1 dm_m_at2
+  dm_num 1 dm_rd_u64 rv 48
+  dm_wrt 1 dm_m_at3
+  dm_num 1 dm_rd_u64 rv 56
+  dm_wrt 1 dm_m_in3
+  dm_wr_hex32 1 64 0 8
+  dm_wrt 1 dm_m_in4
+  dm_wr_hex32 1 256 0 8
+  dm_wrt 1 dm_m_at6
+  dm_wr_hex32 1 192 0 8
+  dm_wrt 1 dm_m_at5
+  dm_wr_hex32 1 224 0 8
+  dm_wrt 1 dm_m_nl
+  ret DM_OK
+end
+
+note ---- Portable Self-Test (Spark + MacBook + Pi 5) ----
+
+fn dm_st_mint_slot role ulong qslot ulong abi view uchar * to void
+  for i ulong 32
+    put dm_sha_src i uchar add 17 i
+    put dm_sha_xout i uchar add 55 i
+    put dm_sha_xelf i uchar add 89 i
+    put dm_sha_cmp i uchar add 120 add i role
+  end
+  put dm_cfg 0 role
+  put dm_cfg 1 1
+  put dm_cfg 2 53
+  put dm_cfg 3 add 14000 mul role 4096
+  for i ulong len abi bound 128
+    put dm_abi i get abi i
+  end
+  put dm_abi_n 0 len abi
+  for i ulong len dm_def_stag bound 64
+    put dm_stag i get dm_def_stag i
+  end
+  put dm_stag_n 0 len dm_def_stag
+  dm_compute_abi_hash
+  dm_derive_host_seed role
+  dm_assemble_rcpt
+  base = mul qslot DM_RCPT_LEN
+  for i ulong DM_RCPT_LEN
+    b = get dm_rcpt i
+    put dm_st_save add base i b
+    if eq qslot 0
+      put dm_q0 i b
+    end
+    if eq qslot 1
+      put dm_q1 i b
+    end
+    if eq qslot 2
+      put dm_q2 i b
+    end
+  end
+end
+
+fn dm_st_restore to void
+  for i ulong DM_RCPT_LEN
+    put dm_q0 i get dm_st_save i
+    put dm_q1 i get dm_st_save add DM_RCPT_LEN i
+    put dm_q2 i get dm_st_save add mul 2 DM_RCPT_LEN i
+  end
+end
+
+fn dm_st_resign_q1 to void
+  for i ulong DM_RCPT_LEN
+    put dm_rcpt i get dm_q1 i
+  end
+  rv = new uchar 352 0
+  for i ulong DM_BODY_LEN
+    put rv i get dm_rcpt i
+  end
+  dm_compute_sem_digest rv
+  for i ulong 32
+    put dm_rcpt add 224 i get dm_sha_sem i
+  end
+  dm_sign_rcpt
+  for i ulong DM_RCPT_LEN
+    put dm_q1 i get dm_rcpt i
+  end
+end
+
+fn dm_st_set_abi abi view uchar * to void
+  for i ulong len abi bound 128
+    put dm_abi i get abi i
+  end
+  put dm_abi_n 0 len abi
+end
+
+fn dm_st_negs to int
+  dm_st_restore
+  put dm_q1 290 xor get dm_q1 290 uchar 1
+  if ne dm_verify_quorum_slots DM_ERR_ED25519
+    ret 11
+  end
+  dm_st_restore
+  put dm_q1 12 xor get dm_q1 12 uchar 1
+  if ne dm_verify_quorum_slots DM_ERR_DOMAIN
+    ret 12
+  end
+  dm_st_restore
+  put dm_q2 0 uchar 88
+  if ne dm_verify_quorum_slots DM_ERR_FORMAT
+    ret 13
+  end
+  dm_st_restore
+  put dm_q1 100 xor get dm_q1 100 uchar 1
+  if ne dm_verify_quorum_slots DM_ERR_SEMANTIC_BIND
+    ret 14
+  end
+  dm_st_restore
+  dm_st_set_abi dm_f_mac
+  dm_derive_host_seed 1
+  dm_st_resign_q1
+  if ne dm_verify_quorum_slots DM_ERR_SYBIL_PUBKEY
+    ret 15
+  end
+  dm_st_restore
+  dm_st_set_abi dm_c_att
+  dm_derive_host_seed 2
+  put dm_q1 36 uchar 1
+  dm_st_resign_q1
+  if ne dm_verify_quorum_slots DM_ERR_ROLE_OR_ABI_DUP
+    ret 16
+  end
+  dm_st_restore
+  dm_st_set_abi dm_c_att
+  dm_derive_host_seed 2
+  put dm_q1 96 xor get dm_q1 96 uchar 1
+  dm_st_resign_q1
+  if ne dm_verify_quorum_slots DM_ERR_SOURCE_MISMATCH
+    ret 17
+  end
+  dm_st_restore
+  put dm_q1 192 xor get dm_q1 192 uchar 1
+  dm_st_resign_q1
+  if ne dm_verify_quorum_slots DM_ERR_THOMPSON_CROSS_ELF
+    ret 18
+  end
+  dm_st_restore
+  put dm_q1 160 xor get dm_q1 160 uchar 1
+  dm_st_resign_q1
+  if ne dm_verify_quorum_slots DM_ERR_THOMPSON_EXEC
+    ret 19
+  end
+  dm_st_restore
+  dm_st_set_abi dm_c_att
+  dm_derive_host_seed 2
+  put dm_q1 224 xor get dm_q1 224 uchar 1
+  for i ulong DM_BODY_LEN
+    put dm_rcpt i get dm_q1 i
+  end
+  dm_sign_rcpt
+  for i ulong DM_RCPT_LEN
+    if ge i 256
+      put dm_q1 i get dm_rcpt i
+    end
+  end
+  if ne dm_verify_quorum_slots DM_ERR_SEMANTIC_BIND
+    ret 20
+  end
+  ret 0
+end
+
+fn dm_cmd_selftest to int
+  dm_st_mint_slot 1 0 dm_f_mac
+  dm_st_mint_slot 2 1 dm_c_att
+  dm_st_mint_slot 3 2 dm_c_vr
+  if ne dm_verify_quorum_slots DM_OK
+    ret 1
+  end
+  rc = dm_st_negs
+  if ne rc 0
+    ret rc
+  end
+  dm_wrt 1 dm_m_st1
+  ret DM_OK
+end
+
+note ---- CLI Dispatcher ----
+
+fn dm_parse_attest_flags ac ulong to void
+  i = ulong 2
+  while lt i ac bound 64
+    al = dm_read_arg i ac
+    matched = false
+    if dm_arg_eq al dm_f_role
+      put dm_cfg 0 dm_parse_dec dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_abi
+      dm_store_str 0 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_src
+      dm_store_path 1 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_cmp
+      dm_store_path 2 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_xelf
+      dm_store_path 3 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_xout
+      dm_store_path 4 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_xrc
+      put dm_cfg 2 dm_parse_dec dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_ep
+      put dm_cfg 1 dm_parse_dec dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_out
+      dm_store_path 0 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_stag
+      dm_store_str 1 dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if and not matched dm_arg_eq al dm_f_shex
+      dm_parse_seed_hex dm_read_arg add i 1 ac
+      i = add i 2
+      matched = true
+    end
+    if not matched
+      dm_wrt 2 dm_m_use
+      exit DM_ERR_USAGE
+    end
+  end
+end
+
+fn main to int
+  if lt argcnt 2
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  ac = ulong argcnt
+  cl = dm_read_arg 1 ac
+  cmd = ulong 99
+  if dm_arg_eq cl dm_c_emit
+    cmd = ulong 0
+  end
+  if dm_arg_eq cl dm_c_att
+    cmd = ulong 1
+  end
+  if dm_arg_eq cl dm_c_vr
+    cmd = ulong 2
+  end
+  if dm_arg_eq cl dm_c_vq
+    cmd = ulong 3
+  end
+  if dm_arg_eq cl dm_c_insp
+    cmd = ulong 4
+  end
+  if dm_arg_eq cl dm_c_st
+    cmd = ulong 5
+  end
+  if eq cmd 99
+    dm_wrt 2 dm_m_use
+    ret DM_ERR_USAGE
+  end
+  if eq cmd 0
+    dm_store_path 0 dm_read_arg 2 ac
+    if ge ac 4
+      fl = dm_read_arg 3 ac
+      if not dm_arg_eq fl dm_f_mac
+        dm_wrt 2 dm_m_use
+        ret DM_ERR_USAGE
+      end
+      put dm_cfg 4 1
+    end
+    ret dm_cmd_emit_payload
+  end
+  if eq cmd 1
+    dm_parse_attest_flags ac
+    ret dm_cmd_attest
+  end
+  if eq cmd 2
+    if ne ac 3
+      dm_wrt 2 dm_m_use
+      ret DM_ERR_USAGE
+    end
+    dm_store_path 5 dm_read_arg 2 ac
+    ret dm_cmd_verify_receipt
+  end
+  if eq cmd 3
+    if ne ac 5
+      dm_wrt 2 dm_m_use
+      ret DM_ERR_USAGE
+    end
+    dm_store_path 5 dm_read_arg 2 ac
+    dm_store_path 6 dm_read_arg 3 ac
+    dm_store_path 7 dm_read_arg 4 ac
+    ret dm_cmd_verify_quorum
+  end
+  if eq cmd 4
+    if ne ac 3
+      dm_wrt 2 dm_m_use
+      ret DM_ERR_USAGE
+    end
+    dm_store_path 5 dm_read_arg 2 ac
+    ret dm_cmd_inspect
+  end
+  ret dm_cmd_selftest
+end
