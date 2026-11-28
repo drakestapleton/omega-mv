@@ -1,0 +1,411 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/gate_regalloc.om: Pure seeded OM-2 verification gate for spill-aware regalloc.om.
+note Composes after seed/ng/target/target_desc.om, seed/ng/target/chips_tsv.om, seed/ng/target/regalloc.om.
+note Link order (Spark Linux AArch64):
+note   cat si/directives/om2.om seed/ng/target/target_desc.om seed/ng/target/chips_tsv.om seed/ng/target/regalloc.om seed/ng/target/gate_regalloc.om | seed/out/omc > /tmp/gate_regalloc
+note Link order (MacBook ARM64):
+note   { printf 'target a64macos\nom2\n'; cat seed/ng/target/target_desc.om seed/ng/target/chips_tsv.om seed/ng/target/regalloc.om seed/ng/target/gate_regalloc.om; } | ~/.local/bin/omc > /tmp/gate_regalloc
+
+global grChk ulong 1
+global grCtrl ulong 1
+global grRegs ulong 64
+global grFrame ulong 256
+global grVals ulong 64
+
+text grPChips "seed/ng/target/chips.tsv"
+text grIdX64 "intel-x64"
+text grIdApp "apple-m"
+text grIdX925 "grace-x925"
+text grIdSm121 "sm121"
+
+text grHdr "=== OMEGA NG SPILL-AWARE REGALLOC (>16 LIVE VALUES) GATE ===\n"
+text grRow1 "REGALLOC chip="
+text grRow2 " ngpr="
+text grRow3 " peak="
+text grRow4 " fast="
+text grRow5 " spills="
+text grRow6 " slots="
+text grRow7 " sim="
+text grRow8 " ref="
+text grPassA "NG-REGALLOC-GATE PASS checks="
+text grPassB " controls="
+text grFailMsg "NG-REGALLOC-GATE FAIL step="
+text grNl "\n"
+
+const GR_POISON ulong 16045690984833335022
+
+fn grFail step ulong to int
+  ctWriteAll 1 grFailMsg
+  ctWriteU64 1 step
+  ctWriteAll 1 grNl
+  ret int step
+end
+
+fn grAddChk n ulong to void
+  put grChk 0 add get grChk 0 n
+end
+
+fn grAddCtrl n ulong to void
+  put grCtrl 0 add get grCtrl 0 n
+end
+
+note Build 24 simultaneously live variables:
+note   pos 0..23: v[k] defined at k, live through 24 + k (all 24 live at pos 23..24)
+note   pos 24..47: accumulate each v[k] into accumulator v[24] (liveness [24, 48])
+fn grBuild24Live to void
+  raReset
+  for k ulong 24
+    id = raAddInterval k add 24 k RA_SPILL
+  end
+  accId = raAddInterval 24 48 RA_SPILL
+end
+
+note Reference semantics of the 24-live-variable kernel:
+note   v[k] = (k + 1) * 131 + 17; acc = sum_{k=0..23} ((v[k] * (k + 3)) xor (k * 17))
+fn grRef24 to ulong
+  acc = ulong 0
+  for k ulong 24
+    vk = add mul add k 1 131 17
+    term = xor mul vk add k 3 mul k 17
+    acc = add acc term
+  end
+  ret acc
+end
+
+note Poison all machine registers and stack frame slots so missing spills/reloads or clobbers fail immediately!
+fn grPoisonMachine to void
+  for r ulong 64
+    put grRegs r GR_POISON
+  end
+  for s ulong 256
+    put grFrame s GR_POISON
+  end
+end
+
+fn grWriteVal v ulong val ulong scrR ulong to void
+  pr = get raPhys v
+  if ne pr RA_SPILL
+    put grRegs pr val
+    ret
+  end
+  put grRegs scrR val
+  put grFrame get raSlot v get grRegs scrR
+end
+
+fn grReadVal v ulong scrR ulong to ulong
+  pr = get raPhys v
+  if ne pr RA_SPILL
+    ret get grRegs pr
+  end
+  put grRegs scrR get grFrame get raSlot v
+  ret get grRegs scrR
+end
+
+note Execute the 24-live-variable kernel strictly through regalloc.om's assigned regs + spill slots!
+fn grSim24 ngpr ulong nScratch ulong dropFirstSpill bool to ulong
+  grPoisonMachine
+  scr0 = sub ngpr 1
+  scr1 = scr0
+  if ge nScratch 2
+    scr1 = sub ngpr 2
+  end
+  for k ulong 24
+    vk = add mul add k 1 131 17
+    if and dropFirstSpill eq get raPhys k RA_SPILL
+      put grRegs scr0 vk
+    else
+      grWriteVal k vk scr0
+    end
+  end
+  grWriteVal 24 0 scr0
+  for k ulong 24
+    xv = grReadVal k scr0
+    term = xor mul xv add k 3 mul k 17
+    ac = grReadVal 24 scr1
+    grWriteVal 24 add ac term scr1
+  end
+  ret grReadVal 24 scr0
+end
+
+fn grLogChip cid ulong nSp ulong nSl ulong simV ulong refV ulong to void
+  ctWriteAll 1 grRow1
+  ctWriteId 1 cid
+  ctWriteAll 1 grRow2
+  ctWriteU64 1 ctNgpr cid
+  ctWriteAll 1 grRow3
+  ctWriteU64 1 raPeak
+  ctWriteAll 1 grRow4
+  if raIsFastPath
+    ctWriteU64 1 1
+  else
+    ctWriteU64 1 0
+  end
+  ctWriteAll 1 grRow5
+  ctWriteU64 1 nSp
+  ctWriteAll 1 grRow6
+  ctWriteU64 1 nSl
+  ctWriteAll 1 grRow7
+  ctWriteU64 1 simV
+  ctWriteAll 1 grRow8
+  ctWriteU64 1 refV
+  ctWriteAll 1 grNl
+end
+
+fn grTestChip24 cid ulong expFast bool expMinSpill ulong nScratch ulong stepBase ulong to int
+  ngpr = ctNgpr cid
+  grBuild24Live
+  sp = raRunWithBudget ngpr nScratch
+  if ne raVerifyComplete ngpr 0
+    ret grFail add stepBase 1
+  end
+  if ne raPeak 25
+    ret grFail add stepBase 2
+  end
+  if ne raIsFastPath expFast
+    ret grFail add stepBase 3
+  end
+  if lt sp expMinSpill
+    ret grFail add stepBase 4
+  end
+  if expFast
+    if or ne sp 0 ne raSlotCount 0
+      ret grFail add stepBase 5
+    end
+  end
+  refV = grRef24
+  simV = grSim24 ngpr nScratch false
+  if ne simV refV
+    ret grFail add stepBase 6
+  end
+  grLogChip cid sp raSlotCount simV refV
+  grAddChk 4
+  ret 0
+end
+
+fn grRunPhase baseV ulong scr0 ulong scr1 ulong to ulong
+  for k ulong 24
+    grWriteVal add baseV k add mul add k 1 131 17 scr0
+  end
+  accV = add baseV 24
+  grWriteVal accV 0 scr0
+  for k ulong 24
+    xv = grReadVal add baseV k scr0
+    ac = grReadVal accV scr1
+    grWriteVal accV add ac xor mul xv add k 3 mul k 17 scr1
+  end
+  ret grReadVal accV scr0
+end
+
+note Two sequential 24-live-variable phases (50 total SSA values) -> must reuse spill slots 100%!
+fn grTestSpillReuse cidX64 ulong to int
+  ngpr = ctNgpr cidX64
+  raReset
+  for k ulong 24
+    id = raAddInterval k add 24 k RA_SPILL
+  end
+  a0 = raAddInterval 24 48 RA_SPILL
+  for k ulong 24
+    id = raAddInterval add 60 k add 84 k RA_SPILL
+  end
+  a1 = raAddInterval 84 108 RA_SPILL
+  sp = raRunWithBudget ngpr 2
+  if ne raVerifyComplete ngpr 0
+    ret grFail 40
+  end
+  if ne raPeak 25
+    ret grFail 41
+  end
+  if le sp 12
+    ret grFail 42
+  end
+  if ge raSlotCount sp
+    ret grFail 43
+  end
+  if gt raSlotCount 12
+    ret grFail 44
+  end
+  grPoisonMachine
+  scr0 = sub ngpr 1
+  scr1 = sub ngpr 2
+  r0 = grRunPhase 0 scr0 scr1
+  r1 = grRunPhase 25 scr0 scr1
+  refV = grRef24
+  if or ne r0 refV ne r1 refV
+    ret grFail 45
+  end
+  grAddChk 5
+  ret 0
+end
+
+note Unsorted intervals + furthest-end eviction + fixed register conflict resolution
+fn grTestOrderAndEvict to int
+  raReset
+  note Long live range added first, then 15 short overlapping ranges in reverse/unsorted order
+  idLong = raAddInterval 0 100 RA_SPILL
+  for k ulong 15
+    idx = sub 14 k
+    idS = raAddInterval add 1 idx 20 RA_SPILL
+  end
+  sp = raRunForNgpr 15
+  if ne raVerifyComplete 15 0
+    ret grFail 50
+  end
+  if ne sp 1
+    ret grFail 51
+  end
+  if ne get raPhys idLong RA_SPILL
+    ret grFail 52
+  end
+  note Fixed register eviction: non-fixed v0 in [0, 30] must yield r0 to fixed v1 in [5, 15]
+  raReset
+  v0 = raAddInterval 0 30 RA_SPILL
+  v1 = raAddInterval 5 15 0
+  sp2 = raRunForNgpr 2
+  if ne raVerifyComplete 2 0
+    ret grFail 53
+  end
+  if ne get raPhys v1 0
+    ret grFail 54
+  end
+  if eq get raPhys v0 0
+    ret grFail 55
+  end
+  grAddChk 4
+  ret 0
+end
+
+note 5 negative controls (killed mutants + fail-closed UB guards)
+fn grTestMutants cidX64 ulong to int
+  ngpr = ctNgpr cidX64
+  grBuild24Live
+  sp = raRunWithBudget ngpr 2
+  if ne raVerifyComplete ngpr 0
+    ret grFail 60
+  end
+
+  note Mutant 1: register aliasing on overlapping intervals -> MUST be killed by raVerifyColoring
+  savP = get raPhys 1
+  put raPhys 1 get raPhys 0
+  if eq raVerifyColoring 0
+    ret grFail 61
+  end
+  if eq raVerifyComplete ngpr 0
+    ret grFail 62
+  end
+  put raPhys 1 savP
+  grAddCtrl 1
+
+  note Mutant 2: spill-slot aliasing on overlapping spilled values -> MUST be killed by raVerifySpillSlots
+  sp0 = ulong 999
+  sp1 = ulong 999
+  for i ulong 25
+    if eq get raPhys i RA_SPILL
+      if eq sp0 999
+        sp0 = i
+      else
+        if eq sp1 999
+          sp1 = i
+        end
+      end
+    end
+  end
+  if or eq sp0 999 eq sp1 999
+    ret grFail 63
+  end
+  savS = get raSlot sp1
+  put raSlot sp1 get raSlot sp0
+  if eq raVerifySpillSlots 0
+    ret grFail 64
+  end
+  if eq raVerifyComplete ngpr 0
+    ret grFail 65
+  end
+  put raSlot sp1 savS
+  grAddCtrl 1
+
+  note Mutant 3: out-of-bounds physical register assignment (pi == ngpr) -> MUST be killed
+  put raPhys 0 ngpr
+  if eq raVerifyColoring 0
+    ret grFail 66
+  end
+  put raPhys 0 savP
+  grAddCtrl 1
+
+  note Mutant 4: dropped spill-store -> execution result diverges from grRef24!
+  badSim = grSim24 ngpr 2 true
+  if eq badSim grRef24
+    ret grFail 67
+  end
+  grAddCtrl 1
+
+  note Mutant 5: zero-UB fail-closed checks (ngpr == 0, inverted interval e < s)
+  raReset
+  dummy = raAddInterval 0 5 RA_SPILL
+  z0 = raRunForNgpr 0
+  if eq get raErr 0 RA_OK
+    ret grFail 68
+  end
+  raReset
+  badId = raAddInterval 20 5 RA_SPILL
+  if ne get raErr 0 RA_ERR_RANGE
+    ret grFail 69
+  end
+  grAddCtrl 1
+  ret 0
+end
+
+fn main to int
+  tdInitAll
+  ctWriteAll 1 grHdr
+  if ne ctLoadFile grPChips len grPChips 0
+    ret grFail 1
+  end
+  cidX64 = ctFindChip grIdX64 len grIdX64
+  cidApp = ctFindChip grIdApp len grIdApp
+  cidX925 = ctFindChip grIdX925 len grIdX925
+  cidSm121 = ctFindChip grIdSm121 len grIdSm121
+  if or ne ctNgpr cidX64 15 ne ctNgpr cidApp 29
+    ret grFail 2
+  end
+  if or ne ctNgpr cidX925 30 ne ctNgpr cidSm121 64
+    ret grFail 3
+  end
+  put grChk 0 4
+  put grCtrl 0 0
+
+  r = grTestChip24 cidX64 false 12 2 10
+  if ne r 0
+    ret r
+  end
+  r = grTestChip24 cidApp true 0 0 20
+  if ne r 0
+    ret r
+  end
+  r = grTestChip24 cidX925 true 0 0 30
+  if ne r 0
+    ret r
+  end
+  r = grTestChip24 cidSm121 true 0 0 35
+  if ne r 0
+    ret r
+  end
+  r = grTestSpillReuse cidX64
+  if ne r 0
+    ret r
+  end
+  r = grTestOrderAndEvict
+  if ne r 0
+    ret r
+  end
+  r = grTestMutants cidX64
+  if ne r 0
+    ret r
+  end
+
+  ctWriteAll 1 grPassA
+  ctWriteU64 1 get grChk 0
+  ctWriteAll 1 grPassB
+  ctWriteU64 1 get grCtrl 0
+  ctWriteAll 1 grNl
+  ret 0
+end

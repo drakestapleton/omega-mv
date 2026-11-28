@@ -1,0 +1,1233 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/multi_target/uni_cc.om: Pure seeded OM-2 Universal Multi-Target Compiler.
+note Compiles ONE pure .om / OIR v2 kernel recipe driven by seed/ng/target/chips.tsv across:
+note   1. arm64-linux (Static ELF64 EM_AARCH64=183)
+note   2. apple-m     (Position-independent ARM64 Mach-O MH_MAGIC_64=0xfeedfacf, codesign-ready)
+note   3. x64-linux   (Static ELF64 EM_X86_64=62, 2-addr lowering)
+note   4. rv64-elf    (Static ELF64 EM_RISCV=243, RV64I LUI+ADDIW sign-ext safe)
+note   5. wasm        (Canonical OSC1IR v1 binary -> seed/wasm/irwasm.om)
+note   6. spirv       (Vulkan 1.1 GLCompute SPIR-V -> gpu/spirv/{val,run}.om + OSC1IR -> vkspirv.om)
+note   7. intel-xe    (128-bit Xe2/Xe3 EU ISA -> gpu/intel/xe/isa.om check)
+note   8. sm121       (128-bit Blackwell SASS via om/encoder/bw_enc_sm121.om + HXP1 cert -> monk_check.om)
+note Link order (Linux AArch64 and MacBook target a64macos):
+note   sha256.om target_desc.om chips_tsv.om regalloc.om isel.om sm121_pe.om bw_enc_sm121.om uni_cc.om
+
+const UC_ERR_USAGE int 70
+const UC_ERR_TARGET int 71
+const UC_ERR_CONTRACT int 72
+const UC_ERR_IO int 74
+
+const UC_NONE ulong 18446744073709551615
+
+global ucOut uchar 65536
+global ucOutLen ulong 1
+global ucIr uchar 256
+global ucIrLen ulong 1
+global ucCert uchar 256
+global ucCertLen ulong 1
+global ucRec uchar 16384
+global ucRecLen ulong 1
+global ucArgBuf uchar 4096
+
+global ucPathChips uchar 4096
+global ucPathChipsN ulong 1
+global ucTarget uchar 64
+global ucTargetN ulong 1
+global ucPathOut uchar 4096
+global ucPathOutN ulong 1
+global ucPathCert uchar 4096
+global ucPathCertN ulong 1
+global ucPathIr uchar 4096
+global ucPathIrN ulong 1
+global ucPathRec uchar 4096
+global ucPathRecN ulong 1
+
+note Kernel recipe state:
+note   ucCfg[0]=argA, [1]=argB, [2]=argC, [3]=op1(1=ADD,2=SUB,3=MUL), [4]=op2(1=ADD,2=SUB,3=MUL)
+note   ucCfg[5]=reqSmem, [6]=reqRegs, [7]=reqL2Kb, [8]=reqMma, [9]=reqFeat, [10]=hasExecOv, [11]=reqExec
+global ucCfg ulong 16
+global ucSpvWords uint 256
+global ucSpvN ulong 1
+
+text ucDefChips "seed/ng/target/chips.tsv"
+text ucFChips "--chips"
+text ucFTgt "--target"
+text ucFOut "--out"
+text ucFCert "--cert"
+text ucFIr "--ir"
+text ucFRec "--recipe"
+text ucFSmem "--smem"
+text ucFRegs "--regs"
+text ucFL2 "--l2"
+text ucFExec "--exec"
+text ucKfnName "kfn"
+text ucTagPure "@pure"
+text ucTagExact "@exact"
+text ucTagSmem "@smem"
+text ucTagRegs "@regs"
+text ucTagL2 "@l2_kb"
+text ucTagArgs "@args"
+text ucTagOps "@ops"
+text ucTokAdd "add"
+text ucTokSub "sub"
+text ucTokMul "mul"
+
+text ucMsgUse "usage: uni_cc --target ID [--chips PATH] [--recipe PATH] [--smem B] [--regs R] [--l2 KB] [--out FILE] [--cert FILE] [--ir FILE]\n"
+text ucMsgRef "UNI_CC REFUSED code=TDK_ERR_"
+text ucMsgTgt " target="
+text ucMsgOk "UNI_CC PASS target="
+text ucMsgBk " backend="
+text ucMsgBytes " bytes="
+text ucMsgRa " regalloc_spills="
+text ucMsgErrTgt "uni_cc: unknown target\n"
+text ucMsgErrIo "uni_cc: I/O or recipe parse error\n"
+text ucMsgNl "\n"
+
+fn ucOutReset to void
+  put ucOutLen 0 0
+end
+
+fn ucOutU8 b ulong to void
+  p = get ucOutLen 0
+  if lt p 65536
+    put ucOut p uchar and b 255
+    put ucOutLen 0 add p 1
+  end
+end
+
+fn ucOutU16 v ulong to void
+  ucOutU8 v
+  ucOutU8 shr v 8
+end
+
+fn ucOutU32 v ulong to void
+  ucOutU16 v
+  ucOutU16 shr v 16
+end
+
+fn ucOutU64 v ulong to void
+  ucOutU32 v
+  ucOutU32 shr v 32
+end
+
+fn ucOutPutAt off ulong v ulong sz ulong to void
+  for k ulong sz bound 8
+    put ucOut add off k uchar and shr v mul k 8 255
+  end
+end
+
+fn ucWriteFd fd int kind ulong n ulong to bool
+  p = ulong 0
+  while lt p n bound 65536
+    k = long 0
+    if eq kind 0
+      k = write fd ucOut p sub n p
+    else
+      if eq kind 1
+        k = write fd ucCert p sub n p
+      else
+        k = write fd ucIr p sub n p
+      end
+    end
+    if le k 0
+      ret false
+    end
+    p = add p ulong k
+  end
+  ret true
+end
+
+fn ucWriteGlobal kind ulong to bool
+  pth = new uchar 4096 0
+  plen = ulong 0
+  if eq kind 0
+    plen = get ucPathOutN 0
+    for i ulong plen bound 4096
+      put pth i get ucPathOut i
+    end
+  else
+    if eq kind 1
+      plen = get ucPathCertN 0
+      for i ulong plen bound 4096
+        put pth i get ucPathCert i
+      end
+    else
+      plen = get ucPathIrN 0
+      for i ulong plen bound 4096
+        put pth i get ucPathIr i
+      end
+    end
+  end
+  if or eq plen 0 gt plen 4095
+    ret false
+  end
+  fd = fopen pth 0 plen 577 493
+  if lt fd 0
+    ret false
+  end
+  n = get ucIrLen 0
+  if eq kind 0
+    n = get ucOutLen 0
+  else
+    if eq kind 1
+      n = get ucCertLen 0
+    end
+  end
+  ok = ucWriteFd int fd kind n
+  z = fclose int fd
+  ret ok
+end
+
+fn ucFail code int msg view uchar * to void
+  z = write 2 msg 0 len msg
+  exit code
+end
+
+fn ucArgEq lenA ulong key view uchar * to bool
+  if ne lenA len key
+    ret false
+  end
+  for i ulong len key bound 64
+    if ne get ucArgBuf i get key i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ucCopyArg dst ulong dstLenPtr ulong n ulong to void
+  if gt n 4095
+    ucFail UC_ERR_USAGE ucMsgUse
+  end
+  for i ulong n bound 4096
+    b = get ucArgBuf i
+    if eq dst 0
+      put ucPathChips i b
+    else
+      if eq dst 1
+        put ucTarget i b
+      else
+        if eq dst 2
+          put ucPathOut i b
+        else
+          if eq dst 3
+            put ucPathCert i b
+          else
+            if eq dst 4
+              put ucPathIr i b
+            else
+              put ucPathRec i b
+            end
+          end
+        end
+      end
+    end
+  end
+  if eq dst 0
+    put ucPathChipsN 0 n
+  end
+  if eq dst 1
+    put ucTargetN 0 n
+  end
+  if eq dst 2
+    put ucPathOutN 0 n
+  end
+  if eq dst 3
+    put ucPathCertN 0 n
+  end
+  if eq dst 4
+    put ucPathIrN 0 n
+  end
+  if eq dst 5
+    put ucPathRecN 0 n
+  end
+end
+
+fn ucParseDec src ulong s ulong e ulong to ulong
+  if ge s e
+    ucFail UC_ERR_IO ucMsgErrIo
+  end
+  v = ulong 0
+  p = s
+  while lt p e bound 32
+    c = uchar 0
+    if eq src 0
+      c = get ucArgBuf p
+    else
+      c = get ucRec p
+    end
+    if or lt c 48 gt c 57
+      ucFail UC_ERR_IO ucMsgErrIo
+    end
+    v = add mul v 10 ulong sub c 48
+    p = add p 1
+  end
+  ret v
+end
+
+fn ucArgDec idx ulong to ulong
+  k = argread idx ucArgBuf 0 4095
+  if lt k 1
+    ucFail UC_ERR_USAGE ucMsgUse
+  end
+  ret ucParseDec 0 0 ulong k
+end
+
+fn ucInitDefaults to void
+  for i ulong len ucDefChips
+    put ucPathChips i get ucDefChips i
+  end
+  put ucPathChipsN 0 len ucDefChips
+  put ucTargetN 0 0
+  put ucPathOutN 0 0
+  put ucPathCertN 0 0
+  put ucPathIrN 0 0
+  put ucPathRecN 0 0
+  put ucCfg 0 7
+  put ucCfg 1 5
+  put ucCfg 2 3
+  put ucCfg 3 OIR_ADD
+  put ucCfg 4 OIR_MUL
+  put ucCfg 5 0
+  put ucCfg 6 3
+  put ucCfg 7 64
+  put ucCfg 8 0
+  put ucCfg 9 0
+  put ucCfg 10 0
+  put ucCfg 11 0
+end
+
+fn ucSkipWs p ulong n ulong to ulong
+  while lt p n bound 16384
+    c = get ucRec p
+    if and ne c 32 and ne c 9 and ne c 10 ne c 13
+      ret p
+    end
+    p = add p 1
+  end
+  ret p
+end
+
+fn ucNextTokEnd p ulong n ulong to ulong
+  while lt p n bound 16384
+    c = get ucRec p
+    if or eq c 32 or eq c 9 or eq c 10 eq c 13
+      ret p
+    end
+    p = add p 1
+  end
+  ret p
+end
+
+fn ucRecTokEq s ulong e ulong kw view uchar * to bool
+  if ne sub e s len kw
+    ret false
+  end
+  for i ulong len kw bound 64
+    if ne get ucRec add s i get kw i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ucParseOpTok s ulong e ulong to ulong
+  if ucRecTokEq s e ucTokAdd
+    ret OIR_ADD
+  end
+  if ucRecTokEq s e ucTokSub
+    ret OIR_SUB
+  end
+  if ucRecTokEq s e ucTokMul
+    ret OIR_MUL
+  end
+  ucFail UC_ERR_IO ucMsgErrIo
+  ret OIR_ADD
+end
+
+fn ucLoadRecipe to void
+  rn = get ucPathRecN 0
+  if eq rn 0
+    ret
+  end
+  fd = fopen ucPathRec 0 rn 0 0
+  if lt fd 0
+    ucFail UC_ERR_IO ucMsgErrIo
+  end
+  tot = ulong 0
+  while lt tot 16383 bound 256
+    r = read int fd ucRec tot sub 16383 tot
+    if le r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  z = fclose int fd
+  put ucRecLen 0 tot
+  p = ulong 0
+  sawPure = false
+  while lt p tot bound 4096
+    p = ucSkipWs p tot
+    if ge p tot
+      break
+    end
+    e = ucNextTokEnd p tot
+    if ucRecTokEq p e ucTagPure
+      sawPure = true
+      p = e
+      continue
+    end
+    if ucRecTokEq p e ucTagSmem
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 5 ucParseDec 1 p e
+      p = e
+      continue
+    end
+    if ucRecTokEq p e ucTagRegs
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 6 ucParseDec 1 p e
+      p = e
+      continue
+    end
+    if ucRecTokEq p e ucTagL2
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 7 ucParseDec 1 p e
+      p = e
+      continue
+    end
+    if ucRecTokEq p e ucTagArgs
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 0 ucParseDec 1 p e
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 1 ucParseDec 1 p e
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 2 ucParseDec 1 p e
+      p = e
+      continue
+    end
+    if ucRecTokEq p e ucTagOps
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 3 ucParseOpTok p e
+      p = ucSkipWs e tot
+      e = ucNextTokEnd p tot
+      put ucCfg 4 ucParseOpTok p e
+      p = e
+      continue
+    end
+    p = e
+  end
+  if not sawPure
+    ucFail UC_ERR_IO ucMsgErrIo
+  end
+end
+
+fn ucMatchFlag al ulong to ulong
+  if ucArgEq al ucFChips
+    ret 0
+  end
+  if ucArgEq al ucFTgt
+    ret 1
+  end
+  if ucArgEq al ucFOut
+    ret 2
+  end
+  if ucArgEq al ucFCert
+    ret 3
+  end
+  if ucArgEq al ucFIr
+    ret 4
+  end
+  if ucArgEq al ucFRec
+    ret 5
+  end
+  if ucArgEq al ucFSmem
+    ret 6
+  end
+  if ucArgEq al ucFRegs
+    ret 7
+  end
+  if ucArgEq al ucFL2
+    ret 8
+  end
+  if ucArgEq al ucFExec
+    ret 9
+  end
+  ret 99
+end
+
+fn ucHandlePair al ulong idx ulong to bool
+  fid = ucMatchFlag al
+  if eq fid 99
+    ret false
+  end
+  k2 = argread idx ucArgBuf 0 4095
+  if lt k2 1
+    ucFail UC_ERR_USAGE ucMsgUse
+  end
+  al2 = ulong k2
+  if le fid 5
+    ucCopyArg fid 0 al2
+    ret true
+  end
+  if eq fid 6
+    put ucCfg 5 ucParseDec 0 0 al2
+    ret true
+  end
+  if eq fid 7
+    put ucCfg 6 ucParseDec 0 0 al2
+    ret true
+  end
+  if eq fid 8
+    put ucCfg 7 ucParseDec 0 0 al2
+    ret true
+  end
+  put ucCfg 10 1
+  put ucCfg 11 ucParseDec 0 0 al2
+  ret true
+end
+
+fn ucParseArgs to void
+  ac = ulong argcnt
+  i = ulong 1
+  while lt i ac bound 64
+    k = argread i ucArgBuf 0 4095
+    if lt k 1
+      ucFail UC_ERR_USAGE ucMsgUse
+    end
+    al = ulong k
+    nx = add i 1
+    if ge nx ac
+      ucFail UC_ERR_USAGE ucMsgUse
+    end
+    if not ucHandlePair al nx
+      ucFail UC_ERR_USAGE ucMsgUse
+    end
+    i = add i 2
+  end
+  if eq get ucTargetN 0 0
+    ucFail UC_ERR_USAGE ucMsgUse
+  end
+end
+
+note ---- Shared Register Allocator + Contract Check Pass ----
+fn ucRunRegalloc cid ulong to ulong
+  ngpr = ctNgpr cid
+  if gt ngpr RA_MAX_REGS
+    ngpr = RA_MAX_REGS
+  end
+  raReset
+  va = raAddInterval 0 2 0
+  vb = raAddInterval 0 2 1
+  vc = raAddInterval 0 4 2
+  vt = raAddInterval 3 4 0
+  vr = raAddInterval 5 6 0
+  sp = raRunForNgpr ngpr
+  if ne raVerifyComplete ngpr 0
+    ret 999
+  end
+  ret sp
+end
+
+note ---- Emit Canonical 60-byte OSC1IR v1 Binary for kfn(a, b, c) = (a op1 b) op2 c ----
+fn ucIrU8 b ulong to void
+  p = get ucIrLen 0
+  if lt p 256
+    put ucIr p uchar and b 255
+    put ucIrLen 0 add p 1
+  end
+end
+
+fn ucIrU16 v ulong to void
+  ucIrU8 v
+  ucIrU8 shr v 8
+end
+
+fn ucIrU32 v ulong to void
+  ucIrU16 v
+  ucIrU16 shr v 16
+end
+
+fn ucEmitOscIr to void
+  put ucIrLen 0 0
+  ucIrU8 79
+  ucIrU8 83
+  ucIrU8 67
+  ucIrU8 49
+  ucIrU8 73
+  ucIrU8 82
+  ucIrU8 0
+  ucIrU8 1
+  ucIrU16 1
+  ucIrU8 3
+  for i ulong 3
+    ucIrU8 ulong get ucKfnName i
+  end
+  ucIrU8 3
+  ucIrU8 5
+  ucIrU16 5
+  for i ulong 5
+    ucIrU8 5
+  end
+  ucIrU16 1
+  ucIrU32 0
+  ucIrU32 3
+  ucIrU32 3
+  ucIrU8 3
+  ucIrU8 get ucCfg 3
+  ucIrU16 3
+  ucIrU16 0
+  ucIrU16 1
+  ucIrU8 3
+  ucIrU8 get ucCfg 4
+  ucIrU16 4
+  ucIrU16 3
+  ucIrU16 2
+  ucIrU8 15
+  ucIrU16 4
+  ucIrU32 0
+end
+
+note ---- AArch64 Immediate Loader (MOVZ + MOVK) ----
+fn ucA6LoadU64 rd ulong v ulong to void
+  lo = and v 65535
+  isEmitU32 or ulong 3531603968 or shl lo 5 rd
+  h1 = and shr v 16 65535
+  if ne h1 0
+    isEmitU32 or ulong 4068474880 or shl ulong 1 21 or shl h1 5 rd
+  end
+  h2 = and shr v 32 65535
+  if ne h2 0
+    isEmitU32 or ulong 4068474880 or shl ulong 2 21 or shl h2 5 rd
+  end
+  h3 = and shr v 48 65535
+  if ne h3 0
+    isEmitU32 or ulong 4068474880 or shl ulong 3 21 or shl h3 5 rd
+  end
+end
+
+note ---- Backend 1: arm64-linux Static ELF64 (EM_AARCH64=183) ----
+fn ucEmitArm64Elf to void
+  isBufReset
+  ucA6LoadU64 0 get ucCfg 0
+  ucA6LoadU64 1 get ucCfg 1
+  ucA6LoadU64 2 get ucCfg 2
+  ok1 = isEmitOp CT_TD_SLOT get ucCfg 3 0 0 1
+  ok2 = isEmitOp CT_TD_SLOT get ucCfg 4 0 0 2
+  isEmitU32 3531606952
+  isEmitU32 3556769793
+  tot = elfEmitStatic CT_TD_SLOT
+  ucOutReset
+  for i ulong tot bound 4096
+    ucOutU8 ulong get elfBuf i
+  end
+end
+
+note ---- Backend 2: apple-m Position-Independent ARM64 Mach-O (codesign-ready) ----
+fn ucEmitAppleMachO to void
+  isBufReset
+  ucA6LoadU64 0 get ucCfg 0
+  ucA6LoadU64 1 get ucCfg 1
+  ucA6LoadU64 2 get ucCfg 2
+  ok1 = isEmitOp CT_TD_SLOT get ucCfg 3 0 0 1
+  ok2 = isEmitOp CT_TD_SLOT get ucCfg 4 0 0 2
+  note movz x16, #1 (0xd2800030); svc #0x80 (0xd4001001)
+  isEmitU32 3531604016
+  isEmitU32 3556773889
+  clen = get isLen 0
+  n = add 16384 clen
+  f = and add n 16383 not ulong 16383
+  gv = ulong 8388608
+  ucOutReset
+  for i ulong add f 40 bound 65536
+    put ucOut i uchar 0
+  end
+  put ucOutLen 0 add f 40
+  ucOutPutAt 0 0xfeedfacf 4
+  ucOutPutAt 4 0x0100000c 4
+  ucOutPutAt 12 2 4
+  ucOutPutAt 16 12 4
+  ucOutPutAt 20 680 4
+  ucOutPutAt 24 0x200085 4
+  ucOutPutAt 32 25 4
+  ucOutPutAt 36 72 4
+  ucOutPutAt 40 4997382908861767519 8
+  ucOutPutAt 48 20306 8
+  ucOutPutAt 64 0x100000000 8
+  ucOutPutAt 104 25 4
+  ucOutPutAt 108 152 4
+  ucOutPutAt 112 92738097012575 8
+  ucOutPutAt 128 0x100000000 8
+  ucOutPutAt 136 f 8
+  ucOutPutAt 152 f 8
+  ucOutPutAt 160 5 4
+  ucOutPutAt 164 5 4
+  ucOutPutAt 168 1 4
+  ucOutPutAt 176 128060447022943 8
+  ucOutPutAt 192 92738097012575 8
+  ucOutPutAt 208 0x100004000 8
+  ucOutPutAt 216 clen 8
+  ucOutPutAt 224 16384 4
+  ucOutPutAt 228 6 4
+  ucOutPutAt 240 0x80000400 4
+  ucOutPutAt 256 25 4
+  ucOutPutAt 260 72 4
+  ucOutPutAt 264 71830128058207 8
+  ucOutPutAt 280 0x100ffc000 8
+  ucOutPutAt 288 add gv 16384 8
+  ucOutPutAt 296 f 8
+  ucOutPutAt 312 3 4
+  ucOutPutAt 316 3 4
+  ucOutPutAt 328 25 4
+  ucOutPutAt 332 72 4
+  ucOutPutAt 336 4919420967581409119 8
+  ucOutPutAt 344 21577 8
+  ucOutPutAt 352 add 0x101000000 gv 8
+  ucOutPutAt 360 16384 8
+  ucOutPutAt 368 f 8
+  ucOutPutAt 376 40 8
+  ucOutPutAt 384 1 4
+  ucOutPutAt 388 1 4
+  ucOutPutAt 400 0x80000022 4
+  ucOutPutAt 404 48 4
+  ucOutPutAt 416 f 4
+  ucOutPutAt 420 24 4
+  ucOutPutAt 448 2 4
+  ucOutPutAt 452 24 4
+  ucOutPutAt 456 add f 24 4
+  ucOutPutAt 464 add f 24 4
+  ucOutPutAt 468 16 4
+  ucOutPutAt 472 11 4
+  ucOutPutAt 476 80 4
+  ucOutPutAt 552 14 4
+  ucOutPutAt 556 32 4
+  ucOutPutAt 560 12 4
+  ucOutPutAt 564 7091318039310988591 8
+  ucOutPutAt 572 431316624431 8
+  ucOutPutAt 584 12 4
+  ucOutPutAt 588 56 4
+  ucOutPutAt 592 24 4
+  ucOutPutAt 600 65536 4
+  ucOutPutAt 604 65536 4
+  ucOutPutAt 608 7091318039310988591 8
+  ucOutPutAt 616 8391183929761688623 8
+  ucOutPutAt 624 7816388778119818597 8
+  ucOutPutAt 632 25193 8
+  ucOutPutAt 640 50 4
+  ucOutPutAt 644 24 4
+  ucOutPutAt 648 1 4
+  ucOutPutAt 652 720896 4
+  ucOutPutAt 656 720896 4
+  ucOutPutAt 664 27 4
+  ucOutPutAt 668 24 4
+  ucOutPutAt 672 7161089769139693422 8
+  ucOutPutAt 680 212436143976 8
+  ucOutPutAt 688 0x80000028 4
+  ucOutPutAt 692 24 4
+  ucOutPutAt 696 16384 8
+  for i ulong clen bound 1024
+    put ucOut add 16384 i get isBuf i
+  end
+  ucOutPutAt f 0x65706f6c645f4011 8
+  ucOutPutAt add f 8 0x5f4090007251006e 8
+  ucOutPutAt add f 16 0x0090006d79736c64 8
+end
+
+note ---- Backend 3: x64-linux Static ELF64 (EM_X86_64=62) ----
+fn ucEmitX64Elf to void
+  isBufReset
+  isEmitU8 72
+  isEmitU8 184
+  isEmitU64 get ucCfg 0
+  isEmitU8 72
+  isEmitU8 191
+  isEmitU64 get ucCfg 1
+  isEmitU8 72
+  isEmitU8 190
+  isEmitU64 get ucCfg 2
+  ok1 = isEmitOp CT_TD_SLOT get ucCfg 3 0 0 1
+  ok2 = isEmitOp CT_TD_SLOT get ucCfg 4 0 0 2
+  isEmitU8 72
+  isEmitU8 137
+  isEmitU8 199
+  isEmitU8 184
+  isEmitU32 60
+  isEmitU8 15
+  isEmitU8 5
+  tot = elfEmitStatic CT_TD_SLOT
+  ucOutReset
+  for i ulong tot bound 4096
+    ucOutU8 ulong get elfBuf i
+  end
+end
+
+note ---- Backend 4: rv64-elf Static ELF64 (EM_RISCV=243, LUI+ADDIW sign-ext safe) ----
+fn ucRvLi rd ulong v ulong to void
+  if lt v 2048
+    isEmitU32 or shl v 20 or shl rd 7 19
+    ret
+  end
+  lo = and v 4095
+  hi = and shr v 12 1048575
+  if ge lo 2048
+    hi = and add hi 1 1048575
+  end
+  isEmitU32 or shl hi 12 or shl rd 7 55
+  if ne lo 0
+    isEmitU32 or shl lo 20 or shl rd 15 or shl rd 7 27
+  end
+end
+
+fn ucEmitRv64Elf to void
+  isBufReset
+  ucRvLi 10 get ucCfg 0
+  ucRvLi 11 get ucCfg 1
+  ucRvLi 12 get ucCfg 2
+  ok1 = isEmitOp CT_TD_SLOT get ucCfg 3 0 0 1
+  ok2 = isEmitOp CT_TD_SLOT get ucCfg 4 0 0 2
+  note addi a7, x0, 93 (0x05d00893); ecall (0x00000073)
+  isEmitU32 97519763
+  isEmitU32 115
+  tot = elfEmitStatic CT_TD_SLOT
+  ucOutReset
+  for i ulong tot bound 4096
+    ucOutU8 ulong get elfBuf i
+  end
+end
+
+note ---- Backend 5: wasm (canonical OSC1IR v1 stream for seed/wasm/irwasm.om) ----
+fn ucEmitWasmIr to void
+  ucEmitOscIr
+  ucOutReset
+  n = get ucIrLen 0
+  for i ulong n bound 256
+    ucOutU8 ulong get ucIr i
+  end
+end
+
+note ---- Backend 6: spirv (Vulkan 1.1 GLCompute SPIR-V for gpu/spirv/{val,run}.om) ----
+fn ucSpvW w ulong to void
+  n = get ucSpvN 0
+  if lt n 256
+    put ucSpvWords n uint and w 4294967295
+    put ucSpvN 0 add n 1
+  end
+end
+
+fn ucSpvOp c ulong wc ulong to void
+  ucSpvW or shl wc 16 c
+end
+
+fn ucSpvOp3 c ulong a ulong b ulong to void
+  ucSpvOp c 3
+  ucSpvW a
+  ucSpvW b
+end
+
+fn ucSpvOp4 c ulong a ulong b ulong d ulong to void
+  ucSpvOp c 4
+  ucSpvW a
+  ucSpvW b
+  ucSpvW d
+end
+
+fn ucSpvOp5 c ulong a ulong b ulong d ulong e ulong to void
+  ucSpvOp c 5
+  ucSpvW a
+  ucSpvW b
+  ucSpvW d
+  ucSpvW e
+end
+
+fn ucSpvAlu opKind ulong to ulong
+  if eq opKind OIR_ADD
+    ret 128
+  end
+  if eq opKind OIR_SUB
+    ret 130
+  end
+  ret 132
+end
+
+fn ucSpvHeaderDecor to void
+  note Cap Shader(1), MemModel Logical(0) GLSL450(1), EntryPoint GLCompute(5) %15 "kfn" %11, ExecMode LocalSize 64 1 1
+  ucSpvOp 17 2
+  ucSpvW 1
+  ucSpvOp3 14 0 1
+  ucSpvOp5 15 5 15 7235179 11
+  ucSpvOp 16 6
+  ucSpvW 15
+  ucSpvW 17
+  ucSpvW 64
+  ucSpvW 1
+  ucSpvW 1
+  note Decorations: %11 BuiltIn GlobalInvocationId(28); %6 ArrayStride 4; %7 Block(2); %7 member 0 Offset 0
+  ucSpvOp4 71 11 11 28
+  ucSpvOp4 71 6 6 4
+  ucSpvOp3 71 7 2
+  ucSpvOp5 72 7 0 35 0
+  note DescriptorSet 0 + Binding 0/1/2 on %12, %13, %14
+  ucSpvOp4 71 12 34 0
+  ucSpvOp4 71 12 33 0
+  ucSpvOp4 71 13 34 0
+  ucSpvOp4 71 13 33 1
+  ucSpvOp4 71 14 34 0
+  ucSpvOp4 71 14 33 2
+end
+
+fn ucSpvTypesConsts to void
+  note 1=void, 2=u32, 3=bool, 4=uvec3, 5=PtrInput_uvec3, 6=RTA_u32, 7=Struct, 8=PtrSB_Struct, 9=PtrSB_u32, 10=FnVoid
+  ucSpvOp 19 2
+  ucSpvW 1
+  ucSpvOp4 21 2 32 0
+  ucSpvOp 20 2
+  ucSpvW 3
+  ucSpvOp4 23 4 2 3
+  ucSpvOp4 32 5 1 4
+  ucSpvOp3 29 6 2
+  ucSpvOp3 30 7 6
+  ucSpvOp4 32 8 12 7
+  ucSpvOp4 32 9 12 2
+  ucSpvOp3 33 10 1
+  note Constants %16=u32(0), %17=u32(argC)
+  ucSpvOp4 43 2 16 0
+  ucSpvOp4 43 2 17 get ucCfg 2
+  note Vars %11=GID(Input=1), %12=in0(SB=12), %13=in1(SB=12), %14=out(SB=12)
+  ucSpvOp4 59 5 11 1
+  ucSpvOp4 59 8 12 12
+  ucSpvOp4 59 8 13 12
+  ucSpvOp4 59 8 14 12
+end
+
+fn ucEmitSpirvCompute to void
+  put ucSpvN 0 0
+  ucSpvHeaderDecor
+  ucSpvTypesConsts
+  note %15 = OpFunction void()
+  ucSpvOp5 54 1 15 0 10
+  ucSpvOp 248 2
+  ucSpvW 18
+  ucSpvOp4 61 4 19 11
+  ucSpvOp5 81 2 20 19 0
+  ucSpvOp5 68 2 21 14 0
+  ucSpvOp5 176 3 22 20 21
+  ucSpvOp3 247 24 0
+  ucSpvOp4 250 22 23 24
+  ucSpvOp 248 2
+  ucSpvW 23
+  ucSpvOp 65 6
+  ucSpvW 9
+  ucSpvW 25
+  ucSpvW 12
+  ucSpvW 16
+  ucSpvW 20
+  ucSpvOp4 61 2 26 25
+  ucSpvOp 65 6
+  ucSpvW 9
+  ucSpvW 27
+  ucSpvW 13
+  ucSpvW 16
+  ucSpvW 20
+  ucSpvOp4 61 2 28 27
+  ucSpvOp5 ucSpvAlu get ucCfg 3 2 29 26 28
+  ucSpvOp5 ucSpvAlu get ucCfg 4 2 30 29 17
+  ucSpvOp 65 6
+  ucSpvW 9
+  ucSpvW 31
+  ucSpvW 14
+  ucSpvW 16
+  ucSpvW 20
+  ucSpvOp3 62 31 30
+  ucSpvOp 249 2
+  ucSpvW 24
+  ucSpvOp 248 2
+  ucSpvW 24
+  ucSpvOp 253 1
+  ucSpvOp 56 1
+  ucOutReset
+  ucOutU32 0x07230203
+  ucOutU32 0x00010300
+  ucOutU32 0
+  ucOutU32 32
+  ucOutU32 0
+  nw = get ucSpvN 0
+  for i ulong nw bound 256
+    ucOutU32 ulong get ucSpvWords i
+  end
+end
+
+note ---- Backend 7: intel-xe (128-bit Xe2/Xe3 EU ISA validated by gpu/intel/xe/isa.om) ----
+fn ucXeAluOp opKind ulong to ulong
+  if eq opKind OIR_ADD
+    ret 0x40
+  end
+  if eq opKind OIR_MUL
+    ret 0x41
+  end
+  ret 0x40
+end
+
+fn ucXeLoad sbid ulong dst ulong addrR ulong to void
+  lo = ulong 0x31
+  lo = or lo 0x0f00
+  lo = or lo sbid
+  lo = or lo 0x00800000
+  lo = or lo shl dst 48
+  hi = or shl addrR 8 0x02100580
+  ucOutU64 lo
+  ucOutU64 hi
+end
+
+fn ucXeAlu op ulong swsb ulong dst ulong s0 ulong s1 ulong to void
+  lo = or op swsb
+  lo = or lo 0x00800000
+  lo = or lo shl dst 48
+  hi = or shl s0 8 shl s1 40
+  ucOutU64 lo
+  ucOutU64 hi
+end
+
+fn ucEmitIntelXe to void
+  ucOutReset
+  ucXeLoad 0x1000 4 2
+  ucXeLoad 0x1100 6 3
+  ucXeAlu ucXeAluOp get ucCfg 3 0x3000 8 4 6
+  ucXeLoad 0x1000 10 5
+  ucXeAlu ucXeAluOp get ucCfg 4 0x3000 8 8 10
+  loSt = ulong 0x31
+  loSt = or loSt 0x0f00
+  loSt = or loSt 0x0100
+  loSt = or loSt 0x00800000
+  hiSt = shl ulong 1 8
+  hiSt = or hiSt shl ulong 8 40
+  hiSt = or hiSt 0x02000584
+  ucOutU64 loSt
+  ucOutU64 hiSt
+  loEot = ulong 0x31
+  loEot = or loEot 0x0300
+  loEot = or loEot 0x0100
+  loEot = or loEot 0x00800000
+  loEot = or loEot 0x0000000400000000
+  ucOutU64 loEot
+  ucOutU64 0x00000010
+end
+
+note ---- Backend 8: sm121 (om/encoder/bw_enc_sm121.om + HXP1 cert for monk_check.om) ----
+fn ucBwPush ins edit ulong 8192 insIdx ulong op ulong d ulong s1 ulong s2 ulong to void
+  b = mul insIdx 8
+  put ins b op
+  put ins add b 1 d
+  put ins add b 2 s1
+  put ins add b 3 s2
+  if eq op 8
+    put ins add b 4 255
+  else
+    put ins add b 4 UC_NONE
+  end
+  put ins add b 5 UC_NONE
+  put ins add b 7 0
+end
+
+fn ucBuildHxp1Cert sassBytes ulong to void
+  nIns = div sassBytes 16
+  for i ulong sassBytes bound 16384
+    put sh_dat i get ucOut i
+  end
+  sh_all sassBytes
+  for i ulong 256
+    put ucCert i uchar 0
+  end
+  put ucCert 0 uchar 72
+  put ucCert 1 uchar 88
+  put ucCert 2 uchar 80
+  put ucCert 3 uchar 49
+  put ucCert 4 uchar and nIns 255
+  put ucCert 5 uchar and shr nIns 8 255
+  put ucCert 6 uchar and shr nIns 16 255
+  put ucCert 7 uchar and shr nIns 24 255
+  for i ulong 32
+    d = get sh_dig i
+    put ucCert add 8 i d
+    put ucCert add 40 i d
+  end
+  for i ulong nIns bound 256
+    o = add 72 mul i 4
+    put ucCert o uchar and i 255
+    put ucCert add o 1 uchar and shr i 8 255
+    put ucCert add o 2 uchar and shr i 16 255
+    put ucCert add o 3 uchar and shr i 24 255
+  end
+  put ucCertLen 0 add 72 mul nIns 4
+end
+
+fn ucEmitSm121 to void
+  ins = new ulong 8192 0
+  phys = new ulong 288 0
+  code = new uchar 16384 0
+  for i ulong 288
+    put phys i i
+  end
+  note stall=6, wbar=7, rbar=7 -> ctl = 1035264 (0x000fcc00); EXIT default ctl = 1042944
+  ctl6 = shl ulong 1035264 32
+  ucBwPush edit ins 0 2 4 UC_NONE UC_NONE
+  put ins 6 or and get ucCfg 0 4294967295 ctl6
+  ucBwPush edit ins 1 2 8 UC_NONE UC_NONE
+  put ins 14 or and get ucCfg 1 4294967295 ctl6
+  ucBwPush edit ins 2 2 12 UC_NONE UC_NONE
+  put ins 22 or and get ucCfg 2 4294967295 ctl6
+  op1 = ulong 8
+  if eq get ucCfg 3 OIR_MUL
+    op1 = ulong 14
+  end
+  ucBwPush edit ins 3 op1 16 4 8
+  put ins 30 ctl6
+  op2 = ulong 14
+  if eq get ucCfg 4 OIR_ADD
+    op2 = ulong 8
+  end
+  ucBwPush edit ins 4 op2 20 16 12
+  put ins 38 ctl6
+  ucBwPush edit ins 5 45 UC_NONE UC_NONE UC_NONE
+  put ins 46 shl ulong 1042944 32
+  nb = bw_enc_sm121 view ins view phys 6 1 edit code
+  if eq nb 0
+    ucFail UC_ERR_CONTRACT ucMsgRef
+  end
+  ucOutReset
+  for i ulong nb bound 16384
+    ucOutU8 ulong get code i
+  end
+  ucBuildHxp1Cert nb
+end
+
+fn ucEmitForBackend bk ulong to void
+  if eq bk CT_BK_ARM64
+    ucEmitArm64Elf
+    ret
+  end
+  if eq bk CT_BK_APPLE
+    ucEmitAppleMachO
+    ret
+  end
+  if eq bk CT_BK_X64
+    ucEmitX64Elf
+    ret
+  end
+  if eq bk CT_BK_RV64
+    ucEmitRv64Elf
+    ret
+  end
+  if eq bk CT_BK_WASM
+    ucEmitWasmIr
+    ret
+  end
+  if eq bk CT_BK_SPIRV
+    ucEmitSpirvCompute
+    ret
+  end
+  if eq bk CT_BK_XE
+    ucEmitIntelXe
+    ret
+  end
+  if eq bk CT_BK_SM121
+    ucEmitSm121
+    ret
+  end
+  ucFail UC_ERR_CONTRACT ucMsgRef
+end
+
+fn ucCheckAndFail cid ulong to ulong
+  ctSyncTd cid
+  if ne get ucCfg 10 0
+    if ne get ucCfg 11 ctExec cid
+      z = write 2 ucMsgRef 0 len ucMsgRef
+      ctWriteU64 2 TDK_ERR_EXEC
+      z = write 2 ucMsgTgt 0 len ucMsgTgt
+      ctWriteId 2 cid
+      z = write 2 ucMsgNl 0 len ucMsgNl
+      exit UC_ERR_CONTRACT
+    end
+  end
+  rc = ctCheckRecipe cid get ucCfg 5 get ucCfg 6 get ucCfg 7 get ucCfg 8 get ucCfg 9
+  if ne rc TDK_OK
+    z = write 2 ucMsgRef 0 len ucMsgRef
+    ctWriteU64 2 rc
+    z = write 2 ucMsgTgt 0 len ucMsgTgt
+    ctWriteId 2 cid
+    z = write 2 ucMsgNl 0 len ucMsgNl
+    exit UC_ERR_CONTRACT
+  end
+  ret ucRunRegalloc cid
+end
+
+fn ucLoadChipsGlobal to int
+  n = get ucPathChipsN 0
+  p = new uchar 4096 0
+  for i ulong n bound 4096
+    put p i get ucPathChips i
+  end
+  ret ctLoadFile view p n
+end
+
+fn ucFindTargetGlobal to ulong
+  n = get ucTargetN 0
+  t = new uchar 64 0
+  for i ulong n bound 64
+    put t i get ucTarget i
+  end
+  ret ctFindChip view t n
+end
+
+fn main to int
+  tdInitAll
+  isInitRules
+  tdCacheInit
+  ucInitDefaults
+  ucParseArgs
+  ucLoadRecipe
+  if ne ucLoadChipsGlobal 0
+    ucFail UC_ERR_IO ucMsgErrIo
+  end
+  cid = ucFindTargetGlobal
+  if ge cid ctCount
+    ucFail UC_ERR_TARGET ucMsgErrTgt
+  end
+  sp = ucCheckAndFail cid
+  if eq sp 999
+    ucFail UC_ERR_CONTRACT ucMsgRef
+  end
+  bk = ctBackend cid
+  ucEmitForBackend bk
+  if gt get ucPathOutN 0 0
+    if not ucWriteGlobal 0
+      ucFail UC_ERR_IO ucMsgErrIo
+    end
+  end
+  if gt get ucPathCertN 0 0
+    if not ucWriteGlobal 1
+      ucFail UC_ERR_IO ucMsgErrIo
+    end
+  end
+  if gt get ucPathIrN 0 0
+    ucEmitOscIr
+    if not ucWriteGlobal 2
+      ucFail UC_ERR_IO ucMsgErrIo
+    end
+  end
+  ctWriteAll 1 ucMsgOk
+  ctWriteId 1 cid
+  ctWriteAll 1 ucMsgBk
+  ctWriteBackend 1 bk
+  ctWriteAll 1 ucMsgBytes
+  ctWriteU64 1 get ucOutLen 0
+  ctWriteAll 1 ucMsgRa
+  ctWriteU64 1 sp
+  ctWriteAll 1 ucMsgNl
+  ret 0
+end
