@@ -1,0 +1,1785 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-fhe/gate_fhe.om
+note Pure Seeded-OM-2 Verification Gate for Wave 5 omega-fhe (Ring-LWE / Leveled BFV).
+note
+note Compose after:
+note   si/directives/om2.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note   protocol/uor-gpu/ed_sign.om
+note
+note Usage:
+note   gate_fhe OMC_BIN REPO_ROOT SCRATCH_DIR
+note   gate_fhe --bins FHE_RLWE_BIN FHE_CHECK_BIN SCRATCH_DIR
+note
+note Checks:
+note   - Pinned omc SHA-256 verification against seed/out/omc.sha256 (mismatch => exit 69)
+note   - 2x deterministic Spark omc compilation of fhe_rlwe and fhe_check (zero stderr, cmp -s)
+note   - Static ELF header inspection (AArch64 e_machine=183, zero PT_DYNAMIC segment)
+note   - Positive suite: selftest, audit-blind, keygen/encrypt/eval-poly/verify-ct/decrypt/inspect, depth-2 mul
+note   - 15 adversarial negative controls (raw & validly-signed non-canonical >= q, wrong sk,
+note     raw & validly-signed rk tamper, depth-3 & forged noise budget exceeded,
+note     OMFHE1 magic/version/domain/SHA-256/Ed25519/truncation/trailing bytes, sk-as-evk)
+note   - 5 live omc-recompiled source mutants (eval-poly +d drop, inv-NTT untwist drop,
+note     rk0 drop, mul-noise bypass, canon < q bypass)
+note
+note Zero C, zero Python, zero Rust, zero gcc, zero floats, zero GPU device writes (hw_writes=0).
+
+const FG_OK int 0
+const FG_ERR_ARG int 1
+const FG_ERR_PIN int 69
+
+const FH_Q ulong 72057594036480257
+const FH_MAX_NOISE ulong 140189871666303
+const FH_CT_BYTES ulong 1280
+const FH_EVK_BYTES ulong 8448
+
+global fg_omc uchar 1024
+global fg_omc_l ulong 1
+global fg_root uchar 1024
+global fg_root_l ulong 1
+global fg_scr uchar 1024
+global fg_scr_l ulong 1
+global fg_rlwe1 uchar 1024
+global fg_rlwe1_l ulong 1
+global fg_rlwe2 uchar 1024
+global fg_rlwe2_l ulong 1
+global fg_chk1 uchar 1024
+global fg_chk1_l ulong 1
+global fg_chk2 uchar 1024
+global fg_chk2_l ulong 1
+global fg_bin uchar 1024
+global fg_bin_l ulong 1
+
+global fg_pa uchar 1024
+global fg_pal ulong 1
+global fg_pb uchar 1024
+global fg_pbl ulong 1
+global fg_pc uchar 1024
+global fg_pcl ulong 1
+global fg_pd uchar 1024
+global fg_pdl ulong 1
+global fg_pe uchar 1024
+global fg_pel ulong 1
+
+global fg_arg uchar 1024
+global fg_av uchar 8192
+global fg_avn ulong 1
+global fg_avc ulong 1
+global fg_stb uchar 4
+
+global fg_src uchar 262144
+global fg_srcl ulong 1
+global fg_mut uchar 262144
+global fg_mutl ulong 1
+global fg_tmp uchar 262144
+
+global fg_ctbuf uchar 16384
+global fg_evkbuf uchar 16384
+global fg_atk uchar 16384
+global fg_out uchar 16384
+global fg_outl ulong 1
+global fg_h1 uchar 32
+global fg_h2 uchar 32
+global fg_pin_hex uchar 128
+global fg_dig uchar 32
+global fg_probe uchar 16
+
+global fg_checks ulong 1
+global fg_ctrls ulong 1
+global fg_caught ulong 1
+global fg_mut_kills ulong 1
+global fg_fails ulong 1
+global fg_cmp_ok ulong 1
+
+text fg_u_msg "usage: gate_fhe OMC_BIN REPO_ROOT SCRATCH_DIR | gate_fhe --bins FHE_RLWE FHE_CHECK SCRATCH_DIR\n"
+text fg_e_pin "FHE-GATE FAIL code=69 omc pin sha256 mismatch\n"
+text fg_m_fail "FHE-GATE FAIL step="
+text fg_m_p1 "FHE-GATE PASS checks="
+text fg_m_p2 " attack_controls="
+text fg_m_p3 " caught="
+text fg_m_p4 " mutants_killed="
+text fg_m_p5 " cmp_eq="
+text fg_m_p6 " hw_writes=0\n"
+text fg_nl "\n"
+
+text fg_f_bins "--bins"
+text fg_p_pin "/seed/out/omc.sha256"
+text fg_u0 "/si/directives/om2.om"
+text fg_u1 "/seed/ng/sha256.om"
+text fg_u2 "/protocol/omnet/om/sha512/sha512.om"
+text fg_u3 "/protocol/omnet/om/ed25519/ed25519.om"
+text fg_u4 "/protocol/uor-gpu/ed_sign.om"
+text fg_u_rlwe "/apps/omega-fhe/fhe_rlwe.om"
+text fg_u_chk "/apps/omega-fhe/fhe_check.om"
+text fg_null "/dev/null"
+
+text fg_f_rsrc "/fhe_rlwe_src.om"
+text fg_f_csrc "/fhe_check_src.om"
+text fg_f_msrc "/fhe_mut.om"
+text fg_f_r1 "/fhe_rlwe_1"
+text fg_f_r2 "/fhe_rlwe_2"
+text fg_f_re1 "/fhe_rlwe_1.err"
+text fg_f_re2 "/fhe_rlwe_2.err"
+text fg_f_c1 "/fhe_check_1"
+text fg_f_c2 "/fhe_check_2"
+text fg_f_ce1 "/fhe_check_1.err"
+text fg_f_ce2 "/fhe_check_2.err"
+text fg_f_mb "/fhe_mut_bin"
+text fg_f_me "/fhe_mut.err"
+text fg_f_out "/fhe_run.out"
+
+text fg_f_sk42 "/sk_42.omfhe"
+text fg_f_evk42 "/evk_42.omfhe"
+text fg_f_sk999 "/sk_999.omfhe"
+text fg_f_evk999 "/evk_999.omfhe"
+text fg_f_ctx "/ctx.omfhe"
+text fg_f_cty "/cty.omfhe"
+text fg_f_ctp "/ct_poly.omfhe"
+text fg_f_ctxy "/ct_xy.omfhe"
+text fg_f_ctd2 "/ct_d2.omfhe"
+text fg_f_ctx2 "/ct_x2.omfhe"
+text fg_f_ctx3 "/ct_x3.omfhe"
+text fg_f_ctx4 "/ct_x4.omfhe"
+text fg_f_atk "/atk.omfhe"
+text fg_f_ebad "/evk_badrk.omfhe"
+text fg_f_ctbad "/ct_badrk.omfhe"
+text fg_f_ctmut "/ct_mut.omfhe"
+text fg_f_audit "/audit_sandbox"
+
+text fg_c_self "selftest"
+text fg_c_kgen "keygen"
+text fg_c_enc "encrypt"
+text fg_c_mul "mul"
+text fg_c_epoly "eval-poly"
+text fg_c_dec "decrypt"
+text fg_c_insp "inspect"
+text fg_c_vct "verify-ct"
+text fg_c_vop "verify-op"
+text fg_c_audit "audit-blind"
+
+text fg_fl_sk "--sk"
+text fg_fl_evk "--evk"
+text fg_fl_in "--in"
+text fg_fl_out "--out"
+text fg_fl_seed "--seed"
+text fg_fl_poly "--poly"
+text fg_fl_ctx "--ct-x"
+text fg_fl_cty "--ct-y"
+text fg_fl_x "--x"
+text fg_fl_y "--y"
+text fg_fl_a "--a"
+text fg_fl_b "--b"
+text fg_fl_c "--c"
+text fg_fl_d "--d"
+text fg_fl_op "--op"
+
+text fg_px "5,12,256,0,42"
+text fg_py "9,3,17,2,100"
+text fg_v_42 "42"
+text fg_v_999 "999"
+text fg_v_7 "7"
+text fg_v_8 "8"
+text fg_v_3 "3"
+text fg_v_5 "5"
+text fg_v_11 "11"
+
+text fg_q_rself "FHE-RLWE SELFTEST PASS"
+text fg_q_cself "FHE-CHECK SELFTEST PASS"
+text fg_q_aud "FHE-CHECK AUDIT PASS"
+text fg_q_eval "FHE-RLWE EVAL PASS"
+text fg_q_vct "FHE-CHECK VERIFY-CT PASS"
+text fg_q_vop "FHE-CHECK VERIFY-OP PASS"
+text fg_q_dec "FHE-RLWE DECRYPT PASS"
+text fg_q_insp "FHE-RLWE INSPECT PASS"
+
+note Live source mutant patches (each unique in fhe_rlwe.om)
+text fg_m1_old "  ret fh_eval_add_const get fh_meta 6"
+text fg_m1_new "  ret fh_eval_add_const 0"
+text fg_m2_old "    fh_bput buf_id i fh_mont_mul v get fh_ipsi_invn add poff i m mp"
+text fg_m2_new "    fh_bput buf_id i v"
+text fg_m3_old "      put fh_rk0 add mul k FH_N i r0"
+text fg_m3_new "      put fh_rk0 add mul k FH_N i 0"
+text fg_m4_old "  nout = fh_calc_mul_noise na nb"
+text fg_m4_new "  nout = add na nb"
+text fg_m5_old "  ret lt v FH_Q"
+text fg_m5_new "  ret true"
+
+note ==== Section 1: Printing, Checks & Path Helpers ====
+
+fn fg_wrt s view uchar * to void
+  z = write 1 s 0 len s
+end
+
+fn fg_werr s view uchar * to void
+  z = write 2 s 0 len s
+end
+
+fn fg_num v ulong to void
+  x = v
+  p = ulong 32
+  for i ulong 24
+    p = sub p 1
+    put fg_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      z = write 1 fg_dig p sub 32 p
+      ret
+    end
+  end
+end
+
+fn fg_fail tag ulong to void
+  put fg_fails 0 add get fg_fails 0 1
+  fg_wrt fg_m_fail
+  fg_num tag
+  fg_wrt fg_nl
+end
+
+fn fg_chk cond bool tag ulong to void
+  put fg_checks 0 add get fg_checks 0 1
+  if not cond
+    fg_fail tag
+  end
+end
+
+fn fg_ctrl cond bool tag ulong to void
+  put fg_ctrls 0 add get fg_ctrls 0 1
+  if cond
+    put fg_caught 0 add get fg_caught 0 1
+  else
+    fg_fail tag
+  end
+end
+
+fn fg_arg_eq idx ulong s view uchar * to bool
+  rn = argread idx fg_arg 0 1020
+  if ne rn long len s
+    ret false
+  end
+  for i ulong len s bound 256
+    if ne get fg_arg i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn fg_arg_to_glob idx ulong slot ulong to ulong
+  rn = argread idx fg_arg 0 1020
+  if le rn 0
+    ret 0
+  end
+  n = ulong rn
+  for i ulong n bound 1020
+    if eq slot 0
+      put fg_omc i get fg_arg i
+    else
+      if eq slot 1
+        put fg_root i get fg_arg i
+      else
+        if eq slot 2
+          put fg_scr i get fg_arg i
+        else
+          if eq slot 3
+            put fg_rlwe1 i get fg_arg i
+          else
+            put fg_chk1 i get fg_arg i
+          end
+        end
+      end
+    end
+  end
+  ret n
+end
+
+fn fg_set_p dst ulong from_scr bool suf view uchar * to ulong
+  rl = ulong 0
+  if from_scr
+    rl = get fg_scr_l 0
+  else
+    rl = get fg_root_l 0
+  end
+  sl = len suf
+  if gt add rl sl 1020
+    ret 0
+  end
+  for i ulong rl bound 1020
+    b = uchar 0
+    if from_scr
+      b = get fg_scr i
+    else
+      b = get fg_root i
+    end
+    if eq dst 0
+      put fg_pa i b
+    else
+      if eq dst 1
+        put fg_pb i b
+      else
+        if eq dst 2
+          put fg_pc i b
+        else
+          if eq dst 3
+            put fg_pd i b
+          else
+            put fg_pe i b
+          end
+        end
+      end
+    end
+  end
+  for j ulong sl bound 512
+    c = get suf j
+    if eq dst 0
+      put fg_pa add rl j c
+    else
+      if eq dst 1
+        put fg_pb add rl j c
+      else
+        if eq dst 2
+          put fg_pc add rl j c
+        else
+          if eq dst 3
+            put fg_pd add rl j c
+          else
+            put fg_pe add rl j c
+          end
+        end
+      end
+    end
+  end
+  tot = add rl sl
+  if eq dst 0
+    put fg_pal 0 tot
+  else
+    if eq dst 1
+      put fg_pbl 0 tot
+    else
+      if eq dst 2
+        put fg_pcl 0 tot
+      else
+        if eq dst 3
+          put fg_pdl 0 tot
+        else
+          put fg_pel 0 tot
+        end
+      end
+    end
+  end
+  ret tot
+end
+
+fn fg_set_bin_scr suf view uchar * to void
+  rl = get fg_scr_l 0
+  for i ulong rl bound 1020
+    put fg_bin i get fg_scr i
+  end
+  sl = len suf
+  for j ulong sl bound 512
+    put fg_bin add rl j get suf j
+  end
+  put fg_bin_l 0 add rl sl
+end
+
+fn fg_use_rlwe1 to void
+  n = get fg_rlwe1_l 0
+  for i ulong n bound 1020
+    put fg_bin i get fg_rlwe1 i
+  end
+  put fg_bin_l 0 n
+end
+
+fn fg_use_rlwe2 to void
+  n = get fg_rlwe2_l 0
+  for i ulong n bound 1020
+    put fg_bin i get fg_rlwe2 i
+  end
+  put fg_bin_l 0 n
+end
+
+fn fg_use_chk2 to void
+  n = get fg_chk2_l 0
+  for i ulong n bound 1020
+    put fg_bin i get fg_chk2 i
+  end
+  put fg_bin_l 0 n
+end
+
+note ==== Section 2: Subprocess, File I/O & Re-signing Helpers ====
+
+fn fg_av_clr to void
+  put fg_avn 0 2
+  put fg_avc 0 0
+  put fg_av 0 0
+  put fg_av 1 0
+end
+
+fn fg_av_fin sl ulong to void
+  p = get fg_avn 0
+  put fg_av p uchar and sl 255
+  put fg_av add p 1 uchar shr sl 8
+  put fg_avn 0 add p add sl 2
+  c = add get fg_avc 0 1
+  put fg_avc 0 c
+  put fg_av 0 uchar and c 255
+  put fg_av 1 uchar shr c 8
+end
+
+fn fg_av_omc to void
+  p = get fg_avn 0
+  sl = get fg_omc_l 0
+  for j ulong sl bound 1024
+    put fg_av add add p 2 j get fg_omc j
+  end
+  fg_av_fin sl
+end
+
+fn fg_av_bin to void
+  p = get fg_avn 0
+  sl = get fg_bin_l 0
+  for j ulong sl bound 1024
+    put fg_av add add p 2 j get fg_bin j
+  end
+  fg_av_fin sl
+end
+
+fn fg_av_lit s view uchar * to void
+  p = get fg_avn 0
+  sl = len s
+  for j ulong sl bound 1024
+    put fg_av add add p 2 j get s j
+  end
+  fg_av_fin sl
+end
+
+fn fg_av_scr suf view uchar * to void
+  zp = fg_set_p 0 true suf
+  p = get fg_avn 0
+  sl = get fg_pal 0
+  for j ulong sl bound 1024
+    put fg_av add add p 2 j get fg_pa j
+  end
+  fg_av_fin sl
+end
+
+fn fg_redir fd int target int to void
+  if ne dupfd fd target 0 long target
+    exit 127
+  end
+end
+
+fn fg_run_sync fi long fo long fe long to ulong
+  if or lt fi 0 or lt fo 0 lt fe 0
+    if ge fi 0
+      z = fclose int fi
+    end
+    if ge fo 0
+      z = fclose int fo
+    end
+    if ge fe 0
+      z = fclose int fe
+    end
+    ret 999
+  end
+  pid = fork
+  if lt pid 0
+    ret 998
+  end
+  if eq pid 0
+    fg_redir int fi 0
+    fg_redir int fo 1
+    fg_redir int fe 2
+    ze = execprog fg_av 0 get fg_avn 0
+    exit 127
+  end
+  z = fclose int fi
+  z = fclose int fo
+  z = fclose int fe
+  t0 = monons
+  while true bound 100000000
+    r = waitpid int pid fg_stb 0 len fg_stb 1
+    if eq r pid
+      if ne get fg_stb 0 0
+        ret add 128 ulong get fg_stb 0
+      end
+      ret ulong get fg_stb 1
+    end
+    if lt r 0
+      ret 997
+    end
+    if gt sub monons t0 60000000000
+      zk = killpid int pid 9
+      zw = waitpid int pid fg_stb 0 len fg_stb 0
+      ret 996
+    end
+  end
+  ret 995
+end
+
+fn fg_read_out_scr to void
+  put fg_outl 0 0
+  zp = fg_set_p 0 true fg_f_out
+  fd = fopen fg_pa 0 get fg_pal 0 0 0
+  if lt fd 0
+    ret
+  end
+  rn = read int fd fg_out 0 16384
+  z = fclose int fd
+  if gt rn 0
+    put fg_outl 0 ulong rn
+  end
+end
+
+fn fg_spawn_cur to ulong
+  zp = fg_set_p 0 true fg_f_out
+  fi = fopen fg_null 0 len fg_null 0 0
+  fo = fopen fg_pa 0 get fg_pal 0 577 420
+  fe = fopen fg_null 0 len fg_null 0 0
+  rc = fg_run_sync fi fo fe
+  fg_read_out_scr
+  ret rc
+end
+
+fn fg_has_sub pat view uchar * to bool
+  ol = get fg_outl 0
+  pl = len pat
+  if or eq pl 0 gt pl ol
+    ret false
+  end
+  lim = add sub ol pl 1
+  for i ulong lim bound 16384
+    ok = true
+    for j ulong pl bound 128
+      if ne get fg_out add i j get pat j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn fg_read_pa_to_sh to long
+  fd = fopen fg_pa 0 get fg_pal 0 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 16000000 bound 4096
+    rn = read int fd sh_dat tot sub 16000000 tot
+    if lt rn 0
+      z = fclose int fd
+      ret -1
+    end
+    if eq rn 0
+      z = fclose int fd
+      ret long tot
+    end
+    tot = add tot ulong rn
+  end
+  z = fclose int fd
+  ret -1
+end
+
+fn fg_scr_file_empty suf view uchar * to bool
+  zp = fg_set_p 0 true suf
+  fd = fopen fg_pa 0 get fg_pal 0 0 0
+  if lt fd 0
+    ret false
+  end
+  rn = read int fd fg_probe 0 1
+  z = fclose int fd
+  ret eq rn 0
+end
+
+fn fg_hash_scr suf view uchar * dst ulong to long
+  zp = fg_set_p 0 true suf
+  nb = fg_read_pa_to_sh
+  if le nb 0
+    ret -1
+  end
+  sh_all ulong nb
+  for j ulong 32
+    if eq dst 1
+      put fg_h1 j get sh_dig j
+    else
+      put fg_h2 j get sh_dig j
+    end
+  end
+  ret nb
+end
+
+fn fg_sh_u16 p ulong to ulong
+  b0 = ulong get sh_dat p
+  b1 = ulong get sh_dat add p 1
+  ret or b0 shl b1 8
+end
+
+fn fg_sh_u32 p ulong to ulong
+  v = ulong 0
+  for b ulong 4
+    v = or v shl ulong get sh_dat add p b mul b 8
+  end
+  ret v
+end
+
+fn fg_sh_u64 p ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get sh_dat add p i mul i 8
+  end
+  ret v
+end
+
+fn fg_check_static_elf suf view uchar * to bool
+  zp = fg_set_p 0 true suf
+  nb = fg_read_pa_to_sh
+  if lt nb 128
+    ret false
+  end
+  if or ne get sh_dat 0 127 ne get sh_dat 1 69
+    ret false
+  end
+  if or ne get sh_dat 2 76 ne get sh_dat 3 70
+    ret false
+  end
+  if or ne get sh_dat 4 2 ne fg_sh_u16 18 183
+    ret false
+  end
+  phoff = fg_sh_u64 32
+  phentsz = fg_sh_u16 54
+  phnum = fg_sh_u16 56
+  if or eq phnum 0 gt phnum 16
+    ret false
+  end
+  for k ulong phnum bound 16
+    if eq fg_sh_u32 add phoff mul k phentsz 2
+      ret false
+    end
+  end
+  ret true
+end
+
+note ==== Section 3: Pin Verification, 2x Deterministic Compile & Mutant Builder ====
+
+fn fg_read_omc_to_sh to long
+  fd = fopen fg_omc 0 get fg_omc_l 0 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 16000000 bound 4096
+    rn = read int fd sh_dat tot sub 16000000 tot
+    if lt rn 0
+      z = fclose int fd
+      ret -1
+    end
+    if eq rn 0
+      z = fclose int fd
+      ret long tot
+    end
+    tot = add tot ulong rn
+  end
+  z = fclose int fd
+  ret -1
+end
+
+fn fg_nib_eq idx ulong dig_b uchar to bool
+  hi = shr dig_b 4
+  lo = and dig_b 15
+  hc = uchar add 48 hi
+  if ge hi 10
+    hc = uchar add 87 hi
+  end
+  lc = uchar add 48 lo
+  if ge lo 10
+    lc = uchar add 87 lo
+  end
+  if ne hc get fg_pin_hex mul idx 2
+    ret false
+  end
+  if ne lc get fg_pin_hex add mul idx 2 1
+    ret false
+  end
+  ret true
+end
+
+fn fg_verify_omc_pin to bool
+  zp = fg_set_p 0 false fg_p_pin
+  fd = fopen fg_pa 0 get fg_pal 0 0 0
+  if lt fd 0
+    ret false
+  end
+  rn = read int fd fg_pin_hex 0 128
+  z = fclose int fd
+  if lt rn 64
+    ret false
+  end
+  nb = fg_read_omc_to_sh
+  if le nb 0
+    ret false
+  end
+  sh_all ulong nb
+  for i ulong 32
+    if not fg_nib_eq i get sh_dig i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn fg_append_root suf view uchar * to bool
+  zp = fg_set_p 0 false suf
+  fd = fopen fg_pa 0 get fg_pal 0 0 0
+  if lt fd 0
+    ret false
+  end
+  tot = get fg_srcl 0
+  while lt tot 262144 bound 64
+    rn = read int fd fg_src tot sub 262144 tot
+    if lt rn 0
+      z = fclose int fd
+      ret false
+    end
+    if eq rn 0
+      z = fclose int fd
+      put fg_srcl 0 tot
+      ret true
+    end
+    tot = add tot ulong rn
+  end
+  z = fclose int fd
+  ret false
+end
+
+fn fg_write_src_buf scr_suf view uchar * n ulong is_mut bool to bool
+  zp = fg_set_p 0 true scr_suf
+  fd = fopen fg_pa 0 get fg_pal 0 577 420
+  if lt fd 0
+    ret false
+  end
+  off = ulong 0
+  while lt off n bound 64
+    wn = long 0
+    if is_mut
+      wn = write int fd fg_mut off sub n off
+    else
+      wn = write int fd fg_src off sub n off
+    end
+    if le wn 0
+      z = fclose int fd
+      ret false
+    end
+    off = add off ulong wn
+  end
+  z = fclose int fd
+  ret true
+end
+
+fn fg_build_rlwe_src to ulong
+  put fg_srcl 0 0
+  if not fg_append_root fg_u0
+    ret 0
+  end
+  if not fg_append_root fg_u1
+    ret 0
+  end
+  if not fg_append_root fg_u2
+    ret 0
+  end
+  if not fg_append_root fg_u3
+    ret 0
+  end
+  if not fg_append_root fg_u4
+    ret 0
+  end
+  if not fg_append_root fg_u_rlwe
+    ret 0
+  end
+  n = get fg_srcl 0
+  if not fg_write_src_buf fg_f_rsrc n false
+    ret 0
+  end
+  ret n
+end
+
+fn fg_build_chk_src to ulong
+  put fg_srcl 0 0
+  if not fg_append_root fg_u0
+    ret 0
+  end
+  if not fg_append_root fg_u1
+    ret 0
+  end
+  if not fg_append_root fg_u2
+    ret 0
+  end
+  if not fg_append_root fg_u3
+    ret 0
+  end
+  if not fg_append_root fg_u_chk
+    ret 0
+  end
+  n = get fg_srcl 0
+  if not fg_write_src_buf fg_f_csrc n false
+    ret 0
+  end
+  ret n
+end
+
+fn fg_compile_scr s_suf view uchar * b_suf view uchar * e_suf view uchar * to ulong
+  fg_av_clr
+  fg_av_omc
+  zp = fg_set_p 0 true s_suf
+  zp = fg_set_p 1 true b_suf
+  zp = fg_set_p 2 true e_suf
+  fi = fopen fg_pa 0 get fg_pal 0 0 0
+  fo = fopen fg_pb 0 get fg_pbl 0 577 493
+  fe = fopen fg_pc 0 get fg_pcl 0 577 420
+  rc = fg_run_sync fi fo fe
+  if eq rc 0
+    zp = fg_set_p 1 true b_suf
+    zcm = chmod fg_pb 0 get fg_pbl 0 493
+  end
+  ret rc
+end
+
+fn fg_mut_reset to void
+  sl = get fg_srcl 0
+  for i ulong sl bound 262144
+    put fg_mut i get fg_src i
+  end
+  put fg_mutl 0 sl
+end
+
+fn fg_mut_match_at base ulong pat view uchar * to bool
+  for j ulong len pat bound 256
+    if ne get fg_mut add base j get pat j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn fg_mut_find old_s view uchar * to long
+  ml = get fg_mutl 0
+  ol = len old_s
+  if gt ol ml
+    ret -1
+  end
+  hits = ulong 0
+  pos = ulong 0
+  lim = add sub ml ol 1
+  for i ulong lim bound 262144
+    if fg_mut_match_at i old_s
+      hits = add hits 1
+      pos = i
+    end
+  end
+  if ne hits 1
+    ret -1
+  end
+  ret long pos
+end
+
+fn fg_mut_copy_tail dst_off ulong src_off ulong count ulong to void
+  for i ulong count bound 262144
+    put fg_tmp add dst_off i get fg_mut add src_off i
+  end
+end
+
+fn fg_mut_splice pos ulong ol ulong new_s view uchar * to bool
+  ml = get fg_mutl 0
+  nl = len new_s
+  outn = add sub ml ol nl
+  if gt outn 262144
+    ret false
+  end
+  for i ulong pos bound 262144
+    put fg_tmp i get fg_mut i
+  end
+  for j ulong nl bound 256
+    put fg_tmp add pos j get new_s j
+  end
+  fg_mut_copy_tail add pos nl add pos ol sub ml add pos ol
+  for i ulong outn bound 262144
+    put fg_mut i get fg_tmp i
+  end
+  put fg_mutl 0 outn
+  ret true
+end
+
+fn fg_mut_patch old_s view uchar * new_s view uchar * to bool
+  pos = fg_mut_find old_s
+  if lt pos 0
+    ret false
+  end
+  ret fg_mut_splice ulong pos len old_s new_s
+end
+
+fn fg_mut_compile to bool
+  if not fg_write_src_buf fg_f_msrc get fg_mutl 0 true
+    ret false
+  end
+  ret eq fg_compile_scr fg_f_msrc fg_f_mb fg_f_me 0
+end
+
+note ==== Section 4: OMFHE1 Container Helpers & Attacker Re-Signer ====
+
+fn fg_load_file_to scr_suf view uchar * dst ulong nmax ulong to long
+  zp = fg_set_p 0 true scr_suf
+  fd = fopen fg_pa 0 get fg_pal 0 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot nmax bound 256
+    rn = long 0
+    if eq dst 0
+      rn = read int fd fg_ctbuf tot sub nmax tot
+    else
+      rn = read int fd fg_evkbuf tot sub nmax tot
+    end
+    if lt rn 0
+      z = fclose int fd
+      ret -1
+    end
+    if eq rn 0
+      z = fclose int fd
+      ret long tot
+    end
+    tot = add tot ulong rn
+  end
+  z = fclose int fd
+  ret -1
+end
+
+fn fg_reset_atk from_evk bool to ulong
+  n = FH_CT_BYTES
+  if from_evk
+    n = FH_EVK_BYTES
+  end
+  for i ulong n bound 16384
+    if from_evk
+      put fg_atk i get fg_evkbuf i
+    else
+      put fg_atk i get fg_ctbuf i
+    end
+  end
+  ret n
+end
+
+fn fg_put_atk_u64 off ulong v ulong to void
+  for i ulong 8
+    put fg_atk add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn fg_resign_ed to void
+  sd = new uchar 32 0
+  pk = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put sd i uchar xor mul i 7 91
+  end
+  ues_pubkey sd pk
+  for i ulong 32
+    put fg_atk add 160 i get pk i
+  end
+  for i ulong 160
+    put m i get fg_atk i
+  end
+  ues_sign sd m 160 sg
+  for i ulong 64
+    put fg_atk add 192 i get sg i
+  end
+end
+
+fn fg_resign_atk tot ulong to void
+  pay_b = sub tot 256
+  for i ulong pay_b bound 16384
+    put sh_dat i get fg_atk add 256 i
+  end
+  sh_all pay_b
+  for i ulong 32
+    put fg_atk add 96 i get sh_dig i
+  end
+  for i ulong 128
+    put sh_dat i get fg_atk i
+  end
+  for i ulong pay_b bound 16384
+    put sh_dat add 128 i get fg_atk add 256 i
+  end
+  sh_all add 128 pay_b
+  for i ulong 32
+    put fg_atk add 128 i get sh_dig i
+  end
+  fg_resign_ed
+end
+
+fn fg_write_atk n ulong to bool
+  zp = fg_set_p 0 true fg_f_atk
+  fd = fopen fg_pa 0 get fg_pal 0 577 420
+  if lt fd 0
+    ret false
+  end
+  off = ulong 0
+  while lt off n bound 256
+    wn = write int fd fg_atk off sub n off
+    if le wn 0
+      z = fclose int fd
+      ret false
+    end
+    off = add off ulong wn
+  end
+  z = fclose int fd
+  ret true
+end
+
+note ==== Section 5: Subprocess Wrappers for fhe_rlwe & fhe_check ====
+
+fn fg_insp_atk exp_rc ulong tag ulong to void
+  fg_use_rlwe2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_insp
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_atk
+  rc = fg_spawn_cur
+  fg_ctrl eq rc exp_rc tag
+end
+
+fn fg_vct_in suf view uchar * sk_suf view uchar * evk_suf view uchar * to ulong
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_vct
+  fg_av_lit fg_fl_sk
+  fg_av_scr sk_suf
+  fg_av_lit fg_fl_evk
+  fg_av_scr evk_suf
+  fg_av_lit fg_fl_x
+  fg_av_lit fg_px
+  fg_av_lit fg_fl_y
+  fg_av_lit fg_py
+  fg_av_lit fg_fl_a
+  fg_av_lit fg_v_3
+  fg_av_lit fg_fl_b
+  fg_av_lit fg_v_5
+  fg_av_lit fg_fl_c
+  fg_av_lit fg_v_7
+  fg_av_lit fg_fl_d
+  fg_av_lit fg_v_11
+  fg_av_lit fg_fl_in
+  fg_av_scr suf
+  ret fg_spawn_cur
+end
+
+fn fg_vct_atk_expect exp_rc ulong tag ulong to void
+  rc = fg_vct_in fg_f_atk fg_f_sk42 fg_f_evk42
+  fg_ctrl eq rc exp_rc tag
+end
+
+fn fg_vct_sk_as_evk suf view uchar * sk_suf view uchar * to ulong
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_vct
+  fg_av_lit fg_fl_sk
+  fg_av_scr sk_suf
+  fg_av_lit fg_fl_evk
+  fg_av_scr sk_suf
+  fg_av_lit fg_fl_x
+  fg_av_lit fg_px
+  fg_av_lit fg_fl_y
+  fg_av_lit fg_py
+  fg_av_lit fg_fl_a
+  fg_av_lit fg_v_3
+  fg_av_lit fg_fl_b
+  fg_av_lit fg_v_5
+  fg_av_lit fg_fl_c
+  fg_av_lit fg_v_7
+  fg_av_lit fg_fl_d
+  fg_av_lit fg_v_11
+  fg_av_lit fg_fl_in
+  fg_av_scr suf
+  ret fg_spawn_cur
+end
+
+fn fg_run_keygen sk_suf view uchar * evk_suf view uchar * seed_s view uchar * to ulong
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_kgen
+  fg_av_lit fg_fl_sk
+  fg_av_scr sk_suf
+  fg_av_lit fg_fl_evk
+  fg_av_scr evk_suf
+  fg_av_lit fg_fl_seed
+  fg_av_lit seed_s
+  ret fg_spawn_cur
+end
+
+fn fg_run_encrypt evk_suf view uchar * out_suf view uchar * use_y bool to ulong
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_enc
+  fg_av_lit fg_fl_evk
+  fg_av_scr evk_suf
+  fg_av_lit fg_fl_poly
+  if use_y
+    fg_av_lit fg_py
+  else
+    fg_av_lit fg_px
+  end
+  fg_av_lit fg_fl_out
+  fg_av_scr out_suf
+  fg_av_lit fg_fl_seed
+  if use_y
+    fg_av_lit fg_v_8
+  else
+    fg_av_lit fg_v_7
+  end
+  ret fg_spawn_cur
+end
+
+fn fg_run_eval_poly out_suf view uchar * to ulong
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_epoly
+  fg_av_lit fg_fl_evk
+  fg_av_scr fg_f_evk42
+  fg_av_lit fg_fl_x
+  fg_av_scr fg_f_ctx
+  fg_av_lit fg_fl_y
+  fg_av_scr fg_f_cty
+  fg_av_lit fg_fl_a
+  fg_av_lit fg_v_3
+  fg_av_lit fg_fl_b
+  fg_av_lit fg_v_5
+  fg_av_lit fg_fl_c
+  fg_av_lit fg_v_7
+  fg_av_lit fg_fl_d
+  fg_av_lit fg_v_11
+  fg_av_lit fg_fl_out
+  fg_av_scr out_suf
+  ret fg_spawn_cur
+end
+
+fn fg_run_mul a_suf view uchar * b_suf view uchar * out_suf view uchar * to ulong
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_mul
+  fg_av_lit fg_fl_evk
+  fg_av_scr fg_f_evk42
+  fg_av_lit fg_fl_a
+  fg_av_scr a_suf
+  fg_av_lit fg_fl_b
+  fg_av_scr b_suf
+  fg_av_lit fg_fl_out
+  fg_av_scr out_suf
+  ret fg_spawn_cur
+end
+
+fn fg_run_mul_sq a_suf view uchar * out_suf view uchar * to ulong
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_mul
+  fg_av_lit fg_fl_evk
+  fg_av_scr fg_f_evk42
+  fg_av_lit fg_fl_a
+  fg_av_scr a_suf
+  fg_av_lit fg_fl_b
+  fg_av_scr a_suf
+  fg_av_lit fg_fl_out
+  fg_av_scr out_suf
+  ret fg_spawn_cur
+end
+
+fn fg_run_mul_ebad out_suf view uchar * to ulong
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_mul
+  fg_av_lit fg_fl_evk
+  fg_av_scr fg_f_ebad
+  fg_av_lit fg_fl_a
+  fg_av_scr fg_f_ctx
+  fg_av_lit fg_fl_b
+  fg_av_scr fg_f_cty
+  fg_av_lit fg_fl_out
+  fg_av_scr out_suf
+  ret fg_spawn_cur
+end
+
+note ==== Section 6: Positive Suite ====
+
+fn fg_run_positive to bool
+  fg_use_rlwe1
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_self
+  rc = fg_spawn_cur
+  fg_chk and eq rc 0 fg_has_sub fg_q_rself 11
+
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_self
+  rc = fg_spawn_cur
+  fg_chk and eq rc 0 fg_has_sub fg_q_cself 12
+
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_audit
+  fg_use_rlwe1
+  fg_av_bin
+  fg_av_scr fg_f_audit
+  rc = fg_spawn_cur
+  fg_chk and eq rc 0 fg_has_sub fg_q_aud 13
+
+  fg_use_rlwe1
+  rc = fg_run_keygen fg_f_sk42 fg_f_evk42 fg_v_42
+  fg_chk eq rc 0 14
+  rc = fg_run_encrypt fg_f_evk42 fg_f_ctx false
+  rc2 = fg_run_encrypt fg_f_evk42 fg_f_cty true
+  fg_chk and eq rc 0 eq rc2 0 15
+
+  rc = fg_run_eval_poly fg_f_ctp
+  fg_chk and eq rc 0 fg_has_sub fg_q_eval 16
+
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_vct
+  fg_av_lit fg_fl_sk
+  fg_av_scr fg_f_sk42
+  fg_av_lit fg_fl_evk
+  fg_av_scr fg_f_evk42
+  fg_av_lit fg_fl_ctx
+  fg_av_scr fg_f_ctx
+  fg_av_lit fg_fl_cty
+  fg_av_scr fg_f_cty
+  fg_av_lit fg_fl_x
+  fg_av_lit fg_px
+  fg_av_lit fg_fl_y
+  fg_av_lit fg_py
+  fg_av_lit fg_fl_a
+  fg_av_lit fg_v_3
+  fg_av_lit fg_fl_b
+  fg_av_lit fg_v_5
+  fg_av_lit fg_fl_c
+  fg_av_lit fg_v_7
+  fg_av_lit fg_fl_d
+  fg_av_lit fg_v_11
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_ctp
+  rc = fg_spawn_cur
+  fg_chk and eq rc 0 fg_has_sub fg_q_vct 17
+
+  fg_use_rlwe2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_dec
+  fg_av_lit fg_fl_sk
+  fg_av_scr fg_f_sk42
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_ctp
+  rc = fg_spawn_cur
+  fg_chk and eq rc 0 fg_has_sub fg_q_dec 18
+
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_insp
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_ctp
+  rc = fg_spawn_cur
+  fg_chk and eq rc 0 fg_has_sub fg_q_insp 19
+
+  fg_use_rlwe1
+  rc = fg_run_mul fg_f_ctx fg_f_cty fg_f_ctxy
+  rc2 = fg_run_mul fg_f_ctxy fg_f_ctx fg_f_ctd2
+  fg_chk and eq rc 0 eq rc2 0 20
+
+  rc = fg_run_keygen fg_f_sk999 fg_f_evk999 fg_v_999
+  fg_chk eq rc 0 21
+
+  lct = fg_load_file_to fg_f_ctp 0 16384
+  levk = fg_load_file_to fg_f_evk42 1 16384
+  fg_chk and eq lct long FH_CT_BYTES eq levk long FH_EVK_BYTES 22
+  ret and eq lct long FH_CT_BYTES eq levk long FH_EVK_BYTES
+end
+
+note ==== Section 7: 15 Adversarial Negative Controls ====
+
+fn fg_ctrl_badrk to void
+  note NC-5: raw 1-bit flip in rk0[0] of evk_42 -> SHA fails closed (72)
+  zn = fg_reset_atk true
+  put fg_atk 1280 xor get fg_atk 1280 1
+  zw = fg_write_atk zn
+  fg_use_rlwe2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_insp
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_atk
+  fg_ctrl eq fg_spawn_cur 72 205
+
+  note NC-6: validly re-signed corrupted rk0 (zeroed digit-0) inside evk_badrk -> eval fails verify-op (81)
+  zn = fg_reset_atk true
+  for j ulong 64
+    fg_put_atk_u64 add 1280 mul j 8 0
+  end
+  fg_resign_atk zn
+  zp = fg_set_p 0 true fg_f_ebad
+  fd = fopen fg_pa 0 get fg_pal 0 577 420
+  if ge fd 0
+    zwr = write int fd fg_atk 0 zn
+    zcl = fclose int fd
+  end
+  fg_use_rlwe1
+  rm_bad = fg_run_mul_ebad fg_f_ctbad
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_vop
+  fg_av_lit fg_fl_sk
+  fg_av_scr fg_f_sk42
+  fg_av_lit fg_fl_op
+  fg_av_lit fg_c_mul
+  fg_av_lit fg_fl_x
+  fg_av_lit fg_px
+  fg_av_lit fg_fl_y
+  fg_av_lit fg_py
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_ctbad
+  rc6 = fg_spawn_cur
+  fg_ctrl and eq rm_bad 0 eq rc6 81 206
+end
+
+fn fg_ctrl_noncanon_and_keys to void
+  note NC-1: raw byte non-canonical c0[0]=q -> SHA fails closed (72)
+  zn = fg_reset_atk false
+  fg_put_atk_u64 256 FH_Q
+  zw = fg_write_atk zn
+  fg_insp_atk 72 201
+
+  note NC-2: validly SHA-256 + Ed25519 re-signed non-canonical c0[0]=q -> exit 74
+  zn = fg_reset_atk false
+  fg_put_atk_u64 256 FH_Q
+  fg_resign_atk zn
+  zw = fg_write_atk zn
+  fg_insp_atk 74 202
+  fg_vct_atk_expect 74 2020
+
+  note NC-3: validly SHA-256 + Ed25519 re-signed c1[0]=2^64-1 -> exit 74
+  zn = fg_reset_atk false
+  fg_put_atk_u64 768 18446744073709551615
+  fg_resign_atk zn
+  zw = fg_write_atk zn
+  fg_insp_atk 74 203
+
+  note NC-4: wrong secret key sk_999 -> mismatch 81
+  rc4 = fg_vct_in fg_f_ctp fg_f_sk999 fg_f_evk42
+  fg_ctrl eq rc4 81 204
+
+  fg_ctrl_badrk
+end
+
+fn fg_ctrl_format_and_kind to void
+  note NC-10: magic byte tamper -> exit 70
+  zn = fg_reset_atk false
+  put fg_atk 0 uchar 88
+  zw = fg_write_atk zn
+  fg_insp_atk 70 210
+
+  note NC-11: version tamper -> exit 70
+  zn = fg_reset_atk false
+  put fg_atk 6 uchar 2
+  zw = fg_write_atk zn
+  fg_insp_atk 70 211
+
+  note NC-12: domain tamper -> exit 71
+  zn = fg_reset_atk false
+  put fg_atk 64 xor get fg_atk 64 1
+  zw = fg_write_atk zn
+  fg_insp_atk 71 212
+
+  note NC-13: Ed25519 signature 1-bit flip -> exit 73
+  zn = fg_reset_atk false
+  put fg_atk 192 xor get fg_atk 192 1
+  zw = fg_write_atk zn
+  fg_insp_atk 73 213
+  fg_vct_atk_expect 73 2130
+
+  note NC-14: truncated (1279 B) and trailing-byte (1281 B) -> exit 70
+  zn = fg_reset_atk false
+  zw = fg_write_atk sub zn 1
+  fg_insp_atk 70 214
+  put fg_atk zn uchar 0
+  zw = fg_write_atk add zn 1
+  fg_vct_atk_expect 70 2140
+
+  note NC-15: sk passed as --evk -> exit 77 on both fhe_rlwe and fhe_check
+  fg_use_rlwe2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_epoly
+  fg_av_lit fg_fl_evk
+  fg_av_scr fg_f_sk42
+  fg_av_lit fg_fl_x
+  fg_av_scr fg_f_ctx
+  fg_av_lit fg_fl_y
+  fg_av_scr fg_f_cty
+  fg_av_lit fg_fl_a
+  fg_av_lit fg_v_3
+  fg_av_lit fg_fl_b
+  fg_av_lit fg_v_5
+  fg_av_lit fg_fl_c
+  fg_av_lit fg_v_7
+  fg_av_lit fg_fl_d
+  fg_av_lit fg_v_11
+  fg_av_lit fg_fl_out
+  fg_av_scr fg_f_ctbad
+  rr_k = fg_spawn_cur
+  rc_k = fg_vct_sk_as_evk fg_f_ctp fg_f_sk42
+  fg_ctrl and eq rr_k 77 eq rc_k 77 215
+end
+
+fn fg_ctrl_noise_and_format to void
+  note NC-7: natural depth-3 mul chain exceeds noise budget -> exit 75
+  fg_use_rlwe1
+  r1 = fg_run_mul_sq fg_f_ctx fg_f_ctx2
+  r2 = fg_run_mul fg_f_ctx2 fg_f_ctx fg_f_ctx3
+  r3 = fg_run_mul fg_f_ctx3 fg_f_ctx fg_f_ctx4
+  fg_ctrl and eq r1 0 and eq r2 0 eq r3 75 207
+
+  note NC-8: validly re-signed header noise_bound = MAX+1, budget = 0 -> exit 75
+  zn = fg_reset_atk false
+  fg_put_atk_u64 32 add FH_MAX_NOISE 1
+  fg_put_atk_u64 40 0
+  fg_resign_atk zn
+  zw = fg_write_atk zn
+  fg_insp_atk 75 208
+  fg_vct_atk_expect 75 2080
+
+  note NC-9: validly re-signed budget mismatch (noise=162, budget=0) -> exit 75
+  zn = fg_reset_atk false
+  fg_put_atk_u64 32 162
+  fg_put_atk_u64 40 0
+  fg_resign_atk zn
+  zw = fg_write_atk zn
+  fg_insp_atk 75 209
+
+  fg_ctrl_format_and_kind
+end
+
+note ==== Section 8: 5 Live OMC-Recompiled Mutants ====
+
+fn fg_kill_eval_mutant tag ulong to void
+  fg_set_bin_scr fg_f_mb
+  rc_e = fg_run_eval_poly fg_f_ctmut
+  rc_v = fg_vct_in fg_f_ctmut fg_f_sk42 fg_f_evk42
+  if and eq rc_e 0 ne rc_v 0
+    put fg_mut_kills 0 add get fg_mut_kills 0 1
+  else
+    fg_fail tag
+  end
+end
+
+fn fg_run_mut_m3 to void
+  fg_mut_reset
+  if not fg_mut_patch fg_m3_old fg_m3_new
+    fg_fail 303
+    ret
+  end
+  if not fg_mut_compile
+    fg_fail 303
+    ret
+  end
+  fg_set_bin_scr fg_f_mb
+  rk = fg_run_keygen fg_f_sk999 fg_f_ebad fg_v_999
+  rm = fg_run_mul_ebad fg_f_ctmut
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_vop
+  fg_av_lit fg_fl_sk
+  fg_av_scr fg_f_sk999
+  fg_av_lit fg_fl_op
+  fg_av_lit fg_c_mul
+  fg_av_lit fg_fl_x
+  fg_av_lit fg_px
+  fg_av_lit fg_fl_y
+  fg_av_lit fg_py
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_ctmut
+  rc_v = fg_spawn_cur
+  if and eq rk 0 and eq rm 0 ne rc_v 0
+    put fg_mut_kills 0 add get fg_mut_kills 0 1
+  else
+    fg_fail 303
+  end
+end
+
+fn fg_run_mut_m4 to void
+  note M-4: mul-noise under-report bypass -> depth-3 succeeds in mutant, killed by verify-op/noise check
+  fg_mut_reset
+  if not fg_mut_patch fg_m4_old fg_m4_new
+    fg_fail 304
+    ret
+  end
+  if not fg_mut_compile
+    fg_fail 304
+    ret
+  end
+  fg_set_bin_scr fg_f_mb
+  rm1 = fg_run_mul_sq fg_f_ctx fg_f_ctx2
+  rm2 = fg_run_mul fg_f_ctx2 fg_f_ctx fg_f_ctx3
+  rm3 = fg_run_mul fg_f_ctx3 fg_f_ctx fg_f_ctmut
+  fg_use_chk2
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_vop
+  fg_av_lit fg_fl_sk
+  fg_av_scr fg_f_sk42
+  fg_av_lit fg_fl_op
+  fg_av_lit fg_c_mul
+  fg_av_lit fg_fl_x
+  fg_av_lit fg_px
+  fg_av_lit fg_fl_y
+  fg_av_lit fg_py
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_ctmut
+  rc_v = fg_spawn_cur
+  if and eq rm1 0 and eq rm2 0 and eq rm3 0 ne rc_v 0
+    put fg_mut_kills 0 add get fg_mut_kills 0 1
+  else
+    fg_fail 304
+  end
+end
+
+fn fg_run_mut_m5 to void
+  note M-5: bypass < q canonical predicate -> mutant accepts non-canonical signed ct where honest returns 74
+  zn = fg_reset_atk false
+  fg_put_atk_u64 256 FH_Q
+  fg_resign_atk zn
+  zw = fg_write_atk zn
+  fg_mut_reset
+  if not fg_mut_patch fg_m5_old fg_m5_new
+    fg_fail 305
+    ret
+  end
+  if not fg_mut_compile
+    fg_fail 305
+    ret
+  end
+  fg_set_bin_scr fg_f_mb
+  fg_av_clr
+  fg_av_bin
+  fg_av_lit fg_c_insp
+  fg_av_lit fg_fl_in
+  fg_av_scr fg_f_atk
+  rc_m5 = fg_spawn_cur
+  if ne rc_m5 74
+    put fg_mut_kills 0 add get fg_mut_kills 0 1
+  else
+    fg_fail 305
+  end
+end
+
+fn fg_run_mut_m4_m5 to void
+  fg_run_mut_m4
+  fg_run_mut_m5
+end
+
+fn fg_run_mutants to void
+  put fg_mut_kills 0 0
+  srcl = fg_build_rlwe_src
+  if le srcl 10000
+    fg_fail 300
+    ret
+  end
+
+  note M-1: drop +d constant addition in eval-poly
+  fg_mut_reset
+  if and fg_mut_patch fg_m1_old fg_m1_new fg_mut_compile
+    fg_kill_eval_mutant 301
+  else
+    fg_fail 301
+  end
+
+  note M-2: drop inverse NTT post-twist + N^-1
+  fg_mut_reset
+  if and fg_mut_patch fg_m2_old fg_m2_new fg_mut_compile
+    fg_kill_eval_mutant 302
+  else
+    fg_fail 302
+  end
+
+  fg_run_mut_m3
+  fg_run_mut_m4_m5
+end
+
+note ==== Section 9: Main Gate Driver ====
+
+fn fg_eq_h1_h2 to bool
+  for j ulong 32
+    if ne get fg_h1 j get fg_h2 j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn fg_build_rlwe_pair to bool
+  rl_l = fg_build_rlwe_src
+  fg_chk gt rl_l 10000 1
+  if le rl_l 10000
+    ret false
+  end
+  rc1 = fg_compile_scr fg_f_rsrc fg_f_r1 fg_f_re1
+  rc2 = fg_compile_scr fg_f_rsrc fg_f_r2 fg_f_re2
+  fg_chk and eq rc1 0 eq rc2 0 2
+  fg_chk and fg_scr_file_empty fg_f_re1 fg_scr_file_empty fg_f_re2 3
+  sr1 = fg_hash_scr fg_f_r1 1
+  sr2 = fg_hash_scr fg_f_r2 2
+  r_det = and gt sr1 10000 and eq sr1 sr2 fg_eq_h1_h2
+  fg_chk r_det 4
+  fg_chk fg_check_static_elf fg_f_r1 5
+  ret r_det
+end
+
+fn fg_build_chk_pair to bool
+  cl_l = fg_build_chk_src
+  fg_chk gt cl_l 10000 6
+  if le cl_l 10000
+    ret false
+  end
+  cc1 = fg_compile_scr fg_f_csrc fg_f_c1 fg_f_ce1
+  cc2 = fg_compile_scr fg_f_csrc fg_f_c2 fg_f_ce2
+  fg_chk and eq cc1 0 eq cc2 0 7
+  fg_chk and fg_scr_file_empty fg_f_ce1 fg_scr_file_empty fg_f_ce2 8
+  sc1 = fg_hash_scr fg_f_c1 1
+  sc2 = fg_hash_scr fg_f_c2 2
+  c_det = and gt sc1 10000 and eq sc1 sc2 fg_eq_h1_h2
+  fg_chk c_det 9
+  fg_chk fg_check_static_elf fg_f_c1 10
+  ret c_det
+end
+
+fn fg_copy_bin_paths to void
+  zp = fg_set_p 0 true fg_f_r1
+  for i ulong get fg_pal 0 bound 1020
+    put fg_rlwe1 i get fg_pa i
+  end
+  put fg_rlwe1_l 0 get fg_pal 0
+
+  zp = fg_set_p 0 true fg_f_r2
+  for i ulong get fg_pal 0 bound 1020
+    put fg_rlwe2 i get fg_pa i
+  end
+  put fg_rlwe2_l 0 get fg_pal 0
+
+  zp = fg_set_p 0 true fg_f_c1
+  for i ulong get fg_pal 0 bound 1020
+    put fg_chk1 i get fg_pa i
+  end
+  put fg_chk1_l 0 get fg_pal 0
+
+  zp = fg_set_p 0 true fg_f_c2
+  for i ulong get fg_pal 0 bound 1020
+    put fg_chk2 i get fg_pa i
+  end
+  put fg_chk2_l 0 get fg_pal 0
+end
+
+fn fg_build_and_verify to bool
+  if not fg_verify_omc_pin
+    fg_werr fg_e_pin
+    ret false
+  end
+  r_det = fg_build_rlwe_pair
+  c_det = fg_build_chk_pair
+  if and r_det c_det
+    put fg_cmp_ok 0 1
+  end
+  fg_copy_bin_paths
+  if fg_run_positive
+    fg_ctrl_noncanon_and_keys
+    fg_ctrl_noise_and_format
+    fg_run_mutants
+  end
+  ret true
+end
+
+fn main to int
+  put fg_checks 0 0
+  put fg_ctrls 0 0
+  put fg_caught 0 0
+  put fg_mut_kills 0 0
+  put fg_fails 0 0
+  put fg_cmp_ok 0 0
+
+  ac = ulong argcnt
+  if eq ac 4
+    put fg_omc_l 0 fg_arg_to_glob 1 0
+    put fg_root_l 0 fg_arg_to_glob 2 1
+    put fg_scr_l 0 fg_arg_to_glob 3 2
+    if or eq get fg_omc_l 0 0 or eq get fg_root_l 0 0 eq get fg_scr_l 0 0
+      fg_werr fg_u_msg
+      ret FG_ERR_ARG
+    end
+    z = makedir fg_scr 0 get fg_scr_l 0 493
+    if not fg_build_and_verify
+      ret FG_ERR_PIN
+    end
+  else
+    if and eq ac 5 fg_arg_eq 1 fg_f_bins
+      put fg_rlwe1_l 0 fg_arg_to_glob 2 3
+      put fg_chk1_l 0 fg_arg_to_glob 3 4
+      put fg_scr_l 0 fg_arg_to_glob 4 2
+      if or eq get fg_rlwe1_l 0 0 or eq get fg_chk1_l 0 0 eq get fg_scr_l 0 0
+        fg_werr fg_u_msg
+        ret FG_ERR_ARG
+      end
+      for i ulong get fg_rlwe1_l 0 bound 1020
+        put fg_rlwe2 i get fg_rlwe1 i
+      end
+      put fg_rlwe2_l 0 get fg_rlwe1_l 0
+      for j ulong get fg_chk1_l 0 bound 1020
+        put fg_chk2 j get fg_chk1 j
+      end
+      put fg_chk2_l 0 get fg_chk1_l 0
+      z = makedir fg_scr 0 get fg_scr_l 0 493
+      if fg_run_positive
+        fg_ctrl_noncanon_and_keys
+        fg_ctrl_noise_and_format
+      end
+    else
+      fg_werr fg_u_msg
+      ret FG_ERR_ARG
+    end
+  end
+
+  if ne get fg_fails 0 0
+    ret FG_ERR_ARG
+  end
+  fg_wrt fg_m_p1
+  fg_num get fg_checks 0
+  fg_wrt fg_m_p2
+  fg_num get fg_ctrls 0
+  fg_wrt fg_m_p3
+  fg_num get fg_caught 0
+  fg_wrt fg_m_p4
+  fg_num get fg_mut_kills 0
+  fg_wrt fg_m_p5
+  fg_num get fg_cmp_ok 0
+  fg_wrt fg_m_p6
+  ret FG_OK
+end
