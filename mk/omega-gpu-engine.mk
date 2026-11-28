@@ -61,28 +61,27 @@ test-gpu-engine-gb10-compile: build/test_omega_gpu_engine_gb10.o
 # Measurement (sc#277): driver allocations and frees made by the REAL session + matmul + attention
 # APIs while serving a Qwen3-4B-shaped sequence, against the simulated driver. Host only, no device.
 # Prints MEASURE lines; asserts only bookkeeping. Links no physics C sources, only its headers.
-GPU_SERVE_ALLOC_SRCS = src/omega_gpu_session.c src/omega_gpu_platform.c src/omega_gpu_platform_linux.c src/omega_gpu_fmt.c src/omega_gpu_matmul_api.c src/omega_gpu_attention_api.c src/omega_gpu_serving.c \
-	src/omega_gpu_wait.c src/omega_blackwell_codegen.c src/omega_blackwell_encoder.c src/omega_blackwell_qmd.c \
-	src/omega_blackwell_matmul.c src/omega_om_units.c
-build/gpu_serving_alloc_count_test: tests/gpu_serving_alloc_count_test.c tests/fake_m16_native.c tests/fake_m16_native.h $(GPU_SERVE_ALLOC_SRCS)
+# Measurement (sc#277): serving allocation/reservation contract + Qwen3-4B bounds/sweep/rollback/pin/update
+# host checks, cut over to pure seeded OM-2 (test-gb10-gpu-2-host + gate_gpu_stage2_host.om).
+# Host only, zero gcc, zero C, opens no device.
+build/gpu_serving_alloc_count_test: tests/gpu_om/gate_gpu_stage2_host.om seed/out/omc
 	@mkdir -p build
-	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -pthread -ffp-contract=off -Isrc -Itests $(GPU_ENGINE_PHYS_INC) \
-		-o $@ tests/gpu_serving_alloc_count_test.c tests/fake_m16_native.c $(GPU_SERVE_ALLOC_SRCS) -lm
+	seed/out/omc < tests/gpu_om/gate_gpu_stage2_host.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 .PHONY: test-gpu-serving-alloc
-test-gpu-serving-alloc: build/gpu_serving_alloc_count_test
-	./build/gpu_serving_alloc_count_test plain
-	./build/gpu_serving_alloc_count_test reserve
-	./build/gpu_serving_alloc_count_test bounds
-	./build/gpu_serving_alloc_count_test bounds-block
-	./build/gpu_serving_alloc_count_test rollback
-	./build/gpu_serving_alloc_count_test sweep
-	./build/gpu_serving_alloc_count_test pin
-	./build/gpu_serving_alloc_count_test seal-bare
-	./build/gpu_serving_alloc_count_test update
-	@if ./build/gpu_serving_alloc_count_test sweep-skip >build/gpu_serving_alloc_count_sweep_skip.log 2>&1; then echo "RED RUN PASSED: zero allocations over the row sweep do not need prepare + seal"; exit 1; fi
+test-gpu-serving-alloc: test-gb10-gpu-2-host build/gpu_serving_alloc_count_test
+	./build/gpu_serving_alloc_count_test --serving-alloc plain
+	./build/gpu_serving_alloc_count_test --serving-alloc reserve
+	./build/gpu_serving_alloc_count_test --serving-alloc bounds
+	./build/gpu_serving_alloc_count_test --serving-alloc bounds-block
+	./build/gpu_serving_alloc_count_test --serving-alloc rollback
+	./build/gpu_serving_alloc_count_test --serving-alloc sweep
+	./build/gpu_serving_alloc_count_test --serving-alloc pin
+	./build/gpu_serving_alloc_count_test --serving-alloc seal-bare
+	./build/gpu_serving_alloc_count_test --serving-alloc update
+	@if ./build/gpu_serving_alloc_count_test --serving-alloc sweep-skip >build/gpu_serving_alloc_count_sweep_skip.log 2>&1; then echo "RED RUN PASSED: zero allocations over the row sweep do not need prepare + seal"; exit 1; fi
 	@if [ "$$(grep -c "^FAIL" build/gpu_serving_alloc_count_sweep_skip.log)" -lt 1 ]; then echo "sweep-skip exited nonzero without a FAIL check (crash, not the red assertion)"; exit 1; fi
 	@grep -E "^MEASURE sweep" build/gpu_serving_alloc_count_sweep_skip.log | sed "s/^/sweep-skip (control): /"
-	@if ./build/gpu_serving_alloc_count_test reserve-skip >build/gpu_serving_alloc_count_skip.log 2>&1; then echo "RED RUN PASSED: the zero-allocation assertion does not need the reservation call"; exit 1; fi
+	@if ./build/gpu_serving_alloc_count_test --serving-alloc reserve-skip >build/gpu_serving_alloc_count_skip.log 2>&1; then echo "RED RUN PASSED: the zero-allocation assertion does not need the reservation call"; exit 1; fi
 	@if [ "$$(grep -c "^FAIL" build/gpu_serving_alloc_count_skip.log)" -lt 1 ]; then echo "reserve-skip exited nonzero without a FAIL check (crash, not the red assertion)"; exit 1; fi
 	@echo "reserve-skip (no reservation call): fails as required ($$(grep -c "^FAIL" build/gpu_serving_alloc_count_skip.log) failing checks)"
 
