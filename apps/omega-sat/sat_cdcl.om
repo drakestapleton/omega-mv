@@ -1,0 +1,2056 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-sat/sat_cdcl.om
+note Wave 5 Alien Breakthrough: Pure Seeded-OM-2 CDCL SAT Solver + RUP/DRAT/LRAT Proof Emitter.
+note
+note Compose after:
+note   si/directives/om2.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note   protocol/uor-gpu/ed_sign.om
+note
+note Features:
+note   - Strict DIMACS CNF parser (fail-closed on malformed headers, out-of-range vars, trailing lits)
+note   - Intrusive 2-watched-literal BCP (zero allocation, conflict-safe watch preservation)
+note   - 1-UIP conflict analysis + LBD computation + chronological level-0/trail LRAT hint extraction
+note   - VSIDS binary max-heap + phase saving + Luby restarts + LBD-guided learned-clause deletion
+note   - Cryptographic OMSAT1 (SAT witness) and OMDR01 (UNSAT RUP/DRAT/LRAT) + OMSR01 signed receipts
+note
+note Exit codes:
+note   selftest -> 0 on PASS
+note   solve    -> 10 on SAT, 20 on UNSAT, non-zero (1..5, 60..69) on error
+note Zero C, zero Python, zero Rust, zero gcc, zero GPU hardware writes (hw_writes=0).
+
+const SC_MAX_VARS ulong 4096
+const SC_MAX_LITS ulong 8196
+const SC_MAX_CLAUSES ulong 65536
+const SC_MAX_POOL ulong 524288
+const SC_MAX_WATCHES ulong 131072
+const SC_MAX_CNF ulong 1048576
+const SC_MAX_PROOF ulong 2097152
+const SC_MAX_HINTS ulong 16384
+const SC_INVALID ulong 0xffffffff
+
+const SC_UNDEF ulong 0
+const SC_TRUE ulong 1
+const SC_FALSE ulong 2
+
+const SC_EXIT_OK int 0
+const SC_EXIT_USAGE int 2
+const SC_EXIT_IO int 3
+const SC_EXIT_PARSE int 4
+const SC_EXIT_LIMIT int 5
+const SC_EXIT_SAT int 10
+const SC_EXIT_UNSAT int 20
+
+const SC_LUBY_BASE ulong 32
+
+note ---- I/O, Arg & Crypto Buffers ----
+
+global sc_arg uchar 4096
+global sc_in_path uchar 1024
+global sc_in_path_n ulong 1
+global sc_out_path uchar 1024
+global sc_out_path_n ulong 1
+global sc_rcpt_path uchar 1024
+global sc_rcpt_path_n ulong 1
+global sc_stag uchar 128
+global sc_stag_n ulong 1
+
+global sc_have_in ulong 1
+global sc_have_out ulong 1
+global sc_have_rcpt ulong 1
+global sc_flag_lrat ulong 1
+global sc_flag_del ulong 1
+global sc_cmd ulong 1
+
+global sc_cnf uchar 1048576
+global sc_cnf_n ulong 1
+global sc_cnf_sha uchar 32
+global sc_prf uchar 2097152
+global sc_prf_n ulong 1
+global sc_prf_sha uchar 32
+global sc_rcpt uchar 352
+
+global sc_seed uchar 32
+global sc_pk uchar 32
+global sc_sig uchar 64
+global sc_body_sha uchar 32
+global sc_probe uchar 4
+global sc_dig uchar 32
+global sc_hex uchar 64
+
+note ---- CDCL Solver Tables ----
+
+global sc_nvars ulong 1
+global sc_norig ulong 1
+global sc_nclauses ulong 1
+global sc_pool_top ulong 1
+global sc_proof_cid ulong 1
+global sc_proof_steps ulong 1
+global sc_learned_cnt ulong 1
+global sc_deleted_cnt ulong 1
+global sc_conflicts ulong 1
+global sc_decisions ulong 1
+global sc_props ulong 1
+global sc_restarts ulong 1
+
+global sc_cl_off ulong 65536
+global sc_cl_len ulong 65536
+global sc_cl_learnt ulong 65536
+global sc_cl_lbd ulong 65536
+global sc_cl_act ulong 65536
+global sc_cl_del ulong 65536
+global sc_cl_pid ulong 65536
+global sc_pool ulong 524288
+
+global sc_w_head ulong 8196
+global sc_w_next ulong 131072
+global sc_w_lit ulong 131072
+
+global sc_val ulong 4098
+global sc_phase ulong 4098
+global sc_level ulong 4098
+global sc_reason ulong 4098
+
+global sc_trail ulong 4098
+global sc_trail_n ulong 1
+global sc_qhead ulong 1
+global sc_lim ulong 4098
+global sc_dl ulong 1
+
+global sc_act ulong 4098
+global sc_var_inc ulong 1
+global sc_heap ulong 4098
+global sc_heap_pos ulong 4098
+global sc_heap_n ulong 1
+
+global sc_seen ulong 4098
+global sc_seen_l0 ulong 4098
+global sc_l0_list ulong 4098
+global sc_l0_n ulong 1
+global sc_lvl_mark ulong 4098
+global sc_lvl_stamp ulong 1
+
+global sc_tmp_cl ulong 8196
+global sc_tmp_n ulong 1
+global sc_cl_seen ulong 8196
+global sc_cl_stamp ulong 1
+
+global sc_learnt ulong 8196
+global sc_learnt_n ulong 1
+global sc_uip_hints ulong 16384
+global sc_uip_hn ulong 1
+global sc_l0_hints ulong 16384
+global sc_l0_hn ulong 1
+
+global sc_del_list ulong 65536
+global sc_del_n ulong 1
+global sc_red_cap ulong 1
+global sc_cl_inc ulong 1
+global sc_l0_confl ulong 1
+global sc_parse_taut ulong 1
+global sc_parse_dup ulong 1
+
+text sc_def_stag "OMEGA-SAT-CDCL-AUTHORITY-V1"
+text sc_dom_sat "OMSAT1-BODY-V1"
+text sc_dom_drat "OMDR01-BODY-V1"
+text sc_env_sat "OMEGA-SAT1-RCPT-V1"
+text sc_env_drat "OMEGA-DRAT1-RCPT-V1"
+text sc_dom_rcpt "OMEGA-SAT-RECEIPT-V1"
+text sc_dom_bind "OMEGA-SAT-BIND-V1"
+text sc_dom_key "OMEGA-SAT-CDCL-KEY-V1"
+text sc_m_omsat "OMSAT1"
+text sc_m_omdr "OMDR01"
+text sc_m_omsr "OMSR01"
+
+text sc_c_solve "solve"
+text sc_c_self "selftest"
+text sc_c_help "--help"
+text sc_c_h "-h"
+text sc_f_in "--in"
+text sc_f_out "--out"
+text sc_f_rcpt "--receipt"
+text sc_f_stag "--seed-tag"
+text sc_f_nolrat "--no-lrat"
+text sc_f_nodel "--no-del"
+
+text sc_u_msg "usage: sat_cdcl <selftest | solve --in FILE.cnf --out PROOF [--receipt R.omsr] [--seed-tag TAG] [--no-lrat] [--no-del]>\n"
+text sc_err_pfx "SAT_CDCL ERROR code="
+text sc_nl "\n"
+text sc_msg_sat1 "SAT_CDCL SAT vars="
+text sc_msg_uns1 "SAT_CDCL UNSAT vars="
+text sc_msg_cl " clauses="
+text sc_msg_lrn " learned="
+text sc_msg_del " deletions="
+text sc_msg_stp " steps="
+text sc_msg_cfl " conflicts="
+text sc_msg_dec " decisions="
+text sc_msg_byt " bytes="
+text sc_msg_sha " sha256="
+text sc_msg_self "SAT_CDCL SELFTEST PASS sat=10 unsat_php32=20 luby=1121124 ed25519=1\n"
+
+text sc_st_sat_cnf "p cnf 4 5\n1 2 0\n-1 3 0\n-2 4 0\n-3 -4 0\n1 -3 0\n"
+text sc_st_php32 "p cnf 6 9\n1 2 0\n3 4 0\n5 6 0\n-1 -3 0\n-1 -5 0\n-3 -5 0\n-2 -4 0\n-2 -6 0\n-4 -6 0\n"
+
+note ==== Section 1: Output, Encoding & Hashing Helpers ====
+
+fn sc_wrt fd int s view uchar * to void
+  p = ulong 0
+  n = len s
+  while lt p n bound 4096
+    k = write int fd s p sub n p
+    if le k 0
+      ret
+    end
+    p = add p ulong k
+  end
+end
+
+fn sc_num fd int v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put sc_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      z = write int fd sc_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn sc_hex_sh fd int to void
+  for i ulong 32
+    b = uint get sh_dig i
+    put sc_hex mul i 2 sh_hexd shr b 4
+    put sc_hex add mul i 2 1 sh_hexd and b 15
+  end
+  z = write int fd sc_hex 0 64
+end
+
+fn sc_hex_prf fd int to void
+  for i ulong 32
+    b = uint get sc_prf_sha i
+    put sc_hex mul i 2 sh_hexd shr b 4
+    put sc_hex add mul i 2 1 sh_hexd and b 15
+  end
+  z = write int fd sc_hex 0 64
+end
+
+fn sc_fail code int to int
+  sc_wrt 2 sc_err_pfx
+  sc_num 2 ulong code
+  sc_wrt 2 sc_nl
+  ret code
+end
+
+fn sc_prf_u8 b ulong to bool
+  p = get sc_prf_n 0
+  if ge p SC_MAX_PROOF
+    ret false
+  end
+  put sc_prf p uchar and b 255
+  put sc_prf_n 0 add p 1
+  ret true
+end
+
+fn sc_prf_u16 p ulong v ulong to void
+  put sc_prf p uchar and v 255
+  put sc_prf add p 1 uchar and shr v 8 255
+end
+
+fn sc_prf_u32 p ulong v ulong to void
+  for i ulong 4
+    put sc_prf add p i uchar and shr v mul i 8 255
+  end
+end
+
+fn sc_prf_u64 p ulong v ulong to void
+  for i ulong 8
+    put sc_prf add p i uchar and shr v mul i 8 255
+  end
+end
+
+fn sc_prf_app_u32 v ulong to bool
+  p = get sc_prf_n 0
+  if gt add p 4 SC_MAX_PROOF
+    ret false
+  end
+  sc_prf_u32 p v
+  put sc_prf_n 0 add p 4
+  ret true
+end
+
+fn sc_prf_app_i32 v long to bool
+  if lt v 0
+    av = ulong sub 0 v
+    u = sub 4294967296 av
+    ret sc_prf_app_u32 u
+  end
+  u = ulong v
+  ret sc_prf_app_u32 u
+end
+
+fn sc_rcpt_u16 p ulong v ulong to void
+  put sc_rcpt p uchar and v 255
+  put sc_rcpt add p 1 uchar and shr v 8 255
+end
+
+fn sc_rcpt_u32 p ulong v ulong to void
+  for i ulong 4
+    put sc_rcpt add p i uchar and shr v mul i 8 255
+  end
+end
+
+fn sc_rcpt_u64 p ulong v ulong to void
+  for i ulong 8
+    put sc_rcpt add p i uchar and shr v mul i 8 255
+  end
+end
+
+fn sc_hash_cnf to void
+  n = get sc_cnf_n 0
+  for i ulong n bound 1048576
+    put sh_dat i get sc_cnf i
+  end
+  sh_all n
+  for i ulong 32
+    put sc_cnf_sha i get sh_dig i
+  end
+end
+
+fn sc_derive_seed to void
+  sl = get sc_stag_n 0
+  if eq sl 0
+    nl = len sc_def_stag
+    for i ulong nl bound 128
+      put sh_dat i get sc_def_stag i
+    end
+    sh_all nl
+    for i ulong 32
+      put sc_seed i get sh_dig i
+    end
+    ret
+  end
+  dl = len sc_dom_key
+  for i ulong dl bound 64
+    put sh_dat i get sc_dom_key i
+  end
+  put sh_dat dl 0
+  p = add dl 1
+  for j ulong sl bound 128
+    put sh_dat add p j get sc_stag j
+  end
+  sh_all add p sl
+  for i ulong 32
+    put sc_seed i get sh_dig i
+  end
+end
+
+note ==== Section 2: Literal & Solver State Reset ====
+
+fn sc_lit_var l ulong to ulong
+  ret shr l 1
+end
+
+fn sc_lit_neg l ulong to ulong
+  ret xor l 1
+end
+
+fn sc_lit_dimacs l ulong to long
+  v = long shr l 1
+  if eq and l 1 0
+    ret v
+  end
+  ret sub 0 v
+end
+
+fn sc_lit_val l ulong to ulong
+  v = shr l 1
+  vv = get sc_val v
+  if eq vv SC_UNDEF
+    ret SC_UNDEF
+  end
+  if eq and l 1 0
+    ret vv
+  end
+  if eq vv SC_TRUE
+    ret SC_FALSE
+  end
+  ret SC_TRUE
+end
+
+fn sc_reset_solver to void
+  put sc_nvars 0 0
+  put sc_norig 0 0
+  put sc_nclauses 0 0
+  put sc_pool_top 0 0
+  put sc_proof_cid 0 0
+  put sc_proof_steps 0 0
+  put sc_learned_cnt 0 0
+  put sc_deleted_cnt 0 0
+  put sc_conflicts 0 0
+  put sc_decisions 0 0
+  put sc_props 0 0
+  put sc_restarts 0 0
+  put sc_trail_n 0 0
+  put sc_qhead 0 0
+  put sc_dl 0 0
+  put sc_heap_n 0 0
+  put sc_var_inc 0 1024
+  put sc_cl_inc 0 1024
+  put sc_red_cap 0 64
+  put sc_l0_confl 0 SC_INVALID
+  put sc_l0_n 0 0
+  put sc_cl_stamp 0 0
+  put sc_lvl_stamp 0 0
+  put sc_prf_n 0 64
+  for i ulong SC_MAX_LITS
+    put sc_w_head i SC_INVALID
+    put sc_cl_seen i 0
+  end
+  for i ulong 4098
+    put sc_val i SC_UNDEF
+    put sc_phase i 0
+    put sc_level i 0
+    put sc_reason i SC_INVALID
+    put sc_act i 0
+    put sc_heap_pos i SC_INVALID
+    put sc_seen i 0
+    put sc_seen_l0 i 0
+    put sc_lvl_mark i 0
+  end
+end
+
+note ==== Section 3: VSIDS Binary Max-Heap ====
+
+fn sc_heap_swap i ulong j ulong to void
+  vi = get sc_heap i
+  vj = get sc_heap j
+  put sc_heap i vj
+  put sc_heap j vi
+  put sc_heap_pos vj i
+  put sc_heap_pos vi j
+end
+
+fn sc_heap_up idx ulong to void
+  i = idx
+  while gt i 0 bound 4098
+    p = shr sub i 1 1
+    vi = get sc_heap i
+    vp = get sc_heap p
+    if le get sc_act vi get sc_act vp
+      ret
+    end
+    sc_heap_swap i p
+    i = p
+  end
+end
+
+fn sc_heap_down idx ulong to void
+  n = get sc_heap_n 0
+  i = idx
+  while true bound 4098
+    l = add mul i 2 1
+    if ge l n
+      ret
+    end
+    best = l
+    r = add l 1
+    if lt r n
+      vr = get sc_heap r
+      vl = get sc_heap l
+      if gt get sc_act vr get sc_act vl
+        best = r
+      end
+    end
+    vi = get sc_heap i
+    vb = get sc_heap best
+    if ge get sc_act vi get sc_act vb
+      ret
+    end
+    sc_heap_swap i best
+    i = best
+  end
+end
+
+fn sc_heap_insert v ulong to void
+  if ne get sc_heap_pos v SC_INVALID
+    ret
+  end
+  n = get sc_heap_n 0
+  put sc_heap n v
+  put sc_heap_pos v n
+  put sc_heap_n 0 add n 1
+  sc_heap_up n
+end
+
+fn sc_heap_pop to ulong
+  n = get sc_heap_n 0
+  if eq n 0
+    ret 0
+  end
+  top = get sc_heap 0
+  put sc_heap_pos top SC_INVALID
+  n = sub n 1
+  put sc_heap_n 0 n
+  if gt n 0
+    last = get sc_heap n
+    put sc_heap 0 last
+    put sc_heap_pos last 0
+    sc_heap_down 0
+  end
+  ret top
+end
+
+fn sc_bump_var v ulong to void
+  inc = get sc_var_inc 0
+  na = add get sc_act v inc
+  put sc_act v na
+  pos = get sc_heap_pos v
+  if ne pos SC_INVALID
+    sc_heap_up pos
+  end
+  if gt na 1000000000000
+    nv = get sc_nvars 0
+    for i ulong nv bound 4098
+      vr = add i 1
+      put sc_act vr shr get sc_act vr 20
+    end
+    vi = shr inc 20
+    if eq vi 0
+      vi = ulong 1
+    end
+    put sc_var_inc 0 vi
+  end
+end
+
+fn sc_decay_var to void
+  inc = get sc_var_inc 0
+  ni = div mul inc 105 100
+  if eq ni inc
+    ni = add inc 1
+  end
+  put sc_var_inc 0 ni
+end
+
+note ==== Section 4: Trail, Enqueue & 2-Watched-Literal BCP ====
+
+fn sc_enqueue l ulong rsn ulong to bool
+  cur = sc_lit_val l
+  if ne cur SC_UNDEF
+    ret eq cur SC_TRUE
+  end
+  v = shr l 1
+  if eq and l 1 0
+    put sc_val v SC_TRUE
+  else
+    put sc_val v SC_FALSE
+  end
+  put sc_level v get sc_dl 0
+  put sc_reason v rsn
+  tn = get sc_trail_n 0
+  put sc_trail tn l
+  put sc_trail_n 0 add tn 1
+  ret true
+end
+
+fn sc_new_decision v ulong to void
+  dl = get sc_dl 0
+  put sc_lim dl get sc_trail_n 0
+  put sc_dl 0 add dl 1
+  put sc_decisions 0 add get sc_decisions 0 1
+  ph = get sc_phase v
+  l = mul v 2
+  if eq ph 1
+    l = add l 1
+  end
+  z = sc_enqueue l SC_INVALID
+end
+
+fn sc_cancel_until lvl ulong to void
+  if le get sc_dl 0 lvl
+    ret
+  end
+  target = get sc_lim lvl
+  tn = get sc_trail_n 0
+  while gt tn target bound 4098
+    tn = sub tn 1
+    l = get sc_trail tn
+    v = shr l 1
+    put sc_phase v and l 1
+    put sc_val v SC_UNDEF
+    put sc_reason v SC_INVALID
+    sc_heap_insert v
+  end
+  put sc_trail_n 0 target
+  put sc_qhead 0 target
+  put sc_dl 0 lvl
+end
+
+fn sc_watch_attach cid ulong l0 ulong l1 ulong to void
+  w0 = mul cid 2
+  w1 = add w0 1
+  put sc_w_lit w0 l0
+  put sc_w_next w0 get sc_w_head l0
+  put sc_w_head l0 w0
+  put sc_w_lit w1 l1
+  put sc_w_next w1 get sc_w_head l1
+  put sc_w_head l1 w1
+end
+
+fn sc_watch_detach_slot lit ulong target_ws ulong to void
+  cur = get sc_w_head lit
+  prev = SC_INVALID
+  while ne cur SC_INVALID bound 131072
+    nxt = get sc_w_next cur
+    if eq cur target_ws
+      if eq prev SC_INVALID
+        put sc_w_head lit nxt
+      else
+        put sc_w_next prev nxt
+      end
+      put sc_w_next cur SC_INVALID
+      ret
+    end
+    prev = cur
+    cur = nxt
+  end
+end
+
+fn sc_scan_watch cid ulong slot ulong false_lit ulong to ulong
+  off = get sc_cl_off cid
+  cln = get sc_cl_len cid
+  oslot = xor slot 1
+  other = get sc_pool add off oslot
+  if eq sc_lit_val other SC_TRUE
+    ret 0
+  end
+  k = ulong 2
+  while lt k cln bound 8196
+    cand = get sc_pool add off k
+    if ne sc_lit_val cand SC_FALSE
+      put sc_pool add off slot cand
+      put sc_pool add off k false_lit
+      ws = add mul cid 2 slot
+      put sc_w_lit ws cand
+      put sc_w_next ws get sc_w_head cand
+      put sc_w_head cand ws
+      ret 1
+    end
+    k = add k 1
+  end
+  if eq sc_lit_val other SC_FALSE
+    ret 2
+  end
+  z = sc_enqueue other cid
+  ret 0
+end
+
+fn sc_reattach_tail lit ulong cur ulong to void
+  while ne cur SC_INVALID bound 131072
+    nxt = get sc_w_next cur
+    put sc_w_next cur get sc_w_head lit
+    put sc_w_head lit cur
+    cur = nxt
+  end
+end
+
+fn sc_propagate to ulong
+  while lt get sc_qhead 0 get sc_trail_n 0 bound 100000000
+    qh = get sc_qhead 0
+    tl = get sc_trail qh
+    put sc_qhead 0 add qh 1
+    put sc_props 0 add get sc_props 0 1
+    fl = xor tl 1
+    cur = get sc_w_head fl
+    put sc_w_head fl SC_INVALID
+    while ne cur SC_INVALID bound 131072
+      nxt = get sc_w_next cur
+      cid = shr cur 1
+      slot = and cur 1
+      st = sc_scan_watch cid slot fl
+      if eq st 0
+        put sc_w_next cur get sc_w_head fl
+        put sc_w_head fl cur
+      else
+        if eq st 2
+          put sc_w_next cur get sc_w_head fl
+          put sc_w_head fl cur
+          sc_reattach_tail fl nxt
+          ret cid
+        end
+      end
+      cur = nxt
+    end
+  end
+  ret SC_INVALID
+end
+
+note ==== Section 5: Proof Emitter (OMDR01 + OMSAT1 + OMSR01) ====
+
+fn sc_emit_rup_step is_lrat bool to bool
+  if not sc_prf_u8 1
+    ret false
+  end
+  ln = get sc_learnt_n 0
+  if not sc_prf_app_u32 ln
+    ret false
+  end
+  for i ulong ln bound 8196
+    if not sc_prf_app_i32 sc_lit_dimacs get sc_learnt i
+      ret false
+    end
+  end
+  if is_lrat
+    l0n = get sc_l0_hn 0
+    un = get sc_uip_hn 0
+    tot = add l0n un
+    if not sc_prf_app_u32 tot
+      ret false
+    end
+    i = l0n
+    while gt i 0 bound 16384
+      i = sub i 1
+      cid = get sc_l0_hints i
+      if not sc_prf_app_u32 get sc_cl_pid cid
+        ret false
+      end
+    end
+    j = un
+    while gt j 0 bound 16384
+      j = sub j 1
+      cid = get sc_uip_hints j
+      if not sc_prf_app_u32 get sc_cl_pid cid
+        ret false
+      end
+    end
+  end
+  put sc_proof_steps 0 add get sc_proof_steps 0 1
+  ret true
+end
+
+fn sc_emit_del_step cid ulong to bool
+  if not sc_prf_u8 2
+    ret false
+  end
+  off = get sc_cl_off cid
+  cln = get sc_cl_len cid
+  if not sc_prf_app_u32 cln
+    ret false
+  end
+  for i ulong cln bound 8196
+    if not sc_prf_app_i32 sc_lit_dimacs get sc_pool add off i
+      ret false
+    end
+  end
+  put sc_proof_steps 0 add get sc_proof_steps 0 1
+  ret true
+end
+
+fn sc_add_clause_db is_lrn ulong lbd ulong pid ulong to ulong
+  cid = get sc_nclauses 0
+  if ge cid SC_MAX_CLAUSES
+    ret SC_INVALID
+  end
+  ln = get sc_learnt_n 0
+  top = get sc_pool_top 0
+  if gt add top ln SC_MAX_POOL
+    ret SC_INVALID
+  end
+  for i ulong ln bound 8196
+    put sc_pool add top i get sc_learnt i
+  end
+  put sc_cl_off cid top
+  put sc_cl_len cid ln
+  put sc_cl_learnt cid is_lrn
+  put sc_cl_lbd cid lbd
+  put sc_cl_act cid get sc_cl_inc 0
+  put sc_cl_del cid 0
+  put sc_cl_pid cid pid
+  put sc_pool_top 0 add top ln
+  put sc_nclauses 0 add cid 1
+  if ge ln 2
+    sc_watch_attach cid get sc_learnt 0 get sc_learnt 1
+  end
+  if eq is_lrn 1
+    put sc_learned_cnt 0 add get sc_learned_cnt 0 1
+  end
+  ret cid
+end
+
+note ==== Section 6: 1-UIP Conflict Analysis + Level-0 LRAT Trace ====
+
+fn sc_mark_l0 v ulong to void
+  if eq get sc_seen_l0 v 0
+    put sc_seen_l0 v 1
+    n = get sc_l0_n 0
+    if lt n 4096
+      put sc_l0_list n v
+      put sc_l0_n 0 add n 1
+    end
+  end
+end
+
+fn sc_mark_l0_reason rsn ulong skip_v ulong to void
+  off = get sc_cl_off rsn
+  cln = get sc_cl_len rsn
+  for j ulong cln bound 8196
+    q = get sc_pool add off j
+    qv = shr q 1
+    if ne qv skip_v
+      sc_mark_l0 qv
+    end
+  end
+end
+
+fn sc_trace_l0_closure to void
+  put sc_l0_hn 0 0
+  lim0 = get sc_trail_n 0
+  if ne get sc_dl 0 0
+    lim0 = get sc_lim 0
+  end
+  i = lim0
+  while gt i 0 bound 4098
+    i = sub i 1
+    l = get sc_trail i
+    v = shr l 1
+    if ne get sc_seen_l0 v 0
+      put sc_seen_l0 v 0
+      rsn = get sc_reason v
+      if ne rsn SC_INVALID
+        hn = get sc_l0_hn 0
+        if lt hn SC_MAX_HINTS
+          put sc_l0_hints hn rsn
+          put sc_l0_hn 0 add hn 1
+        end
+        sc_mark_l0_reason rsn v
+      end
+    end
+  end
+  for j ulong get sc_l0_n 0 bound 4098
+    put sc_seen_l0 get sc_l0_list j 0
+  end
+  put sc_l0_n 0 0
+end
+
+fn sc_compute_lbd to ulong
+  st = add get sc_lvl_stamp 0 1
+  put sc_lvl_stamp 0 st
+  lbd = ulong 1
+  ln = get sc_learnt_n 0
+  for i ulong ln bound 8196
+    if gt i 0
+      lvl = get sc_level shr get sc_learnt i 1
+      if gt lvl 0
+        if ne get sc_lvl_mark lvl st
+          put sc_lvl_mark lvl st
+          lbd = add lbd 1
+        end
+      end
+    end
+  end
+  ret lbd
+end
+
+fn sc_analyze_lit q ulong dl ulong to ulong
+  qv = shr q 1
+  qlvl = get sc_level qv
+  if eq qlvl 0
+    sc_mark_l0 qv
+    ret 0
+  end
+  if ne get sc_seen qv 0
+    ret 0
+  end
+  put sc_seen qv 1
+  sc_bump_var qv
+  if eq qlvl dl
+    ret 1
+  end
+  ln = get sc_learnt_n 0
+  put sc_learnt ln q
+  put sc_learnt_n 0 add ln 1
+  ret 0
+end
+
+fn sc_analyze_clause c ulong p ulong dl ulong to ulong
+  if eq c SC_INVALID
+    ret 0
+  end
+  hn = get sc_uip_hn 0
+  if lt hn SC_MAX_HINTS
+    put sc_uip_hints hn c
+    put sc_uip_hn 0 add hn 1
+  end
+  if eq get sc_cl_learnt c 1
+    put sc_cl_act c add get sc_cl_act c get sc_cl_inc 0
+  end
+  added = ulong 0
+  off = get sc_cl_off c
+  cln = get sc_cl_len c
+  for j ulong cln bound 8196
+    q = get sc_pool add off j
+    if ne q p
+      added = add added sc_analyze_lit q dl
+    end
+  end
+  ret added
+end
+
+fn sc_clear_learnt_seen to void
+  ln = get sc_learnt_n 0
+  for i ulong ln bound 8196
+    if gt i 0
+      lit = get sc_learnt i
+      put sc_seen shr lit 1 0
+    end
+  end
+end
+
+fn sc_find_bt_level to ulong
+  ln = get sc_learnt_n 0
+  if eq ln 1
+    ret 0
+  end
+  max_i = ulong 1
+  max_l = get sc_level shr get sc_learnt 1 1
+  for i ulong ln bound 8196
+    if gt i 1
+      lit = get sc_learnt i
+      lv = get sc_level shr lit 1
+      if gt lv max_l
+        max_l = lv
+        max_i = i
+      end
+    end
+  end
+  if ne max_i 1
+    tmp = get sc_learnt 1
+    put sc_learnt 1 get sc_learnt max_i
+    put sc_learnt max_i tmp
+  end
+  ret max_l
+end
+
+fn sc_next_seen_trail idx_io edit ulong 1 to ulong
+  idx = get idx_io 0
+  while gt idx 0 bound 4098
+    idx = sub idx 1
+    cand = get sc_trail idx
+    if ne get sc_seen shr cand 1 0
+      put idx_io 0 idx
+      ret cand
+    end
+  end
+  ret SC_INVALID
+end
+
+fn sc_analyze confl_cid ulong out_bt edit ulong 1 to bool
+  put sc_learnt_n 0 1
+  put sc_uip_hn 0 0
+  put sc_l0_n 0 0
+  dl = get sc_dl 0
+  path_c = ulong 0
+  p = SC_INVALID
+  c = confl_cid
+  idx_box = new ulong 1 0
+  put idx_box 0 get sc_trail_n 0
+
+  while true bound 4098
+    path_c = add path_c sc_analyze_clause c p dl
+    p = sc_next_seen_trail idx_box
+    pv = shr p 1
+    put sc_seen pv 0
+    path_c = sub path_c 1
+    c = get sc_reason pv
+    if eq path_c 0
+      break
+    end
+  end
+
+  put sc_learnt 0 xor p 1
+  sc_clear_learnt_seen
+  sc_trace_l0_closure
+  put out_bt 0 sc_find_bt_level
+  ret true
+end
+
+fn sc_analyze_l0 confl_cid ulong to void
+  put sc_learnt_n 0 0
+  put sc_uip_hn 0 0
+  put sc_l0_n 0 0
+  put sc_uip_hints 0 confl_cid
+  put sc_uip_hn 0 1
+  off = get sc_cl_off confl_cid
+  cln = get sc_cl_len confl_cid
+  for j ulong cln bound 8196
+    q = get sc_pool add off j
+    sc_mark_l0 shr q 1
+  end
+  sc_trace_l0_closure
+end
+
+note ==== Section 7: Luby Restarts & Learned-Clause DB Reduction ====
+
+fn sc_luby y_in ulong to ulong
+  y = y_in
+  sz = ulong 1
+  seq = ulong 0
+  while lt sz y bound 64
+    sz = add mul sz 2 1
+    seq = add seq 1
+  end
+  while ne sz y bound 64
+    sz = shr sub sz 1 1
+    seq = sub seq 1
+    if gt y sz
+      y = sub y sz
+    end
+  end
+  ret shl ulong 1 seq
+end
+
+fn sc_is_locked cid ulong to bool
+  if eq get sc_cl_len cid 0
+    ret true
+  end
+  l0 = get sc_pool get sc_cl_off cid
+  v0 = shr l0 1
+  if eq get sc_val v0 SC_UNDEF
+    ret false
+  end
+  ret eq get sc_reason v0 cid
+end
+
+fn sc_delete_marked_clauses half ulong to void
+  k = ulong 0
+  while lt k half bound 65536
+    cid = get sc_del_list k
+    off = get sc_cl_off cid
+    l0 = get sc_pool off
+    l1 = get sc_pool add off 1
+    sc_watch_detach_slot l0 mul cid 2
+    sc_watch_detach_slot l1 add mul cid 2 1
+    put sc_cl_del cid 1
+    put sc_deleted_cnt 0 add get sc_deleted_cnt 0 1
+    z = sc_emit_del_step cid
+    k = add k 1
+  end
+end
+
+fn sc_reduce_db to void
+  if eq get sc_flag_del 0 0
+    ret
+  end
+  nc = get sc_nclauses 0
+  put sc_del_n 0 0
+  i = get sc_norig 0
+  while lt i nc bound 65536
+    if and eq get sc_cl_learnt i 1 eq get sc_cl_del i 0
+      if and gt get sc_cl_len i 2 gt get sc_cl_lbd i 3
+        if not sc_is_locked i
+          dn = get sc_del_n 0
+          put sc_del_list dn i
+          put sc_del_n 0 add dn 1
+        end
+      end
+    end
+    i = add i 1
+  end
+  sc_delete_marked_clauses div get sc_del_n 0 2
+  put sc_red_cap 0 div mul get sc_red_cap 0 3 2
+end
+
+note ==== Section 8: DIMACS CNF Parser ====
+
+fn sc_skip_ws p ulong n ulong to ulong
+  i = p
+  while lt i n bound 1048576
+    b = get sc_cnf i
+    if or eq b 32 or eq b 9 or eq b 13 eq b 10
+      i = add i 1
+    else
+      ret i
+    end
+  end
+  ret i
+end
+
+fn sc_skip_line p ulong n ulong to ulong
+  i = p
+  while lt i n bound 1048576
+    b = get sc_cnf i
+    i = add i 1
+    if eq b 10
+      ret i
+    end
+  end
+  ret i
+end
+
+fn sc_skip_ws_comm p ulong n ulong to ulong
+  i = p
+  while lt i n bound 1048576
+    i = sc_skip_ws i n
+    if ge i n
+      ret i
+    end
+    if eq get sc_cnf i 99
+      i = sc_skip_line i n
+    else
+      ret i
+    end
+  end
+  ret i
+end
+
+fn sc_parse_uint p ulong n ulong out_v edit ulong 1 out_p edit ulong 1 to bool
+  if ge p n
+    ret false
+  end
+  b = get sc_cnf p
+  if or lt b 48 gt b 57
+    ret false
+  end
+  v = ulong 0
+  i = p
+  while lt i n bound 32
+    c = get sc_cnf i
+    if or lt c 48 gt c 57
+      break
+    end
+    d = ulong sub c 48
+    if gt v 1844674407370955161
+      ret false
+    end
+    v = add mul v 10 d
+    i = add i 1
+  end
+  put out_v 0 v
+  put out_p 0 i
+  ret true
+end
+
+fn sc_parse_int p ulong n ulong out_v edit long 1 out_p edit ulong 1 to bool
+  if ge p n
+    ret false
+  end
+  sgn = long 1
+  i = p
+  if eq get sc_cnf i 45
+    sgn = long -1
+    i = add i 1
+  else
+    if eq get sc_cnf i 43
+      i = add i 1
+    end
+  end
+  uv = new ulong 1 0
+  np = new ulong 1 0
+  if not sc_parse_uint i n uv np
+    ret false
+  end
+  if gt get uv 0 2147483647
+    ret false
+  end
+  put out_v 0 mul sgn long get uv 0
+  put out_p 0 get np 0
+  ret true
+end
+
+fn sc_parse_header p ulong n ulong out_v edit ulong 1 out_c edit ulong 1 out_p edit ulong 1 to bool
+  i = sc_skip_ws_comm p n
+  if ge add i 5 n
+    ret false
+  end
+  if ne get sc_cnf i 112
+    ret false
+  end
+  i = sc_skip_ws add i 1 n
+  if ge add i 3 n
+    ret false
+  end
+  if ne get sc_cnf i 99
+    ret false
+  end
+  if ne get sc_cnf add i 1 110
+    ret false
+  end
+  if ne get sc_cnf add i 2 102
+    ret false
+  end
+  i = add i 3
+  if lt i n
+    b = get sc_cnf i
+    if and ne b 32 and ne b 9 ne b 13
+      if ne b 10
+        ret false
+      end
+    end
+  end
+  i = sc_skip_ws i n
+  np = new ulong 1 0
+  if not sc_parse_uint i n out_v np
+    ret false
+  end
+  i = sc_skip_ws get np 0 n
+  if not sc_parse_uint i n out_c np
+    ret false
+  end
+  put out_p 0 get np 0
+  ret true
+end
+
+fn sc_commit_parsed_clause orig_pid ulong to int
+  if ne get sc_parse_taut 0 0
+    put sc_learnt_n 0 0
+    cid_t = sc_add_clause_db 0 0 orig_pid
+    if eq cid_t SC_INVALID
+      ret SC_EXIT_LIMIT
+    end
+    put sc_cl_del cid_t 1
+    ret SC_EXIT_OK
+  end
+  tn = get sc_tmp_n 0
+  if eq tn 0
+    put sc_learnt_n 0 0
+    cid_e = sc_add_clause_db 0 0 orig_pid
+    if eq cid_e SC_INVALID
+      ret SC_EXIT_LIMIT
+    end
+    if eq get sc_l0_confl 0 SC_INVALID
+      put sc_l0_confl 0 cid_e
+    end
+    ret SC_EXIT_OK
+  end
+  if ne get sc_parse_dup 0 0
+    put sc_learnt_n 0 0
+    cid_raw = sc_add_clause_db 0 0 orig_pid
+    if eq cid_raw SC_INVALID
+      ret SC_EXIT_LIMIT
+    end
+    put sc_cl_del cid_raw 1
+    for j ulong tn bound 8196
+      put sc_learnt j get sc_tmp_cl j
+    end
+    put sc_learnt_n 0 tn
+    put sc_uip_hn 0 1
+    put sc_uip_hints 0 cid_raw
+    put sc_l0_hn 0 0
+    npid = add get sc_proof_cid 0 1
+    put sc_proof_cid 0 npid
+    if not sc_emit_rup_step ne get sc_flag_lrat 0 0
+      ret SC_EXIT_LIMIT
+    end
+    cid_d = sc_add_clause_db 0 0 npid
+    if eq cid_d SC_INVALID
+      ret SC_EXIT_LIMIT
+    end
+    if eq tn 1
+      if not sc_enqueue get sc_learnt 0 cid_d
+        if eq get sc_l0_confl 0 SC_INVALID
+          put sc_l0_confl 0 cid_d
+        end
+      end
+    end
+    ret SC_EXIT_OK
+  end
+  for j ulong tn bound 8196
+    put sc_learnt j get sc_tmp_cl j
+  end
+  put sc_learnt_n 0 tn
+  cid = sc_add_clause_db 0 0 orig_pid
+  if eq cid SC_INVALID
+    ret SC_EXIT_LIMIT
+  end
+  if eq tn 1
+    if not sc_enqueue get sc_learnt 0 cid
+      if eq get sc_l0_confl 0 SC_INVALID
+        put sc_l0_confl 0 cid
+      end
+    end
+  end
+  ret SC_EXIT_OK
+end
+
+fn sc_add_parsed_lit val long nvars ulong st ulong to int
+  av = ulong 0
+  if lt val 0
+    av = ulong sub 0 val
+  else
+    av = ulong val
+  end
+  if or eq av 0 gt av nvars
+    ret SC_EXIT_PARSE
+  end
+  code = mul av 2
+  if lt val 0
+    code = add code 1
+  end
+  if eq get sc_cl_seen xor code 1 st
+    put sc_parse_taut 0 1
+    ret SC_EXIT_OK
+  end
+  if eq get sc_cl_seen code st
+    put sc_parse_dup 0 1
+    ret SC_EXIT_OK
+  end
+  put sc_cl_seen code st
+  tn = get sc_tmp_n 0
+  if ge tn 8192
+    ret SC_EXIT_LIMIT
+  end
+  put sc_tmp_cl tn code
+  put sc_tmp_n 0 add tn 1
+  ret SC_EXIT_OK
+end
+
+fn sc_parse_clauses_loop p_in ulong n ulong nvars ulong ncls ulong to int
+  p = p_in
+  read_cls = ulong 0
+  lv = new long 1 0
+  np = new ulong 1 0
+  put sc_tmp_n 0 0
+  put sc_parse_taut 0 0
+  put sc_parse_dup 0 0
+  st = add get sc_cl_stamp 0 1
+  put sc_cl_stamp 0 st
+
+  while true bound 1048576
+    p = sc_skip_ws_comm p n
+    if ge p n
+      break
+    end
+    if not sc_parse_int p n lv np
+      ret SC_EXIT_PARSE
+    end
+    p = get np 0
+    val = get lv 0
+    if eq val 0
+      read_cls = add read_cls 1
+      if gt read_cls ncls
+        ret SC_EXIT_PARSE
+      end
+      rc = sc_commit_parsed_clause read_cls
+      if ne rc SC_EXIT_OK
+        ret rc
+      end
+      put sc_tmp_n 0 0
+      put sc_parse_taut 0 0
+      put sc_parse_dup 0 0
+      st = add get sc_cl_stamp 0 1
+      put sc_cl_stamp 0 st
+    else
+      lrc = sc_add_parsed_lit val nvars st
+      if ne lrc SC_EXIT_OK
+        ret lrc
+      end
+    end
+  end
+
+  if ne get sc_tmp_n 0 0
+    ret SC_EXIT_PARSE
+  end
+  if ne read_cls ncls
+    ret SC_EXIT_PARSE
+  end
+  ret SC_EXIT_OK
+end
+
+fn sc_parse_and_load to int
+  sc_reset_solver
+  n = get sc_cnf_n 0
+  nv = new ulong 1 0
+  nc = new ulong 1 0
+  pos = new ulong 1 0
+  if not sc_parse_header 0 n nv nc pos
+    ret SC_EXIT_PARSE
+  end
+  nvars = get nv 0
+  ncls = get nc 0
+  if or gt nvars SC_MAX_VARS gt ncls SC_MAX_CLAUSES
+    ret SC_EXIT_LIMIT
+  end
+  put sc_nvars 0 nvars
+  put sc_norig 0 ncls
+  put sc_proof_cid 0 ncls
+  for i ulong nvars bound 4098
+    sc_heap_insert add i 1
+  end
+
+  rc = sc_parse_clauses_loop get pos 0 n nvars ncls
+  if ne rc SC_EXIT_OK
+    ret rc
+  end
+  l0c = get sc_l0_confl 0
+  if ne l0c SC_INVALID
+    sc_analyze_l0 l0c
+    if not sc_emit_rup_step ne get sc_flag_lrat 0 0
+      ret SC_EXIT_LIMIT
+    end
+    ret SC_EXIT_UNSAT
+  end
+  ret SC_EXIT_OK
+end
+
+note ==== Section 9: CDCL Main Solve Loop ====
+
+fn sc_pick_branch_var to ulong
+  while gt get sc_heap_n 0 0 bound 4098
+    v = sc_heap_pop
+    if eq get sc_val v SC_UNDEF
+      ret v
+    end
+  end
+  nv = get sc_nvars 0
+  for i ulong nv bound 4098
+    vr = add i 1
+    if eq get sc_val vr SC_UNDEF
+      ret vr
+    end
+  end
+  ret 0
+end
+
+fn sc_solve_cdcl to int
+  bt = new ulong 1 0
+  next_restart = mul SC_LUBY_BASE sc_luby 1
+  put sc_restarts 0 1
+
+  while true bound 100000000
+    confl = sc_propagate
+    if ne confl SC_INVALID
+      put sc_conflicts 0 add get sc_conflicts 0 1
+      if eq get sc_dl 0 0
+        sc_analyze_l0 confl
+        if not sc_emit_rup_step ne get sc_flag_lrat 0 0
+          ret SC_EXIT_LIMIT
+        end
+        ret SC_EXIT_UNSAT
+      end
+      if not sc_analyze confl bt
+        ret SC_EXIT_LIMIT
+      end
+      npid = add get sc_proof_cid 0 1
+      put sc_proof_cid 0 npid
+      if not sc_emit_rup_step ne get sc_flag_lrat 0 0
+        ret SC_EXIT_LIMIT
+      end
+      lbd = sc_compute_lbd
+      sc_cancel_until get bt 0
+      ncid = sc_add_clause_db 1 lbd npid
+      if eq ncid SC_INVALID
+        ret SC_EXIT_LIMIT
+      end
+      z = sc_enqueue get sc_learnt 0 ncid
+      sc_decay_var
+    else
+      if ge get sc_conflicts 0 next_restart
+        sc_cancel_until 0
+        r = add get sc_restarts 0 1
+        put sc_restarts 0 r
+        next_restart = add get sc_conflicts 0 mul SC_LUBY_BASE sc_luby r
+        if gt sub get sc_learned_cnt 0 get sc_deleted_cnt 0 get sc_red_cap 0
+          sc_reduce_db
+        end
+      end
+      dv = sc_pick_branch_var
+      if eq dv 0
+        ret SC_EXIT_SAT
+      end
+      sc_new_decision dv
+    end
+  end
+  ret SC_EXIT_LIMIT
+end
+
+note ==== Section 10: Cryptographic OMSAT1 / OMDR01 / OMSR01 Packaging ====
+
+fn sc_fill_rcpt_tag m edit uchar 65536 is_sat bool to void
+  if is_sat
+    rtl = len sc_env_sat
+    for i ulong rtl bound 32
+      put m i get sc_env_sat i
+    end
+  else
+    rtl = len sc_env_drat
+    for i ulong rtl bound 32
+      put m i get sc_env_drat i
+    end
+  end
+end
+
+fn sc_sign_envelope env_tag view uchar * body_len ulong to void
+  sc_derive_seed
+  tl = len env_tag
+  for j ulong tl bound 64
+    put sh_dat j get env_tag j
+  end
+  put sh_dat tl 0
+  for k ulong body_len bound 2097152
+    put sh_dat add add tl 1 k get sc_prf k
+  end
+  sh_all add add tl 1 body_len
+  for i ulong 32
+    put sc_body_sha i get sh_dig i
+  end
+
+  m = new uchar 65536 0
+  for i ulong 128
+    put m i 0
+  end
+  sc_fill_rcpt_tag m eq get sc_prf 2 83
+  for i ulong 64
+    put m add 32 i get sc_prf i
+  end
+  for i ulong 32
+    put m add 96 i get sc_body_sha i
+  end
+  sd = new uchar 32 0
+  pk = new uchar 32 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put sd i get sc_seed i
+  end
+  ues_pubkey sd pk
+  ues_sign sd m 128 sg
+  for i ulong 32
+    put sc_pk i get pk i
+  end
+  for i ulong 64
+    put sc_sig i get sg i
+  end
+end
+
+fn sc_build_omsat1 to bool
+  nv = get sc_nvars 0
+  tot = add 192 nv
+  if gt tot SC_MAX_PROOF
+    ret false
+  end
+  for i ulong 6
+    put sc_prf i get sc_m_omsat i
+  end
+  sc_prf_u16 6 1
+  sc_prf_u32 8 nv
+  sc_prf_u32 12 get sc_norig 0
+  sc_prf_u64 16 nv
+  sc_prf_u64 24 0
+  for i ulong 32
+    put sc_prf add 32 i get sc_cnf_sha i
+  end
+  for v ulong nv bound 4098
+    vv = get sc_val add v 1
+    b = uchar 0
+    if eq vv SC_TRUE
+      b = uchar 1
+    end
+    put sc_prf add 64 v b
+  end
+  put sc_prf_n 0 add 64 nv
+  sc_sign_envelope sc_dom_sat add 64 nv
+  base = add 64 nv
+  for i ulong 32
+    put sc_prf add base i get sc_body_sha i
+  end
+  for i ulong 32
+    put sc_prf add add base 32 i get sc_pk i
+  end
+  for i ulong 64
+    put sc_prf add add base 64 i get sc_sig i
+  end
+  put sc_prf_n 0 tot
+  for i ulong tot bound 2097152
+    put sh_dat i get sc_prf i
+  end
+  sh_all tot
+  for i ulong 32
+    put sc_prf_sha i get sh_dig i
+  end
+  ret true
+end
+
+fn sc_build_omdr01 to bool
+  body_len = get sc_prf_n 0
+  pay_len = sub body_len 64
+  tot = add body_len 128
+  if gt tot SC_MAX_PROOF
+    ret false
+  end
+  for i ulong 6
+    put sc_prf i get sc_m_omdr i
+  end
+  sc_prf_u16 6 1
+  sc_prf_u32 8 get sc_nvars 0
+  sc_prf_u32 12 get sc_norig 0
+  sc_prf_u32 16 get sc_proof_steps 0
+  fl = ulong 2
+  if ne get sc_flag_lrat 0 0
+    fl = or fl 1
+  end
+  sc_prf_u32 20 fl
+  sc_prf_u64 24 pay_len
+  for i ulong 32
+    put sc_prf add 32 i get sc_cnf_sha i
+  end
+  sc_sign_envelope sc_dom_drat body_len
+  for i ulong 32
+    put sc_prf add body_len i get sc_body_sha i
+  end
+  for i ulong 32
+    put sc_prf add add body_len 32 i get sc_pk i
+  end
+  for i ulong 64
+    put sc_prf add add body_len 64 i get sc_sig i
+  end
+  put sc_prf_n 0 tot
+  for i ulong tot bound 2097152
+    put sh_dat i get sc_prf i
+  end
+  sh_all tot
+  for i ulong 32
+    put sc_prf_sha i get sh_dig i
+  end
+  ret true
+end
+
+fn sc_fill_rcpt_bind verdict ulong to void
+  bl = len sc_dom_bind
+  for i ulong bl bound 32
+    put sh_dat i get sc_dom_bind i
+  end
+  put sh_dat bl 0
+  p = add bl 1
+  for j ulong 4
+    put sh_dat add p j uchar and shr verdict mul j 8 255
+  end
+  p = add p 4
+  for i ulong 32
+    put sh_dat add p i get sc_cnf_sha i
+  end
+  p = add p 32
+  for i ulong 32
+    put sh_dat add p i get sc_prf_sha i
+  end
+  sh_all add p 32
+end
+
+fn sc_build_omsr01 verdict ulong to void
+  for i ulong 352
+    put sc_rcpt i 0
+  end
+  for i ulong 6
+    put sc_rcpt i get sc_m_omsr i
+  end
+  sc_rcpt_u16 6 1
+  dl = len sc_dom_rcpt
+  for i ulong dl bound 24
+    put sc_rcpt add 8 i get sc_dom_rcpt i
+  end
+  sc_rcpt_u32 32 verdict
+  sc_rcpt_u32 36 get sc_nvars 0
+  sc_rcpt_u32 40 get sc_norig 0
+  sc_rcpt_u32 44 get sc_proof_steps 0
+  sc_rcpt_u64 48 get sc_prf_n 0
+  sc_rcpt_u64 56 get sc_conflicts 0
+  for i ulong 32
+    put sc_rcpt add 64 i get sc_cnf_sha i
+  end
+  for i ulong 32
+    put sc_rcpt add 96 i get sc_prf_sha i
+  end
+  sc_fill_rcpt_bind verdict
+  for i ulong 32
+    put sc_rcpt add 128 i get sh_dig i
+  end
+  for i ulong 32
+    put sc_rcpt add 256 i get sc_pk i
+  end
+  m = new uchar 65536 0
+  for i ulong 288
+    put m i get sc_rcpt i
+  end
+  sd = new uchar 32 0
+  for i ulong 32
+    put sd i get sc_seed i
+  end
+  sg = new uchar 64 0
+  ues_sign sd m 288 sg
+  for i ulong 64
+    put sc_rcpt add 288 i get sg i
+  end
+end
+
+note ==== Section 11: File I/O, CLI & Selftest ====
+
+fn sc_read_cnf_file to bool
+  fd = fopen sc_in_path 0 get sc_in_path_n 0 0 0
+  if lt fd 0
+    ret false
+  end
+  tot = ulong 0
+  eof = false
+  while lt tot SC_MAX_CNF bound 1024
+    remc = sub SC_MAX_CNF tot
+    if gt remc 65536
+      remc = ulong 65536
+    end
+    k = read int fd sc_cnf tot remc
+    if lt k 0
+      z = fclose int fd
+      ret false
+    end
+    if eq k 0
+      eof = true
+      break
+    end
+    tot = add tot ulong k
+  end
+  if not eof
+    ex = read int fd sc_probe 0 1
+    if ne ex 0
+      z = fclose int fd
+      ret false
+    end
+  end
+  z = fclose int fd
+  put sc_cnf_n 0 tot
+  ret true
+end
+
+fn sc_write_out_prf to bool
+  fd = fopen sc_out_path 0 get sc_out_path_n 0 577 420
+  if lt fd 0
+    ret false
+  end
+  n = get sc_prf_n 0
+  off = ulong 0
+  while lt off n bound 1024
+    want = sub n off
+    if gt want 65536
+      want = ulong 65536
+    end
+    w = write int fd sc_prf off want
+    if le w 0
+      z = fclose int fd
+      ret false
+    end
+    off = add off ulong w
+  end
+  z = fclose int fd
+  ret true
+end
+
+fn sc_write_rcpt_file to bool
+  fd = fopen sc_rcpt_path 0 get sc_rcpt_path_n 0 577 420
+  if lt fd 0
+    ret false
+  end
+  off = ulong 0
+  while lt off 352 bound 16
+    w = write int fd sc_rcpt off sub 352 off
+    if le w 0
+      z = fclose int fd
+      ret false
+    end
+    off = add off ulong w
+  end
+  z = fclose int fd
+  ret true
+end
+
+fn sc_arg_eq idx ulong lit view uchar * to bool
+  rn = argread idx sc_arg 0 4000
+  if ne rn long len lit
+    ret false
+  end
+  for i ulong len lit bound 128
+    if ne get sc_arg i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn sc_copy_arg_to idx ulong which ulong to bool
+  rn = argread idx sc_arg 0 1020
+  if le rn 0
+    ret false
+  end
+  u = ulong rn
+  if and eq which 3 gt u 120
+    ret false
+  end
+  for i ulong u bound 1024
+    b = get sc_arg i
+    if eq which 0
+      put sc_in_path i b
+    end
+    if eq which 1
+      put sc_out_path i b
+    end
+    if eq which 2
+      put sc_rcpt_path i b
+    end
+    if eq which 3
+      put sc_stag i b
+    end
+  end
+  if eq which 0
+    put sc_in_path_n 0 u
+    put sc_have_in 0 1
+  end
+  if eq which 1
+    put sc_out_path_n 0 u
+    put sc_have_out 0 1
+  end
+  if eq which 2
+    put sc_rcpt_path_n 0 u
+    put sc_have_rcpt 0 1
+  end
+  if eq which 3
+    put sc_stag_n 0 u
+  end
+  ret true
+end
+
+fn sc_parse_args to bool
+  put sc_cmd 0 0
+  put sc_have_in 0 0
+  put sc_have_out 0 0
+  put sc_have_rcpt 0 0
+  put sc_stag_n 0 0
+  put sc_flag_lrat 0 1
+  put sc_flag_del 0 1
+
+  ac = ulong argcnt
+  if lt ac 2
+    ret false
+  end
+  if or sc_arg_eq 1 sc_c_help sc_arg_eq 1 sc_c_h
+    ret false
+  end
+  if sc_arg_eq 1 sc_c_self
+    put sc_cmd 0 1
+    ret eq ac 2
+  end
+  if not sc_arg_eq 1 sc_c_solve
+    ret false
+  end
+  put sc_cmd 0 2
+  i = ulong 2
+  while lt i ac bound 32
+    if sc_arg_eq i sc_f_nolrat
+      put sc_flag_lrat 0 0
+      i = add i 1
+      continue
+    end
+    if sc_arg_eq i sc_f_nodel
+      put sc_flag_del 0 0
+      i = add i 1
+      continue
+    end
+    if ge add i 1 ac
+      ret false
+    end
+    if sc_arg_eq i sc_f_in
+      if not sc_copy_arg_to add i 1 0
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    if sc_arg_eq i sc_f_out
+      if not sc_copy_arg_to add i 1 1
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    if sc_arg_eq i sc_f_rcpt
+      if not sc_copy_arg_to add i 1 2
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    if sc_arg_eq i sc_f_stag
+      if not sc_copy_arg_to add i 1 3
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    ret false
+  end
+  ret and eq get sc_have_in 0 1 eq get sc_have_out 0 1
+end
+
+fn sc_load_text_cnf s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    put sc_cnf i get s i
+  end
+  put sc_cnf_n 0 n
+end
+
+fn sc_verify_self_sig is_sat bool to bool
+  m = new uchar 65536 0
+  for i ulong 128
+    put m i 0
+  end
+  sc_fill_rcpt_tag m is_sat
+  for i ulong 64
+    put m add 32 i get sc_prf i
+  end
+  for i ulong 32
+    put m add 96 i get sc_body_sha i
+  end
+  pk = new uchar 32 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get sc_pk i
+  end
+  for i ulong 64
+    put sg i get sc_sig i
+  end
+  ret eq edverify pk m 128 sg 0 1
+end
+
+fn sc_run_selftest to int
+  put sc_flag_lrat 0 1
+  put sc_flag_del 0 1
+  put sc_stag_n 0 0
+  if ne sc_luby 1 1
+    ret 1
+  end
+  if ne sc_luby 2 1
+    ret 1
+  end
+  if ne sc_luby 3 2
+    ret 1
+  end
+  if ne sc_luby 7 4
+    ret 1
+  end
+  sc_load_text_cnf sc_st_sat_cnf
+  sc_hash_cnf
+  rc1 = sc_parse_and_load
+  if eq rc1 SC_EXIT_OK
+    rc1 = sc_solve_cdcl
+  end
+  if ne rc1 SC_EXIT_SAT
+    ret 2
+  end
+  if not sc_build_omsat1
+    ret 3
+  end
+  if not sc_verify_self_sig true
+    ret 4
+  end
+
+  sc_load_text_cnf sc_st_php32
+  sc_hash_cnf
+  rc2 = sc_parse_and_load
+  if eq rc2 SC_EXIT_OK
+    rc2 = sc_solve_cdcl
+  end
+  if ne rc2 SC_EXIT_UNSAT
+    ret 5
+  end
+  if not sc_build_omdr01
+    ret 6
+  end
+  if not sc_verify_self_sig false
+    ret 7
+  end
+  sc_wrt 1 sc_msg_self
+  ret SC_EXIT_OK
+end
+
+fn sc_print_solve_summary is_sat bool to void
+  if is_sat
+    sc_wrt 1 sc_msg_sat1
+  else
+    sc_wrt 1 sc_msg_uns1
+  end
+  sc_num 1 get sc_nvars 0
+  sc_wrt 1 sc_msg_cl
+  sc_num 1 get sc_norig 0
+  if not is_sat
+    sc_wrt 1 sc_msg_lrn
+    sc_num 1 get sc_learned_cnt 0
+    sc_wrt 1 sc_msg_del
+    sc_num 1 get sc_deleted_cnt 0
+    sc_wrt 1 sc_msg_stp
+    sc_num 1 get sc_proof_steps 0
+  end
+  sc_wrt 1 sc_msg_cfl
+  sc_num 1 get sc_conflicts 0
+  sc_wrt 1 sc_msg_dec
+  sc_num 1 get sc_decisions 0
+  sc_wrt 1 sc_msg_byt
+  sc_num 1 get sc_prf_n 0
+  sc_wrt 1 sc_msg_sha
+  sc_hex_prf 1
+  sc_wrt 1 sc_nl
+end
+
+fn main to int
+  if not sc_parse_args
+    sc_wrt 2 sc_u_msg
+    ret SC_EXIT_USAGE
+  end
+  if eq get sc_cmd 0 1
+    rc = sc_run_selftest
+    if ne rc SC_EXIT_OK
+      ret sc_fail rc
+    end
+    ret SC_EXIT_OK
+  end
+
+  if not sc_read_cnf_file
+    ret sc_fail SC_EXIT_IO
+  end
+  sc_hash_cnf
+  rc = sc_parse_and_load
+  if eq rc SC_EXIT_OK
+    rc = sc_solve_cdcl
+  end
+  if eq rc SC_EXIT_SAT
+    if not sc_build_omsat1
+      ret sc_fail SC_EXIT_LIMIT
+    end
+    if not sc_write_out_prf
+      ret sc_fail SC_EXIT_IO
+    end
+    if eq get sc_have_rcpt 0 1
+      sc_build_omsr01 10
+      if not sc_write_rcpt_file
+        ret sc_fail SC_EXIT_IO
+      end
+    end
+    sc_print_solve_summary true
+    ret SC_EXIT_SAT
+  end
+  if eq rc SC_EXIT_UNSAT
+    if not sc_build_omdr01
+      ret sc_fail SC_EXIT_LIMIT
+    end
+    if not sc_write_out_prf
+      ret sc_fail SC_EXIT_IO
+    end
+    if eq get sc_have_rcpt 0 1
+      sc_build_omsr01 20
+      if not sc_write_rcpt_file
+        ret sc_fail SC_EXIT_IO
+      end
+    end
+    sc_print_solve_summary false
+    ret SC_EXIT_UNSAT
+  end
+  ret sc_fail rc
+end

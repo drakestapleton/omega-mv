@@ -1,0 +1,2151 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-sat/sat_check.om
+note Wave 5 Alien Breakthrough: Independent Zero-Shared-Code SAT Witness & RUP/DRAT/LRAT Verifier.
+note
+note Compose after (verification-only crypto libs; ZERO solver code, ZERO ed_sign.om):
+note   si/directives/om2.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note
+note Independent Algorithms:
+note   - Separate strict DIMACS CNF parser + raw-byte SHA-256 binding check
+note   - Independent SAT assignment evaluator (OMSAT1: exact length, {0,1} domain, every clause SAT)
+note   - Independent occurrence-list + falsified-counter RUP/DRAT/LRAT verifier (OMDR01 + ASCII .drat)
+note   - Standalone 352-byte OMSR01 Ed25519/SHA-256 receipt verifier
+note
+note Fail-Closed Exit Codes:
+note   0  = VALID
+note   2  = usage error
+note   3  = I/O error
+note   4  = CNF parse error
+note   5  = capacity limit
+note   60 = CK_ERR_FORMAT      (magic/version/length/truncation/trailing-byte tamper)
+note   61 = CK_ERR_HASH        (cnf_sha256 / body_sha256 / bind_digest mismatch)
+note   62 = CK_ERR_SIG         (Ed25519 RFC 8032 strict signature or pubkey mismatch)
+note   63 = CK_ERR_SAT_WITNESS (witness byte not 0/1 or falsifies at least one clause)
+note   64 = CK_ERR_PROOF_LIT   (bad op, lit=0, |lit|>nvars, empty-clause delete, malformed DRAT)
+note   65 = CK_ERR_NOT_RUP     (added clause fails RUP and DRAT check)
+note   66 = CK_ERR_NO_EMPTY    (UNSAT proof lacks empty clause [] or has trailing steps after [])
+note   67 = CK_ERR_BAD_HINT    (LRAT hint ID invalid/deleted or fails causal conflict check)
+note Zero C, zero Python, zero Rust, zero gcc, zero GPU hardware writes (hw_writes=0).
+
+const CK_MAX_VARS ulong 4096
+const CK_MAX_LITS ulong 8196
+const CK_MAX_CLAUSES ulong 65536
+const CK_MAX_POOL ulong 524288
+const CK_MAX_OCC ulong 1048576
+const CK_MAX_CNF ulong 1048576
+const CK_MAX_PROOF ulong 2097152
+const CK_INVALID ulong 0xffffffff
+
+const CK_UNDEF ulong 0
+const CK_TRUE ulong 1
+const CK_FALSE ulong 2
+
+const CK_OK int 0
+const CK_ERR_USAGE int 2
+const CK_ERR_IO int 3
+const CK_ERR_CNF int 4
+const CK_ERR_LIMIT int 5
+const CK_ERR_FORMAT int 60
+const CK_ERR_HASH int 61
+const CK_ERR_SIG int 62
+const CK_ERR_SAT int 63
+const CK_ERR_LIT int 64
+const CK_ERR_RUP int 65
+const CK_ERR_EMPTY int 66
+const CK_ERR_HINT int 67
+
+note ---- Arguments, Buffers & Verification State ----
+
+global ck_arg uchar 4096
+global ck_p_cnf uchar 1024
+global ck_p_cnf_n ulong 1
+global ck_p_prf uchar 1024
+global ck_p_prf_n ulong 1
+global ck_p_rcpt uchar 1024
+global ck_p_rcpt_n ulong 1
+
+global ck_have_cnf ulong 1
+global ck_have_prf ulong 1
+global ck_have_rcpt ulong 1
+global ck_have_pk ulong 1
+global ck_cmd ulong 1
+global ck_exp_pk uchar 32
+
+global ck_cnf uchar 1048576
+global ck_cnf_n ulong 1
+global ck_cnf_sha uchar 32
+global ck_prf uchar 2097152
+global ck_prf_n ulong 1
+global ck_prf_sha uchar 32
+global ck_rcpt uchar 352
+global ck_probe uchar 4
+global ck_dig uchar 32
+global ck_hex uchar 64
+
+global ck_nvars ulong 1
+global ck_norig ulong 1
+global ck_nclauses ulong 1
+global ck_pool_top ulong 1
+global ck_occ_top ulong 1
+global ck_empty_orig ulong 1
+
+global ck_cl_off ulong 65536
+global ck_cl_len ulong 65536
+global ck_cl_active ulong 65536
+global ck_cl_taut ulong 65536
+global ck_cl_hash ulong 65536
+global ck_false_cnt ulong 65536
+global ck_pool ulong 524288
+
+global ck_occ_head ulong 8196
+global ck_occ_cid ulong 1048576
+global ck_occ_next ulong 1048576
+
+global ck_unit_cids ulong 65536
+global ck_unit_n ulong 1
+
+global ck_val ulong 4098
+global ck_trail ulong 4098
+global ck_trail_n ulong 1
+global ck_dirty ulong 65536
+global ck_dirty_n ulong 1
+
+global ck_step_lits ulong 8196
+global ck_step_n ulong 1
+global ck_step_pivot ulong 1
+global ck_step_taut ulong 1
+global ck_seen ulong 8196
+global ck_stamp ulong 1
+global ck_hints ulong 16384
+global ck_hints_n ulong 1
+
+global ck_hdr_nv ulong 1
+global ck_hdr_nc ulong 1
+global ck_hdr_ns ulong 1
+global ck_hdr_fl ulong 1
+global ck_hdr_pl ulong 1
+global ck_res_steps ulong 1
+global ck_res_dels ulong 1
+global ck_res_rats ulong 1
+global ck_rcpt_ver ulong 1
+global ck_rcpt_nv ulong 1
+global ck_rcpt_nc ulong 1
+global ck_rcpt_st ulong 1
+
+global ck_rat_cids ulong 65536
+global ck_rat_n ulong 1
+global ck_allow_rat ulong 1
+global ck_has_lrat ulong 1
+global ck_saw_empty ulong 1
+global ck_is_drat_txt ulong 1
+
+text ck_m_omsat "OMSAT1"
+text ck_m_omdr "OMDR01"
+text ck_m_omsr "OMSR01"
+text ck_dom_sat "OMSAT1-BODY-V1"
+text ck_dom_drat "OMDR01-BODY-V1"
+text ck_env_sat "OMEGA-SAT1-RCPT-V1"
+text ck_env_drat "OMEGA-DRAT1-RCPT-V1"
+text ck_dom_rcpt "OMEGA-SAT-RECEIPT-V1"
+text ck_dom_bind "OMEGA-SAT-BIND-V1"
+
+text ck_c_self "selftest"
+text ck_c_ver "verify"
+text ck_c_vdrat "verify-drat"
+text ck_c_vrcpt "verify-receipt"
+text ck_c_insp "inspect"
+text ck_c_help "--help"
+text ck_c_h "-h"
+
+text ck_f_cnf "--cnf"
+text ck_f_prf "--proof"
+text ck_f_drat "--drat"
+text ck_f_rcpt "--receipt"
+text ck_f_pk "--pubkey"
+
+text ck_u_msg "usage: sat_check <selftest | verify --cnf F --proof P [--pubkey HEX] | verify-drat --cnf F --drat D | verify-receipt --receipt R [--cnf F] [--proof P] [--pubkey HEX] | inspect (--proof P | --receipt R)>\n"
+text ck_msg_fail "SAT_CHECK FAIL code="
+text ck_msg_ok_sat "SAT_CHECK PASS kind=OMSAT1 vars="
+text ck_msg_ok_drat "SAT_CHECK PASS kind=OMDR01 vars="
+text ck_msg_ok_tx "SAT_CHECK PASS kind=DRAT_TXT vars="
+text ck_msg_ok_rcpt "SAT_CHECK PASS kind=OMSR01 verdict="
+text ck_msg_ins_sat "SAT_CHECK INSPECT kind=OMSAT1 vars="
+text ck_msg_ins_drat "SAT_CHECK INSPECT kind=OMDR01 vars="
+text ck_msg_ins_rcpt "SAT_CHECK INSPECT kind=OMSR01 verdict="
+text ck_msg_cl " clauses="
+text ck_msg_stp " steps="
+text ck_msg_del " deletions="
+text ck_msg_lrat " lrat="
+text ck_msg_rat " rat_steps="
+text ck_msg_byt " bytes="
+text ck_msg_sha " sha256="
+text ck_msg_pk " pubkey="
+text ck_msg_self "SAT_CHECK SELFTEST PASS sat=0 rup_php32=0 drat_rat=0 neg_flip=63 neg_rup=65 neg_empty=66\n"
+text ck_nl "\n"
+
+text ck_st_sat_cnf "p cnf 3 3\n1 2 0\n-1 3 0\n-2 3 0\n"
+text ck_st_php32 "p cnf 6 9\n1 2 0\n3 4 0\n5 6 0\n-1 -3 0\n-1 -5 0\n-3 -5 0\n-2 -4 0\n-2 -6 0\n-4 -6 0\n"
+text ck_st_php32_drat "-1 0\n-3 0\n-5 0\n0\n"
+text ck_st_rat_cnf "p cnf 9 12\n1 2 0\n3 4 0\n5 6 0\n-1 -3 0\n-1 -5 0\n-3 -5 0\n-2 -4 0\n-2 -6 0\n-4 -6 0\n7 8 0\n-7 -8 0\n-9 -7 8 0\n"
+text ck_st_rat_ok "9 7 -8 0\n-1 0\n-3 0\n-5 0\n0\n"
+text ck_st_rat_bad "p cnf 2 2\n-1 2 0\n-1 -2 0\n"
+text ck_st_bad_rup "1 0\n0\n"
+text ck_st_no_emp "-1 0\n-3 0\n"
+
+note ==== Section 1: Printing & Little-Endian Decoders ====
+
+fn ck_wrt fd int s view uchar * to void
+  p = ulong 0
+  n = len s
+  while lt p n bound 4096
+    k = write int fd s p sub n p
+    if le k 0
+      ret
+    end
+    p = add p ulong k
+  end
+end
+
+fn ck_num fd int v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put ck_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      z = write int fd ck_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn ck_hex32 fd int arr view uchar 32 to void
+  for i ulong 32
+    b = uint get arr i
+    put ck_hex mul i 2 sh_hexd shr b 4
+    put ck_hex add mul i 2 1 sh_hexd and b 15
+  end
+  z = write int fd ck_hex 0 64
+end
+
+fn ck_hex_prf fd int to void
+  for i ulong 32
+    b = uint get ck_prf_sha i
+    put ck_hex mul i 2 sh_hexd shr b 4
+    put ck_hex add mul i 2 1 sh_hexd and b 15
+  end
+  z = write int fd ck_hex 0 64
+end
+
+fn ck_fail code int to int
+  ck_wrt 2 ck_msg_fail
+  ck_num 2 ulong code
+  ck_wrt 2 ck_nl
+  ret code
+end
+
+fn ck_prf_u16 p ulong to ulong
+  b0 = ulong get ck_prf p
+  b1 = ulong get ck_prf add p 1
+  ret or b0 shl b1 8
+end
+
+fn ck_prf_u32 p ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    v = or v shl ulong get ck_prf add p i mul i 8
+  end
+  ret v
+end
+
+fn ck_prf_u64 p ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get ck_prf add p i mul i 8
+  end
+  ret v
+end
+
+fn ck_prf_i32 p ulong to long
+  u = ck_prf_u32 p
+  if ge u 2147483648
+    ret sub 0 long sub 4294967296 u
+  end
+  ret long u
+end
+
+fn ck_rcpt_u16 p ulong to ulong
+  b0 = ulong get ck_rcpt p
+  b1 = ulong get ck_rcpt add p 1
+  ret or b0 shl b1 8
+end
+
+fn ck_rcpt_u32 p ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    v = or v shl ulong get ck_rcpt add p i mul i 8
+  end
+  ret v
+end
+
+fn ck_rcpt_u64 p ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get ck_rcpt add p i mul i 8
+  end
+  ret v
+end
+
+note ==== Section 2: Hashing & Ed25519 Signature Verification ====
+
+fn ck_hash_cnf to void
+  n = get ck_cnf_n 0
+  for i ulong n bound 1048576
+    put sh_dat i get ck_cnf i
+  end
+  sh_all n
+  for i ulong 32
+    put ck_cnf_sha i get sh_dig i
+  end
+end
+
+fn ck_hash_prf to void
+  n = get ck_prf_n 0
+  for i ulong n bound 2097152
+    put sh_dat i get ck_prf i
+  end
+  sh_all n
+  for i ulong 32
+    put ck_prf_sha i get sh_dig i
+  end
+end
+
+fn ck_chk_body_sha tag view uchar * body_len ulong sha_off ulong to bool
+  tl = len tag
+  for i ulong tl bound 64
+    put sh_dat i get tag i
+  end
+  put sh_dat tl 0
+  for i ulong body_len bound 2097152
+    put sh_dat add add tl 1 i get ck_prf i
+  end
+  sh_all add add tl 1 body_len
+  for i ulong 32
+    if ne get sh_dig i get ck_prf add sha_off i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ck_chk_pk_nonzero pk view uchar 32 to bool
+  nz = ulong 0
+  for i ulong 32
+    nz = or nz ulong get pk i
+  end
+  if eq nz 0
+    ret false
+  end
+  if ne get ck_have_pk 0 0
+    for i ulong 32
+      if ne get pk i get ck_exp_pk i
+        ret false
+      end
+    end
+  end
+  ret true
+end
+
+fn ck_fill_prf_msg m edit uchar 65536 env_tag view uchar * sha_off ulong to void
+  for i ulong 128
+    put m i 0
+  end
+  tl = len env_tag
+  for i ulong tl bound 32
+    put m i get env_tag i
+  end
+  for i ulong 64
+    put m add 32 i get ck_prf i
+  end
+  for i ulong 32
+    put m add 96 i get ck_prf add sha_off i
+  end
+end
+
+fn ck_chk_prf_ed25519 env_tag view uchar * sha_off ulong to bool
+  pk = new uchar 32 0
+  for i ulong 32
+    put pk i get ck_prf add add sha_off 32 i
+  end
+  if not ck_chk_pk_nonzero pk
+    ret false
+  end
+  sg = new uchar 64 0
+  for i ulong 64
+    put sg i get ck_prf add add sha_off 64 i
+  end
+  m = new uchar 65536 0
+  ck_fill_prf_msg m env_tag sha_off
+  ret eq edverify pk m 128 sg 0 1
+end
+
+note ==== Section 3: Independent Clause DB & Occurrence Index ====
+
+fn ck_reset_db to void
+  put ck_nvars 0 0
+  put ck_norig 0 0
+  put ck_nclauses 0 0
+  put ck_pool_top 0 0
+  put ck_occ_top 0 0
+  put ck_unit_n 0 0
+  put ck_empty_orig 0 0
+  put ck_trail_n 0 0
+  put ck_dirty_n 0 0
+  put ck_stamp 0 0
+  for i ulong CK_MAX_LITS
+    put ck_occ_head i CK_INVALID
+    put ck_seen i 0
+  end
+  for i ulong 4098
+    put ck_val i CK_UNDEF
+  end
+end
+
+fn ck_lit_val l ulong to ulong
+  v = shr l 1
+  vv = get ck_val v
+  if eq vv CK_UNDEF
+    ret CK_UNDEF
+  end
+  if eq and l 1 0
+    ret vv
+  end
+  if eq vv CK_TRUE
+    ret CK_FALSE
+  end
+  ret CK_TRUE
+end
+
+fn ck_hash_step_lits to ulong
+  h = ulong 0
+  n = get ck_step_n 0
+  for i ulong n bound 8196
+    l = get ck_step_lits i
+    mix = mul l 11400714819323198485
+    mix = xor mix shr mix 3
+    h = add h mix
+  end
+  ret h
+end
+
+fn ck_occ_push lit ulong cid ulong to bool
+  oid = get ck_occ_top 0
+  if ge oid CK_MAX_OCC
+    ret false
+  end
+  put ck_occ_cid oid cid
+  put ck_occ_next oid get ck_occ_head lit
+  put ck_occ_head lit oid
+  put ck_occ_top 0 add oid 1
+  ret true
+end
+
+fn ck_db_push_step to ulong
+  cid = get ck_nclauses 0
+  if ge cid CK_MAX_CLAUSES
+    ret CK_INVALID
+  end
+  sn = get ck_step_n 0
+  top = get ck_pool_top 0
+  if gt add top sn CK_MAX_POOL
+    ret CK_INVALID
+  end
+  taut = get ck_step_taut 0
+  for i ulong sn bound 8196
+    put ck_pool add top i get ck_step_lits i
+  end
+  put ck_cl_off cid top
+  put ck_cl_len cid sn
+  put ck_cl_taut cid taut
+  put ck_cl_hash cid ck_hash_step_lits
+  put ck_false_cnt cid 0
+  put ck_pool_top 0 add top sn
+  put ck_nclauses 0 add cid 1
+  if eq taut 0
+    put ck_cl_active cid 1
+    if eq sn 1
+      un = get ck_unit_n 0
+      if ge un CK_MAX_CLAUSES
+        ret CK_INVALID
+      end
+      put ck_unit_cids un cid
+      put ck_unit_n 0 add un 1
+    end
+    for i ulong sn bound 8196
+      if not ck_occ_push get ck_step_lits i cid
+        ret CK_INVALID
+      end
+    end
+  else
+    put ck_cl_active cid 0
+  end
+  ret cid
+end
+
+fn ck_begin_step to void
+  put ck_step_n 0 0
+  put ck_step_taut 0 0
+  put ck_step_pivot 0 CK_INVALID
+  put ck_stamp 0 add get ck_stamp 0 1
+end
+
+fn ck_push_lit_raw val long nvars ulong to int
+  if eq val 0
+    ret CK_ERR_LIT
+  end
+  av = ulong 0
+  if lt val 0
+    av = ulong sub 0 val
+  else
+    av = ulong val
+  end
+  if or eq av 0 gt av nvars
+    ret CK_ERR_LIT
+  end
+  code = mul av 2
+  if lt val 0
+    code = add code 1
+  end
+  if eq get ck_step_pivot 0 CK_INVALID
+    put ck_step_pivot 0 code
+  end
+  st = get ck_stamp 0
+  if eq get ck_seen xor code 1 st
+    put ck_step_taut 0 1
+    ret CK_OK
+  end
+  if eq get ck_seen code st
+    ret CK_OK
+  end
+  put ck_seen code st
+  sn = get ck_step_n 0
+  if ge sn 8192
+    ret CK_ERR_LIMIT
+  end
+  put ck_step_lits sn code
+  put ck_step_n 0 add sn 1
+  ret CK_OK
+end
+
+note ==== Section 4: Independent DIMACS CNF Parser ====
+
+fn ck_skip_ws buf_kind ulong p ulong n ulong to ulong
+  i = p
+  while lt i n bound 2097152
+    b = uchar 0
+    if eq buf_kind 0
+      b = get ck_cnf i
+    else
+      b = get ck_prf i
+    end
+    if or eq b 32 or eq b 9 or eq b 13 eq b 10
+      i = add i 1
+    else
+      ret i
+    end
+  end
+  ret i
+end
+
+fn ck_skip_line buf_kind ulong p ulong n ulong to ulong
+  i = p
+  while lt i n bound 2097152
+    b = uchar 0
+    if eq buf_kind 0
+      b = get ck_cnf i
+    else
+      b = get ck_prf i
+    end
+    i = add i 1
+    if eq b 10
+      ret i
+    end
+  end
+  ret i
+end
+
+fn ck_skip_ws_comm buf_kind ulong p ulong n ulong to ulong
+  i = p
+  while lt i n bound 2097152
+    i = ck_skip_ws buf_kind i n
+    if ge i n
+      ret i
+    end
+    b = uchar 0
+    if eq buf_kind 0
+      b = get ck_cnf i
+    else
+      b = get ck_prf i
+    end
+    if eq b 99
+      i = ck_skip_line buf_kind i n
+    else
+      ret i
+    end
+  end
+  ret i
+end
+
+fn ck_parse_uint buf_kind ulong p ulong n ulong out_v edit ulong 1 out_p edit ulong 1 to bool
+  if ge p n
+    ret false
+  end
+  b = uchar 0
+  if eq buf_kind 0
+    b = get ck_cnf p
+  else
+    b = get ck_prf p
+  end
+  if or lt b 48 gt b 57
+    ret false
+  end
+  v = ulong 0
+  i = p
+  while lt i n bound 32
+    c = uchar 0
+    if eq buf_kind 0
+      c = get ck_cnf i
+    else
+      c = get ck_prf i
+    end
+    if or lt c 48 gt c 57
+      break
+    end
+    d = ulong sub c 48
+    if gt v 1844674407370955161
+      ret false
+    end
+    v = add mul v 10 d
+    i = add i 1
+  end
+  put out_v 0 v
+  put out_p 0 i
+  ret true
+end
+
+fn ck_parse_int buf_kind ulong p ulong n ulong out_v edit long 1 out_p edit ulong 1 to bool
+  if ge p n
+    ret false
+  end
+  sgn = long 1
+  i = p
+  b = uchar 0
+  if eq buf_kind 0
+    b = get ck_cnf i
+  else
+    b = get ck_prf i
+  end
+  if eq b 45
+    sgn = long -1
+    i = add i 1
+  else
+    if eq b 43
+      i = add i 1
+    end
+  end
+  uv = new ulong 1 0
+  np = new ulong 1 0
+  if not ck_parse_uint buf_kind i n uv np
+    ret false
+  end
+  if gt get uv 0 2147483647
+    ret false
+  end
+  put out_v 0 mul sgn long get uv 0
+  put out_p 0 get np 0
+  ret true
+end
+
+fn ck_match_p_cnf p ulong n ulong to ulong
+  i = ck_skip_ws_comm 0 p n
+  if ge add i 5 n
+    ret CK_INVALID
+  end
+  if ne get ck_cnf i 112
+    ret CK_INVALID
+  end
+  i = ck_skip_ws 0 add i 1 n
+  if ge add i 3 n
+    ret CK_INVALID
+  end
+  if ne get ck_cnf i 99
+    ret CK_INVALID
+  end
+  if ne get ck_cnf add i 1 110
+    ret CK_INVALID
+  end
+  if ne get ck_cnf add i 2 102
+    ret CK_INVALID
+  end
+  i = add i 3
+  if lt i n
+    b = get ck_cnf i
+    if and ne b 32 and ne b 9 ne b 13
+      if ne b 10
+        ret CK_INVALID
+      end
+    end
+  end
+  ret ck_skip_ws 0 i n
+end
+
+fn ck_parse_cnf_header p ulong n ulong out_v edit ulong 1 out_c edit ulong 1 out_p edit ulong 1 to bool
+  i = ck_match_p_cnf p n
+  if eq i CK_INVALID
+    ret false
+  end
+  np = new ulong 1 0
+  if not ck_parse_uint 0 i n out_v np
+    ret false
+  end
+  i = ck_skip_ws 0 get np 0 n
+  if not ck_parse_uint 0 i n out_c np
+    ret false
+  end
+  put out_p 0 get np 0
+  ret true
+end
+
+fn ck_commit_cnf_clause to int
+  if eq get ck_step_n 0 0
+    if eq get ck_step_taut 0 0
+      put ck_empty_orig 0 1
+    end
+  end
+  cid = ck_db_push_step
+  if eq cid CK_INVALID
+    ret CK_ERR_LIMIT
+  end
+  ck_begin_step
+  ret CK_OK
+end
+
+fn ck_parse_cnf_clauses p_in ulong n ulong nvars ulong ncls ulong to int
+  p = p_in
+  read_cls = ulong 0
+  lv = new long 1 0
+  np = new ulong 1 0
+  ck_begin_step
+
+  while true bound 1048576
+    p = ck_skip_ws_comm 0 p n
+    if ge p n
+      break
+    end
+    if not ck_parse_int 0 p n lv np
+      ret CK_ERR_CNF
+    end
+    p = get np 0
+    val = get lv 0
+    if eq val 0
+      read_cls = add read_cls 1
+      if gt read_cls ncls
+        ret CK_ERR_CNF
+      end
+      crc = ck_commit_cnf_clause
+      if ne crc CK_OK
+        ret crc
+      end
+    else
+      rc = ck_push_lit_raw val nvars
+      if ne rc CK_OK
+        ret CK_ERR_CNF
+      end
+    end
+  end
+  if ne get ck_step_n 0 0
+    ret CK_ERR_CNF
+  end
+  if ne get ck_step_taut 0 0
+    ret CK_ERR_CNF
+  end
+  if ne read_cls ncls
+    ret CK_ERR_CNF
+  end
+  ret CK_OK
+end
+
+fn ck_parse_cnf to int
+  ck_reset_db
+  n = get ck_cnf_n 0
+  nv = new ulong 1 0
+  nc = new ulong 1 0
+  pos = new ulong 1 0
+  if not ck_parse_cnf_header 0 n nv nc pos
+    ret CK_ERR_CNF
+  end
+  nvars = get nv 0
+  ncls = get nc 0
+  if or gt nvars CK_MAX_VARS gt ncls CK_MAX_CLAUSES
+    ret CK_ERR_LIMIT
+  end
+  put ck_nvars 0 nvars
+  put ck_norig 0 ncls
+  ret ck_parse_cnf_clauses get pos 0 n nvars ncls
+end
+
+note ==== Section 5: Independent SAT Witness Evaluator (OMSAT1) ====
+
+fn ck_eval_clause cid ulong to bool
+  if ne get ck_cl_taut cid 0
+    ret true
+  end
+  off = get ck_cl_off cid
+  cln = get ck_cl_len cid
+  for j ulong cln bound 8196
+    l = get ck_pool add off j
+    if eq ck_lit_val l CK_TRUE
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ck_verify_omsat1 to int
+  fl = get ck_prf_n 0
+  if lt fl 192
+    ret CK_ERR_FORMAT
+  end
+  for i ulong 6
+    if ne get ck_prf i get ck_m_omsat i
+      ret CK_ERR_FORMAT
+    end
+  end
+  if ne ck_prf_u16 6 1
+    ret CK_ERR_FORMAT
+  end
+  nv = ck_prf_u32 8
+  nc = ck_prf_u32 12
+  pl = ck_prf_u64 16
+  rsv = ck_prf_u64 24
+  if or ne rsv 0 ne pl nv
+    ret CK_ERR_FORMAT
+  end
+  if ne fl add 192 nv
+    ret CK_ERR_FORMAT
+  end
+  for i ulong 32
+    if ne get ck_prf add 32 i get ck_cnf_sha i
+      ret CK_ERR_HASH
+    end
+  end
+  body_len = add 64 nv
+  if not ck_chk_body_sha ck_dom_sat body_len body_len
+    ret CK_ERR_HASH
+  end
+  if not ck_chk_prf_ed25519 ck_env_sat body_len
+    ret CK_ERR_SIG
+  end
+  if or ne nv get ck_nvars 0 ne nc get ck_norig 0
+    ret CK_ERR_SAT
+  end
+  for v ulong nv bound 4098
+    b = get ck_prf add 64 v
+    if eq b 0
+      put ck_val add v 1 CK_FALSE
+    else
+      if eq b 1
+        put ck_val add v 1 CK_TRUE
+      else
+        ret CK_ERR_SAT
+      end
+    end
+  end
+  for cid ulong nc bound 65536
+    if not ck_eval_clause cid
+      ret CK_ERR_SAT
+    end
+  end
+  put ck_hdr_nv 0 nv
+  put ck_hdr_nc 0 nc
+  ret CK_OK
+end
+
+note ==== Section 6: Independent Occurrence-Counter RUP / DRAT / LRAT Verifier ====
+
+fn ck_assign_lit l ulong to ulong
+  cur = ck_lit_val l
+  if eq cur CK_TRUE
+    ret 0
+  end
+  if eq cur CK_FALSE
+    ret 2
+  end
+  v = shr l 1
+  if eq and l 1 0
+    put ck_val v CK_TRUE
+  else
+    put ck_val v CK_FALSE
+  end
+  tn = get ck_trail_n 0
+  put ck_trail tn l
+  put ck_trail_n 0 add tn 1
+  ret 1
+end
+
+fn ck_rollback_trail to void
+  dn = get ck_dirty_n 0
+  for i ulong dn bound 65536
+    put ck_false_cnt get ck_dirty i 0
+  end
+  put ck_dirty_n 0 0
+  tn = get ck_trail_n 0
+  for i ulong tn bound 4098
+    l = get ck_trail i
+    put ck_val shr l 1 CK_UNDEF
+  end
+  put ck_trail_n 0 0
+end
+
+fn ck_seed_active_units to bool
+  un = get ck_unit_n 0
+  for i ulong un bound 65536
+    ucid = get ck_unit_cids i
+    if eq get ck_cl_active ucid 1
+      ul = get ck_pool get ck_cl_off ucid
+      st = ck_assign_lit ul
+      if eq st 2
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn ck_find_unit_lit cid ulong to ulong
+  off = get ck_cl_off cid
+  cln = get ck_cl_len cid
+  for j ulong cln bound 8196
+    u = get ck_pool add off j
+    lv = ck_lit_val u
+    if eq lv CK_TRUE
+      ret CK_INVALID
+    end
+    if eq lv CK_UNDEF
+      ret u
+    end
+  end
+  ret CK_INVALID
+end
+
+fn ck_visit_occ cid ulong to bool
+  fc = get ck_false_cnt cid
+  if eq fc 0
+    dn = get ck_dirty_n 0
+    put ck_dirty dn cid
+    put ck_dirty_n 0 add dn 1
+  end
+  fc = add fc 1
+  put ck_false_cnt cid fc
+  cln = get ck_cl_len cid
+  if eq fc cln
+    ret true
+  end
+  if eq fc sub cln 1
+    u = ck_find_unit_lit cid
+    if ne u CK_INVALID
+      z = ck_assign_lit u
+    end
+  end
+  ret false
+end
+
+fn ck_propagate_until_confl to bool
+  q = ulong 0
+  while lt q get ck_trail_n 0 bound 4098
+    tl = get ck_trail q
+    q = add q 1
+    fl = xor tl 1
+    cur = get ck_occ_head fl
+    prev = CK_INVALID
+    while ne cur CK_INVALID bound 1048576
+      nxt = get ck_occ_next cur
+      cid = get ck_occ_cid cur
+      if eq get ck_cl_active cid 0
+        if eq prev CK_INVALID
+          put ck_occ_head fl nxt
+        else
+          put ck_occ_next prev nxt
+        end
+      else
+        prev = cur
+        if ck_visit_occ cid
+          ret true
+        end
+      end
+      cur = nxt
+    end
+  end
+  ret false
+end
+
+fn ck_check_rup_base skip_lit ulong extra_cid ulong skip_extra ulong to bool
+  if ne get ck_empty_orig 0 0
+    ret true
+  end
+  put ck_trail_n 0 0
+  put ck_dirty_n 0 0
+  if ck_seed_active_units
+    ck_rollback_trail
+    ret true
+  end
+  sn = get ck_step_n 0
+  for i ulong sn bound 8196
+    l = get ck_step_lits i
+    if ne l skip_lit
+      st = ck_assign_lit xor l 1
+      if eq st 2
+        ck_rollback_trail
+        ret true
+      end
+    end
+  end
+  if ne extra_cid CK_INVALID
+    off = get ck_cl_off extra_cid
+    cln = get ck_cl_len extra_cid
+    for j ulong cln bound 8196
+      d = get ck_pool add off j
+      if ne d skip_extra
+        st2 = ck_assign_lit xor d 1
+        if eq st2 2
+          ck_rollback_trail
+          ret true
+        end
+      end
+    end
+  end
+  ok = ck_propagate_until_confl
+  ck_rollback_trail
+  ret ok
+end
+
+fn ck_collect_rat_cids neg_p ulong to void
+  put ck_rat_n 0 0
+  cur = get ck_occ_head neg_p
+  while ne cur CK_INVALID bound 1048576
+    cid = get ck_occ_cid cur
+    if eq get ck_cl_active cid 1
+      rn = get ck_rat_n 0
+      if lt rn CK_MAX_CLAUSES
+        put ck_rat_cids rn cid
+        put ck_rat_n 0 add rn 1
+      end
+    end
+    cur = get ck_occ_next cur
+  end
+end
+
+fn ck_check_rat_step to bool
+  if eq get ck_step_n 0 0
+    ret false
+  end
+  piv = get ck_step_pivot 0
+  neg_p = xor piv 1
+  ck_collect_rat_cids neg_p
+  rn = get ck_rat_n 0
+  for i ulong rn bound 65536
+    dcid = get ck_rat_cids i
+    if ne get ck_cl_taut dcid 0
+      continue
+    end
+    if not ck_check_rup_base piv dcid neg_p
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ck_eval_hint_clause hid ulong to ulong
+  off = get ck_cl_off hid
+  cln = get ck_cl_len hid
+  ucnt = ulong 0
+  ul = CK_INVALID
+  for j ulong cln bound 8196
+    l = get ck_pool add off j
+    lv = ck_lit_val l
+    if eq lv CK_TRUE
+      ret 0
+    end
+    if eq lv CK_UNDEF
+      ucnt = add ucnt 1
+      ul = l
+    end
+  end
+  if eq ucnt 0
+    ret 2
+  end
+  if eq ucnt 1
+    z = ck_assign_lit ul
+  end
+  ret 1
+end
+
+fn ck_verify_lrat_hints to bool
+  hn = get ck_hints_n 0
+  if eq hn 0
+    ret ne get ck_empty_orig 0 0
+  end
+  nc = get ck_nclauses 0
+  for i ulong hn bound 16384
+    raw_id = get ck_hints i
+    if or eq raw_id 0 gt raw_id nc
+      ret false
+    end
+    cid = sub raw_id 1
+    if ne get ck_cl_active cid 1
+      ret false
+    end
+  end
+  put ck_trail_n 0 0
+  put ck_dirty_n 0 0
+  sn = get ck_step_n 0
+  confl = false
+  for i ulong sn bound 8196
+    l = get ck_step_lits i
+    if eq ck_assign_lit xor l 1 2
+      confl = true
+      break
+    end
+  end
+  if not confl
+    for i ulong hn bound 16384
+      cid = sub get ck_hints i 1
+      st = ck_eval_hint_clause cid
+      if eq st 2
+        confl = true
+        break
+      end
+    end
+  end
+  ck_rollback_trail
+  ret confl
+end
+
+fn ck_clause_matches_step cid ulong h ulong to bool
+  if ne get ck_cl_active cid 1
+    ret false
+  end
+  if ne get ck_cl_len cid get ck_step_n 0
+    ret false
+  end
+  if ne get ck_cl_hash cid h
+    ret false
+  end
+  st = get ck_stamp 0
+  off = get ck_cl_off cid
+  cln = get ck_cl_len cid
+  for j ulong cln bound 8196
+    if ne get ck_seen get ck_pool add off j st
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ck_delete_step_clause to void
+  sn = get ck_step_n 0
+  if eq sn 0
+    ret
+  end
+  h = ck_hash_step_lits
+  l0 = get ck_step_lits 0
+  cur = get ck_occ_head l0
+  while ne cur CK_INVALID bound 1048576
+    cid = get ck_occ_cid cur
+    if ck_clause_matches_step cid h
+      put ck_cl_active cid 0
+      ret
+    end
+    cur = get ck_occ_next cur
+  end
+end
+
+note ==== Section 7: OMDR01 Binary Proof & ASCII DRAT Streams ====
+
+fn ck_read_step_lits off_io edit ulong 1 end_off ulong nvars ulong to int
+  pos = get off_io 0
+  if gt add pos 4 end_off
+    ret CK_ERR_FORMAT
+  end
+  cnt = ck_prf_u32 pos
+  pos = add pos 4
+  if gt cnt 8192
+    ret CK_ERR_LIMIT
+  end
+  if gt add pos mul cnt 4 end_off
+    ret CK_ERR_FORMAT
+  end
+  ck_begin_step
+  for i ulong cnt bound 8196
+    lv = ck_prf_i32 pos
+    pos = add pos 4
+    rc = ck_push_lit_raw lv nvars
+    if ne rc CK_OK
+      ret rc
+    end
+  end
+  put off_io 0 pos
+  ret CK_OK
+end
+
+fn ck_read_step_hints off_io edit ulong 1 end_off ulong to int
+  pos = get off_io 0
+  if gt add pos 4 end_off
+    ret CK_ERR_FORMAT
+  end
+  hcnt = ck_prf_u32 pos
+  pos = add pos 4
+  if gt hcnt 16384
+    ret CK_ERR_LIMIT
+  end
+  if gt add pos mul hcnt 4 end_off
+    ret CK_ERR_FORMAT
+  end
+  for i ulong hcnt bound 16384
+    put ck_hints i ck_prf_u32 pos
+    pos = add pos 4
+  end
+  put ck_hints_n 0 hcnt
+  put off_io 0 pos
+  ret CK_OK
+end
+
+fn ck_exec_add_step to int
+  if ne get ck_step_taut 0 0
+    cid = ck_db_push_step
+    if eq cid CK_INVALID
+      ret CK_ERR_LIMIT
+    end
+    ret CK_OK
+  end
+  is_emp = eq get ck_step_n 0 0
+  rup_ok = ck_check_rup_base CK_INVALID CK_INVALID CK_INVALID
+  if rup_ok
+    if ne get ck_has_lrat 0 0
+      if not ck_verify_lrat_hints
+        ret CK_ERR_HINT
+      end
+    end
+  else
+    if and ne get ck_allow_rat 0 0 not is_emp
+      if not ck_check_rat_step
+        ret CK_ERR_RUP
+      end
+      put ck_res_rats 0 add get ck_res_rats 0 1
+    else
+      ret CK_ERR_RUP
+    end
+  end
+  cid = ck_db_push_step
+  if eq cid CK_INVALID
+    ret CK_ERR_LIMIT
+  end
+  if is_emp
+    put ck_saw_empty 0 1
+  end
+  ret CK_OK
+end
+
+fn ck_verify_omdr01_hdr to int
+  fl = get ck_prf_n 0
+  if lt fl 192
+    ret CK_ERR_FORMAT
+  end
+  for i ulong 6
+    if ne get ck_prf i get ck_m_omdr i
+      ret CK_ERR_FORMAT
+    end
+  end
+  if ne ck_prf_u16 6 1
+    ret CK_ERR_FORMAT
+  end
+  nv = ck_prf_u32 8
+  nc = ck_prf_u32 12
+  ns = ck_prf_u32 16
+  hfl = ck_prf_u32 20
+  pl = ck_prf_u64 24
+  if ne and hfl 7 hfl
+    ret CK_ERR_FORMAT
+  end
+  if or eq ns 0 ne fl add 192 pl
+    ret CK_ERR_FORMAT
+  end
+  for i ulong 32
+    if ne get ck_prf add 32 i get ck_cnf_sha i
+      ret CK_ERR_HASH
+    end
+  end
+  body_len = add 64 pl
+  if not ck_chk_body_sha ck_dom_drat body_len body_len
+    ret CK_ERR_HASH
+  end
+  if not ck_chk_prf_ed25519 ck_env_drat body_len
+    ret CK_ERR_SIG
+  end
+  if or ne nv get ck_nvars 0 ne nc get ck_norig 0
+    ret CK_ERR_FORMAT
+  end
+  put ck_hdr_nv 0 nv
+  put ck_hdr_nc 0 nc
+  put ck_hdr_ns 0 ns
+  put ck_hdr_fl 0 hfl
+  put ck_hdr_pl 0 pl
+  ret CK_OK
+end
+
+fn ck_verify_omdr01 to int
+  hrc = ck_verify_omdr01_hdr
+  if ne hrc CK_OK
+    ret hrc
+  end
+  nv = get ck_hdr_nv 0
+  ns = get ck_hdr_ns 0
+  hfl = get ck_hdr_fl 0
+  pl = get ck_hdr_pl 0
+  put ck_has_lrat 0 and hfl 1
+  put ck_allow_rat 0 and hfl 4
+  put ck_saw_empty 0 0
+  put ck_res_dels 0 0
+  put ck_res_rats 0 0
+
+  pos_box = new ulong 1 64
+  end_off = add 64 pl
+  step_i = ulong 0
+  while lt step_i ns bound 1048576
+    if ne get ck_saw_empty 0 0
+      ret CK_ERR_EMPTY
+    end
+    pos = get pos_box 0
+    if ge pos end_off
+      ret CK_ERR_FORMAT
+    end
+    op = get ck_prf pos
+    put pos_box 0 add pos 1
+    rc = ck_read_step_lits pos_box end_off nv
+    if ne rc CK_OK
+      ret rc
+    end
+    if eq op 1
+      if ne get ck_has_lrat 0 0
+        rc2 = ck_read_step_hints pos_box end_off
+        if ne rc2 CK_OK
+          ret rc2
+        end
+      end
+      rc3 = ck_exec_add_step
+      if ne rc3 CK_OK
+        ret rc3
+      end
+    else
+      if eq op 2
+        if eq get ck_step_n 0 0
+          ret CK_ERR_LIT
+        end
+        ck_delete_step_clause
+        put ck_res_dels 0 add get ck_res_dels 0 1
+      else
+        ret CK_ERR_LIT
+      end
+    end
+    step_i = add step_i 1
+  end
+  if ne get pos_box 0 end_off
+    ret CK_ERR_FORMAT
+  end
+  if eq get ck_saw_empty 0 0
+    ret CK_ERR_EMPTY
+  end
+  ret CK_OK
+end
+
+fn ck_is_ascii_del_prefix pos_io edit ulong 1 n ulong to bool
+  p = ck_skip_ws_comm 1 get pos_io 0 n
+  put pos_io 0 p
+  if ge p n
+    ret false
+  end
+  if ne get ck_prf p 100
+    ret false
+  end
+  nxt = add p 1
+  if lt nxt n
+    b = get ck_prf nxt
+    if or eq b 32 or eq b 9 or eq b 13 eq b 10
+      put pos_io 0 nxt
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ck_read_ascii_clause pos_io edit ulong 1 n ulong nvars ulong to int
+  p = get pos_io 0
+  lv = new long 1 0
+  np = new ulong 1 0
+  ck_begin_step
+  while true bound 8196
+    p = ck_skip_ws_comm 1 p n
+    if ge p n
+      ret CK_ERR_LIT
+    end
+    if not ck_parse_int 1 p n lv np
+      ret CK_ERR_LIT
+    end
+    p = get np 0
+    val = get lv 0
+    if eq val 0
+      put pos_io 0 p
+      ret CK_OK
+    end
+    rc = ck_push_lit_raw val nvars
+    if ne rc CK_OK
+      ret rc
+    end
+  end
+  ret CK_ERR_LIMIT
+end
+
+fn ck_verify_ascii_drat allow_rat bool to int
+  nvars = get ck_nvars 0
+  n = get ck_prf_n 0
+  put ck_has_lrat 0 0
+  put ck_allow_rat 0 0
+  if allow_rat
+    put ck_allow_rat 0 1
+  end
+  put ck_saw_empty 0 0
+  put ck_res_steps 0 0
+  put ck_res_dels 0 0
+  put ck_res_rats 0 0
+
+  pos_box = new ulong 1 0
+  while true bound 1048576
+    is_del = ck_is_ascii_del_prefix pos_box n
+    p = ck_skip_ws_comm 1 get pos_box 0 n
+    put pos_box 0 p
+    if ge p n
+      break
+    end
+    if ne get ck_saw_empty 0 0
+      ret CK_ERR_EMPTY
+    end
+    rc0 = ck_read_ascii_clause pos_box n nvars
+    if ne rc0 CK_OK
+      ret rc0
+    end
+    put ck_res_steps 0 add get ck_res_steps 0 1
+    if is_del
+      if eq get ck_step_n 0 0
+        ret CK_ERR_LIT
+      end
+      ck_delete_step_clause
+      put ck_res_dels 0 add get ck_res_dels 0 1
+    else
+      rc2 = ck_exec_add_step
+      if ne rc2 CK_OK
+        ret rc2
+      end
+    end
+  end
+  if eq get ck_saw_empty 0 0
+    ret CK_ERR_EMPTY
+  end
+  ret CK_OK
+end
+
+note ==== Section 8: OMSR01 Ed25519/SHA-256 Receipt Verifier ====
+
+fn ck_chk_rcpt_bind verdict ulong to bool
+  bl = len ck_dom_bind
+  for i ulong bl bound 32
+    put sh_dat i get ck_dom_bind i
+  end
+  put sh_dat bl 0
+  p = add bl 1
+  for j ulong 4
+    put sh_dat add p j uchar and shr verdict mul j 8 255
+  end
+  p = add p 4
+  for i ulong 32
+    put sh_dat add p i get ck_rcpt add 64 i
+  end
+  p = add p 32
+  for i ulong 32
+    put sh_dat add p i get ck_rcpt add 96 i
+  end
+  sh_all add p 32
+  for i ulong 32
+    if ne get sh_dig i get ck_rcpt add 128 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ck_verify_omsr01_sig to int
+  pk = new uchar 32 0
+  for i ulong 32
+    put pk i get ck_rcpt add 256 i
+  end
+  if not ck_chk_pk_nonzero pk
+    ret CK_ERR_SIG
+  end
+  sg = new uchar 64 0
+  for i ulong 64
+    put sg i get ck_rcpt add 288 i
+  end
+  m = new uchar 65536 0
+  for i ulong 288
+    put m i get ck_rcpt i
+  end
+  if ne edverify pk m 288 sg 0 1
+    ret CK_ERR_SIG
+  end
+  ret CK_OK
+end
+
+fn ck_verify_omsr01 check_cnf bool check_prf bool to int
+  for i ulong 6
+    if ne get ck_rcpt i get ck_m_omsr i
+      ret CK_ERR_FORMAT
+    end
+  end
+  if ne ck_rcpt_u16 6 1
+    ret CK_ERR_FORMAT
+  end
+  dl = len ck_dom_rcpt
+  for i ulong 24
+    exp_b = uchar 0
+    if lt i dl
+      exp_b = get ck_dom_rcpt i
+    end
+    if ne get ck_rcpt add 8 i exp_b
+      ret CK_ERR_FORMAT
+    end
+  end
+  for i ulong 96
+    if ne get ck_rcpt add 160 i 0
+      ret CK_ERR_FORMAT
+    end
+  end
+  verdict = ck_rcpt_u32 32
+  if and ne verdict 10 ne verdict 20
+    ret CK_ERR_FORMAT
+  end
+  if not ck_chk_rcpt_bind verdict
+    ret CK_ERR_HASH
+  end
+  src = ck_verify_omsr01_sig
+  if ne src CK_OK
+    ret src
+  end
+  if check_cnf
+    for i ulong 32
+      if ne get ck_rcpt add 64 i get ck_cnf_sha i
+        ret CK_ERR_HASH
+      end
+    end
+  end
+  if check_prf
+    for i ulong 32
+      if ne get ck_rcpt add 96 i get ck_prf_sha i
+        ret CK_ERR_HASH
+      end
+    end
+  end
+  put ck_rcpt_ver 0 verdict
+  put ck_rcpt_nv 0 ck_rcpt_u32 36
+  put ck_rcpt_nc 0 ck_rcpt_u32 40
+  put ck_rcpt_st 0 ck_rcpt_u32 44
+  ret CK_OK
+end
+
+note ==== Section 9: File I/O, CLI, Inspect & Selftest ====
+
+fn ck_read_file_to kind ulong to long
+  fd = long -1
+  if eq kind 0
+    fd = fopen ck_p_cnf 0 get ck_p_cnf_n 0 0 0
+  else
+    if eq kind 1
+      fd = fopen ck_p_prf 0 get ck_p_prf_n 0 0 0
+    else
+      fd = fopen ck_p_rcpt 0 get ck_p_rcpt_n 0 0 0
+    end
+  end
+  if lt fd 0
+    ret -1
+  end
+  maxb = CK_MAX_CNF
+  if eq kind 1
+    maxb = CK_MAX_PROOF
+  end
+  if eq kind 2
+    maxb = ulong 352
+  end
+  tot = ulong 0
+  eof = false
+  while lt tot maxb bound 1024
+    remc = sub maxb tot
+    if gt remc 65536
+      remc = ulong 65536
+    end
+    k = long 0
+    if eq kind 0
+      k = read int fd ck_cnf tot remc
+    else
+      if eq kind 1
+        k = read int fd ck_prf tot remc
+      else
+        k = read int fd ck_rcpt tot remc
+      end
+    end
+    if lt k 0
+      z = fclose int fd
+      ret -1
+    end
+    if eq k 0
+      eof = true
+      break
+    end
+    tot = add tot ulong k
+  end
+  if not eof
+    ex = read int fd ck_probe 0 1
+    if ne ex 0
+      z = fclose int fd
+      if eq kind 2
+        ret -2
+      end
+      ret -1
+    end
+  end
+  z = fclose int fd
+  if eq kind 0
+    put ck_cnf_n 0 tot
+  end
+  if eq kind 1
+    put ck_prf_n 0 tot
+  end
+  ret long tot
+end
+
+fn ck_arg_eq idx ulong lit view uchar * to bool
+  rn = argread idx ck_arg 0 4000
+  if ne rn long len lit
+    ret false
+  end
+  for i ulong len lit bound 128
+    if ne get ck_arg i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ck_copy_path idx ulong which ulong to bool
+  rn = argread idx ck_arg 0 1020
+  if le rn 0
+    ret false
+  end
+  u = ulong rn
+  for i ulong u bound 1024
+    b = get ck_arg i
+    if eq which 0
+      put ck_p_cnf i b
+    end
+    if eq which 1
+      put ck_p_prf i b
+    end
+    if eq which 2
+      put ck_p_rcpt i b
+    end
+  end
+  if eq which 0
+    put ck_p_cnf_n 0 u
+    put ck_have_cnf 0 1
+  end
+  if eq which 1
+    put ck_p_prf_n 0 u
+    put ck_have_prf 0 1
+  end
+  if eq which 2
+    put ck_p_rcpt_n 0 u
+    put ck_have_rcpt 0 1
+  end
+  ret true
+end
+
+fn ck_parse_nib c ulong to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret long add 10 sub c 97
+  end
+  if and ge c 65 le c 70
+    ret long add 10 sub c 65
+  end
+  ret long -1
+end
+
+fn ck_parse_pubkey_arg idx ulong to bool
+  rn = argread idx ck_arg 0 128
+  if ne rn 64
+    ret false
+  end
+  for i ulong 32
+    hi = ck_parse_nib ulong get ck_arg mul i 2
+    lo = ck_parse_nib ulong get ck_arg add mul i 2 1
+    if or lt hi 0 lt lo 0
+      ret false
+    end
+    put ck_exp_pk i uchar or shl ulong hi 4 ulong lo
+  end
+  put ck_have_pk 0 1
+  ret true
+end
+
+fn ck_parse_flags start_i ulong ac ulong to bool
+  i = start_i
+  while lt i ac bound 32
+    if ge add i 1 ac
+      ret false
+    end
+    if ck_arg_eq i ck_f_cnf
+      if not ck_copy_path add i 1 0
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    if or ck_arg_eq i ck_f_prf ck_arg_eq i ck_f_drat
+      if not ck_copy_path add i 1 1
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    if ck_arg_eq i ck_f_rcpt
+      if not ck_copy_path add i 1 2
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    if ck_arg_eq i ck_f_pk
+      if not ck_parse_pubkey_arg add i 1
+        ret false
+      end
+      i = add i 2
+      continue
+    end
+    ret false
+  end
+  ret true
+end
+
+fn ck_parse_args to bool
+  put ck_cmd 0 0
+  put ck_have_cnf 0 0
+  put ck_have_prf 0 0
+  put ck_have_rcpt 0 0
+  put ck_have_pk 0 0
+
+  ac = ulong argcnt
+  if lt ac 2
+    ret false
+  end
+  if or ck_arg_eq 1 ck_c_help ck_arg_eq 1 ck_c_h
+    ret false
+  end
+  if ck_arg_eq 1 ck_c_self
+    put ck_cmd 0 1
+    ret eq ac 2
+  end
+  if ck_arg_eq 1 ck_c_ver
+    put ck_cmd 0 2
+  else
+    if ck_arg_eq 1 ck_c_vdrat
+      put ck_cmd 0 3
+    else
+      if ck_arg_eq 1 ck_c_vrcpt
+        put ck_cmd 0 4
+      else
+        if ck_arg_eq 1 ck_c_insp
+          put ck_cmd 0 5
+        else
+          ret false
+        end
+      end
+    end
+  end
+  if not ck_parse_flags 2 ac
+    ret false
+  end
+  cmd = get ck_cmd 0
+  if eq cmd 2
+    ret and eq get ck_have_cnf 0 1 eq get ck_have_prf 0 1
+  end
+  if eq cmd 3
+    ret and eq get ck_have_cnf 0 1 eq get ck_have_prf 0 1
+  end
+  if eq cmd 4
+    ret eq get ck_have_rcpt 0 1
+  end
+  ret or eq get ck_have_prf 0 1 eq get ck_have_rcpt 0 1
+end
+
+fn ck_load_str_cnf s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    put ck_cnf i get s i
+  end
+  put ck_cnf_n 0 n
+end
+
+fn ck_load_str_prf s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    put ck_prf i get s i
+  end
+  put ck_prf_n 0 n
+end
+
+fn ck_run_selftest to int
+  ck_load_str_cnf ck_st_sat_cnf
+  if ne ck_parse_cnf CK_OK
+    ret 10
+  end
+  put ck_val 1 CK_FALSE
+  put ck_val 2 CK_TRUE
+  put ck_val 3 CK_TRUE
+  for cid ulong 3
+    if not ck_eval_clause cid
+      ret 11
+    end
+  end
+  put ck_val 3 CK_FALSE
+  if ck_eval_clause 2
+    ret 12
+  end
+
+  ck_load_str_cnf ck_st_php32
+  if ne ck_parse_cnf CK_OK
+    ret 13
+  end
+  ck_load_str_prf ck_st_php32_drat
+  if ne ck_verify_ascii_drat true CK_OK
+    ret 14
+  end
+
+  ck_load_str_cnf ck_st_rat_cnf
+  if ne ck_parse_cnf CK_OK
+    ret 15
+  end
+  ck_load_str_prf ck_st_rat_ok
+  if ne ck_verify_ascii_drat true CK_OK
+    ret 16
+  end
+  if ne get ck_res_rats 0 1
+    ret 17
+  end
+
+  ck_load_str_cnf ck_st_rat_bad
+  z = ck_parse_cnf
+  ck_load_str_prf ck_st_bad_rup
+  if ne ck_verify_ascii_drat true CK_ERR_RUP
+    ret 18
+  end
+
+  ck_load_str_cnf ck_st_php32
+  z = ck_parse_cnf
+  ck_load_str_prf ck_st_no_emp
+  if ne ck_verify_ascii_drat true CK_ERR_EMPTY
+    ret 19
+  end
+
+  ck_wrt 1 ck_msg_self
+  ret CK_OK
+end
+
+fn ck_inspect_omsat1 fl ulong to int
+  nv = ck_prf_u32 8
+  nc = ck_prf_u32 12
+  if ne fl add 192 nv
+    ret CK_ERR_FORMAT
+  end
+  body_len = add 64 nv
+  if not ck_chk_body_sha ck_dom_sat body_len body_len
+    ret CK_ERR_HASH
+  end
+  if not ck_chk_prf_ed25519 ck_env_sat body_len
+    ret CK_ERR_SIG
+  end
+  ck_wrt 1 ck_msg_ins_sat
+  ck_num 1 nv
+  ck_wrt 1 ck_msg_cl
+  ck_num 1 nc
+  ck_wrt 1 ck_msg_byt
+  ck_num 1 fl
+  ck_wrt 1 ck_msg_sha
+  ck_hex_prf 1
+  ck_wrt 1 ck_nl
+  ret CK_OK
+end
+
+fn ck_inspect_omdr01 fl ulong to int
+  nv = ck_prf_u32 8
+  nc = ck_prf_u32 12
+  ns = ck_prf_u32 16
+  pl = ck_prf_u64 24
+  if ne fl add 192 pl
+    ret CK_ERR_FORMAT
+  end
+  body_len = add 64 pl
+  if not ck_chk_body_sha ck_dom_drat body_len body_len
+    ret CK_ERR_HASH
+  end
+  if not ck_chk_prf_ed25519 ck_env_drat body_len
+    ret CK_ERR_SIG
+  end
+  ck_wrt 1 ck_msg_ins_drat
+  ck_num 1 nv
+  ck_wrt 1 ck_msg_cl
+  ck_num 1 nc
+  ck_wrt 1 ck_msg_stp
+  ck_num 1 ns
+  ck_wrt 1 ck_msg_byt
+  ck_num 1 fl
+  ck_wrt 1 ck_msg_sha
+  ck_hex_prf 1
+  ck_wrt 1 ck_nl
+  ret CK_OK
+end
+
+fn ck_inspect_cmd to int
+  if eq get ck_have_prf 0 1
+    if lt ck_read_file_to 1 0
+      ret CK_ERR_IO
+    end
+    ck_hash_prf
+    fl = get ck_prf_n 0
+    if lt fl 192
+      ret CK_ERR_FORMAT
+    end
+    if eq get ck_prf 2 83
+      ret ck_inspect_omsat1 fl
+    end
+    if eq get ck_prf 2 68
+      ret ck_inspect_omdr01 fl
+    end
+    ret CK_ERR_FORMAT
+  end
+
+  rl = ck_read_file_to 2
+  if eq rl -2
+    ret CK_ERR_FORMAT
+  end
+  if ne rl 352
+    if lt rl 0
+      ret CK_ERR_IO
+    end
+    ret CK_ERR_FORMAT
+  end
+  rc = ck_verify_omsr01 false false
+  if ne rc CK_OK
+    ret rc
+  end
+  pk = new uchar 32 0
+  for i ulong 32
+    put pk i get ck_rcpt add 256 i
+  end
+  ck_wrt 1 ck_msg_ins_rcpt
+  ck_num 1 get ck_rcpt_ver 0
+  ck_wrt 1 ck_msg_cl
+  ck_num 1 get ck_rcpt_nc 0
+  ck_wrt 1 ck_msg_stp
+  ck_num 1 get ck_rcpt_st 0
+  ck_wrt 1 ck_msg_pk
+  ck_hex32 1 pk
+  ck_wrt 1 ck_nl
+  ret CK_OK
+end
+
+fn ck_verify_bin_cmd to int
+  if lt ck_read_file_to 0 0
+    ret CK_ERR_IO
+  end
+  if lt ck_read_file_to 1 0
+    ret CK_ERR_IO
+  end
+  ck_hash_cnf
+  ck_hash_prf
+  prc = ck_parse_cnf
+  if ne prc CK_OK
+    ret prc
+  end
+  fl = get ck_prf_n 0
+  if lt fl 6
+    ret CK_ERR_FORMAT
+  end
+  if eq get ck_prf 2 83
+    rc = ck_verify_omsat1
+    if ne rc CK_OK
+      ret rc
+    end
+    ck_wrt 1 ck_msg_ok_sat
+    ck_num 1 get ck_hdr_nv 0
+    ck_wrt 1 ck_msg_cl
+    ck_num 1 get ck_hdr_nc 0
+    ck_wrt 1 ck_msg_byt
+    ck_num 1 fl
+    ck_wrt 1 ck_msg_sha
+    ck_hex_prf 1
+    ck_wrt 1 ck_nl
+    ret CK_OK
+  end
+  rc2 = ck_verify_omdr01
+  if ne rc2 CK_OK
+    ret rc2
+  end
+  ck_wrt 1 ck_msg_ok_drat
+  ck_num 1 get ck_hdr_nv 0
+  ck_wrt 1 ck_msg_cl
+  ck_num 1 get ck_hdr_nc 0
+  ck_wrt 1 ck_msg_stp
+  ck_num 1 get ck_hdr_ns 0
+  ck_wrt 1 ck_msg_del
+  ck_num 1 get ck_res_dels 0
+  ck_wrt 1 ck_msg_lrat
+  ck_num 1 get ck_has_lrat 0
+  ck_wrt 1 ck_msg_byt
+  ck_num 1 fl
+  ck_wrt 1 ck_msg_sha
+  ck_hex_prf 1
+  ck_wrt 1 ck_nl
+  ret CK_OK
+end
+
+fn ck_verify_drat_cmd to int
+  if lt ck_read_file_to 0 0
+    ret CK_ERR_IO
+  end
+  if lt ck_read_file_to 1 0
+    ret CK_ERR_IO
+  end
+  prc = ck_parse_cnf
+  if ne prc CK_OK
+    ret prc
+  end
+  rc = ck_verify_ascii_drat true
+  if ne rc CK_OK
+    ret rc
+  end
+  ck_wrt 1 ck_msg_ok_tx
+  ck_num 1 get ck_nvars 0
+  ck_wrt 1 ck_msg_cl
+  ck_num 1 get ck_norig 0
+  ck_wrt 1 ck_msg_stp
+  ck_num 1 get ck_res_steps 0
+  ck_wrt 1 ck_msg_del
+  ck_num 1 get ck_res_dels 0
+  ck_wrt 1 ck_msg_rat
+  ck_num 1 get ck_res_rats 0
+  ck_wrt 1 ck_nl
+  ret CK_OK
+end
+
+fn ck_verify_rcpt_cmd to int
+  rl = ck_read_file_to 2
+  if eq rl -2
+    ret CK_ERR_FORMAT
+  end
+  if ne rl 352
+    if lt rl 0
+      ret CK_ERR_IO
+    end
+    ret CK_ERR_FORMAT
+  end
+  has_c = ne get ck_have_cnf 0 0
+  if has_c
+    if lt ck_read_file_to 0 0
+      ret CK_ERR_IO
+    end
+    ck_hash_cnf
+  end
+  has_p = ne get ck_have_prf 0 0
+  if has_p
+    if lt ck_read_file_to 1 0
+      ret CK_ERR_IO
+    end
+    ck_hash_prf
+  end
+  rc = ck_verify_omsr01 has_c has_p
+  if ne rc CK_OK
+    ret rc
+  end
+  ck_wrt 1 ck_msg_ok_rcpt
+  ck_num 1 get ck_rcpt_ver 0
+  ck_wrt 1 ck_msg_cl
+  ck_num 1 get ck_rcpt_nc 0
+  ck_wrt 1 ck_msg_stp
+  ck_num 1 get ck_rcpt_st 0
+  ck_wrt 1 ck_nl
+  ret CK_OK
+end
+
+fn main to int
+  if not ck_parse_args
+    ck_wrt 2 ck_u_msg
+    ret CK_ERR_USAGE
+  end
+  cmd = get ck_cmd 0
+  if eq cmd 1
+    rc = ck_run_selftest
+    if ne rc CK_OK
+      ret ck_fail rc
+    end
+    ret CK_OK
+  end
+  if eq cmd 2
+    rc = ck_verify_bin_cmd
+    if ne rc CK_OK
+      ret ck_fail rc
+    end
+    ret CK_OK
+  end
+  if eq cmd 3
+    rc = ck_verify_drat_cmd
+    if ne rc CK_OK
+      ret ck_fail rc
+    end
+    ret CK_OK
+  end
+  if eq cmd 4
+    rc = ck_verify_rcpt_cmd
+    if ne rc CK_OK
+      ret ck_fail rc
+    end
+    ret CK_OK
+  end
+  rc = ck_inspect_cmd
+  if ne rc CK_OK
+    ret ck_fail rc
+  end
+  ret CK_OK
+end
