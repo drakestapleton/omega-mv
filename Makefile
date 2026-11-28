@@ -1655,11 +1655,13 @@ test-gpu-matmul-api: $(GPU_API_TEST) $(GPU_R4_RECEIPT)
 	./$(GPU_API_TEST) --host-only
 	./$(GPU_R4_RECEIPT) --host-only
 
-# omega #473 R4: the sealed CTA-budget receipt (full-output comparison at the training shapes,
-# every budget, repeats, I42 stale-output check, negative controls). Host-only self-test above; the
-# chip receipt is `quietlock run -- ./build/gpu_matmul_r4_receipt --out receipt.json`.
-$(GPU_R4_RECEIPT): tests/gpu_matmul_r4_receipt.c src/omega_gpu_matmul_api.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -o $@ tests/gpu_matmul_r4_receipt.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+# omega #473 R4: the sealed CTA-budget receipt host-only checks (reference + comparator negative controls),
+# cut over to pure seeded OM-2 (tests/gpu_om/gate_gpu_stage2_host.om --host-only). Zero gcc.
+.PHONY: test-gpu-r4-host
+$(GPU_R4_RECEIPT): tests/gpu_om/gate_gpu_stage2_host.om seed/out/omc | $(OUT_DIR)
+	seed/out/omc < tests/gpu_om/gate_gpu_stage2_host.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+test-gpu-r4-host: $(GPU_R4_RECEIPT)
+	./$(GPU_R4_RECEIPT) --host-only
 
 # FB-1 cut 4: native rmsnorm / rope / swiglu (+ EX2 and shared-exchange probes).
 # test-gpu-elementwise is host-only (refusals, codegen, word fixtures, nvdisasm
@@ -1868,12 +1870,13 @@ test-gpu-fp8gemm: $(GPU_FP8GEMM_TEST)
 	$(GPU_FP8GEMM_TEST) --sim
 
 # OWN-30B (2026-10-13): host-only audit that every launcher declares peak + 2 registers (the chip hung at peak + 1).
+# OWN-30B (2026-10-13): declared-register rule (>= peak + 2 rounded up to multiple of 8), cut over to pure seeded OM-2.
 .PHONY: test-gpu-gpr-boundary
 GPU_GPR_BOUNDARY_TEST = $(OUT_DIR)/gpu_gpr_boundary_test
-$(GPU_GPR_BOUNDARY_TEST): tests/gpu_gpr_boundary_test.c src/omega_blackwell_codegen.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -o $@ tests/gpu_gpr_boundary_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-gpr-boundary: $(GPU_GPR_BOUNDARY_TEST)
-	$(GPU_GPR_BOUNDARY_TEST)
+$(GPU_GPR_BOUNDARY_TEST): $(TR3_GPR_BOUNDARY_BIN) | $(OUT_DIR)
+	cp $< $@
+test-gpu-gpr-boundary: $(TR3_GPR_BOUNDARY_BIN)
+	./$(TR3_GPR_BOUNDARY_BIN)
 
 # omega-mv#554: static scoreboard hazard checker (RAW / WAR / WAW) over the encoded bytes of every kernel the generators
 # build, after the launchers' patch steps. Host only: decoder vs encoder, the pre-#553 attend red receipt
@@ -1943,9 +1946,12 @@ GPU_PFHOST_TEST = $(OUT_DIR)/gpu_pfhost_test
 $(GPU_PFHOST_TEST): tests/gpu_pfhost_test.c tests/bw_warp_sim_tc.h src/omega_gpu_pfhost.h src/omega_blackwell_codegen_pfhost.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -DWS_MAX_THREADS=1024 -Itests -o $@ tests/gpu_pfhost_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 
+.PHONY: test-gpu-moe-plan
 GPU_MOE_PLAN_TEST = $(OUT_DIR)/gpu_moe_plan_test
-$(GPU_MOE_PLAN_TEST): tests/gpu_moe_plan_test.c src/omega_gpu_moe_plan.h src/omega_gpu_pfhost.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_moe_plan_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+$(GPU_MOE_PLAN_TEST): $(TR4_MOE_PLAN_BIN) | $(OUT_DIR)
+	cp $< $@
+test-gpu-moe-plan: $(TR4_MOE_PLAN_BIN)
+	./$(TR4_MOE_PLAN_BIN)
 # omega#456: the prefill tests above, host model and warp simulator only. Every run names --host-only or --sim, the two
 # modes that never open the device (each test's main returns before its chip part); chip runs stay under the GB10 lock.
 .PHONY: test-gpu-prefill-host
