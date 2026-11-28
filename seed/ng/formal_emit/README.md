@@ -25,9 +25,9 @@
 
 ## Source Files
 
-- [lean_emit.om](file:///seed/ng/formal_emit/lean_emit.om) (3,289 lines): Pure seeded OM-2 CLI, unit parser, `chips.tsv` / `regalloc.om` / `isel.om` / `ir.om` checkers, ASCII `GeneratedCert.lean` generator, `fork`+`execprog`+`waitpid` Lean 4.36.0 runner, strict `#print axioms` auditor, and `0600 RW -> SHA-256 -> fchmod 0500 RX` ELF sealer.
-- [gate_formal_emit.om](file:///seed/ng/formal_emit/gate_formal_emit.om) (1,177 lines): Pure seeded OM-2 verification suite testing 2x `omc` determinism, 3 positive units (`pure_arith`, `om3_gb20b_dma`, `sm121_gemv_contract`), and 12 killed negative mutants (before sealing).
-- [RECEIPT.txt](file:///evidence/ALIEN-AUTO-FORMALIZER-20261127/RECEIPT.txt) & [SHA256SUMS.txt](file:///evidence/ALIEN-AUTO-FORMALIZER-20261127/SHA256SUMS.txt): Content-addressed verification receipt and root checksum manifest.
+- [lean_emit.om](lean_emit.om) (3,289 lines): Pure seeded OM-2 CLI, unit parser, `chips.tsv` / `regalloc.om` / `isel.om` / `ir.om` checkers, ASCII `GeneratedCert.lean` generator, `fork`+`execprog`+`waitpid` Lean 4.36.0 runner, strict `#print axioms` auditor, and `0600 RW -> SHA-256 -> fchmod 0500 RX` ELF sealer.
+- [gate_formal_emit.om](gate_formal_emit.om) (1,177 lines): Pure seeded OM-2 verification suite testing 2x `omc` determinism, 3 positive units (`pure_arith`, `om3_gb20b_dma`, `sm121_gemv_contract`), and 12 killed negative mutants (before sealing).
+- [RECEIPT.txt](../../../evidence/ALIEN-AUTO-FORMALIZER-20261127/RECEIPT.txt) & [SHA256SUMS.txt](../../../evidence/ALIEN-AUTO-FORMALIZER-20261127/SHA256SUMS.txt): Content-addressed verification receipt and root checksum manifest.
 
 ## How to Build & Run (AArch64 Host with `seed/out/omc` + Lean 4.36.0)
 
