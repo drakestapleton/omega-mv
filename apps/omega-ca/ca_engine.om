@@ -1,0 +1,1598 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-ca/ca_engine.om
+note Pure seeded OM-2 Lean-verified reversible 2D Margolus BBM cellular automaton engine (OMCA01).
+note Compose with SHA-256:
+note   cat si/directives/om2.om seed/ng/sha256.om apps/omega-ca/ca_engine.om | seed/out/omc > ca_engine
+
+const CA_ERR_RULE     ulong 61
+const CA_ERR_REVERSE  ulong 62
+const CA_ERR_DIMS     ulong 63
+const CA_ERR_SHA      ulong 64
+const CA_ERR_POP      ulong 65
+const CA_ERR_MAGIC    ulong 66
+const CA_ERR_TRUNC    ulong 67
+const CA_ERR_WORKER   ulong 68
+const CA_ERR_UNDER    ulong 69
+const CA_ERR_IO       ulong 70
+
+const CA_HDR_BYTES    ulong 72
+const CA_MAX_WORDS    ulong 65536
+const CA_MAX_FBUF     ulong 600000
+const CA_MAX_WORKERS  ulong 20
+const CA_PKT_MAGIC    ulong 1128355633
+const CA_EPOCH_STEPS  ulong 32
+
+text ca_s_magic   "OMCA01"
+text ca_s_defw    "./ca_worker"
+text ca_s_init    "init"
+text ca_s_evolve  "evolve"
+text ca_s_reverse "reverse"
+text ca_s_verify  "verify"
+text ca_s_inspect "inspect"
+text ca_s_selftest "selftest"
+text ca_s_bench   "bench"
+text ca_s_fw      "--worker"
+text ca_s_ft      "--threads"
+text ca_s_fsc     "--scalar"
+text ca_s_ffr     "--fault-rule"
+text ca_s_ffv     "--fault-reverse"
+text ca_s_ffw     "--fault-worker"
+
+text ca_m_usage "usage: ca_engine <init|evolve|reverse|verify|inspect|selftest|bench> ...\n"
+text ca_m_e61   "FAIL(61): particle popcount conservation violated\n"
+text ca_m_e62   "FAIL(62): reversibility SHA-256 identity violated\n"
+text ca_m_e63   "FAIL(63): invalid or odd lattice dimensions (Margolus 2x2 requires even W,H and 64|W)\n"
+text ca_m_e64   "FAIL(64): OMCA01 state_sha256 tamper detected\n"
+text ca_m_e65   "FAIL(65): OMCA01 popcount header mismatch\n"
+text ca_m_e66   "FAIL(66): invalid OMCA01 magic/version/rule\n"
+text ca_m_e67   "FAIL(67): truncated or malformed OMCA01 container\n"
+text ca_m_e68   "FAIL(68): worker pool process fault exit or pipe error\n"
+text ca_m_e69   "FAIL(69): reverse steps exceeds current generation\n"
+text ca_m_e70   "FAIL(70): file open/write I/O error\n"
+
+text ca_k_init  "INIT "
+text ca_k_insp  "OMCA01 "
+text ca_k_w     "W="
+text ca_k_h     " H="
+text ca_k_st    " step="
+text ca_k_pop   " pop="
+text ca_k_sha   " sha256="
+text ca_k_ev    "EVOLVE "
+text ca_k_rv    "REVERSE "
+text ca_k_vok   "VERIFY_OK "
+text ca_k_self  "SELFTEST_OK "
+text ca_k_bok   "BENCH_PARITY "
+text ca_k_bscale "BENCH_SCALE "
+text ca_k_sc    "scalar_med9_ns="
+text ca_k_w1    "w1_med9_ns="
+text ca_k_w10   " w10_med9_ns="
+text ca_k_w20   " w20_med9_ns="
+text ca_k_diff  " diff_bytes="
+text ca_k_sp1   " speedup_w10_vs_scalar="
+text ca_k_sp2   " speedup_w10_vs_w1="
+text ca_k_x100  "x(x100)"
+
+global ca_a     ulong 65536
+global ca_b     ulong 65536
+global ca_ref   ulong 65536
+global ca_bak   ulong 65536
+
+global ca_fbuf  uchar 600000
+global ca_pkt   uchar 524360
+global ca_obuf  uchar 128
+global ca_chbuf uchar 2
+
+global ca_arg1  uchar 4096
+global ca_arg2  uchar 4096
+global ca_arg3  uchar 4096
+global ca_arg4  uchar 4096
+global ca_wpath uchar 4096
+global ca_tmparg uchar 4096
+global ca_arglen ulong 8
+
+global ca_avpkt uchar 4104
+global ca_mask  uchar 128
+global ca_ptmp  uchar 8
+global ca_wst   uchar 8
+
+global ca_pids  int 20
+global ca_inwr  int 20
+global ca_outrd int 20
+global ca_cores ulong 20
+global ca_s_off ulong 20
+global ca_s_cnt ulong 20
+global ca_times ulong 9
+
+global ca_hdr   ulong 8
+global ca_sha_in uchar 32
+global ca_sha_sc uchar 32
+global ca_sha_w1 uchar 32
+global ca_sha_w20 uchar 32
+global ca_opt   ulong 8
+
+note ---- Output Helpers ----
+fn ca_wstr s view uchar * to void
+  p = ulong 0
+  n = len s
+  while lt p n bound 4096
+    c = sub n p
+    if gt c 128
+      c = 128
+    end
+    for i ulong c bound 129
+      put ca_obuf i get s add p i
+    end
+    z = write 1 ca_obuf 0 c
+    p = add p c
+  end
+end
+
+fn ca_wch c uchar to void
+  put ca_chbuf 0 c
+  z = write 1 ca_chbuf 0 1
+end
+
+fn ca_wnl to void
+  ca_wch 10
+end
+
+fn ca_wu64 v ulong to void
+  if eq v 0
+    ca_wch 48
+    ret
+  end
+  x = v
+  k = ulong 0
+  while gt x 0 bound 32
+    d = rem x 10
+    put ca_obuf k uchar add d 48
+    x = div x 10
+    k = add k 1
+  end
+  while gt k 0 bound 32
+    k = sub k 1
+    ca_wch get ca_obuf k
+  end
+end
+
+fn ca_whex which ulong to void
+  for i ulong 32
+    b = uint 0
+    if eq which 0
+      b = uint get sh_dig i
+    else
+      b = uint get ca_sha_in i
+    end
+    put ca_obuf mul i 2 sh_hexd shr b 4
+    put ca_obuf add mul i 2 1 sh_hexd and b 15
+  end
+  z = write 1 ca_obuf 0 64
+end
+
+fn ca_fail code ulong msg view uchar * to void
+  ca_wstr msg
+  exit int code
+end
+
+fn ca_fail_code code ulong to void
+  if eq code CA_ERR_RULE
+    ca_fail code ca_m_e61
+  end
+  if eq code CA_ERR_REVERSE
+    ca_fail code ca_m_e62
+  end
+  if eq code CA_ERR_DIMS
+    ca_fail code ca_m_e63
+  end
+  if eq code CA_ERR_SHA
+    ca_fail code ca_m_e64
+  end
+  if eq code CA_ERR_POP
+    ca_fail code ca_m_e65
+  end
+  if eq code CA_ERR_MAGIC
+    ca_fail code ca_m_e66
+  end
+  if eq code CA_ERR_TRUNC
+    ca_fail code ca_m_e67
+  end
+  if eq code CA_ERR_WORKER
+    ca_fail code ca_m_e68
+  end
+  if eq code CA_ERR_UNDER
+    ca_fail code ca_m_e69
+  end
+  ca_fail CA_ERR_IO ca_m_e70
+end
+
+note ---- Global Arg Helpers (slot 0=tmp, 1=arg1, 2=arg2, 3=arg3, 4=arg4, 5=wpath) ----
+fn ca_rd_arg idx ulong slot ulong to ulong
+  if ge idx ulong argcnt
+    ret 0
+  end
+  n = long -1
+  if eq slot 1
+    n = argread idx ca_arg1 0 4095
+  end
+  if eq slot 2
+    n = argread idx ca_arg2 0 4095
+  end
+  if eq slot 3
+    n = argread idx ca_arg3 0 4095
+  end
+  if eq slot 4
+    n = argread idx ca_arg4 0 4095
+  end
+  if eq slot 5
+    n = argread idx ca_wpath 0 4095
+  end
+  if eq slot 0
+    n = argread idx ca_tmparg 0 4095
+  end
+  if lt n 0
+    ret 0
+  end
+  put ca_arglen slot ulong n
+  ret ulong n
+end
+
+fn ca_tmp_eq b view uchar * to bool
+  na = get ca_arglen 0
+  if ne na len b
+    ret false
+  end
+  for i ulong na bound 4096
+    if ne get ca_tmparg i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ca_arg1_eq b view uchar * to bool
+  na = get ca_arglen 1
+  if ne na len b
+    ret false
+  end
+  for i ulong na bound 4096
+    if ne get ca_arg1 i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ca_parse_u64 slot ulong to ulong
+  na = get ca_arglen slot
+  if eq na 0
+    ca_fail CA_ERR_DIMS ca_m_e63
+  end
+  v = ulong 0
+  for i ulong na bound 32
+    ch = ulong 0
+    if eq slot 0
+      ch = ulong get ca_tmparg i
+    end
+    if eq slot 2
+      ch = ulong get ca_arg2 i
+    end
+    if eq slot 3
+      ch = ulong get ca_arg3 i
+    end
+    if eq slot 4
+      ch = ulong get ca_arg4 i
+    end
+    if or lt ch 48 gt ch 57
+      ca_fail CA_ERR_DIMS ca_m_e63
+    end
+    v = add mul v 10 sub ch 48
+  end
+  ret v
+end
+
+fn ca_set_def_worker to void
+  n = len ca_s_defw
+  for i ulong n bound 64
+    put ca_wpath i get ca_s_defw i
+  end
+  put ca_arglen 5 n
+end
+
+fn ca_scan_flags start ulong to void
+  ca_set_def_worker
+  put ca_opt 0 20
+  put ca_opt 1 0
+  put ca_opt 2 0
+  put ca_opt 3 0
+  put ca_opt 4 0
+  ac = ulong argcnt
+  i = start
+  while lt i ac bound 32
+    n = ca_rd_arg i 0
+    if ca_tmp_eq ca_s_fsc
+      put ca_opt 1 1
+    end
+    if ca_tmp_eq ca_s_ffr
+      put ca_opt 2 1
+    end
+    if ca_tmp_eq ca_s_ffv
+      put ca_opt 3 1
+    end
+    if ca_tmp_eq ca_s_ffw
+      put ca_opt 4 1
+    end
+    if ca_tmp_eq ca_s_fw
+      if ge add i 1 ac
+        ca_fail CA_ERR_IO ca_m_usage
+      end
+      i = add i 1
+      wl = ca_rd_arg i 5
+      if or eq wl 0 gt wl 1020
+        ca_fail CA_ERR_IO ca_m_usage
+      end
+    end
+    if ca_tmp_eq ca_s_ft
+      if ge add i 1 ac
+        ca_fail CA_ERR_IO ca_m_usage
+      end
+      i = add i 1
+      tl = ca_rd_arg i 0
+      tv = ca_parse_u64 0
+      if and ne tv 1 and ne tv 10 ne tv 20
+        ca_fail CA_ERR_DIMS ca_m_e63
+      end
+      put ca_opt 0 tv
+    end
+    i = add i 1
+  end
+end
+
+note ---- Direct Global Byte/Word Encoding Helpers ----
+fn ca_fbuf_u32 pos ulong to ulong
+  b0 = ulong get ca_fbuf pos
+  b1 = shl ulong get ca_fbuf add pos 1 8
+  b2 = shl ulong get ca_fbuf add pos 2 16
+  b3 = shl ulong get ca_fbuf add pos 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn ca_fbuf_put32 pos ulong v ulong to void
+  put ca_fbuf pos uchar and v 255
+  put ca_fbuf add pos 1 uchar and shr v 8 255
+  put ca_fbuf add pos 2 uchar and shr v 16 255
+  put ca_fbuf add pos 3 uchar and shr v 24 255
+end
+
+fn ca_fbuf_u64 pos ulong to ulong
+  ret or ca_fbuf_u32 pos shl ca_fbuf_u32 add pos 4 32
+end
+
+fn ca_fbuf_put64 pos ulong v ulong to void
+  ca_fbuf_put32 pos and v 4294967295
+  ca_fbuf_put32 add pos 4 shr v 32
+end
+
+fn ca_pkt_u32 pos ulong to ulong
+  b0 = ulong get ca_pkt pos
+  b1 = shl ulong get ca_pkt add pos 1 8
+  b2 = shl ulong get ca_pkt add pos 2 16
+  b3 = shl ulong get ca_pkt add pos 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn ca_pkt_put32 pos ulong v ulong to void
+  put ca_pkt pos uchar and v 255
+  put ca_pkt add pos 1 uchar and shr v 8 255
+  put ca_pkt add pos 2 uchar and shr v 16 255
+  put ca_pkt add pos 3 uchar and shr v 24 255
+end
+
+fn ca_pkt_u64 pos ulong to ulong
+  acc = ulong 0
+  for b ulong 8
+    acc = or acc shl ulong get ca_pkt add pos b mul b 8
+  end
+  ret acc
+end
+
+fn ca_pkt_put64 pos ulong v ulong to void
+  put ca_pkt pos uchar and v 255
+  put ca_pkt add pos 1 uchar and shr v 8 255
+  put ca_pkt add pos 2 uchar and shr v 16 255
+  put ca_pkt add pos 3 uchar and shr v 24 255
+  put ca_pkt add pos 4 uchar and shr v 32 255
+  put ca_pkt add pos 5 uchar and shr v 40 255
+  put ca_pkt add pos 6 uchar and shr v 48 255
+  put ca_pkt add pos 7 uchar and shr v 56 255
+end
+
+fn ca_shdat_put64 pos ulong v ulong to void
+  put sh_dat pos uchar and v 255
+  put sh_dat add pos 1 uchar and shr v 8 255
+  put sh_dat add pos 2 uchar and shr v 16 255
+  put sh_dat add pos 3 uchar and shr v 24 255
+  put sh_dat add pos 4 uchar and shr v 32 255
+  put sh_dat add pos 5 uchar and shr v 40 255
+  put sh_dat add pos 6 uchar and shr v 48 255
+  put sh_dat add pos 7 uchar and shr v 56 255
+end
+
+fn ca_pop64 x ulong to ulong
+  a = sub x and shr x 1 6148914691236517205
+  b = add and a 3689348814741910323 and shr a 2 3689348814741910323
+  c = and add b shr b 4 1085102592571150095
+  ret shr mul c 72340172838076673 56
+end
+
+fn ca_pop_grid gid ulong nw ulong to ulong
+  acc = ulong 0
+  for i ulong nw bound 65537
+    if eq gid 0
+      acc = add acc ca_pop64 get ca_a i
+    else
+      acc = add acc ca_pop64 get ca_b i
+    end
+  end
+  ret acc
+end
+
+note Grid IDs: 0=ca_a, 1=ca_b, 2=ca_ref, 3=ca_bak
+fn ca_copy_grid dst ulong src ulong nw ulong to void
+  for i ulong nw bound 65537
+    v = ulong 0
+    if eq src 0
+      v = get ca_a i
+    end
+    if eq src 1
+      v = get ca_b i
+    end
+    if eq src 2
+      v = get ca_ref i
+    end
+    if eq src 3
+      v = get ca_bak i
+    end
+    if eq dst 0
+      put ca_a i v
+    end
+    if eq dst 1
+      put ca_b i v
+    end
+    if eq dst 2
+      put ca_ref i v
+    end
+    if eq dst 3
+      put ca_bak i v
+    end
+  end
+end
+
+fn ca_diff_grid gid1 ulong gid2 ulong nw ulong to ulong
+  diffb = ulong 0
+  for i ulong nw bound 65537
+    va = ulong 0
+    if eq gid1 0
+      va = get ca_a i
+    else
+      va = get ca_b i
+    end
+    vb = ulong 0
+    if eq gid2 2
+      vb = get ca_ref i
+    else
+      vb = get ca_bak i
+    end
+    if ne va vb
+      for k ulong 8
+        ba = and shr va mul k 8 255
+        bb = and shr vb mul k 8 255
+        if ne ba bb
+          diffb = add diffb 1
+        end
+      end
+    end
+  end
+  ret diffb
+end
+
+note SHA IDs: 0=sh_dig, 1=ca_sha_in, 2=ca_sha_sc, 3=ca_sha_w1, 4=ca_sha_w20
+fn ca_sha_grid gid ulong nw ulong sid ulong to void
+  for w ulong nw bound 65537
+    v = ulong 0
+    if eq gid 0
+      v = get ca_a w
+    else
+      v = get ca_ref w
+    end
+    ca_shdat_put64 mul w 8 v
+  end
+  sh_all mul nw 8
+  if eq sid 0
+    ret
+  end
+  for i ulong 32
+    b = get sh_dig i
+    if eq sid 1
+      put ca_sha_in i b
+    end
+    if eq sid 2
+      put ca_sha_sc i b
+    end
+    if eq sid 3
+      put ca_sha_w1 i b
+    end
+    if eq sid 4
+      put ca_sha_w20 i b
+    end
+  end
+end
+
+fn ca_sha_eq_dig_in to bool
+  for i ulong 32
+    if ne get sh_dig i get ca_sha_in i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ca_sha_eq_sc_in to bool
+  for i ulong 32
+    if ne get ca_sha_sc i get ca_sha_in i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ca_check_dims w ulong h ulong to void
+  if or lt w 64 gt w 4096
+    ca_fail_code CA_ERR_DIMS
+  end
+  if or ne and w 1 0 ne and w 63 0
+    ca_fail_code CA_ERR_DIMS
+  end
+  if or lt h 2 gt h 2048
+    ca_fail_code CA_ERR_DIMS
+  end
+  if ne and h 1 0
+    ca_fail_code CA_ERR_DIMS
+  end
+  if gt mul div w 64 h CA_MAX_WORDS
+    ca_fail_code CA_ERR_DIMS
+  end
+end
+
+fn ca_slurp_arg1 to ulong
+  plen = get ca_arglen 1
+  if or eq plen 0 gt plen 4095
+    ca_fail_code CA_ERR_IO
+  end
+  fd = fopen ca_arg1 0 plen 0 0
+  if lt fd 0
+    ca_fail_code CA_ERR_IO
+  end
+  ifd = int fd
+  tot = ulong 0
+  go = true
+  while go bound 20000
+    remb = sub CA_MAX_FBUF tot
+    if eq remb 0
+      z = fclose ifd
+      ca_fail_code CA_ERR_TRUNC
+    end
+    n = read ifd ca_fbuf tot remb
+    if lt n 0
+      z = fclose ifd
+      ca_fail_code CA_ERR_IO
+    end
+    if eq n 0
+      go = false
+    else
+      tot = add tot ulong n
+    end
+  end
+  z = fclose ifd
+  ret tot
+end
+
+fn ca_read_omca_arg1 to void
+  tot = ca_slurp_arg1
+  if lt tot CA_HDR_BYTES
+    ca_fail_code CA_ERR_TRUNC
+  end
+  for i ulong 6
+    if ne get ca_fbuf i get ca_s_magic i
+      ca_fail_code CA_ERR_MAGIC
+    end
+  end
+  if or ne ulong get ca_fbuf 6 1 ne ulong get ca_fbuf 7 1
+    ca_fail_code CA_ERR_MAGIC
+  end
+  w = ca_fbuf_u32 8
+  h = ca_fbuf_u32 12
+  ca_check_dims w h
+  if or ne ca_fbuf_u64 32 mul div w 8 h ne tot add CA_HDR_BYTES mul div w 8 h
+    ca_fail_code CA_ERR_TRUNC
+  end
+  put ca_hdr 0 w
+  put ca_hdr 1 h
+  put ca_hdr 2 ca_fbuf_u64 16
+  put ca_hdr 3 ca_fbuf_u64 24
+  nw = mul div w 64 h
+  put ca_hdr 4 nw
+  for i ulong nw bound 65537
+    put ca_a i ca_fbuf_u64 add CA_HDR_BYTES mul i 8
+  end
+  for i ulong 32
+    put ca_sha_in i get ca_fbuf add 40 i
+  end
+  ca_sha_grid 0 nw 0
+  if not ca_sha_eq_dig_in
+    ca_fail_code CA_ERR_SHA
+  end
+  if ne ca_pop_grid 0 nw get ca_hdr 3
+    ca_fail_code CA_ERR_POP
+  end
+end
+
+fn ca_pack_omca w ulong h ulong st ulong to ulong
+  ca_check_dims w h
+  nw = mul div w 64 h
+  pop = ca_pop_grid 0 nw
+  for i ulong 6
+    put ca_fbuf i get ca_s_magic i
+  end
+  put ca_fbuf 6 1
+  put ca_fbuf 7 1
+  ca_fbuf_put32 8 w
+  ca_fbuf_put32 12 h
+  ca_fbuf_put64 16 st
+  ca_fbuf_put64 24 pop
+  ca_fbuf_put64 32 mul nw 8
+  ca_sha_grid 0 nw 1
+  for i ulong 32
+    put ca_fbuf add 40 i get ca_sha_in i
+  end
+  for i ulong nw bound 65537
+    ca_fbuf_put64 add CA_HDR_BYTES mul i 8 get ca_a i
+  end
+  ret add CA_HDR_BYTES mul nw 8
+end
+
+fn ca_write_omca slot ulong w ulong h ulong st ulong to void
+  plen = get ca_arglen slot
+  if or eq plen 0 gt plen 4095
+    ca_fail_code CA_ERR_IO
+  end
+  tot = ca_pack_omca w h st
+  fd = long -1
+  if eq slot 1
+    fd = fopen ca_arg1 0 plen 577 420
+  else
+    fd = fopen ca_arg2 0 plen 577 420
+  end
+  if lt fd 0
+    ca_fail_code CA_ERR_IO
+  end
+  ifd = int fd
+  ofs = ulong 0
+  while lt ofs tot bound 20000
+    n = write ifd ca_fbuf ofs sub tot ofs
+    if le n 0
+      z = fclose ifd
+      ca_fail_code CA_ERR_IO
+    end
+    ofs = add ofs ulong n
+  end
+  z = fclose ifd
+end
+
+note ---- Pure OM-2 Scalar Cell-by-Cell Margolus BBM Reference ----
+fn bbm_fwd_block x ulong to ulong
+  if or eq x 1 eq x 8
+    ret xor x 9
+  end
+  if or eq x 2 eq x 4
+    ret xor x 6
+  end
+  if or eq x 9 eq x 6
+    ret xor x 15
+  end
+  ret x
+end
+
+fn ca_get_a idx ulong x ulong to ulong
+  ret and shr get ca_a idx and x 63 1
+end
+
+fn ca_get_b idx ulong x ulong to ulong
+  ret and shr get ca_b idx and x 63 1
+end
+
+fn ca_set_a idx ulong x ulong bit ulong to void
+  sh = and x 63
+  w = get ca_a idx
+  clr = and w xor 18446744073709551615 shl 1 sh
+  put ca_a idx or clr shl bit sh
+end
+
+fn ca_set_b idx ulong x ulong bit ulong to void
+  sh = and x 63
+  w = get ca_b idx
+  clr = and w xor 18446744073709551615 shl 1 sh
+  put ca_b idx or clr shl bit sh
+end
+
+fn ca_wrap_inc v ulong m ulong to ulong
+  n = add v 1
+  if ge n m
+    ret sub n m
+  end
+  ret n
+end
+
+fn ca_get_grid gbit ulong idx ulong x ulong to ulong
+  if eq gbit 0
+    ret ca_get_a idx x
+  end
+  ret ca_get_b idx x
+end
+
+fn ca_set_grid gbit ulong idx ulong x ulong bit ulong to void
+  if eq gbit 0
+    ca_set_a idx x bit
+  else
+    ca_set_b idx x bit
+  end
+end
+
+fn ca_rd_2x2 use_ab ulong w ulong h ulong x0 ulong y0 ulong to ulong
+  kw = div w 64
+  x1 = ca_wrap_inc x0 w
+  y1 = ca_wrap_inc y0 h
+  nib = ca_get_grid use_ab add mul y0 kw shr x0 6 x0
+  nib = or nib shl ca_get_grid use_ab add mul y0 kw shr x1 6 x1 1
+  nib = or nib shl ca_get_grid use_ab add mul y1 kw shr x0 6 x0 2
+  nib = or nib shl ca_get_grid use_ab add mul y1 kw shr x1 6 x1 3
+  ret nib
+end
+
+fn ca_wr_2x2 dst ulong w ulong h ulong x0 ulong y0 ulong nx ulong to void
+  kw = div w 64
+  x1 = ca_wrap_inc x0 w
+  y1 = ca_wrap_inc y0 h
+  ca_set_grid dst add mul y0 kw shr x0 6 x0 and nx 1
+  ca_set_grid dst add mul y0 kw shr x1 6 x1 and shr nx 1 1
+  ca_set_grid dst add mul y1 kw shr x0 6 x0 and shr nx 2 1
+  ca_set_grid dst add mul y1 kw shr x1 6 x1 and shr nx 3 1
+end
+
+fn ca_step_block use_ab ulong w ulong h ulong x0 ulong y0 ulong to void
+  nx = bbm_fwd_block ca_rd_2x2 use_ab w h x0 y0
+  ca_wr_2x2 sub 1 use_ab w h x0 y0 nx
+end
+
+fn ca_scalar_step_once use_ab ulong w ulong h ulong phase ulong to void
+  nw = mul div w 64 h
+  for i ulong nw bound 65537
+    if eq use_ab 0
+      put ca_b i 0
+    else
+      put ca_a i 0
+    end
+  end
+  py = ulong 0
+  while lt py shr h 1 bound 1025
+    y0 = add mul py 2 phase
+    if ge y0 h
+      y0 = sub y0 h
+    end
+    px = ulong 0
+    while lt px shr w 1 bound 2049
+      x0 = add mul px 2 phase
+      if ge x0 w
+        x0 = sub x0 w
+      end
+      ca_step_block use_ab w h x0 y0
+      px = add px 1
+    end
+    py = add py 1
+  end
+end
+
+fn ca_scalar_evolve w ulong h ulong st0 ulong steps ulong is_rev ulong pop0 ulong to void
+  nw = mul div w 64 h
+  if eq steps 0
+    ret
+  end
+  for s ulong steps bound 8193
+    ph = ulong 0
+    if eq is_rev 0
+      ph = and add st0 s 1
+    else
+      ph = and xor sub st0 1 s 1
+    end
+    if eq and s 1 0
+      ca_scalar_step_once 0 w h ph
+      if ne ca_pop_grid 1 nw pop0
+        ca_fail_code CA_ERR_RULE
+      end
+    else
+      ca_scalar_step_once 1 w h ph
+      if ne ca_pop_grid 0 nw pop0
+        ca_fail_code CA_ERR_RULE
+      end
+    end
+  end
+  if ne and steps 1 0
+    ca_copy_grid 0 1 nw
+  end
+end
+
+note ---- Grace 20-Core CPU Map & Worker Pool (pipefds + fork + dupfd + cpuset + execprog) ----
+fn ca_init_cores nw ulong to void
+  if eq nw 1
+    put ca_cores 0 5
+    ret
+  end
+  put ca_cores 0 5
+  put ca_cores 1 6
+  put ca_cores 2 7
+  put ca_cores 3 8
+  put ca_cores 4 9
+  put ca_cores 5 15
+  put ca_cores 6 16
+  put ca_cores 7 17
+  put ca_cores 8 18
+  put ca_cores 9 19
+  put ca_cores 10 0
+  put ca_cores 11 1
+  put ca_cores 12 2
+  put ca_cores 13 3
+  put ca_cores 14 4
+  put ca_cores 15 10
+  put ca_cores 16 11
+  put ca_cores 17 12
+  put ca_cores 18 13
+  put ca_cores 19 14
+end
+
+fn ca_pin_core core ulong to void
+  for i ulong 128
+    put ca_mask i 0
+  end
+  put ca_mask div core 8 shl uchar 1 uchar rem core 8
+  z = cpuset 0 ca_mask 0 128
+end
+
+fn ca_rd_ptmp_fd32 off ulong to int
+  b0 = ulong get ca_ptmp off
+  b1 = shl ulong get ca_ptmp add off 1 8
+  b2 = shl ulong get ca_ptmp add off 2 16
+  b3 = shl ulong get ca_ptmp add off 3 24
+  ret int or or b0 b1 or b2 b3
+end
+
+fn ca_rd_wst_u32 to ulong
+  b0 = ulong get ca_wst 0
+  b1 = shl ulong get ca_wst 1 8
+  b2 = shl ulong get ca_wst 2 16
+  b3 = shl ulong get ca_wst 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn ca_pack_avpkt to void
+  pl = get ca_arglen 5
+  put ca_avpkt 0 1
+  put ca_avpkt 1 0
+  put ca_avpkt 2 uchar and pl 255
+  put ca_avpkt 3 uchar shr pl 8
+  for i ulong pl bound 1024
+    put ca_avpkt add 4 i get ca_wpath i
+  end
+end
+
+fn ca_plan_strips nw ulong h ulong to ulong
+  if eq nw 1
+    put ca_s_off 0 0
+    put ca_s_cnt 0 h
+    ret 1
+  end
+  if and eq nw 20 eq rem h 80 0
+    unit = div h 80
+    off = ulong 0
+    for i ulong 20
+      cnt = ulong 0
+      if lt i 10
+        cnt = mul 5 unit
+      else
+        cnt = mul 3 unit
+      end
+      put ca_s_off i off
+      put ca_s_cnt i cnt
+      off = add off cnt
+    end
+    ret 20
+  end
+  pairs = div h 2
+  act = nw
+  if gt act pairs
+    act = pairs
+  end
+  base = div pairs act
+  ex = rem pairs act
+  off = ulong 0
+  for i ulong act bound 21
+    p = base
+    if lt i ex
+      p = add p 1
+    end
+    cnt = mul p 2
+    put ca_s_off i off
+    put ca_s_cnt i cnt
+    off = add off cnt
+  end
+  ret act
+end
+
+fn ca_spawn_one i ulong pl ulong to void
+  if ne pipefds ca_ptmp 0 8 0 0
+    ca_fail_code CA_ERR_WORKER
+  end
+  in_rd = ca_rd_ptmp_fd32 0
+  in_wr = ca_rd_ptmp_fd32 4
+  if ne pipefds ca_ptmp 0 8 0 0
+    z = fclose in_rd
+    z = fclose in_wr
+    ca_fail_code CA_ERR_WORKER
+  end
+  out_rd = ca_rd_ptmp_fd32 0
+  out_wr = ca_rd_ptmp_fd32 4
+  pid = fork
+  if lt pid 0
+    z = fclose in_rd
+    z = fclose in_wr
+    z = fclose out_rd
+    z = fclose out_wr
+    ca_fail_code CA_ERR_WORKER
+  end
+  if eq pid 0
+    for j ulong i bound 21
+      z = fclose get ca_inwr j
+      z = fclose get ca_outrd j
+    end
+    z = dupfd in_rd 0 0
+    z = dupfd out_wr 1 0
+    z = fclose in_rd
+    z = fclose in_wr
+    z = fclose out_rd
+    z = fclose out_wr
+    ca_pin_core get ca_cores i
+    z = execprog ca_avpkt 0 add 4 pl
+    exit 127
+  end
+  put ca_pids i int pid
+  put ca_inwr i in_wr
+  put ca_outrd i out_rd
+  z = fclose in_rd
+  z = fclose out_wr
+end
+
+fn ca_spawn_workers nw ulong to void
+  ca_init_cores nw
+  ca_pack_avpkt
+  pl = get ca_arglen 5
+  for i ulong nw bound 21
+    ca_spawn_one i pl
+  end
+end
+
+fn ca_stop_workers nw ulong to void
+  bad = false
+  for i ulong nw bound 21
+    z = fclose get ca_inwr i
+    z = fclose get ca_outrd i
+  end
+  for i ulong nw bound 21
+    st = waitpid get ca_pids i ca_wst 0 4 0
+    ws = ca_rd_wst_u32
+    if or lt st 0 ne ws 0
+      bad = true
+    end
+  end
+  if bad
+    ca_fail_code CA_ERR_WORKER
+  end
+end
+
+fn ca_write_pkt fd int tot ulong to bool
+  ofs = ulong 0
+  while lt ofs tot bound 20000
+    n = write fd ca_pkt ofs sub tot ofs
+    if le n 0
+      ret false
+    end
+    ofs = add ofs ulong n
+  end
+  ret true
+end
+
+fn ca_read_pkt fd int tot ulong to bool
+  ofs = ulong 0
+  while lt ofs tot bound 20000
+    n = read fd ca_pkt ofs sub tot ofs
+    if le n 0
+      ret false
+    end
+    ofs = add ofs ulong n
+  end
+  ret true
+end
+
+fn ca_send_row ry ulong gy ulong kw ulong to void
+  db = add 64 mul mul ry kw 8
+  sb = mul gy kw
+  for kx ulong kw bound 65
+    v = get ca_a add sb kx
+    ca_pkt_put64 add db mul kx 8 v
+  end
+end
+
+fn ca_send_hdr wid ulong steps ulong kw ulong r_tot ulong ph0 ulong to void
+  flt = ulong 0
+  if and ne get ca_opt 4 0 eq add wid 1 get ca_opt 4
+    flt = 1
+  end
+  ca_pkt_put64 0 CA_PKT_MAGIC
+  ca_pkt_put64 8 steps
+  ca_pkt_put64 16 kw
+  ca_pkt_put64 24 r_tot
+  ca_pkt_put64 32 ph0
+  ca_pkt_put64 40 get ca_opt 5
+  ca_pkt_put64 48 get ca_s_cnt wid
+  ca_pkt_put64 56 flt
+end
+
+fn ca_mod_sub a ulong b ulong h ulong to ulong
+  ma = rem a h
+  mb = rem b h
+  if ge ma mb
+    ret sub ma mb
+  end
+  ret sub add ma h mb
+end
+
+fn ca_send_strip wid ulong act ulong kw ulong h ulong steps ulong ph0 ulong to void
+  oc = get ca_s_cnt wid
+  ha = ulong 0
+  if ne oc h
+    ha = mul div add steps 1 2 2
+  end
+  put ca_opt 5 ha
+  rt = add oc mul 2 ha
+  sy = ca_mod_sub get ca_s_off wid ha h
+  ca_send_hdr wid steps kw rt ph0
+  for ry ulong rt bound 2049
+    ca_send_row ry rem add sy ry h kw
+  end
+  tot = add 64 mul mul rt kw 8
+  if not ca_write_pkt get ca_inwr wid tot
+    ca_stop_workers act
+    ca_fail_code CA_ERR_WORKER
+  end
+end
+
+fn ca_recv_row ry ulong gy ulong kw ulong to void
+  sb = mul mul ry kw 8
+  db = mul gy kw
+  for kx ulong kw bound 65
+    v = ca_pkt_u64 add sb mul kx 8
+    put ca_b add db kx v
+  end
+end
+
+fn ca_recv_strip wid ulong act ulong kw ulong to void
+  oo = get ca_s_off wid
+  oc = get ca_s_cnt wid
+  tot = mul mul oc kw 8
+  if not ca_read_pkt get ca_outrd wid tot
+    ca_stop_workers act
+    ca_fail_code CA_ERR_WORKER
+  end
+  for ry ulong oc bound 2049
+    ca_recv_row ry add oo ry kw
+  end
+end
+
+fn ca_pool_epoch act ulong w ulong h ulong steps ulong ph0 ulong to void
+  kw = div w 64
+  nw = mul kw h
+  for i ulong act bound 21
+    ca_send_strip i act kw h steps ph0
+  end
+  for i ulong act bound 21
+    ca_recv_strip i act kw
+  end
+  ca_copy_grid 0 1 nw
+end
+
+fn ca_phase_for is_rev ulong st0 ulong done ulong to ulong
+  if eq is_rev 0
+    ret and add st0 done 1
+  end
+  cur = sub st0 done
+  ret and sub cur 1 1
+end
+
+fn ca_next_ep act ulong rem_s ulong to ulong
+  ep = rem_s
+  cap = ulong 32
+  if and gt act 1 gt ep cap
+    ep = cap
+  end
+  if gt ep 4096
+    ep = 4096
+  end
+  ret ep
+end
+
+fn ca_pool_evolve nw_cfg ulong w ulong h ulong st0 ulong steps ulong is_rev ulong to void
+  if eq steps 0
+    ret
+  end
+  put ca_opt 6 div w 64
+  put ca_hdr 7 ca_pop_grid 0 mul div w 64 h
+  act = ca_plan_strips nw_cfg h
+  ca_spawn_workers act
+  done = ulong 0
+  while lt done steps bound 4096
+    ep = ca_next_ep act sub steps done
+    ph0 = ca_phase_for is_rev st0 done
+    ca_pool_epoch act w h ep ph0
+    if ne ca_pop_grid 0 mul div w 64 h get ca_hdr 7
+      ca_stop_workers act
+      ca_fail_code CA_ERR_RULE
+    end
+    done = add done ep
+  end
+  ca_stop_workers act
+end
+
+fn ca_run_steps_pool act ulong w ulong h ulong st0 ulong steps ulong is_rev ulong to void
+  put ca_opt 6 div w 64
+  done = ulong 0
+  while lt done steps bound 4096
+    ep = ca_next_ep act sub steps done
+    ph0 = ca_phase_for is_rev st0 done
+    ca_pool_epoch act w h ep ph0
+    done = add done ep
+  end
+end
+
+fn ca_sort9 to void
+  for i ulong 9
+    j = add i 1
+    while lt j 9 bound 10
+      vi = get ca_times i
+      vj = get ca_times j
+      if gt vi vj
+        put ca_times i vj
+        put ca_times j vi
+      end
+      j = add j 1
+    end
+  end
+end
+
+note ---- Asymmetric Margolus BBM Glider + Collider Initializer ----
+fn ca_place_glider_se kw ulong x ulong y ulong to void
+  ca_set_a add mul y kw shr x 6 x 1
+  ca_set_a add mul add y 1 kw shr add x 2 6 add x 2 1
+  ca_set_a add mul add y 1 kw shr x 6 x 1
+end
+
+fn ca_place_glider_nw kw ulong x ulong y ulong to void
+  ca_set_a add mul y kw shr x 6 x 1
+  ca_set_a add mul add y 1 kw shr add x 1 6 add x 1 1
+  ca_set_a add mul add y 2 kw shr x 6 x 1
+end
+
+fn ca_init_soup kw ulong h ulong seed ulong to void
+  xs = add mul seed 6364136223846793005 1442695040888963407
+  if eq xs 0
+    xs = 73519824011923419
+  end
+  for y ulong h bound 2049
+    for kx ulong kw bound 65
+      xs = xor xs shl xs 13
+      xs = xor xs shr xs 7
+      xs = xor xs shl xs 17
+      mask = ulong 0
+      if eq rem add y kx 3 0
+        mask = and xs 382972389238192013
+      else
+        if eq rem add mul y 3 kx 5 0
+          mask = and xs 1229782938247303441
+        end
+      end
+      idx = add mul y kw kx
+      put ca_a idx or get ca_a idx mask
+    end
+  end
+end
+
+fn ca_init_collider w ulong h ulong seed ulong to void
+  ca_check_dims w h
+  kw = div w 64
+  nw = mul kw h
+  for i ulong nw bound 65537
+    put ca_a i 0
+  end
+  ym = and div h 2 18446744073709551614
+  if ge ym 8
+    ca_place_glider_se kw 8 sub ym 6
+    ca_place_glider_nw kw 26 add ym 2
+    ca_set_a mul sub ym 2 kw 16 1
+    ca_set_a mul sub ym 1 kw 17 1
+    ca_set_a mul ym kw 18 1
+    ca_set_a mul add ym 1 kw 19 1
+  end
+  ca_init_soup kw h seed
+end
+
+note ---- Subcommands ----
+fn cmd_init to void
+  if lt ulong argcnt 5
+    ca_fail CA_ERR_IO ca_m_usage
+  end
+  ca_scan_flags 5
+  z = ca_rd_arg 2 1
+  z = ca_rd_arg 3 2
+  z = ca_rd_arg 4 3
+  w = ca_parse_u64 2
+  h = ca_parse_u64 3
+  seed = ulong 20261127
+  if ge ulong argcnt 6
+    sl = ca_rd_arg 5 4
+    if and ne get ca_arg4 0 45 gt sl 0
+      seed = ca_parse_u64 4
+    end
+  end
+  ca_init_collider w h seed
+  ca_write_omca 1 w h 0
+  nw = mul div w 64 h
+  pop = ca_pop_grid 0 nw
+  ca_wstr ca_k_init
+  ca_wstr ca_k_w
+  ca_wu64 w
+  ca_wstr ca_k_h
+  ca_wu64 h
+  ca_wstr ca_k_pop
+  ca_wu64 pop
+  ca_wstr ca_k_sha
+  ca_whex 1
+  ca_wnl
+end
+
+fn cmd_inspect to void
+  if lt ulong argcnt 3
+    ca_fail CA_ERR_IO ca_m_usage
+  end
+  z = ca_rd_arg 2 1
+  ca_read_omca_arg1
+  ca_wstr ca_k_insp
+  ca_wstr ca_k_w
+  ca_wu64 get ca_hdr 0
+  ca_wstr ca_k_h
+  ca_wu64 get ca_hdr 1
+  ca_wstr ca_k_st
+  ca_wu64 get ca_hdr 2
+  ca_wstr ca_k_pop
+  ca_wu64 get ca_hdr 3
+  ca_wstr ca_k_sha
+  ca_whex 1
+  ca_wnl
+end
+
+fn cmd_evolve is_rev ulong to void
+  if lt ulong argcnt 5
+    ca_fail CA_ERR_IO ca_m_usage
+  end
+  ca_scan_flags 5
+  z = ca_rd_arg 2 1
+  z = ca_rd_arg 3 2
+  z = ca_rd_arg 4 3
+  steps = ca_parse_u64 3
+  ca_read_omca_arg1
+  w = get ca_hdr 0
+  h = get ca_hdr 1
+  st0 = get ca_hdr 2
+  pop0 = get ca_hdr 3
+  nw = get ca_hdr 4
+  if and ne is_rev 0 gt steps st0
+    ca_fail_code CA_ERR_UNDER
+  end
+  if ne get ca_opt 2 0
+    put ca_a 0 xor get ca_a 0 1
+    if ne ca_pop_grid 0 nw pop0
+      ca_fail_code CA_ERR_RULE
+    end
+  end
+  if ne get ca_opt 4 0
+    act = ca_plan_strips get ca_opt 0 h
+    ca_spawn_workers act
+    ca_run_steps_pool act w h st0 1 is_rev
+    ca_stop_workers act
+  end
+  if ne get ca_opt 1 0
+    ca_scalar_evolve w h st0 steps is_rev pop0
+  else
+    ca_pool_evolve get ca_opt 0 w h st0 steps is_rev
+  end
+  nst = ulong 0
+  if eq is_rev 0
+    nst = add st0 steps
+    ca_wstr ca_k_ev
+  else
+    nst = sub st0 steps
+    ca_wstr ca_k_rv
+  end
+  ca_write_omca 2 w h nst
+  ca_wstr ca_k_st
+  ca_wu64 nst
+  ca_wstr ca_k_pop
+  ca_wu64 pop0
+  ca_wstr ca_k_sha
+  ca_whex 1
+  ca_wnl
+end
+
+fn ca_flip_preserve_pop nw ulong to void
+  for i ulong nw bound 65537
+    v = get ca_a i
+    if and ne v 0 ne v 18446744073709551615
+      put ca_a i xor v 3
+      ret
+    end
+  end
+  put ca_a 0 xor get ca_a 0 1
+end
+
+fn ca_verify_core w ulong h ulong st0 ulong steps ulong to void
+  nw = mul div w 64 h
+  pop0 = ca_pop_grid 0 nw
+  ca_copy_grid 3 0 nw
+  ca_sha_grid 0 nw 1
+  ca_scalar_evolve w h st0 steps 0 pop0
+  ca_copy_grid 2 0 nw
+  ca_sha_grid 2 nw 2
+  if ca_sha_eq_sc_in
+    ca_fail_code CA_ERR_REVERSE
+  end
+  ca_copy_grid 0 3 nw
+  ca_pool_evolve 1 w h st0 steps 0
+  if ne ca_diff_grid 0 2 nw 0
+    ca_fail_code CA_ERR_RULE
+  end
+  ca_copy_grid 0 3 nw
+  ca_pool_evolve 20 w h st0 steps 0
+  if ne ca_diff_grid 0 2 nw 0
+    ca_fail_code CA_ERR_RULE
+  end
+  if ne get ca_opt 3 0
+    ca_flip_preserve_pop nw
+  end
+  ca_pool_evolve 20 w h add st0 steps steps 1
+  if or ne ca_diff_grid 0 3 nw 0 ne ca_pop_grid 0 nw pop0
+    ca_fail_code CA_ERR_REVERSE
+  end
+  ca_sha_grid 0 nw 0
+  if not ca_sha_eq_dig_in
+    ca_fail_code CA_ERR_REVERSE
+  end
+end
+
+fn cmd_verify to void
+  if lt ulong argcnt 4
+    ca_fail CA_ERR_IO ca_m_usage
+  end
+  ca_scan_flags 4
+  z = ca_rd_arg 2 1
+  z = ca_rd_arg 3 2
+  steps = ca_parse_u64 2
+  ca_read_omca_arg1
+  ca_verify_core get ca_hdr 0 get ca_hdr 1 get ca_hdr 2 steps
+  ca_wstr ca_k_vok
+  ca_wstr ca_k_w
+  ca_wu64 get ca_hdr 0
+  ca_wstr ca_k_h
+  ca_wu64 get ca_hdr 1
+  ca_wstr ca_k_st
+  ca_wu64 steps
+  ca_wstr ca_k_pop
+  ca_wu64 get ca_hdr 3
+  ca_wstr ca_k_sha
+  ca_whex 0
+  ca_wnl
+end
+
+fn cmd_selftest to void
+  ca_scan_flags 2
+  ca_init_collider 256 160 20261127
+  ca_verify_core 256 160 0 64
+  ca_init_collider 256 160 99887766
+  ca_verify_core 256 160 0 128
+  ca_init_collider 256 160 44556677
+  ca_verify_core 256 160 0 17
+  ca_wstr ca_k_self
+  ca_wstr ca_k_w
+  ca_wu64 256
+  ca_wstr ca_k_h
+  ca_wu64 160
+  ca_wstr ca_k_st
+  ca_wu64 128
+  ca_wstr ca_k_sha
+  ca_whex 0
+  ca_wnl
+end
+
+fn ca_bench_scalar w ulong h ulong steps ulong pop0 ulong to ulong
+  nw = mul div w 64 h
+  ca_copy_grid 0 3 nw
+  ca_scalar_evolve w h 0 steps 0 pop0
+  ca_copy_grid 2 0 nw
+  for r ulong 9
+    ca_copy_grid 0 3 nw
+    t0 = monons
+    ca_scalar_evolve w h 0 steps 0 pop0
+    t1 = monons
+    put ca_times r ulong sub t1 t0
+  end
+  ca_sort9
+  ret get ca_times 4
+end
+
+fn ca_bench_pool nw_cfg ulong w ulong h ulong steps ulong to ulong
+  nw = mul div w 64 h
+  act = ca_plan_strips nw_cfg h
+  ca_spawn_workers act
+  ca_copy_grid 0 3 nw
+  ca_run_steps_pool act w h 0 steps 0
+  for r ulong 9
+    ca_copy_grid 0 3 nw
+    t0 = monons
+    ca_run_steps_pool act w h 0 steps 0
+    t1 = monons
+    put ca_times r ulong sub t1 t0
+  end
+  ca_stop_workers act
+  ca_sort9
+  ret get ca_times 4
+end
+
+fn ca_bench_scale to void
+  w = ulong 1024
+  h = ulong 2048
+  steps = ulong 512
+  nw = mul div w 64 h
+  ca_init_collider w h 20261127
+  ca_copy_grid 3 0 nw
+  w1_med = ca_bench_pool 1 w h steps
+  ca_copy_grid 2 0 nw
+  w10_med = ca_bench_pool 10 w h steps
+  db = ca_diff_grid 0 2 nw
+  if ne db 0
+    ca_fail_code CA_ERR_RULE
+  end
+  ca_copy_grid 0 3 nw
+  ca_pool_evolve 1 w h 0 128 0
+  ca_copy_grid 2 0 nw
+  ca_copy_grid 0 3 nw
+  ca_pool_evolve 20 w h 0 128 0
+  db = add db ca_diff_grid 0 2 nw
+  if ne db 0
+    ca_fail_code CA_ERR_RULE
+  end
+  ca_wstr ca_k_bscale
+  ca_wstr ca_k_w
+  ca_wu64 w
+  ca_wstr ca_k_h
+  ca_wu64 h
+  ca_wstr ca_k_st
+  ca_wu64 steps
+  ca_wnl
+  ca_wstr ca_k_w1
+  ca_wu64 w1_med
+  ca_wstr ca_k_w10
+  ca_wu64 w10_med
+  ca_wstr ca_k_diff
+  ca_wu64 db
+  ca_wstr ca_k_sp2
+  ca_wu64 div mul w1_med 100 w10_med
+  ca_wstr ca_k_x100
+  ca_wnl
+end
+
+fn cmd_bench to void
+  ca_scan_flags 2
+  w = ulong 1024
+  h = ulong 320
+  steps = ulong 64
+  nw = mul div w 64 h
+  ca_init_collider w h 20261127
+  pop0 = ca_pop_grid 0 nw
+  ca_copy_grid 3 0 nw
+  sc_med = ca_bench_scalar w h steps pop0
+  w1_med = ca_bench_pool 1 w h steps
+  d1 = ca_diff_grid 0 2 nw
+  w10_med = ca_bench_pool 10 w h steps
+  d10 = ca_diff_grid 0 2 nw
+  w20_med = ca_bench_pool 20 w h steps
+  d20 = ca_diff_grid 0 2 nw
+  db = add add d1 d10 d20
+  if ne db 0
+    ca_fail_code CA_ERR_RULE
+  end
+  ca_wstr ca_k_bok
+  ca_wstr ca_k_w
+  ca_wu64 w
+  ca_wstr ca_k_h
+  ca_wu64 h
+  ca_wstr ca_k_st
+  ca_wu64 steps
+  ca_wnl
+  ca_wstr ca_k_sc
+  ca_wu64 sc_med
+  ca_wch 32
+  ca_wstr ca_k_w1
+  ca_wu64 w1_med
+  ca_wstr ca_k_w10
+  ca_wu64 w10_med
+  ca_wstr ca_k_w20
+  ca_wu64 w20_med
+  ca_wstr ca_k_diff
+  ca_wu64 db
+  ca_wstr ca_k_sp1
+  ca_wu64 div mul sc_med 100 w10_med
+  ca_wstr ca_k_x100
+  ca_wnl
+  ca_bench_scale
+end
+
+fn main to int
+  if lt ulong argcnt 2
+    ca_fail CA_ERR_IO ca_m_usage
+  end
+  cl = ca_rd_arg 1 1
+  if ca_arg1_eq ca_s_init
+    cmd_init
+    ret 0
+  end
+  if ca_arg1_eq ca_s_inspect
+    cmd_inspect
+    ret 0
+  end
+  if ca_arg1_eq ca_s_evolve
+    cmd_evolve 0
+    ret 0
+  end
+  if ca_arg1_eq ca_s_reverse
+    cmd_evolve 1
+    ret 0
+  end
+  if ca_arg1_eq ca_s_verify
+    cmd_verify
+    ret 0
+  end
+  if ca_arg1_eq ca_s_selftest
+    cmd_selftest
+    ret 0
+  end
+  if ca_arg1_eq ca_s_bench
+    cmd_bench
+    ret 0
+  end
+  ca_fail CA_ERR_IO ca_m_usage
+  ret 70
+end
