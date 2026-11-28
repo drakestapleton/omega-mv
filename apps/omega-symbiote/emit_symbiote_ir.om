@@ -1,0 +1,569 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-symbiote/emit_symbiote_ir.om
+note Pure seeded OM-2 binary Omega-IR (OSC1IR v9, omega.ng.ir.v1) generator for the
+note 128-bit NEON vec-f32x4 Symbiote compute worker.
+note Compose after seed/ng/src/ir.om:
+note   cat seed/ng/src/ir.om apps/omega-symbiote/emit_symbiote_ir.om | seed/out/omc > emit_symbiote_ir
+note Pipeline:
+note   ./emit_symbiote_ir > worker.ir
+note   ngcheck < worker.ir
+note   { printf '@ng opt\n'; cat worker.ir; } | ng > worker.opt.ir
+note   { printf '@ng opt-count\n'; cat worker.ir; } | ng
+note   ngcheck < worker.opt.ir
+note   { printf '@ng a64\n'; cat worker.opt.ir; } | ng > symbiote_worker
+note   readelf -d symbiote_worker   # reports: There is no dynamic section in this file.
+
+const ES_MAX_FLOATS ulong 8192
+const ES_MAX_BYTES ulong 32768
+const ES_VEC_LIM ulong 8189
+const ES_MAX_ITERS ulong 65536
+const ES_HDR_BYTES ulong 32
+const ES_MAGIC ulong 827152723
+
+note Type handles:
+note 0=vec4 1=arr_f 2=ref_f 3=arr_io 4=ref_io 5=arr_hdr 6=ref_hdr 7=arr_rdy 8=ref_rdy
+global es_t uint 16
+note Global handles: 0=g_in 1=g_out 2=g_io 3=g_hdr 4=g_rdy
+global es_g uint 8
+note Function handles: 0=hdr_u32 1=read_hdr 2=read_io 3=write_io 4=unpack 5=compute_neon 6=pack 7=main
+global es_f uint 16
+note Scratch SSA value handles & block handles (keeps live register count <= 6 per fn)
+global es_v uint 64
+global es_b uint 32
+
+text es_rdy_bytes "SYM1"
+
+fn es_k b uint t uint v ulong to uint
+  ret ir_res ir_op b 1 t v 0
+end
+
+fn es_un b uint op uint t uint x uint to uint
+  o = ir_op b op t 0 1
+  ir_set o 0 x
+  ret ir_res o
+end
+
+fn es_bin b uint op uint t uint x uint y uint to uint
+  o = ir_op b op t 0 2
+  ir_set o 0 x
+  ir_set o 1 y
+  ret ir_res o
+end
+
+fn es_fma b uint t uint a uint bb uint c uint to uint
+  o = ir_op b 46 t 0 3
+  ir_set o 0 a
+  ir_set o 1 bb
+  ir_set o 2 c
+  ret ir_res o
+end
+
+fn es_gaddr b uint gidx ulong tidx ulong to uint
+  o = ir_op b 52 get es_t tidx ulong get es_g gidx 0
+  ret ir_res o
+end
+
+fn es_chk_bnd b uint tk uint r uint idx uint cnt uint to uint
+  o = ir_op b 79 0 3 4
+  ir_set o 0 tk
+  ir_set o 1 r
+  ir_set o 2 idx
+  ir_set o 3 cnt
+  ret ir_otok o
+end
+
+fn es_chk_slc b uint tk uint r uint off uint cnt uint to uint
+  o = ir_op b 80 0 3 4
+  ir_set o 0 tk
+  ir_set o 1 r
+  ir_set o 2 off
+  ir_set o 3 cnt
+  ret ir_otok o
+end
+
+fn es_chk_fuel b uint tk uint k uint bd uint to uint
+  o = ir_op b 81 0 4 3
+  ir_set o 0 tk
+  ir_set o 1 k
+  ir_set o 2 bd
+  ret ir_otok o
+end
+
+fn es_load b uint tk uint ty uint r uint idx uint to uint
+  o = ir_op b 42 ty 0 3
+  ir_set o 0 tk
+  ir_set o 1 r
+  ir_set o 2 idx
+  ret ir_res o
+end
+
+fn es_store b uint tk uint r uint idx uint val uint to uint
+  o = ir_op b 43 0 0 4
+  ir_set o 0 tk
+  ir_set o 1 r
+  ir_set o 2 idx
+  ir_set o 3 val
+  ret ir_otok o
+end
+
+fn es_vload b uint tk uint r uint idx uint to uint
+  o = ir_op b 58 get es_t 0 0 3
+  ir_set o 0 tk
+  ir_set o 1 r
+  ir_set o 2 idx
+  ret ir_res o
+end
+
+fn es_vstore b uint tk uint r uint idx uint val uint to uint
+  o = ir_op b 59 0 0 4
+  ir_set o 0 tk
+  ir_set o 1 r
+  ir_set o 2 idx
+  ir_set o 3 val
+  ret ir_otok o
+end
+
+fn es_cbr b uint tk uint cond uint bt uint bf uint to void
+  o = ir_op b 61 0 0 4
+  ir_set o 0 tk
+  ir_set o 1 cond
+  ir_set o 2 bt
+  ir_set o 3 bf
+end
+
+fn es_br0 b uint dst uint tk uint to void
+  o = ir_op b 60 0 0 2
+  ir_set o 0 dst
+  ir_set o 1 tk
+end
+
+fn es_br1 b uint dst uint tk uint a0 uint to void
+  o = ir_op b 60 0 0 3
+  ir_set o 0 dst
+  ir_set o 1 tk
+  ir_set o 2 a0
+end
+
+fn es_br2 b uint dst uint tk uint a0 uint a1 uint to void
+  o = ir_op b 60 0 0 4
+  ir_set o 0 dst
+  ir_set o 1 tk
+  ir_set o 2 a0
+  ir_set o 3 a1
+end
+
+fn es_ret b uint tk uint to void
+  o = ir_op b 62 0 0 1
+  ir_set o 0 tk
+end
+
+fn es_retv b uint tk uint v uint to void
+  o = ir_op b 63 0 0 2
+  ir_set o 0 tk
+  ir_set o 1 v
+end
+
+fn es_host_io b uint tk uint wid ulong fd uint r uint off uint to uint
+  o = ir_op b 110 9 wid 5
+  ir_set o 0 tk
+  ir_set o 1 fd
+  ir_set o 2 r
+  ir_set o 3 off
+  ir_set o 4 get es_v 15
+  ret o
+end
+
+fn es_call1 b uint tk uint fidx ulong ty uint a0 uint to uint
+  o = ir_op b 64 ty 0 3
+  ir_set o 0 tk
+  ir_set o 1 get es_f fidx
+  ir_set o 2 a0
+  ret o
+end
+
+fn es_call5_void b uint tk uint fidx ulong to uint
+  o = ir_op b 64 0 0 7
+  ir_set o 0 tk
+  ir_set o 1 get es_f fidx
+  for i ulong 5
+    ir_set o uint add i 2 get es_v i
+  end
+  ret ir_otok o
+end
+
+fn es_init_types_and_globals to void
+  put es_t 0 ir_tvec 13 4
+  put es_t 1 ir_tarr 13 uint ES_MAX_FLOATS
+  put es_t 2 ir_tref get es_t 1 1 0
+  put es_t 3 ir_tarr 2 uint ES_MAX_BYTES
+  put es_t 4 ir_tref get es_t 3 1 0
+  put es_t 5 ir_tarr 2 uint ES_HDR_BYTES
+  put es_t 6 ir_tref get es_t 5 1 0
+  put es_t 7 ir_tarr 2 4
+  put es_t 8 ir_tref get es_t 7 0 0
+
+  put es_g 0 ir_glob get es_t 1 0
+  put es_g 1 ir_glob get es_t 1 0
+  put es_g 2 ir_glob get es_t 3 0
+  put es_g 3 ir_glob get es_t 5 0
+  gr = ir_glob get es_t 7 1
+  for i ulong 4
+    ir_gbyt gr uint get es_rdy_bytes i
+  end
+  put es_g 4 gr
+end
+
+note fn hdr_u32(off: u64) -> u32: reads 4 LE bytes from @g_hdr[off..off+4)
+fn es_build_hdr_u32 to void
+  f = ir_fnew 0 0 4
+  put es_f 0 f
+  put es_v 0 ir_fpar f 5
+  b = ir_blk f
+  put es_v 1 es_gaddr b 3 6
+  put es_v 2 es_k b 5 1
+  tk = ir_ftok f
+  acc = es_k b 4 0
+  for i ulong 4
+    idx = get es_v 0
+    if gt i 0
+      idx = es_bin b 10 5 idx es_k b 5 i
+    end
+    tk = es_chk_bnd b tk get es_v 1 idx get es_v 2
+    u = es_un b 36 4 es_load b tk 2 get es_v 1 idx
+    if gt i 0
+      u = es_bin b 20 4 u es_k b 4 mul i 8
+    end
+    acc = es_bin b 17 4 acc u
+  end
+  es_retv b tk acc
+end
+
+fn es_emit_io_rets to void
+  b = get es_b 6
+  es_retv b ir_btok b es_k b 9 0
+  b = get es_b 7
+  es_retv b ir_btok b es_k b 9 bitcast ulong long -1
+  b = get es_b 8
+  es_retv b ir_btok b es_un b 36 9 get es_v 2
+  b = get es_b 9
+  es_retv b ir_btok b es_k b 9 bitcast ulong long -22
+end
+
+fn es_emit_io_tail maxb ulong wid ulong fdnum ulong to void
+  b = get es_b 3
+  v = es_bin b 11 5 get es_v 0 get es_v 2
+  put es_v 15 v
+  tk = es_chk_slc b ir_btok b get es_v 1 get es_v 2 v
+  tk = es_chk_fuel b tk get es_v 2 es_k b 5 add maxb 1
+  ho = es_host_io b tk wid es_k b 8 fdnum get es_v 1 get es_v 2
+  put es_v 3 ir_res ho
+  put es_v 4 ir_otok ho
+  v = es_k b 9 0
+  put es_v 5 v
+  v = es_bin b 34 1 get es_v 3 v
+  es_cbr b get es_v 4 v get es_b 4 get es_b 5
+
+  b = get es_b 4
+  v = es_un b 36 5 get es_v 3
+  v = es_bin b 10 5 get es_v 2 v
+  es_br1 b get es_b 2 ir_btok b v
+
+  b = get es_b 5
+  v = es_bin b 30 1 get es_v 3 get es_v 5
+  ho = es_bin b 30 1 get es_v 2 es_k b 5 0
+  v = es_bin b 16 1 v ho
+  es_cbr b ir_btok b v get es_b 6 get es_b 7
+
+  es_emit_io_rets
+end
+
+fn es_build_io_fn fidx ulong gidx ulong ridx ulong maxb ulong wid ulong fdnum ulong to void
+  f = ir_fnew 0 0 9
+  put es_f fidx f
+  put es_v 0 ir_fpar f 5
+  for i ulong 10
+    put es_b i ir_blk f
+  end
+  b = get es_b 0
+  put es_v 1 es_gaddr b gidx ridx
+  c = es_bin b 33 1 get es_v 0 es_k b 5 maxb
+  es_cbr b ir_ftok f c get es_b 1 get es_b 9
+  b = get es_b 1
+  es_br1 b get es_b 2 ir_btok b es_k b 5 0
+  b = get es_b 2
+  put es_v 2 ir_bpar b 5
+  c = es_bin b 32 1 get es_v 2 get es_v 0
+  es_cbr b ir_btok b c get es_b 3 get es_b 8
+  es_emit_io_tail maxb wid fdnum
+end
+
+fn es_emit_io_guards nf uint to void
+  b = get es_b 1
+  j = ir_bpar b 5
+  put es_v 10 j
+  es_cbr b ir_btok b es_bin b 32 1 j es_k b 5 ES_MAX_FLOATS get es_b 2 get es_b 8
+  b = get es_b 2
+  es_cbr b ir_btok b es_bin b 32 1 j nf get es_b 3 get es_b 8
+
+  b = get es_b 3
+  k = es_bin b 12 5 j es_k b 5 4
+  put es_v 11 k
+  es_cbr b ir_btok b es_bin b 32 1 k es_k b 5 ES_MAX_BYTES get es_b 4 get es_b 8
+
+  b = get es_b 4
+  k = es_bin b 10 5 get es_v 11 es_k b 5 1
+  put es_v 12 k
+  es_cbr b ir_btok b es_bin b 32 1 k es_k b 5 ES_MAX_BYTES get es_b 5 get es_b 8
+
+  b = get es_b 5
+  k = es_bin b 10 5 get es_v 11 es_k b 5 2
+  put es_v 13 k
+  es_cbr b ir_btok b es_bin b 32 1 k es_k b 5 ES_MAX_BYTES get es_b 6 get es_b 8
+
+  b = get es_b 6
+  k = es_bin b 10 5 get es_v 11 es_k b 5 3
+  put es_v 14 k
+  es_cbr b ir_btok b es_bin b 32 1 k es_k b 5 ES_MAX_BYTES get es_b 7 get es_b 8
+end
+
+fn es_emit_unpack_body rio uint rin uint to void
+  b = get es_b 7
+  j = get es_v 10
+  c1 = es_k b 5 1
+  tk = es_chk_fuel b ir_btok b j es_k b 5 add ES_MAX_FLOATS 1
+
+  tk = es_chk_bnd b tk rio get es_v 11 c1
+  put es_v 16 es_un b 36 4 es_load b tk 2 rio get es_v 11
+  tk = es_chk_bnd b tk rio get es_v 12 c1
+  put es_v 17 es_bin b 20 4 es_un b 36 4 es_load b tk 2 rio get es_v 12 es_k b 4 8
+  tk = es_chk_bnd b tk rio get es_v 13 c1
+  put es_v 18 es_bin b 20 4 es_un b 36 4 es_load b tk 2 rio get es_v 13 es_k b 4 16
+  tk = es_chk_bnd b tk rio get es_v 14 c1
+  put es_v 19 es_bin b 20 4 es_un b 36 4 es_load b tk 2 rio get es_v 14 es_k b 4 24
+
+  tk = es_chk_bnd b tk rin j c1
+  fv = es_un b 37 13 es_bin b 17 4 es_bin b 17 4 get es_v 16 get es_v 17 es_bin b 17 4 get es_v 18 get es_v 19
+  tk = es_store b tk rin j fv
+  es_br1 b get es_b 1 tk es_bin b 10 5 j c1
+end
+
+fn es_build_unpack to void
+  f = ir_fnew 0 0 0
+  put es_f 4 f
+  nf = ir_fpar f 5
+  for i ulong 9
+    put es_b i ir_blk f
+  end
+  b0 = get es_b 0
+  rio = es_gaddr b0 2 4
+  rin = es_gaddr b0 0 2
+  es_br1 b0 get es_b 1 ir_ftok f es_k b0 5 0
+  es_emit_io_guards nf
+  es_emit_unpack_body rio rin
+  es_ret get es_b 8 ir_btok get es_b 8
+end
+
+fn es_emit_pack_body rio uint rout uint to void
+  bbody = get es_b 7
+  j = get es_v 10
+  c1 = es_k bbody 5 1
+  tk = es_chk_fuel bbody ir_btok bbody j es_k bbody 5 add ES_MAX_FLOATS 1
+  tk = es_chk_bnd bbody tk rout j c1
+  u32v = es_un bbody 37 4 es_load bbody tk 13 rout j
+
+  tk = es_chk_bnd bbody tk rio get es_v 11 c1
+  tk = es_store bbody tk rio get es_v 11 es_un bbody 36 2 u32v
+  tk = es_chk_bnd bbody tk rio get es_v 12 c1
+  tk = es_store bbody tk rio get es_v 12 es_un bbody 36 2 es_bin bbody 21 4 u32v es_k bbody 4 8
+  tk = es_chk_bnd bbody tk rio get es_v 13 c1
+  tk = es_store bbody tk rio get es_v 13 es_un bbody 36 2 es_bin bbody 21 4 u32v es_k bbody 4 16
+  tk = es_chk_bnd bbody tk rio get es_v 14 c1
+  tk = es_store bbody tk rio get es_v 14 es_un bbody 36 2 es_bin bbody 21 4 u32v es_k bbody 4 24
+  es_br1 bbody get es_b 1 tk es_bin bbody 10 5 j c1
+end
+
+fn es_build_pack to void
+  f = ir_fnew 0 0 0
+  put es_f 6 f
+  nf = ir_fpar f 5
+  for i ulong 9
+    put es_b i ir_blk f
+  end
+  b0 = get es_b 0
+  rio = es_gaddr b0 2 4
+  rout = es_gaddr b0 1 2
+  es_br1 b0 get es_b 1 ir_ftok f es_k b0 5 0
+  es_emit_io_guards nf
+  es_emit_pack_body rio rout
+  es_ret get es_b 8 ir_btok get es_b 8
+end
+
+fn es_emit_cn_inner iters uint v0 uint to void
+  tv = get es_t 0
+  b = get es_b 4
+  es_cbr b ir_btok b es_bin b 32 1 get es_v 24 iters get es_b 5 get es_b 6
+
+  b = get es_b 5
+  tk = es_chk_fuel b ir_btok b get es_v 24 es_k b 5 add ES_MAX_ITERS 1
+  w = es_fma b tv get es_v 25 get es_v 20 get es_v 21
+  w = es_fma b tv w get es_v 22 v0
+  w = es_fma b tv w get es_v 20 get es_v 21
+  w = es_fma b tv w get es_v 22 v0
+  es_br2 b get es_b 4 tk es_bin b 10 5 get es_v 24 es_k b 5 1 w
+end
+
+fn es_emit_cn_loop nf uint iters uint rin uint rout uint to void
+  b = get es_b 1
+  i = ir_bpar b 5
+  put es_v 24 ir_bpar get es_b 4 5
+  put es_v 25 ir_bpar get es_b 4 get es_t 0
+
+  es_cbr b ir_btok b es_bin b 32 1 i es_k b 5 ES_VEC_LIM get es_b 2 get es_b 7
+  b = get es_b 2
+  es_cbr b ir_btok b es_bin b 32 1 i nf get es_b 3 get es_b 7
+
+  b = get es_b 3
+  tk = es_chk_fuel b ir_btok b i es_k b 5 add ES_VEC_LIM 1
+  tk = es_chk_bnd b tk rin i es_k b 5 4
+  v0 = es_vload b tk rin i
+  es_br2 b get es_b 4 tk es_k b 5 0 v0
+
+  es_emit_cn_inner iters v0
+
+  b = get es_b 6
+  tk = es_chk_bnd b ir_btok b rout i es_k b 5 4
+  tk = es_vstore b tk rout i get es_v 25
+  es_br1 b get es_b 1 tk es_bin b 10 5 i es_k b 5 4
+  b = get es_b 7
+  es_ret b ir_btok b
+end
+
+fn es_build_compute_neon to void
+  tv = get es_t 0
+  f = ir_fnew 0 0 0
+  put es_f 5 f
+  put es_v 30 ir_fpar f 5
+  put es_v 31 ir_fpar f 5
+  put es_v 32 ir_fpar f 4
+  put es_v 33 ir_fpar f 4
+  put es_v 34 ir_fpar f 4
+  for bi ulong 8
+    put es_b bi ir_blk f
+  end
+  b = get es_b 0
+  put es_v 20 es_un b 100 tv es_un b 37 13 get es_v 32
+  put es_v 21 es_un b 100 tv es_un b 37 13 get es_v 33
+  put es_v 22 es_un b 100 tv es_un b 37 13 get es_v 34
+  put es_v 26 es_gaddr b 0 2
+  put es_v 27 es_gaddr b 1 2
+  es_br1 b get es_b 1 ir_ftok f es_k b 5 0
+  es_emit_cn_loop get es_v 30 get es_v 31 get es_v 26 get es_v 27
+end
+
+fn es_build_main_body to void
+  b = get es_b 4
+  c = es_call1 b ir_btok b 0 4 es_k b 5 4
+  put es_v 40 es_un b 36 5 ir_res c
+  ok = es_bin b 16 1 es_bin b 35 1 get es_v 40 es_k b 5 4 es_bin b 33 1 get es_v 40 es_k b 5 ES_MAX_FLOATS
+  ok = es_bin b 16 1 ok es_bin b 30 1 es_bin b 16 5 get es_v 40 es_k b 5 3 es_k b 5 0
+  es_cbr b ir_otok c ok get es_b 5 get es_b 11
+
+  b = get es_b 5
+  c = es_call1 b ir_btok b 0 4 es_k b 5 8
+  put es_v 41 es_un b 36 5 ir_res c
+  ok = es_bin b 16 1 es_bin b 35 1 get es_v 41 es_k b 5 1 es_bin b 33 1 get es_v 41 es_k b 5 ES_MAX_ITERS
+  es_cbr b ir_otok c ok get es_b 6 get es_b 12
+
+  b = get es_b 6
+  c = es_call1 b ir_btok b 0 4 es_k b 5 16
+  put es_v 42 ir_res c
+  c = es_call1 b ir_otok c 0 4 es_k b 5 20
+  put es_v 43 ir_res c
+  c = es_call1 b ir_otok c 0 4 es_k b 5 24
+  put es_v 44 ir_res c
+  ok = es_bin b 12 5 get es_v 40 es_k b 5 4
+  put es_v 45 ok
+  c = es_call1 b ir_otok c 2 9 ok
+  es_cbr b ir_otok c es_bin b 30 1 ir_res c es_un b 36 9 ok get es_b 7 get es_b 13
+
+  b = get es_b 7
+  c = ir_otok es_call1 b ir_btok b 4 0 get es_v 40
+  put es_v 0 get es_v 40
+  put es_v 1 get es_v 41
+  put es_v 2 get es_v 42
+  put es_v 3 get es_v 43
+  put es_v 4 get es_v 44
+  c = es_call5_void b c 5
+  c = ir_otok es_call1 b c 6 0 get es_v 40
+  c = es_call1 b c 3 9 get es_v 45
+  es_cbr b ir_otok c es_bin b 30 1 ir_res c es_un b 36 9 get es_v 45 get es_b 8 get es_b 13
+end
+
+fn es_build_main_rets to void
+  b = get es_b 9
+  es_retv b ir_btok b es_k b 8 0
+  b = get es_b 10
+  es_retv b ir_btok b es_k b 8 2
+  b = get es_b 11
+  es_retv b ir_btok b es_k b 8 3
+  b = get es_b 12
+  es_retv b ir_btok b es_k b 8 4
+  b = get es_b 13
+  es_retv b ir_btok b es_k b 8 5
+end
+
+fn es_build_main to void
+  f = ir_fnew 2 0 8
+  put es_f 7 f
+  for bi ulong 15
+    put es_b bi ir_blk f
+  end
+  b = get es_b 0
+  c = es_gaddr b 4 8
+  put es_v 14 es_k b 5 0
+  put es_v 15 es_k b 5 4
+  tk = es_chk_slc b ir_ftok f c get es_v 14 get es_v 15
+  ho = es_host_io b tk 54 es_k b 8 1 c get es_v 14
+  es_br1 b get es_b 1 ir_otok ho es_k b 5 0
+
+  b = get es_b 1
+  put es_v 48 ir_bpar b 5
+  ho = es_call1 b ir_btok b 1 9 es_k b 5 ES_HDR_BYTES
+  put es_v 49 ir_res ho
+  es_cbr b ir_otok ho es_bin b 30 1 get es_v 49 es_k b 9 ES_HDR_BYTES get es_b 2 get es_b 14
+
+  b = get es_b 14
+  es_cbr b ir_btok b es_bin b 30 1 get es_v 49 es_k b 9 0 get es_b 9 get es_b 13
+
+  b = get es_b 2
+  ho = es_call1 b ir_btok b 0 4 es_k b 5 0
+  put es_v 49 ir_res ho
+  es_cbr b ir_otok ho es_bin b 30 1 get es_v 49 es_k b 4 0 get es_b 9 get es_b 3
+  b = get es_b 3
+  es_cbr b ir_btok b es_bin b 30 1 get es_v 49 es_k b 4 ES_MAGIC get es_b 4 get es_b 10
+
+  es_build_main_body
+
+  b = get es_b 8
+  tk = es_chk_fuel b ir_btok b get es_v 48 es_k b 5 4096
+  es_br1 b get es_b 1 tk es_bin b 10 5 get es_v 48 es_k b 5 1
+  es_build_main_rets
+end
+
+fn main to int
+  ir_init
+  es_init_types_and_globals
+  es_build_hdr_u32
+  es_build_io_fn 1 3 6 ES_HDR_BYTES 53 0
+  es_build_io_fn 2 2 4 ES_MAX_BYTES 53 0
+  es_build_io_fn 3 2 4 ES_MAX_BYTES 54 1
+  es_build_unpack
+  es_build_compute_neon
+  es_build_pack
+  es_build_main
+  n = ir_wr
+  if eq ar_out 1 1 0 n 0
+    ret 27
+  end
+  ret 0
+end
