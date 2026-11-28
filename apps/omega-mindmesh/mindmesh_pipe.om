@@ -1,0 +1,2415 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-mindmesh/mindmesh_pipe.om
+note Wave 3 Grand Unification closed-loop pipeline verifier & OMMM01 manifest driver.
+note
+note Pure seeded OM-2 (zero C, zero GCC, zero Python, zero Rust, zero CUDA, hw_writes=0).
+note Portable across DGX Spark (aarch64 Linux), Pi 5 hub (aarch64 Linux), and MacBook (target a64macos).
+note
+note Compose after:
+note   si/directives/om2.om
+note   apps/omega-wattd/watt_sense.om
+note   apps/omega-wattd/watt_cbf.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note   protocol/uor-gpu/ed_sign.om
+note
+note OMMM01 Grand Unification Convergence Manifest (512 bytes, little-endian):
+note   [0..6)     magic                 "OMMM01"
+note   [6..8)     version               u16 LE = 1
+note   [8..12)    flags                 u32 LE (bit0=om2, bit1=hw0, bit2=wx, bit3=gpu_not_run, bit4=trojan_ok, bit5=live_3host)
+note   [12..16)   stage_mask            u32 LE = 0x3f (Stages 1..6 all verified)
+note   [16..24)   watt_gpu_mw           u64 LE (< 80000)
+note   [24..28)   tdie_mc               u32 LE
+note   [28..32)   live_sensors          u32 LE
+note   [32..36)   lean_exit             u32 LE (= 48)
+note   [36..40)   lean_axioms_ok        u32 LE (= 1)
+note   [40..44)   symbiote_ulp_diff     u32 LE (= 0)
+note   [44..48)   symbiote_memo_hit     u32 LE (= 1)
+note   [48..56)   symbiote_w20_ns       u64 LE
+note   [56..64)   symbiote_warm_ns      u64 LE
+note   [64..68)   ddc_quorum_votes      u32 LE (= 3)
+note   [68..72)   trojan_kill_rc        u32 LE (!= 0)
+note   [72..76)   dna_ratchet_old       u32 LE
+note   [76..80)   dna_ratchet_new       u32 LE (> dna_ratchet_old)
+note   [80..84)   dna_surfaces          u32 LE (= 5)
+note   [84..88)   hw_writes             u32 LE (= 0)
+note   [88..96)   timestamp_ns          u64 LE (monons)
+note   [96..128)  c1_sha256             Stage 1 chain commitment
+note   [128..160) c2_sha256             Stage 2 chain commitment (chained from c1)
+note   [160..192) c3_sha256             Stage 3 chain commitment (chained from c2)
+note   [192..224) c4_sha256             Stage 4 chain commitment (chained from c3)
+note   [224..256) c5_sha256             Stage 5 chain commitment (chained from c4)
+note   [256..288) c6_sha256             Stage 6 convergence digest (chained from c5)
+note   [288..320) s1_ommp_sha256        SHA-256(k1.ommp)
+note   [320..352) s2_otkj_tip_sha256    OTKJ v1 tip chain hash
+note   [352..384) s5_ddc_sem_sha256     DDC3 consensus semantic_digest
+note   [384..416) manifest_body_sha256  SHA-256("OMMM01-BODY-V1\0" || man[0..384))
+note   [416..448) authority_pubkey      RFC 8032 Ed25519 pubkey (32 B)
+note   [448..512) ed25519_sig           RFC 8032 strict (mode=0) Ed25519 sig over man[0..416)
+
+const MM_OK int 0
+const MM_ERR_USAGE int 2
+const MM_ERR_IO int 10
+const MM_ERR_STAGE1 int 11
+const MM_ERR_WATTCBF int 12
+const MM_ERR_STAGE2 int 13
+const MM_ERR_STAGE3 int 14
+const MM_ERR_STAGE4 int 15
+const MM_ERR_STAGE5 int 16
+const MM_ERR_STAGE6 int 17
+const MM_ERR_MANIFEST int 18
+
+const MM_MAX_FILE ulong 4194304
+const MM_MAN_LEN ulong 512
+const MM_MAN_BODY_LIM ulong 384
+const MM_MAN_SIG_LIM ulong 416
+const MM_GPU_STRICT_MAX_MW ulong 79999
+const MM_TCEIL_MAX_MC ulong 90000
+
+note Hash slots inside g_mm_hashes (slot * 32):
+const MM_H0 ulong 0
+const MM_H1 ulong 1
+const MM_H2 ulong 2
+const MM_H3 ulong 3
+const MM_C0 ulong 4
+const MM_C1 ulong 5
+const MM_C2 ulong 6
+const MM_C3 ulong 7
+const MM_C4 ulong 8
+const MM_C5 ulong 9
+const MM_C6 ulong 10
+const MM_PREV_H ulong 11
+const MM_S1_OMMP_H ulong 12
+const MM_S2_OTKJ_H ulong 13
+const MM_S5_SEM_H ulong 14
+const MM_TMP_H ulong 15
+
+global g_mm_bufa uchar 4194304
+global g_mm_io uchar 65536
+global g_mm_man uchar 512
+
+global g_mm_arg uchar 1024
+global g_mm_p0 uchar 1024
+global g_mm_p1 uchar 1024
+global g_mm_p2 uchar 1024
+global g_mm_p3 uchar 1024
+global g_mm_omepath uchar 1024
+global g_mm_plen ulong 5
+global g_mm_omehex uchar 64
+global g_mm_w20hex uchar 64
+global g_mm_seedtag uchar 256
+global g_mm_seedlen ulong 1
+
+global g_mm_aidx ulong 24
+global g_mm_st ulong 24
+global g_mm_rcpts uchar 1056
+global g_mm_hashes uchar 512
+global g_mm_out uchar 256
+global g_mm_hexbuf uchar 128
+
+text mm_t_magic "OMMM01"
+text mm_t_ommp "OMMP01"
+text mm_t_om31 "OM31"
+text mm_t_oir "OSC1IR"
+text mm_t_otkj "OTKJ"
+text mm_t_otkj_dom "OTKJ1"
+text mm_t_omem "OMEM"
+text mm_t_omrc "OMRC0001"
+text mm_t_ddc_dom "OMEGA-DDC3-RECEIPT-V1"
+text mm_t_ddc_sem "OMEGA-DDC3-SEMANTIC-V1"
+text mm_t_dna "OMDNA1"
+text mm_t_abdy "ABDY"
+text mm_t_dna_rec "OMDNA1-REC"
+text mm_t_def_seed "OMEGA-MINDMESH-WAVE3-OMMM01-V1!"
+
+text mm_dom_gen "OMMM01-GENESIS"
+text mm_dom_s1 "OMMM1-S1"
+text mm_dom_s2 "OMMM1-S2"
+text mm_dom_s3 "OMMM1-S3"
+text mm_dom_s4 "OMMM1-S4"
+text mm_dom_s5 "OMMM1-S5"
+text mm_dom_s6 "OMMM1-S6"
+text mm_dom_body "OMMM01-BODY-V1"
+
+text mm_c_self "selftest"
+text mm_c_s1 "verify-stage1"
+text mm_c_s2 "verify-stage2"
+text mm_c_s3 "verify-stage3"
+text mm_c_s4 "verify-stage4"
+text mm_c_s5 "verify-stage5"
+text mm_c_s6 "verify-stage6"
+text mm_c_seal "seal"
+text mm_c_ver "verify-manifest"
+text mm_c_insp "inspect"
+
+text mm_f_simw "--sim-watt-mw"
+text mm_f_exrc "--exec-rc"
+text mm_f_trj "--trojan-rc"
+text mm_f_s1o "--s1-ommp"
+text mm_f_s1m "--s1-morph"
+text mm_f_s1a "--s1-macho"
+text mm_f_s20 "--s2-tl0"
+text mm_f_s21 "--s2-tl1"
+text mm_f_s22 "--s2-tl2"
+text mm_f_s2k "--s2-otkj"
+text mm_f_s3l "--s3-lean"
+text mm_f_s3r "--s3-rx"
+text mm_f_s3g "--s3-log"
+text mm_f_s3c "--s3-rc"
+text mm_f_s4w "--s4-worker"
+text mm_f_s4g "--s4-log"
+text mm_f_s4m "--s4-memo-dir"
+text mm_f_s51 "--s5-r1"
+text mm_f_s52 "--s5-r2"
+text mm_f_s53 "--s5-r3"
+text mm_f_s5t "--s5-trojan-rc"
+text mm_f_s5h "--s5-live-hosts"
+text mm_f_s6o "--s6-old"
+text mm_f_s6n "--s6-new"
+text mm_f_out "--out"
+text mm_f_seed "--seed-tag"
+
+text mm_l_ns "namespace GeneratedCert"
+text mm_l_mast "theorem cert_master_admissible"
+text mm_l_pr "#print axioms GeneratedCert.cert_master_admissible"
+text mm_l_sorry "sorry"
+text mm_l_admit "admit"
+text mm_l_nd "native_decide"
+text mm_l_ax "axiom "
+text mm_l_ch "cheatAx"
+
+text mm_g_err "error:"
+text mm_g_sax "sorryAx"
+text mm_g_rb "ofReduceBool"
+text mm_g_th0 "GeneratedCert.pure_implies_no_effects"
+text mm_g_th1 "GeneratedCert.om3_kernel_slab_never_mapped"
+text mm_g_th2 "GeneratedCert.om3_reclaim_requires_4step_fence"
+text mm_g_th3 "GeneratedCert.watt_strict_lt_80w"
+text mm_g_th4 "GeneratedCert.sm121_raw_floor_sound"
+text mm_g_th5 "GeneratedCert.cert_purity_and_semantic_id"
+text mm_g_th6 "GeneratedCert.cert_om3_domain_and_fence"
+text mm_g_th7 "GeneratedCert.cert_wattcbf_thermal_cap"
+text mm_g_th8 "GeneratedCert.cert_sm121_hazard_and_regs"
+text mm_g_th9 "GeneratedCert.cert_master_admissible"
+
+text mm_s4_arb "SYMBIOTE_ARBORIS workers=20 x925=10 a725=10"
+text mm_s4_d1 "diff_w1_scalar=0"
+text mm_s4_d2 "diff_w20_scalar=0"
+text mm_s4_d3 "diff_memo_w20=0"
+text mm_s4_mem "SYMBIOTE_MEMO"
+text mm_s4_hit "MEMO_HIT"
+text mm_s4_skp "skipped_compute=1"
+text mm_s4_tmp "tamper_input_miss=MM_MISS"
+text mm_s4_w20 "w20_med_ns="
+text mm_s4_wmns "warm_ns="
+text mm_s4_w20sh "w20_sha256="
+text mm_s4_eh "entry_sha256="
+text mm_s4_key "d08ce0bc232777789514e441f09831719d8ff387cdcb86869a805be37ad07d03"
+text mm_s4_ome ".ome"
+
+text mm_m_use "usage: mindmesh_pipe <selftest|verify-stage1..6|seal|verify-manifest|inspect> ...\n"
+text mm_m_nl "\n"
+text mm_m_self "MINDMESH_PIPE SELFTEST PASS sha256=1 ed25519=1 wattcbf=1 ommm01=1 tamper_reject=1 hw_writes=0\n"
+text mm_m_s1 "MINDMESH_STAGE1 PASS watt_mw="
+text mm_m_s2 "MINDMESH_STAGE2 PASS otkj_entries="
+text mm_m_s3 "MINDMESH_STAGE3 PASS lean_theorems=10 lean_exit=48 wx=0500_RX c3="
+text mm_m_s4 "MINDMESH_STAGE4 PASS ulp_diff=0 memo_hit=1 w20_ns="
+text mm_m_s5 "MINDMESH_STAGE5 PASS ddc_quorum=3/3 trojan_rc="
+text mm_m_s6 "MINDMESH_STAGE6 PASS dna_ratchet="
+text mm_m_seal "MINDMESH_SEAL PASS stage_mask=0x3f hw_writes=0 watt_gpu_mw="
+text mm_m_vman "MINDMESH_MANIFEST VERIFY PASS stage_mask=0x3f hw_writes=0 watt_gpu_mw="
+text mm_m_insp1 "OMMM01 INSPECT magic=OMMM01 version=1 stage_mask=0x3f hw_writes="
+text mm_m_ref "MINDMESH_PIPE REFUSED code="
+text mm_k_tdie " tdie_mc="
+text mm_k_live " live_sensors="
+text mm_k_hw0 " hw_writes=0 c"
+text mm_k_eq "="
+text mm_k_wm " warm_ns="
+text mm_k_ar "->"
+text mm_k_c4 " c4="
+text mm_k_c5 " c5="
+text mm_k_c6 " c6="
+text mm_k_s3 " lean_exit=48 symbiote_ulp=0 ddc_quorum=3/3 trojan_rc="
+text mm_k_dn " dna_ratchet="
+
+note --- Printing and basic helpers ---
+
+fn mm_write_fd fd int buf view uchar * n ulong to void
+  pos = ulong 0
+  while lt pos n bound 65536
+    w = write fd buf pos sub n pos
+    if le w 0
+      ret
+    end
+    pos = add pos ulong w
+  end
+end
+
+fn mm_write_out_fd fd int n ulong to void
+  pos = ulong 0
+  while lt pos n bound 256
+    w = write fd g_mm_out pos sub n pos
+    if le w 0
+      ret
+    end
+    pos = add pos ulong w
+  end
+end
+
+fn mm_puts s view uchar * to void
+  mm_write_fd int 1 s len s
+end
+
+fn mm_err s view uchar * to void
+  mm_write_fd int 2 s len s
+end
+
+fn mm_putn_fd fd int v ulong to void
+  if eq v 0
+    put g_mm_out 0 48
+    mm_write_out_fd fd 1
+    ret
+  end
+  idx = ulong 0
+  cur = v
+  while gt cur 0 bound 32
+    d = rem cur 10
+    put g_mm_out idx uchar add 48 d
+    idx = add idx 1
+    cur = div cur 10
+  end
+  for i ulong idx bound 32
+    put g_mm_out add 32 i get g_mm_out sub sub idx 1 i
+  end
+  for i ulong idx bound 32
+    put g_mm_out i get g_mm_out add 32 i
+  end
+  mm_write_out_fd fd idx
+end
+
+fn mm_putn v ulong to void
+  mm_putn_fd int 1 v
+end
+
+fn mm_put_hex_slot slot ulong to void
+  base = mul slot 32
+  for i ulong 32
+    b = uint get g_mm_hashes add base i
+    put g_mm_hexbuf mul i 2 sh_hexd and shr b 4 15
+    put g_mm_hexbuf add mul i 2 1 sh_hexd and b 15
+  end
+  pos = ulong 0
+  while lt pos 64 bound 64
+    w = write int 1 g_mm_hexbuf pos sub 64 pos
+    if le w 0
+      ret
+    end
+    pos = add pos ulong w
+  end
+end
+
+fn mm_refuse code int to int
+  mm_err mm_m_ref
+  mm_putn_fd int 2 ulong code
+  mm_err mm_m_nl
+  ret code
+end
+
+fn mm_get_u16_a off ulong to ulong
+  b0 = ulong get g_mm_bufa off
+  b1 = ulong get g_mm_bufa add off 1
+  ret or b0 shl b1 8
+end
+
+fn mm_get_u32_a off ulong to ulong
+  v = ulong 0
+  for j ulong 4
+    v = or v shl ulong get g_mm_bufa add off j mul j 8
+  end
+  ret v
+end
+
+fn mm_get_u64_a off ulong to ulong
+  v = ulong 0
+  for j ulong 8
+    v = or v shl ulong get g_mm_bufa add off j mul j 8
+  end
+  ret v
+end
+
+fn mm_get_u16_m off ulong to ulong
+  b0 = ulong get g_mm_man off
+  b1 = ulong get g_mm_man add off 1
+  ret or b0 shl b1 8
+end
+
+fn mm_get_u32_m off ulong to ulong
+  v = ulong 0
+  for j ulong 4
+    v = or v shl ulong get g_mm_man add off j mul j 8
+  end
+  ret v
+end
+
+fn mm_get_u64_m off ulong to ulong
+  v = ulong 0
+  for j ulong 8
+    v = or v shl ulong get g_mm_man add off j mul j 8
+  end
+  ret v
+end
+
+fn mm_put_u16_m off ulong v ulong to void
+  put g_mm_man off uchar and v 255
+  put g_mm_man add off 1 uchar and shr v 8 255
+end
+
+fn mm_put_u32_m off ulong v ulong to void
+  for j ulong 4
+    put g_mm_man add off j uchar and shr v mul j 8 255
+  end
+end
+
+fn mm_put_u64_m off ulong v ulong to void
+  for j ulong 8
+    put g_mm_man add off j uchar and shr v mul j 8 255
+  end
+end
+
+fn mm_streq_arg idx ulong s view uchar * to bool
+  sn = argread idx g_mm_arg 0 1023
+  if lt sn 0
+    ret false
+  end
+  n = ulong sn
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 1024
+    if ne get g_mm_arg i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_set_path slot ulong idx ulong to void
+  if eq slot 0
+    sn = argread idx g_mm_p0 0 1023
+    n = ulong 0
+    if gt sn 0
+      n = ulong sn
+    end
+    put g_mm_p0 n 0
+    put g_mm_plen 0 n
+    ret
+  end
+  if eq slot 1
+    sn = argread idx g_mm_p1 0 1023
+    n = ulong 0
+    if gt sn 0
+      n = ulong sn
+    end
+    put g_mm_p1 n 0
+    put g_mm_plen 1 n
+    ret
+  end
+  if eq slot 2
+    sn = argread idx g_mm_p2 0 1023
+    n = ulong 0
+    if gt sn 0
+      n = ulong sn
+    end
+    put g_mm_p2 n 0
+    put g_mm_plen 2 n
+    ret
+  end
+  sn = argread idx g_mm_p3 0 1023
+  n = ulong 0
+  if gt sn 0
+    n = ulong sn
+  end
+  put g_mm_p3 n 0
+  put g_mm_plen 3 n
+end
+
+fn mm_parse_u64_arg idx ulong to long
+  sn = argread idx g_mm_arg 0 1023
+  if or le sn 0 gt sn 18
+    ret -1
+  end
+  n = ulong sn
+  v = ulong 0
+  for i ulong n bound 18
+    c = get g_mm_arg i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    v = add mul v 10 ulong sub c 48
+  end
+  ret long v
+end
+
+fn mm_parse_u64_a off ulong nmax ulong to long
+  v = ulong 0
+  cnt = ulong 0
+  while lt cnt 18 bound 18
+    if ge add off cnt nmax
+      break
+    end
+    c = get g_mm_bufa add off cnt
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 ulong sub c 48
+    cnt = add cnt 1
+  end
+  if eq cnt 0
+    ret -1
+  end
+  ret long v
+end
+
+fn mm_find_sub_a n ulong pat view uchar * to long
+  pn = len pat
+  if or eq pn 0 gt pn n
+    ret -1
+  end
+  lim = add sub n pn 1
+  for i ulong lim bound 4194304
+    mhit = true
+    for j ulong pn bound 256
+      if ne get g_mm_bufa add i j get pat j
+        mhit = false
+        break
+      end
+    end
+    if mhit
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn mm_eq_magic_a off ulong s view uchar * to bool
+  for i ulong len s bound 64
+    if ne get g_mm_bufa add off i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_hex_val c uchar to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret add 10 long sub c 97
+  end
+  if and ge c 65 le c 70
+    ret add 10 long sub c 65
+  end
+  ret -1
+end
+
+note --- File I/O (portable Linux aarch64 + macOS a64macos) ---
+
+fn mm_open_slot_ro slot ulong to long
+  if eq slot 0
+    ret fopen g_mm_p0 0 get g_mm_plen 0 0 0
+  end
+  if eq slot 1
+    ret fopen g_mm_p1 0 get g_mm_plen 1 0 0
+  end
+  if eq slot 2
+    ret fopen g_mm_p2 0 get g_mm_plen 2 0 0
+  end
+  if eq slot 3
+    ret fopen g_mm_p3 0 get g_mm_plen 3 0 0
+  end
+  ret fopen g_mm_omepath 0 get g_mm_plen 4 0 0
+end
+
+fn mm_read_slot_a slot ulong to long
+  fd = mm_open_slot_ro slot
+  if lt fd 0
+    ret -1
+  end
+  off = ulong 0
+  while true bound 2048
+    k = read int fd g_mm_io 0 65536
+    if lt k 0
+      r = fclose int fd
+      ret -1
+    end
+    if eq k 0
+      break
+    end
+    nk = ulong k
+    if gt add off nk MM_MAX_FILE
+      r = fclose int fd
+      ret -1
+    end
+    for j ulong nk bound 65536
+      put g_mm_bufa add off j get g_mm_io j
+    end
+    off = add off nk
+  end
+  r = fclose int fd
+  ret long off
+end
+
+fn mm_write_man_p0 to int
+  fd = fopen g_mm_p0 0 get g_mm_plen 0 577 420
+  if lt fd 0
+    ret MM_ERR_IO
+  end
+  for j ulong MM_MAN_LEN
+    put g_mm_io j get g_mm_man j
+  end
+  w = write int fd g_mm_io 0 MM_MAN_LEN
+  if ne w long MM_MAN_LEN
+    r = fclose int fd
+    ret MM_ERR_IO
+  end
+  r1 = fsync int fd
+  r2 = fclose int fd
+  if ne r2 0
+    ret MM_ERR_IO
+  end
+  ret MM_OK
+end
+
+note --- Hashing, chain slots, and Ed25519 helpers ---
+
+fn mm_sha256_a_slot off ulong n ulong slot ulong to void
+  for i ulong n bound 4194304
+    put sh_dat i get g_mm_bufa add off i
+  end
+  sh_all n
+  base = mul slot 32
+  for i ulong 32
+    put g_mm_hashes add base i get sh_dig i
+  end
+end
+
+fn mm_copy_hash src_slot ulong dst_slot ulong to void
+  sb = mul src_slot 32
+  db = mul dst_slot 32
+  for i ulong 32
+    put g_mm_hashes add db i get g_mm_hashes add sb i
+  end
+end
+
+fn mm_zero_hash slot ulong to void
+  db = mul slot 32
+  for i ulong 32
+    put g_mm_hashes add db i 0
+  end
+end
+
+fn mm_eq32_a_slot aoff ulong slot ulong to bool
+  sb = mul slot 32
+  for i ulong 32
+    if ne get g_mm_bufa add aoff i get g_mm_hashes add sb i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_init_c0 to void
+  dn = len mm_dom_gen
+  for i ulong dn bound 64
+    put sh_dat i get mm_dom_gen i
+  end
+  put sh_dat dn 0
+  sh_all add dn 1
+  cb = mul MM_C0 32
+  for i ulong 32
+    put g_mm_hashes add cb i get sh_dig i
+  end
+end
+
+fn mm_copy_slot_to_shdat off ulong slot ulong to void
+  hb = mul slot 32
+  for i ulong 32
+    b = get g_mm_hashes add hb i
+    put sh_dat add off i b
+  end
+end
+
+fn mm_chain_commit dom view uchar * prev_slot ulong cnt ulong dst_slot ulong to void
+  dn = len dom
+  for i ulong dn bound 32
+    put sh_dat i get dom i
+  end
+  put sh_dat dn 0
+  off = add dn 1
+  mm_copy_slot_to_shdat off prev_slot
+  off = add off 32
+  for s ulong cnt bound 4
+    mm_copy_slot_to_shdat off s
+    off = add off 32
+  end
+  sh_all off
+  db = mul dst_slot 32
+  for i ulong 32
+    put g_mm_hashes add db i get sh_dig i
+  end
+end
+
+fn mm_edverify_a pk_off ulong msg_off ulong mlen ulong sig_off ulong to bool
+  pk = new uchar 32 0
+  msg = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get g_mm_bufa add pk_off i
+  end
+  for i ulong mlen bound 65536
+    put msg i get g_mm_bufa add msg_off i
+  end
+  for i ulong 64
+    put sg i get g_mm_bufa add sig_off i
+  end
+  ret eq edverify pk msg mlen sg 0 1
+end
+
+fn mm_edverify_dna_tlr cnt ulong to bool
+  pk = new uchar 32 0
+  msg = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get g_mm_bufa add 32 i
+  end
+  for i ulong 64
+    put msg i get g_mm_bufa i
+  end
+  pb = mul MM_PREV_H 32
+  for i ulong 32
+    put msg add 64 i get g_mm_hashes add pb i
+  end
+  tlr = add 64 mul cnt 256
+  for i ulong 64
+    put sg i get g_mm_bufa add tlr i
+  end
+  ret eq edverify pk msg 96 sg 0 1
+end
+
+fn mm_edverify_man to bool
+  pk = new uchar 32 0
+  msg = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get g_mm_man add 416 i
+  end
+  for i ulong MM_MAN_SIG_LIM
+    put msg i get g_mm_man i
+  end
+  for i ulong 64
+    put sg i get g_mm_man add 448 i
+  end
+  ret eq edverify pk msg MM_MAN_SIG_LIM sg 0 1
+end
+
+fn mm_edsign_man use_def ulong to void
+  sd = new uchar 32 0
+  pk = new uchar 32 0
+  msg = new uchar 65536 0
+  sg = new uchar 64 0
+  if ne use_def 0
+    tl = len mm_t_def_seed
+    for i ulong tl bound 256
+      put sh_dat i get mm_t_def_seed i
+    end
+    sh_all tl
+  else
+    sl = get g_mm_seedlen 0
+    for i ulong sl bound 256
+      put sh_dat i get g_mm_seedtag i
+    end
+    sh_all sl
+  end
+  for i ulong 32
+    put sd i get sh_dig i
+  end
+  ues_pubkey sd pk
+  for i ulong 32
+    put g_mm_man add 416 i get pk i
+  end
+  for i ulong MM_MAN_SIG_LIM
+    put msg i get g_mm_man i
+  end
+  ues_sign sd msg MM_MAN_SIG_LIM sg
+  for i ulong 64
+    put g_mm_man add 448 i get sg i
+  end
+end
+
+note --- Binary structure & WattCBF checks ---
+
+fn mm_elf_scan_phdrs n ulong phoff ulong phent ulong phnum ulong to ulong
+  rx_cnt = ulong 0
+  for i ulong phnum bound 64
+    po = add phoff mul i phent
+    if gt add po 56 n
+      ret 0
+    end
+    pt = mm_get_u32_a po
+    pf = mm_get_u32_a add po 4
+    if or eq pt 2 eq pt 3
+      ret 0
+    end
+    if eq pt 1
+      if eq and pf 3 3
+        ret 0
+      end
+      if ne and pf 1 0
+        rx_cnt = add rx_cnt 1
+      end
+    end
+  end
+  ret rx_cnt
+end
+
+fn mm_check_elf64_wx_a n ulong to ulong
+  if lt n 64
+    ret 0
+  end
+  if or ne get g_mm_bufa 0 127 or ne get g_mm_bufa 1 69 or ne get g_mm_bufa 2 76 ne get g_mm_bufa 3 70
+    ret 0
+  end
+  if or ne get g_mm_bufa 4 2 ne get g_mm_bufa 5 1
+    ret 0
+  end
+  if ne mm_get_u16_a 18 183
+    ret 0
+  end
+  phoff = mm_get_u64_a 32
+  phent = mm_get_u16_a 54
+  phnum = mm_get_u16_a 56
+  if or lt phent 56 or eq phnum 0 gt phnum 64
+    ret 0
+  end
+  if eq mm_elf_scan_phdrs n phoff phent phnum 0
+    ret 0
+  end
+  ret 1
+end
+
+fn mm_check_macho_arm64_a n ulong to ulong
+  if lt n 32
+    ret 0
+  end
+  if ne mm_get_u32_a 0 0xfeedfacf
+    ret 0
+  end
+  if ne mm_get_u32_a 4 0x0100000c
+    ret 0
+  end
+  ret 1
+end
+
+fn mm_check_wattcbf_mw prop_mw ulong to int
+  ws_sense_all
+  if ne get g_wmeta 12 0
+    ret MM_ERR_WATTCBF
+  end
+  st = new WattThermal 0 0 0
+  live_ok = ws_fill_thermal_state st
+  if not live_ok
+    put st t_die 50000
+    put st t_sink 40000
+    put st t_amb 25000
+  end
+  pol = new WattPolicy 140000 79999 88000 2
+  prop = new WattProp long prop_mw 25000 10000 75
+  cmd = new WattCmd 0 0 0 0 0 0
+  if wc_must_fail_closed st pol
+    ret MM_ERR_WATTCBF
+  end
+  wc_cbf_filter st pol prop cmd
+  if or ne get cmd fail_closed 0 ne get cmd clamped 0
+    ret MM_ERR_WATTCBF
+  end
+  if or le get cmd p_gpu 0 gt get cmd p_gpu 79999
+    ret MM_ERR_WATTCBF
+  end
+  td = get st t_die
+  if lt td 0
+    td = 0
+  end
+  ls = get g_wmeta 13
+  if lt ls 0
+    ls = 0
+  end
+  put g_mm_st 1 ulong td
+  put g_mm_st 2 ulong ls
+  ret MM_OK
+end
+
+note --- Stage 1: OMMP01 + Morphed Binary + ARM64 Mach-O ---
+
+fn mm_ommp01_check_hash n ulong to bool
+  for i ulong 96
+    put sh_dat i get g_mm_bufa i
+  end
+  pay_len = sub n 224
+  for i ulong pay_len bound 4194304
+    b = get g_mm_bufa add 224 i
+    put sh_dat add 96 i b
+  end
+  sh_all add 96 pay_len
+  for i ulong 32
+    if ne get g_mm_bufa add 96 i get sh_dig i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_check_ommp01_a n ulong to int
+  if lt n 224
+    ret MM_ERR_STAGE1
+  end
+  if not mm_eq_magic_a 0 mm_t_ommp
+    ret MM_ERR_STAGE1
+  end
+  if or ne mm_get_u16_a 6 1 ne mm_get_u32_a 8 7
+    ret MM_ERR_STAGE1
+  end
+  if not mm_eq_magic_a 12 mm_t_om31
+    ret MM_ERR_STAGE1
+  end
+  wmw = mm_get_u32_a 16
+  tc = mm_get_u32_a 20
+  if or eq wmw 0 gt wmw MM_GPU_STRICT_MAX_MW
+    ret MM_ERR_WATTCBF
+  end
+  if or eq tc 0 gt tc MM_TCEIL_MAX_MC
+    ret MM_ERR_STAGE1
+  end
+  ol = mm_get_u32_a 56
+  el = mm_get_u32_a 60
+  if or lt ol 6 ne add 224 add ol el n
+    ret MM_ERR_STAGE1
+  end
+  if not mm_eq_magic_a 224 mm_t_oir
+    ret MM_ERR_STAGE1
+  end
+  if not mm_ommp01_check_hash n
+    ret MM_ERR_STAGE1
+  end
+  if not mm_edverify_a 128 0 128 160
+    ret MM_ERR_STAGE1
+  end
+  wrc = mm_check_wattcbf_mw wmw
+  if ne wrc MM_OK
+    ret wrc
+  end
+  put g_mm_st 0 wmw
+  ret MM_OK
+end
+
+fn mm_verify_stage1 to int
+  sn1 = mm_read_slot_a 0
+  if lt sn1 0
+    ret MM_ERR_IO
+  end
+  n1 = ulong sn1
+  rc = mm_check_ommp01_a n1
+  if ne rc MM_OK
+    ret rc
+  end
+  mm_sha256_a_slot 0 n1 MM_H0
+  mm_copy_hash MM_H0 MM_S1_OMMP_H
+  sn2 = mm_read_slot_a 1
+  if lt sn2 0
+    ret MM_ERR_IO
+  end
+  n2 = ulong sn2
+  if and ne mm_check_elf64_wx_a n2 1 ne mm_check_macho_arm64_a n2 1
+    ret MM_ERR_STAGE1
+  end
+  mm_sha256_a_slot 0 n2 MM_H1
+  sn3 = mm_read_slot_a 2
+  if lt sn3 0
+    ret MM_ERR_IO
+  end
+  n3 = ulong sn3
+  if ne mm_check_macho_arm64_a n3 1
+    ret MM_ERR_STAGE1
+  end
+  mm_sha256_a_slot 0 n3 MM_H2
+  mm_chain_commit mm_dom_s1 MM_C0 3 MM_C1
+  ret MM_OK
+end
+
+note --- Stage 2: Chrono 3-Timeline W^X + OTKJ v1 Chain + Live WattCBF ---
+
+fn mm_otkj_hash_verify pos ulong plen ulong eh_off ulong to int
+  body_len = add add 21 plen 32
+  for j ulong 5
+    put sh_dat j get mm_t_otkj_dom j
+  end
+  put sh_dat 5 0
+  for j ulong body_len bound 1048576
+    b = get g_mm_bufa add pos j
+    put sh_dat add 6 j b
+  end
+  sh_all add 6 body_len
+  pb = mul MM_PREV_H 32
+  for j ulong 32
+    d = get sh_dig j
+    if ne get g_mm_bufa add eh_off j d
+      ret MM_ERR_STAGE2
+    end
+    put g_mm_hashes add pb j d
+  end
+  put g_mm_st 18 add eh_off 32
+  ret MM_OK
+end
+
+fn mm_verify_otkj_one idx ulong pos ulong tot ulong to int
+  if gt add pos 85 tot
+    ret MM_ERR_STAGE2
+  end
+  if ne mm_get_u64_a pos idx
+    ret MM_ERR_STAGE2
+  end
+  kind = ulong get g_mm_bufa add pos 8
+  if or eq kind 0 gt kind 13
+    ret MM_ERR_STAGE2
+  end
+  plen = mm_get_u32_a add pos 17
+  if gt plen sub tot add pos 85
+    ret MM_ERR_STAGE2
+  end
+  ph_off = add add pos 21 plen
+  if not mm_eq32_a_slot ph_off MM_PREV_H
+    ret MM_ERR_STAGE2
+  end
+  ret mm_otkj_hash_verify pos plen add ph_off 32
+end
+
+fn mm_verify_otkj_a n ulong to int
+  if lt n 16
+    ret MM_ERR_STAGE2
+  end
+  if not mm_eq_magic_a 0 mm_t_otkj
+    ret MM_ERR_STAGE2
+  end
+  if or ne get g_mm_bufa 4 1 or ne get g_mm_bufa 5 0 or ne get g_mm_bufa 6 0 ne get g_mm_bufa 7 0
+    ret MM_ERR_STAGE2
+  end
+  ecnt = mm_get_u64_a 8
+  if eq ecnt 0
+    ret MM_ERR_STAGE2
+  end
+  mm_zero_hash MM_PREV_H
+  pos = ulong 16
+  for i ulong ecnt bound 65536
+    rc = mm_verify_otkj_one i pos n
+    if ne rc MM_OK
+      ret rc
+    end
+    pos = get g_mm_st 18
+  end
+  if ne pos n
+    ret MM_ERR_STAGE2
+  end
+  mm_copy_hash MM_PREV_H MM_S2_OTKJ_H
+  put g_mm_st 19 ecnt
+  ret MM_OK
+end
+
+fn mm_verify_stage2_tl fslot ulong hslot ulong to int
+  sn = mm_read_slot_a fslot
+  if lt sn 0
+    ret MM_ERR_IO
+  end
+  n = ulong sn
+  if ne mm_check_elf64_wx_a n 1
+    ret MM_ERR_STAGE2
+  end
+  mm_sha256_a_slot 0 n hslot
+  ret MM_OK
+end
+
+fn mm_verify_stage2 sim_mw ulong to int
+  rc = mm_verify_stage2_tl 0 MM_H0
+  if ne rc MM_OK
+    ret rc
+  end
+  rc = mm_verify_stage2_tl 1 MM_H1
+  if ne rc MM_OK
+    ret rc
+  end
+  rc = mm_verify_stage2_tl 2 MM_H2
+  if ne rc MM_OK
+    ret rc
+  end
+  sn = mm_read_slot_a 3
+  if lt sn 0
+    ret MM_ERR_IO
+  end
+  rc = mm_verify_otkj_a ulong sn
+  if ne rc MM_OK
+    ret rc
+  end
+  pmw = sim_mw
+  if eq pmw 0
+    pmw = get g_mm_st 0
+    if eq pmw 0
+      pmw = ulong 72000
+    end
+  end
+  rc = mm_check_wattcbf_mw pmw
+  if ne rc MM_OK
+    ret rc
+  end
+  mm_copy_hash MM_S2_OTKJ_H MM_H3
+  mm_chain_commit mm_dom_s2 MM_C1 4 MM_C2
+  ret MM_OK
+end
+
+note --- Stage 3: Lean 4.36.0 Formal Certificate + Standard Axioms + 0500 RX ---
+
+fn mm_check_lean_src_a n ulong to int
+  if eq n 0
+    ret MM_ERR_STAGE3
+  end
+  if lt mm_find_sub_a n mm_l_ns 0
+    ret MM_ERR_STAGE3
+  end
+  if lt mm_find_sub_a n mm_l_mast 0
+    ret MM_ERR_STAGE3
+  end
+  if lt mm_find_sub_a n mm_l_pr 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_l_sorry 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_l_admit 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_l_nd 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_l_ax 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_l_ch 0
+    ret MM_ERR_STAGE3
+  end
+  ret MM_OK
+end
+
+fn mm_check_lean_log_a n ulong to int
+  if eq n 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_g_err 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_g_sax 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_g_rb 0
+    ret MM_ERR_STAGE3
+  end
+  if ge mm_find_sub_a n mm_l_ch 0
+    ret MM_ERR_STAGE3
+  end
+  if or lt mm_find_sub_a n mm_g_th0 0 lt mm_find_sub_a n mm_g_th1 0
+    ret MM_ERR_STAGE3
+  end
+  if or lt mm_find_sub_a n mm_g_th2 0 lt mm_find_sub_a n mm_g_th3 0
+    ret MM_ERR_STAGE3
+  end
+  if or lt mm_find_sub_a n mm_g_th4 0 lt mm_find_sub_a n mm_g_th5 0
+    ret MM_ERR_STAGE3
+  end
+  if or lt mm_find_sub_a n mm_g_th6 0 lt mm_find_sub_a n mm_g_th7 0
+    ret MM_ERR_STAGE3
+  end
+  if or lt mm_find_sub_a n mm_g_th8 0 lt mm_find_sub_a n mm_g_th9 0
+    ret MM_ERR_STAGE3
+  end
+  ret MM_OK
+end
+
+fn mm_verify_stage3 exec_rc ulong to int
+  if ne exec_rc 48
+    ret MM_ERR_STAGE3
+  end
+  sn0 = mm_read_slot_a 0
+  if lt sn0 0
+    ret MM_ERR_IO
+  end
+  n0 = ulong sn0
+  if ne mm_check_lean_src_a n0 MM_OK
+    ret MM_ERR_STAGE3
+  end
+  mm_sha256_a_slot 0 n0 MM_H0
+  sn1 = mm_read_slot_a 1
+  if lt sn1 0
+    ret MM_ERR_IO
+  end
+  n1 = ulong sn1
+  if ne mm_check_elf64_wx_a n1 1
+    ret MM_ERR_STAGE3
+  end
+  mm_sha256_a_slot 0 n1 MM_H1
+  sn2 = mm_read_slot_a 2
+  if lt sn2 0
+    ret MM_ERR_IO
+  end
+  n2 = ulong sn2
+  if ne mm_check_lean_log_a n2 MM_OK
+    ret MM_ERR_STAGE3
+  end
+  mm_sha256_a_slot 0 n2 MM_H2
+  mm_chain_commit mm_dom_s3 MM_C2 3 MM_C3
+  put g_mm_st 3 48
+  put g_mm_st 4 1
+  ret MM_OK
+end
+
+note --- Stage 4: 20-Core Grace NEON Symbiote + OMEGA-MEMO OMEM v1 ---
+
+fn mm_parse_kv_u64_a n ulong pat view uchar * to long
+  pos = mm_find_sub_a n pat
+  if lt pos 0
+    ret -1
+  end
+  off = add ulong pos len pat
+  ret mm_parse_u64_a off n
+end
+
+fn mm_p2_ends_ome mlen ulong to bool
+  if lt mlen 4
+    ret false
+  end
+  for i ulong 4
+    if ne get g_mm_p2 add sub mlen 4 i get mm_s4_ome i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_build_ome_path_p2 use_entry ulong to void
+  mlen = get g_mm_plen 2
+  if mm_p2_ends_ome mlen
+    for i ulong mlen bound 1000
+      put g_mm_omepath i get g_mm_p2 i
+    end
+    put g_mm_omepath mlen 0
+    put g_mm_plen 4 mlen
+    ret
+  end
+  idx = ulong 0
+  for i ulong mlen bound 900
+    put g_mm_omepath idx get g_mm_p2 i
+    idx = add idx 1
+  end
+  if and gt idx 0 ne get g_mm_omepath sub idx 1 47
+    put g_mm_omepath idx 47
+    idx = add idx 1
+  end
+  if eq use_entry 0
+    put g_mm_omepath idx get mm_s4_key 0
+    put g_mm_omepath add idx 1 get mm_s4_key 1
+    put g_mm_omepath add idx 2 47
+    idx = add idx 3
+    for i ulong 64
+      put g_mm_omepath idx get mm_s4_key i
+      idx = add idx 1
+    end
+  else
+    put g_mm_omepath idx get g_mm_omehex 0
+    put g_mm_omepath add idx 1 get g_mm_omehex 1
+    put g_mm_omepath add idx 2 47
+    idx = add idx 3
+    for i ulong 64
+      put g_mm_omepath idx get g_mm_omehex i
+      idx = add idx 1
+    end
+  end
+  for i ulong len mm_s4_ome bound 8
+    put g_mm_omepath idx get mm_s4_ome i
+    idx = add idx 1
+  end
+  put g_mm_omepath idx 0
+  put g_mm_plen 4 idx
+end
+
+fn mm_extract_hex64_a n ulong pat view uchar * use_w20 ulong to int
+  pos = mm_find_sub_a n pat
+  if lt pos 0
+    ret MM_ERR_STAGE4
+  end
+  hoff = add ulong pos len pat
+  if gt add hoff 64 n
+    ret MM_ERR_STAGE4
+  end
+  for i ulong 64
+    c = get g_mm_bufa add hoff i
+    if lt mm_hex_val c 0
+      ret MM_ERR_STAGE4
+    end
+    if ne use_w20 0
+      put g_mm_w20hex i c
+    else
+      put g_mm_omehex i c
+    end
+  end
+  ret MM_OK
+end
+
+fn mm_check_symbiote_log_a n ulong to int
+  if lt mm_find_sub_a n mm_s4_arb 0
+    ret MM_ERR_STAGE4
+  end
+  if or lt mm_find_sub_a n mm_s4_d1 0 lt mm_find_sub_a n mm_s4_d2 0
+    ret MM_ERR_STAGE4
+  end
+  if or lt mm_find_sub_a n mm_s4_d3 0 lt mm_find_sub_a n mm_s4_mem 0
+    ret MM_ERR_STAGE4
+  end
+  if or lt mm_find_sub_a n mm_s4_hit 0 lt mm_find_sub_a n mm_s4_skp 0
+    ret MM_ERR_STAGE4
+  end
+  if lt mm_find_sub_a n mm_s4_tmp 0
+    ret MM_ERR_STAGE4
+  end
+  w20 = mm_parse_kv_u64_a n mm_s4_w20
+  wm = mm_parse_kv_u64_a n mm_s4_wmns
+  if or lt w20 0 lt wm 0
+    ret MM_ERR_STAGE4
+  end
+  put g_mm_st 7 ulong w20
+  put g_mm_st 8 ulong wm
+  if ne mm_extract_hex64_a n mm_s4_w20sh 1 MM_OK
+    ret MM_ERR_STAGE4
+  end
+  ret mm_extract_hex64_a n mm_s4_eh 0
+end
+
+fn mm_verify_ome_a n ulong to int
+  if le n 224
+    ret MM_ERR_STAGE4
+  end
+  if not mm_eq_magic_a 0 mm_t_omem
+    ret MM_ERR_STAGE4
+  end
+  if or ne mm_get_u32_a 4 1 or ne get g_mm_bufa 8 1 ne get g_mm_bufa 9 1
+    ret MM_ERR_STAGE4
+  end
+  plen = mm_get_u64_a 88
+  if or ne plen 327680 ne add 224 plen n
+    ret MM_ERR_STAGE4
+  end
+  mm_sha256_a_slot 224 plen MM_TMP_H
+  if not mm_eq32_a_slot 96 MM_TMP_H
+    ret MM_ERR_STAGE4
+  end
+  tb = mul MM_TMP_H 32
+  for i ulong 32
+    hi = mm_hex_val get g_mm_w20hex mul i 2
+    lo = mm_hex_val get g_mm_w20hex add mul i 2 1
+    b = uchar or shl ulong hi 4 ulong lo
+    if ne get g_mm_hashes add tb i b
+      ret MM_ERR_STAGE4
+    end
+  end
+  mm_sha256_a_slot 0 192 MM_TMP_H
+  if not mm_eq32_a_slot 192 MM_TMP_H
+    ret MM_ERR_STAGE4
+  end
+  for i ulong 32
+    hi = mm_hex_val get g_mm_omehex mul i 2
+    lo = mm_hex_val get g_mm_omehex add mul i 2 1
+    b = uchar or shl ulong hi 4 ulong lo
+    if ne get g_mm_hashes add tb i b
+      ret MM_ERR_STAGE4
+    end
+  end
+  ret MM_OK
+end
+
+fn mm_verify_stage4 to int
+  sn0 = mm_read_slot_a 0
+  if lt sn0 0
+    ret MM_ERR_IO
+  end
+  n0 = ulong sn0
+  if ne mm_check_elf64_wx_a n0 1
+    ret MM_ERR_STAGE4
+  end
+  mm_sha256_a_slot 0 n0 MM_H0
+  sn1 = mm_read_slot_a 1
+  if lt sn1 0
+    ret MM_ERR_IO
+  end
+  n1 = ulong sn1
+  if ne mm_check_symbiote_log_a n1 MM_OK
+    ret MM_ERR_STAGE4
+  end
+  mm_sha256_a_slot 0 n1 MM_H1
+  mm_build_ome_path_p2 0
+  sn2 = mm_read_slot_a 4
+  if lt sn2 0
+    mm_build_ome_path_p2 1
+    sn2 = mm_read_slot_a 4
+  end
+  if lt sn2 0
+    ret MM_ERR_IO
+  end
+  n2 = ulong sn2
+  if ne mm_verify_ome_a n2 MM_OK
+    ret MM_ERR_STAGE4
+  end
+  mm_sha256_a_slot 0 n2 MM_H2
+  mm_chain_commit mm_dom_s4 MM_C3 3 MM_C4
+  put g_mm_st 5 0
+  put g_mm_st 6 1
+  ret MM_OK
+end
+
+note --- Stage 5: 3-Host Byzantine DDC Quorum (OMRC0001 + Trojan Kill) ---
+
+fn mm_omrc_check_sem to bool
+  dn = len mm_t_ddc_sem
+  for i ulong dn bound 32
+    put sh_dat i get mm_t_ddc_sem i
+  end
+  put sh_dat dn 0
+  off = add dn 1
+  for i ulong 32
+    put sh_dat add off i get g_mm_bufa add 96 i
+  end
+  off = add off 32
+  for i ulong 32
+    put sh_dat add off i get g_mm_bufa add 160 i
+  end
+  off = add off 32
+  for i ulong 8
+    put sh_dat add off i get g_mm_bufa add 56 i
+  end
+  off = add off 8
+  for i ulong 32
+    put sh_dat add off i get g_mm_bufa add 192 i
+  end
+  off = add off 32
+  sh_all off
+  for i ulong 32
+    if ne get g_mm_bufa add 224 i get sh_dig i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_verify_omrc_slot fslot ulong hslot ulong rslot ulong to int
+  sn = mm_read_slot_a fslot
+  if lt sn 0
+    ret MM_ERR_IO
+  end
+  if ne ulong sn 352
+    ret MM_ERR_STAGE5
+  end
+  if not mm_eq_magic_a 0 mm_t_omrc
+    ret MM_ERR_STAGE5
+  end
+  if not mm_eq_magic_a 8 mm_t_ddc_dom
+    ret MM_ERR_STAGE5
+  end
+  for i ulong 3
+    if ne get g_mm_bufa add 29 i 0
+      ret MM_ERR_STAGE5
+    end
+  end
+  ver = mm_get_u32_a 32
+  if ne ver 1
+    ret MM_ERR_STAGE5
+  end
+  role = mm_get_u32_a 36
+  if or eq role 0 gt role 3
+    ret MM_ERR_STAGE5
+  end
+  ep = mm_get_u64_a 40
+  cb = mm_get_u64_a 48
+  if or eq ep 0 eq cb 0
+    ret MM_ERR_STAGE5
+  end
+  if not mm_omrc_check_sem
+    ret MM_ERR_STAGE5
+  end
+  if not mm_edverify_a 256 0 288 288
+    ret MM_ERR_STAGE5
+  end
+  mm_sha256_a_slot 0 352 hslot
+  rb = mul rslot 352
+  for i ulong 352
+    put g_mm_rcpts add rb i get g_mm_bufa i
+  end
+  ret MM_OK
+end
+
+fn mm_rcpt_role rslot ulong to ulong
+  rb = mul rslot 352
+  v = ulong 0
+  for j ulong 4
+    v = or v shl ulong get g_mm_rcpts add add rb 36 j mul j 8
+  end
+  ret v
+end
+
+fn mm_rcpt_eq_slice s1 ulong s2 ulong off ulong n ulong to bool
+  b1 = add mul s1 352 off
+  b2 = add mul s2 352 off
+  for i ulong n bound 64
+    if ne get g_mm_rcpts add b1 i get g_mm_rcpts add b2 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_check_quorum_pair s1 ulong s2 ulong to bool
+  if eq mm_rcpt_role s1 mm_rcpt_role s2
+    ret false
+  end
+  if mm_rcpt_eq_slice s1 s2 256 32
+    ret false
+  end
+  if mm_rcpt_eq_slice s1 s2 64 32
+    ret false
+  end
+  if not mm_rcpt_eq_slice s1 s2 56 8
+    ret false
+  end
+  if not mm_rcpt_eq_slice s1 s2 96 32
+    ret false
+  end
+  if not mm_rcpt_eq_slice s1 s2 160 32
+    ret false
+  end
+  if not mm_rcpt_eq_slice s1 s2 192 32
+    ret false
+  end
+  if not mm_rcpt_eq_slice s1 s2 224 32
+    ret false
+  end
+  ret true
+end
+
+fn mm_verify_stage5 trojan_rc ulong to int
+  if eq trojan_rc 0
+    ret MM_ERR_STAGE5
+  end
+  rc = mm_verify_omrc_slot 0 MM_H0 0
+  if ne rc MM_OK
+    ret rc
+  end
+  rc = mm_verify_omrc_slot 1 MM_H1 1
+  if ne rc MM_OK
+    ret rc
+  end
+  rc = mm_verify_omrc_slot 2 MM_H2 2
+  if ne rc MM_OK
+    ret rc
+  end
+  if not mm_check_quorum_pair 0 1
+    ret MM_ERR_STAGE5
+  end
+  if not mm_check_quorum_pair 0 2
+    ret MM_ERR_STAGE5
+  end
+  if not mm_check_quorum_pair 1 2
+    ret MM_ERR_STAGE5
+  end
+  b0 = shl 1 sub mm_rcpt_role 0 1
+  b1 = shl 1 sub mm_rcpt_role 1 1
+  b2 = shl 1 sub mm_rcpt_role 2 1
+  rmask = or b0 or b1 b2
+  if ne rmask 7
+    ret MM_ERR_STAGE5
+  end
+  sb = mul MM_S5_SEM_H 32
+  for i ulong 32
+    put g_mm_hashes add sb i get g_mm_rcpts add 224 i
+  end
+  mm_chain_commit mm_dom_s5 MM_C4 3 MM_C5
+  put g_mm_st 9 3
+  put g_mm_st 10 trojan_rc
+  ret MM_OK
+end
+
+note --- Stage 6: Proof-DNA OMDNA1 Immune Evolution & Ratchet ---
+
+fn mm_dna_check_chain i ulong off ulong to int
+  pb = mul MM_PREV_H 32
+  ch_off = add off 160
+  ak_off = add off 128
+  if gt i 0
+    for j ulong 32
+      put sh_dat j get g_mm_hashes add pb j
+    end
+    for j ulong 32
+      put sh_dat add 32 j get g_mm_bufa add ak_off j
+    end
+    sh_all 64
+    for j ulong 32
+      if ne get g_mm_bufa add ch_off j get sh_dig j
+        ret MM_ERR_STAGE6
+      end
+    end
+  end
+  for j ulong 32
+    put g_mm_hashes add pb j get g_mm_bufa add ch_off j
+  end
+  ret MM_OK
+end
+
+fn mm_dna_check_attack off ulong to bool
+  dn = len mm_t_dna_rec
+  for j ulong dn bound 32
+    put sh_dat j get mm_t_dna_rec j
+  end
+  put sh_dat dn 0
+  bo = add dn 1
+  for j ulong 128
+    b = get g_mm_bufa add off j
+    put sh_dat add bo j b
+  end
+  sh_all add bo 128
+  ak_off = add off 128
+  for j ulong 32
+    if ne get g_mm_bufa add ak_off j get sh_dig j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_verify_omdna_rec i ulong off ulong to int
+  if not mm_eq_magic_a off mm_t_abdy
+    ret MM_ERR_STAGE6
+  end
+  aid = mm_get_u32_a add off 4
+  if ne aid add i 1
+    ret MM_ERR_STAGE6
+  end
+  surf = mm_get_u32_a add off 8
+  if or eq surf 0 gt surf 5
+    ret MM_ERR_STAGE6
+  end
+  bft = mm_get_u32_a add off 20
+  veto = mm_get_u32_a add off 28
+  if or lt bft 3 ne veto 0
+    ret MM_ERR_STAGE6
+  end
+  if not mm_dna_check_attack off
+    ret MM_ERR_STAGE6
+  end
+  if ne mm_dna_check_chain i off MM_OK
+    ret MM_ERR_STAGE6
+  end
+  if not mm_edverify_a 32 off 192 add off 192
+    ret MM_ERR_STAGE6
+  end
+  ret int surf
+end
+
+fn mm_dna_parse_hdr n ulong to long
+  if lt n 128
+    ret -1
+  end
+  if not mm_eq_magic_a 0 mm_t_dna
+    ret -1
+  end
+  ver = mm_get_u16_a 6
+  rsz = mm_get_u32_a 8
+  if or ne ver 1 ne rsz 256
+    ret -1
+  end
+  cnt = mm_get_u32_a 12
+  if or eq cnt 0 gt cnt 240
+    ret -1
+  end
+  ep = mm_get_u64_a 16
+  rat = mm_get_u64_a 24
+  if or eq ep 0 lt rat cnt
+    ret -1
+  end
+  want = add 64 add mul cnt 256 64
+  if ne n want
+    ret -1
+  end
+  put g_mm_st 20 rat
+  ret long cnt
+end
+
+fn mm_verify_omdna_a n ulong to int
+  scnt = mm_dna_parse_hdr n
+  if lt scnt 0
+    ret MM_ERR_STAGE6
+  end
+  cnt = ulong scnt
+  smask = ulong 0
+  for i ulong cnt bound 240
+    off = add 64 mul i 256
+    sr = mm_verify_omdna_rec i off
+    if lt sr 0
+      ret sr
+    end
+    smask = or smask shl 1 ulong sub sr 1
+  end
+  if not mm_edverify_dna_tlr cnt
+    ret MM_ERR_STAGE6
+  end
+  put g_mm_st 21 smask
+  ret MM_OK
+end
+
+fn mm_verify_stage6 to int
+  sn0 = mm_read_slot_a 0
+  if lt sn0 0
+    ret MM_ERR_IO
+  end
+  n0 = ulong sn0
+  rc = mm_verify_omdna_a n0
+  if ne rc MM_OK
+    ret rc
+  end
+  r_old = get g_mm_st 20
+  mm_sha256_a_slot 0 n0 MM_H0
+  sn1 = mm_read_slot_a 1
+  if lt sn1 0
+    ret MM_ERR_IO
+  end
+  n1 = ulong sn1
+  rc = mm_verify_omdna_a n1
+  if ne rc MM_OK
+    ret rc
+  end
+  r_new = get g_mm_st 20
+  sm_new = get g_mm_st 21
+  mm_sha256_a_slot 0 n1 MM_H1
+  if or le r_new r_old ne sm_new 31
+    ret MM_ERR_STAGE6
+  end
+  mm_chain_commit mm_dom_s6 MM_C5 2 MM_C6
+  put g_mm_st 11 r_old
+  put g_mm_st 12 r_new
+  put g_mm_st 13 5
+  ret MM_OK
+end
+
+note --- OMMM01 Manifest Pack, Sign, and Fail-Closed Verification ---
+
+fn mm_copy_slot_to_man moff ulong slot ulong to void
+  sb = mul slot 32
+  for i ulong 32
+    put g_mm_man add moff i get g_mm_hashes add sb i
+  end
+end
+
+fn mm_fill_manifest_body flags ulong ts ulong to void
+  for i ulong MM_MAN_LEN
+    put g_mm_man i 0
+  end
+  for i ulong 6
+    put g_mm_man i get mm_t_magic i
+  end
+  mm_put_u16_m 6 1
+  mm_put_u32_m 8 flags
+  mm_put_u32_m 12 63
+  mm_put_u64_m 16 get g_mm_st 0
+  mm_put_u32_m 24 get g_mm_st 1
+  mm_put_u32_m 28 get g_mm_st 2
+  mm_put_u32_m 32 get g_mm_st 3
+  mm_put_u32_m 36 get g_mm_st 4
+  mm_put_u32_m 40 get g_mm_st 5
+  mm_put_u32_m 44 get g_mm_st 6
+  mm_put_u64_m 48 get g_mm_st 7
+  mm_put_u64_m 56 get g_mm_st 8
+  mm_put_u32_m 64 get g_mm_st 9
+  mm_put_u32_m 68 get g_mm_st 10
+  mm_put_u32_m 72 get g_mm_st 11
+  mm_put_u32_m 76 get g_mm_st 12
+  mm_put_u32_m 80 get g_mm_st 13
+  mm_put_u32_m 84 0
+  mm_put_u64_m 88 ts
+  mm_copy_slot_to_man 96 MM_C1
+  mm_copy_slot_to_man 128 MM_C2
+  mm_copy_slot_to_man 160 MM_C3
+  mm_copy_slot_to_man 192 MM_C4
+  mm_copy_slot_to_man 224 MM_C5
+  mm_copy_slot_to_man 256 MM_C6
+  mm_copy_slot_to_man 288 MM_S1_OMMP_H
+  mm_copy_slot_to_man 320 MM_S2_OTKJ_H
+  mm_copy_slot_to_man 352 MM_S5_SEM_H
+end
+
+fn mm_seal_manifest flags ulong ts ulong use_def ulong to void
+  mm_fill_manifest_body flags ts
+  dn = len mm_dom_body
+  for i ulong dn bound 32
+    put sh_dat i get mm_dom_body i
+  end
+  put sh_dat dn 0
+  bo = add dn 1
+  for i ulong MM_MAN_BODY_LIM
+    put sh_dat add bo i get g_mm_man i
+  end
+  sh_all add bo MM_MAN_BODY_LIM
+  for i ulong 32
+    put g_mm_man add 384 i get sh_dig i
+  end
+  mm_edsign_man use_def
+end
+
+fn mm_verify_manifest_fields to int
+  for i ulong 6
+    if ne get g_mm_man i get mm_t_magic i
+      ret MM_ERR_MANIFEST
+    end
+  end
+  if or ne mm_get_u16_m 6 1 ne mm_get_u32_m 12 63
+    ret MM_ERR_MANIFEST
+  end
+  if ne mm_get_u32_m 84 0
+    ret MM_ERR_MANIFEST
+  end
+  wmw = mm_get_u64_m 16
+  if or eq wmw 0 gt wmw MM_GPU_STRICT_MAX_MW
+    ret MM_ERR_MANIFEST
+  end
+  if or ne mm_get_u32_m 32 48 ne mm_get_u32_m 36 1
+    ret MM_ERR_MANIFEST
+  end
+  if or ne mm_get_u32_m 40 0 ne mm_get_u32_m 44 1
+    ret MM_ERR_MANIFEST
+  end
+  if or ne mm_get_u32_m 64 3 eq mm_get_u32_m 68 0
+    ret MM_ERR_MANIFEST
+  end
+  r_old = mm_get_u32_m 72
+  r_new = mm_get_u32_m 76
+  if or le r_new r_old ne mm_get_u32_m 80 5
+    ret MM_ERR_MANIFEST
+  end
+  for s ulong 6
+    off = add 96 mul s 32
+    nz = false
+    for j ulong 32
+      if ne get g_mm_man add off j 0
+        nz = true
+        break
+      end
+    end
+    if not nz
+      ret MM_ERR_MANIFEST
+    end
+  end
+  ret MM_OK
+end
+
+fn mm_verify_manifest_man n ulong to int
+  if ne n MM_MAN_LEN
+    ret MM_ERR_MANIFEST
+  end
+  rc = mm_verify_manifest_fields
+  if ne rc MM_OK
+    ret rc
+  end
+  dn = len mm_dom_body
+  for i ulong dn bound 32
+    put sh_dat i get mm_dom_body i
+  end
+  put sh_dat dn 0
+  bo = add dn 1
+  for i ulong MM_MAN_BODY_LIM
+    put sh_dat add bo i get g_mm_man i
+  end
+  sh_all add bo MM_MAN_BODY_LIM
+  for i ulong 32
+    if ne get g_mm_man add 384 i get sh_dig i
+      ret MM_ERR_MANIFEST
+    end
+  end
+  if not mm_edverify_man
+    ret MM_ERR_MANIFEST
+  end
+  ret MM_OK
+end
+
+note --- CLI commands ---
+
+fn mm_cmd_selftest to int
+  mm_init_c0
+  put g_mm_st 0 72000
+  put g_mm_st 1 50000
+  put g_mm_st 2 1
+  put g_mm_st 3 48
+  put g_mm_st 4 1
+  put g_mm_st 5 0
+  put g_mm_st 6 1
+  put g_mm_st 7 123456
+  put g_mm_st 8 42
+  put g_mm_st 9 3
+  put g_mm_st 10 109
+  put g_mm_st 11 5
+  put g_mm_st 12 22
+  put g_mm_st 13 5
+  if ne mm_check_wattcbf_mw 72000 MM_OK
+    ret mm_refuse MM_ERR_WATTCBF
+  end
+  if eq mm_check_wattcbf_mw 80000 MM_OK
+    ret mm_refuse MM_ERR_WATTCBF
+  end
+  for s ulong 6
+    cb = mul add MM_C1 s 32
+    for i ulong 32
+      put g_mm_hashes add cb i uchar add add s 1 i
+    end
+  end
+  mm_seal_manifest 31 ulong monons 1
+  if ne mm_verify_manifest_man MM_MAN_LEN MM_OK
+    ret mm_refuse MM_ERR_MANIFEST
+  end
+  save = get g_mm_man 100
+  put g_mm_man 100 xor save 1
+  tamp = mm_verify_manifest_man MM_MAN_LEN
+  put g_mm_man 100 save
+  if eq tamp MM_OK
+    ret mm_refuse MM_ERR_MANIFEST
+  end
+  if ne mm_verify_manifest_man 511 MM_ERR_MANIFEST
+    ret mm_refuse MM_ERR_MANIFEST
+  end
+  mm_puts mm_m_self
+  ret MM_OK
+end
+
+fn mm_cmd_s1 argc ulong to int
+  if ne argc 5
+    ret mm_refuse MM_ERR_USAGE
+  end
+  mm_init_c0
+  mm_set_path 0 2
+  mm_set_path 1 3
+  mm_set_path 2 4
+  rc = mm_verify_stage1
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  mm_puts mm_m_s1
+  mm_putn get g_mm_st 0
+  mm_puts mm_k_tdie
+  mm_putn get g_mm_st 1
+  mm_puts mm_k_live
+  mm_putn get g_mm_st 2
+  mm_puts mm_k_hw0
+  mm_putn 1
+  mm_puts mm_k_eq
+  mm_put_hex_slot MM_C1
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_cmd_s2 argc ulong to int
+  if and ne argc 6 ne argc 8
+    ret mm_refuse MM_ERR_USAGE
+  end
+  sim_mw = ulong 0
+  if eq argc 8
+    if not mm_streq_arg 6 mm_f_simw
+      ret mm_refuse MM_ERR_USAGE
+    end
+    sv = mm_parse_u64_arg 7
+    if lt sv 0
+      ret mm_refuse MM_ERR_USAGE
+    end
+    sim_mw = ulong sv
+  end
+  mm_init_c0
+  mm_copy_hash MM_C0 MM_C1
+  mm_set_path 0 2
+  mm_set_path 1 3
+  mm_set_path 2 4
+  mm_set_path 3 5
+  rc = mm_verify_stage2 sim_mw
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  mm_puts mm_m_s2
+  mm_putn get g_mm_st 19
+  mm_puts mm_k_tdie
+  mm_putn get g_mm_st 1
+  mm_puts mm_k_hw0
+  mm_putn 2
+  mm_puts mm_k_eq
+  mm_put_hex_slot MM_C2
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_cmd_s3 argc ulong to int
+  if and ne argc 5 ne argc 7
+    ret mm_refuse MM_ERR_USAGE
+  end
+  ex_rc = ulong 48
+  if eq argc 7
+    if not mm_streq_arg 5 mm_f_exrc
+      ret mm_refuse MM_ERR_USAGE
+    end
+    ev = mm_parse_u64_arg 6
+    if lt ev 0
+      ret mm_refuse MM_ERR_USAGE
+    end
+    ex_rc = ulong ev
+  end
+  mm_init_c0
+  mm_copy_hash MM_C0 MM_C2
+  mm_set_path 0 2
+  mm_set_path 1 3
+  mm_set_path 2 4
+  rc = mm_verify_stage3 ex_rc
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  mm_puts mm_m_s3
+  mm_put_hex_slot MM_C3
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_cmd_s4 argc ulong to int
+  if ne argc 5
+    ret mm_refuse MM_ERR_USAGE
+  end
+  mm_init_c0
+  mm_copy_hash MM_C0 MM_C3
+  mm_set_path 0 2
+  mm_set_path 1 3
+  mm_set_path 2 4
+  rc = mm_verify_stage4
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  mm_puts mm_m_s4
+  mm_putn get g_mm_st 7
+  mm_puts mm_k_wm
+  mm_putn get g_mm_st 8
+  mm_puts mm_k_c4
+  mm_put_hex_slot MM_C4
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_cmd_s5 argc ulong to int
+  if and ne argc 5 ne argc 7
+    ret mm_refuse MM_ERR_USAGE
+  end
+  tr_rc = ulong 109
+  if eq argc 7
+    if not mm_streq_arg 5 mm_f_trj
+      ret mm_refuse MM_ERR_USAGE
+    end
+    tv = mm_parse_u64_arg 6
+    if lt tv 0
+      ret mm_refuse MM_ERR_USAGE
+    end
+    tr_rc = ulong tv
+  end
+  mm_init_c0
+  mm_copy_hash MM_C0 MM_C4
+  mm_set_path 0 2
+  mm_set_path 1 3
+  mm_set_path 2 4
+  rc = mm_verify_stage5 tr_rc
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  mm_puts mm_m_s5
+  mm_putn tr_rc
+  mm_puts mm_k_c5
+  mm_put_hex_slot MM_C5
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_cmd_s6 argc ulong to int
+  if ne argc 4
+    ret mm_refuse MM_ERR_USAGE
+  end
+  mm_init_c0
+  mm_copy_hash MM_C0 MM_C5
+  mm_set_path 0 2
+  mm_set_path 1 3
+  rc = mm_verify_stage6
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  mm_puts mm_m_s6
+  mm_putn get g_mm_st 11
+  mm_puts mm_k_ar
+  mm_putn get g_mm_st 12
+  mm_puts mm_k_c6
+  mm_put_hex_slot MM_C6
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_seal_flag_paths i ulong vi ulong to int
+  if mm_streq_arg i mm_f_s1o
+    put g_mm_aidx 0 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s1m
+    put g_mm_aidx 1 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s1a
+    put g_mm_aidx 2 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s20
+    put g_mm_aidx 3 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s21
+    put g_mm_aidx 4 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s22
+    put g_mm_aidx 5 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s2k
+    put g_mm_aidx 6 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s3l
+    put g_mm_aidx 7 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s3r
+    put g_mm_aidx 8 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s3g
+    put g_mm_aidx 9 vi
+    ret 1
+  end
+  ret 0
+end
+
+fn mm_seal_flag_more i ulong vi ulong to int
+  if mm_streq_arg i mm_f_s4w
+    put g_mm_aidx 10 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s4g
+    put g_mm_aidx 11 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s4m
+    put g_mm_aidx 12 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s51
+    put g_mm_aidx 13 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s52
+    put g_mm_aidx 14 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s53
+    put g_mm_aidx 15 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s6o
+    put g_mm_aidx 16 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s6n
+    put g_mm_aidx 17 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_out
+    put g_mm_aidx 18 vi
+    ret 1
+  end
+  if mm_streq_arg i mm_f_seed
+    put g_mm_aidx 19 vi
+    ret 1
+  end
+  ret 0
+end
+
+fn mm_seal_flag_nums i ulong vi ulong to int
+  if mm_streq_arg i mm_f_s3c
+    pv = mm_parse_u64_arg vi
+    if lt pv 0
+      ret -1
+    end
+    put g_mm_st 14 ulong pv
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s5t
+    pv = mm_parse_u64_arg vi
+    if lt pv 0
+      ret -1
+    end
+    put g_mm_st 15 ulong pv
+    ret 1
+  end
+  if mm_streq_arg i mm_f_s5h
+    pv = mm_parse_u64_arg vi
+    if lt pv 0
+      ret -1
+    end
+    put g_mm_st 16 ulong pv
+    ret 1
+  end
+  ret 0
+end
+
+fn mm_seal_parse_flags argc ulong to int
+  for i ulong 24
+    put g_mm_aidx i 0
+  end
+  put g_mm_st 14 48
+  put g_mm_st 15 109
+  put g_mm_st 16 0
+  i = ulong 2
+  while lt add i 1 argc bound 64
+    vi = add i 1
+    r1 = mm_seal_flag_paths i vi
+    if eq r1 0
+      r2 = mm_seal_flag_more i vi
+      if eq r2 0
+        r3 = mm_seal_flag_nums i vi
+        if le r3 0
+          ret MM_ERR_USAGE
+        end
+      end
+    end
+    i = add i 2
+  end
+  if ne i argc
+    ret MM_ERR_USAGE
+  end
+  for k ulong 19
+    if eq get g_mm_aidx k 0
+      ret MM_ERR_USAGE
+    end
+  end
+  ret MM_OK
+end
+
+fn mm_seal_run_s1_to_s3 to int
+  mm_set_path 0 get g_mm_aidx 0
+  mm_set_path 1 get g_mm_aidx 1
+  mm_set_path 2 get g_mm_aidx 2
+  rc = mm_verify_stage1
+  if ne rc MM_OK
+    ret rc
+  end
+  mm_set_path 0 get g_mm_aidx 3
+  mm_set_path 1 get g_mm_aidx 4
+  mm_set_path 2 get g_mm_aidx 5
+  mm_set_path 3 get g_mm_aidx 6
+  rc = mm_verify_stage2 0
+  if ne rc MM_OK
+    ret rc
+  end
+  mm_set_path 0 get g_mm_aidx 7
+  mm_set_path 1 get g_mm_aidx 8
+  mm_set_path 2 get g_mm_aidx 9
+  ret mm_verify_stage3 get g_mm_st 14
+end
+
+fn mm_seal_run_s4_to_s6 to int
+  mm_set_path 0 get g_mm_aidx 10
+  mm_set_path 1 get g_mm_aidx 11
+  mm_set_path 2 get g_mm_aidx 12
+  rc = mm_verify_stage4
+  if ne rc MM_OK
+    ret rc
+  end
+  mm_set_path 0 get g_mm_aidx 13
+  mm_set_path 1 get g_mm_aidx 14
+  mm_set_path 2 get g_mm_aidx 15
+  rc = mm_verify_stage5 get g_mm_st 15
+  if ne rc MM_OK
+    ret rc
+  end
+  mm_set_path 0 get g_mm_aidx 16
+  mm_set_path 1 get g_mm_aidx 17
+  ret mm_verify_stage6
+end
+
+fn mm_cmd_seal argc ulong to int
+  if ne mm_seal_parse_flags argc MM_OK
+    ret mm_refuse MM_ERR_USAGE
+  end
+  mm_init_c0
+  rc = mm_seal_run_s1_to_s3
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  rc = mm_seal_run_s4_to_s6
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  flags = ulong 31
+  if ne get g_mm_st 16 0
+    flags = ulong 63
+  end
+  if eq get g_mm_aidx 19 0
+    mm_seal_manifest flags ulong monons 1
+  else
+    ssl = argread get g_mm_aidx 19 g_mm_seedtag 0 255
+    sl = ulong 0
+    if gt ssl 0
+      sl = ulong ssl
+    end
+    put g_mm_seedtag sl 0
+    put g_mm_seedlen 0 sl
+    mm_seal_manifest flags ulong monons 0
+  end
+  if ne mm_verify_manifest_man MM_MAN_LEN MM_OK
+    ret mm_refuse MM_ERR_MANIFEST
+  end
+  mm_set_path 0 get g_mm_aidx 18
+  wrc = mm_write_man_p0
+  if ne wrc MM_OK
+    ret mm_refuse wrc
+  end
+  mm_puts mm_m_seal
+  mm_putn mm_get_u64_m 16
+  mm_puts mm_k_s3
+  mm_putn mm_get_u32_m 68
+  mm_puts mm_k_dn
+  mm_putn mm_get_u32_m 72
+  mm_puts mm_k_ar
+  mm_putn mm_get_u32_m 76
+  mm_puts mm_k_c6
+  mm_put_hex_slot MM_C6
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_load_manifest_arg argc ulong to int
+  if ne argc 3
+    ret MM_ERR_USAGE
+  end
+  mm_set_path 0 2
+  sn = mm_read_slot_a 0
+  if lt sn 0
+    ret MM_ERR_IO
+  end
+  if ne ulong sn MM_MAN_LEN
+    ret MM_ERR_MANIFEST
+  end
+  for i ulong MM_MAN_LEN
+    put g_mm_man i get g_mm_bufa i
+  end
+  ret mm_verify_manifest_man MM_MAN_LEN
+end
+
+fn mm_cmd_verify_manifest argc ulong to int
+  rc = mm_load_manifest_arg argc
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  cb = mul MM_C6 32
+  for i ulong 32
+    put g_mm_hashes add cb i get g_mm_man add 256 i
+  end
+  mm_puts mm_m_vman
+  mm_putn mm_get_u64_m 16
+  mm_puts mm_k_s3
+  mm_putn mm_get_u32_m 68
+  mm_puts mm_k_dn
+  mm_putn mm_get_u32_m 72
+  mm_puts mm_k_ar
+  mm_putn mm_get_u32_m 76
+  mm_puts mm_k_c6
+  mm_put_hex_slot MM_C6
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn mm_cmd_inspect argc ulong to int
+  rc = mm_load_manifest_arg argc
+  if ne rc MM_OK
+    ret mm_refuse rc
+  end
+  cb = mul MM_C6 32
+  for i ulong 32
+    put g_mm_hashes add cb i get g_mm_man add 256 i
+  end
+  mm_puts mm_m_insp1
+  mm_putn mm_get_u32_m 84
+  mm_puts mm_k_tdie
+  mm_putn mm_get_u32_m 24
+  mm_puts mm_k_live
+  mm_putn mm_get_u32_m 28
+  mm_puts mm_k_c6
+  mm_put_hex_slot MM_C6
+  mm_puts mm_m_nl
+  ret MM_OK
+end
+
+fn main to int
+  ac = argcnt
+  if lt ac 2
+    mm_err mm_m_use
+    ret MM_ERR_USAGE
+  end
+  argc = ulong ac
+  if mm_streq_arg 1 mm_c_self
+    ret mm_cmd_selftest
+  end
+  if mm_streq_arg 1 mm_c_s1
+    ret mm_cmd_s1 argc
+  end
+  if mm_streq_arg 1 mm_c_s2
+    ret mm_cmd_s2 argc
+  end
+  if mm_streq_arg 1 mm_c_s3
+    ret mm_cmd_s3 argc
+  end
+  if mm_streq_arg 1 mm_c_s4
+    ret mm_cmd_s4 argc
+  end
+  if mm_streq_arg 1 mm_c_s5
+    ret mm_cmd_s5 argc
+  end
+  if mm_streq_arg 1 mm_c_s6
+    ret mm_cmd_s6 argc
+  end
+  if mm_streq_arg 1 mm_c_seal
+    ret mm_cmd_seal argc
+  end
+  if mm_streq_arg 1 mm_c_ver
+    ret mm_cmd_verify_manifest argc
+  end
+  if mm_streq_arg 1 mm_c_insp
+    ret mm_cmd_inspect argc
+  end
+  mm_err mm_m_use
+  ret MM_ERR_USAGE
+end
