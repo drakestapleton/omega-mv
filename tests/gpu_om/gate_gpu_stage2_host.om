@@ -77,11 +77,17 @@ text t_fail_b " failed="
 text t_fail_c " checks="
 text t_fail_d " controls="
 text t_nl "\n"
-text t_usage "usage: gate_gpu_stage2_host [--audit <STAGE2-GPU-AUDIT.tsv>] [--r4-host|--host-only] [--serving-alloc <mode>]\n"
+text t_usage "usage: gate_gpu_stage2_host [--audit <STAGE2-GPU-AUDIT.tsv>] [--r4-host|--host-only|--fp8-slots|--fp8-slots-mutant|--q38-graph|--q38-graph-mutant|--transc-gb10|--transc-gb10-mutant] [--serving-alloc <mode>]\n"
 text t_f_audit "--audit"
 text t_f_r4 "--r4-host"
 text t_f_host "--host-only"
 text t_f_sa "--serving-alloc"
+text t_f_slots "--fp8-slots"
+text t_f_slots_m "--fp8-slots-mutant"
+text t_f_q38 "--q38-graph"
+text t_f_q38_m "--q38-graph-mutant"
+text t_f_tg "--transc-gb10"
+text t_f_tg_m "--transc-gb10-mutant"
 text t_m_plain "plain"
 text t_m_res "reserve"
 text t_m_bnd "bounds"
@@ -96,6 +102,12 @@ text t_m_ress "reserve-skip"
 text t_r4_pass "PASS: r4_host_reference_and_comparator_om2 (37x80x52 bf16 ref + 3 controls + neg symmetry)\n"
 text t_r4_fail "FAIL: r4_host_reference_and_comparator_om2 code="
 text t_sa_pass "gpu_serving_alloc_count_test (om2): PASS\n"
+text t_slots_pass "PASS: fp8_slots_host_om2 (16 slots, multi-pin BUSY, STALE ABA, 1000-cycle churn)\n"
+text t_slots_fail "[FAIL] FP8_SLOTS_MUTANT_PIN_BYPASS: pinned slot reload/evict bypassed fence code="
+text t_q38_pass "PASS: q38_graph_host_om2 (27B 14336 + 9B 10240 gather permutations, refusals, QMD0/1, R4)\n"
+text t_q38_fail "[FAIL] Q38_GRAPH_MUTANT_GATHER_CORRUPT: gather permutation/bijection mismatch code="
+text t_tg_pass "PASS: transc_gb10_host_om2 (EXP/LOG IEEE binary32 Horner + 1-ULP mutant discrimination)\n"
+text t_tg_fail "[FAIL] TG_EXP_LOG_HOST_MODEL_MUTANT: host polynomial divergence code="
 text t_sa_meas_swp_a "MEASURE sweep (slots="
 text t_sa_meas_swp_b " seal="
 text t_sa_meas_swp_c "): "
@@ -1258,7 +1270,71 @@ fn suite_s6_fp8_slots to void
   chk s6_stress_1000 get v3 0 6018
   chk sl_idle 6019
 
+  note Wave 2: multi-pin fence + pin-bypass negative control
+  chk eq s6_verify_slots false OK 6020
+  chk_neg eq s6_verify_slots true 6199 6111
+
   suite_done t_s6
+end
+
+fn s6_verify_slots mut bool to ulong
+  sl_reset
+  v0 = new ulong 1 0
+  if ne sl_begin_load 0 701 OK
+    ret 6151
+  end
+  if ne sl_finish_load 0 1 v0 OK
+    ret 6152
+  end
+  ver0 = get v0 0
+  if or ne sl_pin 0 ver0 OK ne sl_pin 0 ver0 OK
+    ret 6153
+  end
+  if ne get g_sl_pins 0 2
+    ret 6154
+  end
+  if mut
+    note Mutant ignores reader pins and overwrites/evicts slot 0
+    put g_sl_pins 0 0
+    if ne sl_evict 0 OK
+      ret 6155
+    end
+    put g_sl_pins 0 2
+    ret 6199
+  end
+  if or ne sl_begin_load 0 702 SL_ERR_BUSY ne sl_evict 0 SL_ERR_BUSY
+    ret 6156
+  end
+  if or ne sl_unpin 0 ver0 OK ne sl_unpin 0 ver0 OK
+    ret 6157
+  end
+  if ne sl_evict 0 OK
+    ret 6158
+  end
+  if ne sl_pin 0 ver0 SL_ERR_STALE
+    ret 6159
+  end
+  if not s6_stress_1000 ver0
+    ret 6160
+  end
+  if not sl_idle
+    ret 6161
+  end
+  ret OK
+end
+
+fn s6_cli_run mut bool to int
+  rc = s6_verify_slots mut
+  if eq rc OK
+    wr_str t_slots_pass
+    out_flush
+    ret 0
+  end
+  wr_str t_slots_fail
+  out_u64 rc
+  wr_str t_nl
+  out_flush
+  ret 1
 end
 
 note =========================================================================
@@ -2787,7 +2863,137 @@ fn suite_s8_graph_qmd_matmul to void
   note R4 Matmul receipt host oracle + comparator controls + sign negation
   chk eq s8_r4_host_verify OK 8018
 
+  note Wave 2: full Qwen3.8-27B (14336) & 9B (10240) gather permutation tables + invalid-shape refusals + mutant
+  chk eq s8_gather_full_suite false OK 8019
+  chk_neg eq s8_gather_full_suite true 8199 8108
+
   suite_done t_s8
+end
+
+global g_q38_tab uint 14336
+global g_q38_seen uchar 14336
+
+fn s8_perm_slot idx ulong rotary ulong to ulong
+  half = div rotary 2
+  if lt idx 128
+    if lt idx half
+      ret idx
+    end
+    ret add rotary sub idx half
+  end
+  j = sub idx 128
+  if lt j half
+    ret add half j
+  end
+  ret idx
+end
+
+fn s8_gather_slot n ulong qh ulong kvh ulong to ulong
+  qn = mul qh 256
+  if lt n qn
+    ret add mul div n 256 512 s8_perm_slot rem n 256 64
+  end
+  kn = mul kvh 256
+  qp = mul qh 512
+  if lt n add qn kn
+    d = sub n qn
+    ret add add qp mul div d 256 256 s8_perm_slot rem d 256 64
+  end
+  qkv = add qn mul 2 kn
+  if lt n qkv
+    ret add add qp kn sub sub n qn kn
+  end
+  d = sub n qkv
+  ret add add mul div d 256 512 256 rem d 256
+end
+
+fn s8_gather_fill qh ulong kvh ulong to ulong
+  if or eq qh 0 gt qh 24
+    ret 8181
+  end
+  if or eq kvh 0 ne rem qh kvh 0
+    ret 8182
+  end
+  mix = mul add qh kvh 512
+  for n ulong mix bound 16384
+    put g_q38_tab n uint s8_gather_slot n qh kvh
+  end
+  ret OK
+end
+
+fn s8_gather_check qh ulong kvh ulong to ulong
+  mix = mul add qh kvh 512
+  for i ulong mix bound 16384
+    put g_q38_seen i uchar 0
+  end
+  for i ulong mix bound 16384
+    v = ulong get g_q38_tab i
+    if ge v mix
+      ret 8199
+    end
+    if ne get g_q38_seen v uchar 0
+      ret 8199
+    end
+    put g_q38_seen v uchar 1
+    if ne v s8_gather_slot i qh kvh
+      ret 8199
+    end
+  end
+  ret OK
+end
+
+fn s8_gather_full_suite mut bool to ulong
+  if or ne s8_gather_fill 16 3 8182 or ne s8_gather_fill 0 4 8181 ne s8_gather_fill 32 4 8181
+    ret 8183
+  end
+  rc = s8_gather_fill 24 4
+  if ne rc OK
+    ret rc
+  end
+  if mut
+    put g_q38_tab 17 add get g_q38_tab 17 uint 1
+  end
+  rc = s8_gather_check 24 4
+  if ne rc OK
+    ret rc
+  end
+  for i ulong 14336
+    put g_q38_tab i uint 0xffffffff
+  end
+  rc = s8_gather_fill 16 4
+  if ne rc OK
+    ret rc
+  end
+  if ne get g_q38_tab 10240 uint 0xffffffff
+    ret 8184
+  end
+  ret s8_gather_check 16 4
+end
+
+fn s8_q38_cli_run mut bool to int
+  rc = s8_gather_full_suite mut
+  if ne rc OK
+    wr_str t_q38_fail
+    out_u64 rc
+    wr_str t_nl
+    out_flush
+    ret 1
+  end
+  if ne qmd_pack 0x0000000020001000 32768 OK
+    ret 1
+  end
+  if ne qmd_verify OK
+    ret 1
+  end
+  if ne q38_plan_layer_ops 8 28
+    ret 1
+  end
+  if ne s8_r4_host_verify OK
+    ret 1
+  end
+  wr_str t_q38_pass
+  out_flush
+  ret 0
 end
 
 note =========================================================================
@@ -2945,7 +3151,102 @@ fn suite_s9_imadhi_window_num_tc to void
   chk_neg not tc_tile_ok 2 16 8 32 9106
   chk_neg not tc_tile_ok 1 16 4 16 9107
 
+  note Wave 2: EXP/LOG IEEE binary32 Horner verifier + 1-ULP polynomial mutant catch
+  chk eq s9_transc_gb10_verify false OK 9018
+  chk_neg eq s9_transc_gb10_verify true 9199 9108
+
   suite_done t_s9
+end
+
+fn s9_exp_f32 x uint mut_c2 bool to uint
+  fx = bitcast f32 x
+  if f32_is_nan x
+    ret uint 0x7fc00000
+  end
+  if lt fx bitcast f32 uint 0xc2d00000
+    ret uint 0
+  end
+  if gt fx bitcast f32 uint 0x42b17218
+    ret uint 0x7f800000
+  end
+  prod = mul fx bitcast f32 uint 0x3fb8aa3b
+  k = int 0
+  if ge prod bitcast f32 uint 0
+    k = int add prod bitcast f32 uint 0x3f000000
+  else
+    k = int sub prod bitcast f32 uint 0x3f000000
+  end
+  fk = f32 k
+  r = sub sub fx mul fk bitcast f32 uint 0x3f317200 mul fk bitcast f32 uint 0x35bfbe8e
+  c2 = uint 0x3d2aaaab
+  if mut_c2
+    c2 = uint 0x3d2aaaac
+  end
+  p = mul r add bitcast f32 c2 mul r bitcast f32 uint 0x3c088889
+  p = mul r add bitcast f32 uint 0x3e2aaaab p
+  p = mul r add bitcast f32 uint 0x3f000000 p
+  poly = add bitcast f32 uint 0x3f800000 mul r add bitcast f32 uint 0x3f800000 p
+  ret bitcast uint mul poly bitcast f32 shl uint add k int 127 23
+end
+
+fn s9_log_f32 x uint mut_c1 bool to uint
+  if f32_is_nan x
+    ret uint 0x7fc00000
+  end
+  fx = bitcast f32 x
+  if lt fx bitcast f32 uint 0
+    ret uint 0x7fc00000
+  end
+  if eq and x uint 0x7fffffff uint 0
+    ret uint 0xff800000
+  end
+  e = sub int and shr x 23 uint 0xff int 127
+  m = bitcast f32 or and x uint 0x007fffff uint 0x3f800000
+  if gt m bitcast f32 uint 0x3fb504f3
+    m = mul m bitcast f32 uint 0x3f000000
+    e = add e int 1
+  end
+  z = div sub m bitcast f32 uint 0x3f800000 add m bitcast f32 uint 0x3f800000
+  z2 = mul z z
+  c1 = uint 0x3eaaaaab
+  if mut_c1
+    c1 = uint 0x3eaaaaac
+  end
+  poly = add bitcast f32 uint 0x3e4ccccd mul z2 bitcast f32 uint 0x3e124925
+  poly = add bitcast f32 c1 mul z2 poly
+  poly = add bitcast f32 uint 0x3f800000 mul z2 poly
+  ln_m = mul mul bitcast f32 uint 0x40000000 z poly
+  ret bitcast uint add mul f32 e bitcast f32 uint 0x3f317218 ln_m
+end
+
+fn s9_transc_gb10_verify mut bool to ulong
+  if ne s9_exp_f32 uint 0x00000000 false uint 0x3f800000
+    ret 9191
+  end
+  if ne s9_exp_f32 uint 0x3e816600 mut uint 0x3fa4ce02
+    ret 9199
+  end
+  if ne s9_log_f32 uint 0x3f800000 false uint 0x00000000
+    ret 9192
+  end
+  if ne s9_log_f32 uint 0x3fa09700 mut uint 0x3e68445d
+    ret 9199
+  end
+  ret OK
+end
+
+fn s9_tg_cli_run mut bool to int
+  rc = s9_transc_gb10_verify mut
+  if eq rc OK
+    wr_str t_tg_pass
+    out_flush
+    ret 0
+  end
+  wr_str t_tg_fail
+  out_u64 rc
+  wr_str t_nl
+  out_flush
+  ret 1
 end
 
 note =========================================================================
@@ -3364,11 +3665,33 @@ fn main to int
   pathn = ulong 0
   if eq ac 2
     n1 = argread 1 g_arg 0 4096
-    if or le n1 0 not or eq_arg1 ulong n1 t_f_r4 eq_arg1 ulong n1 t_f_host
+    if le n1 0
       wr_str t_usage
       ret 2
     end
-    ret run_r4_cli
+    if or eq_arg1 ulong n1 t_f_r4 eq_arg1 ulong n1 t_f_host
+      ret run_r4_cli
+    end
+    if eq_arg1 ulong n1 t_f_slots
+      ret s6_cli_run false
+    end
+    if eq_arg1 ulong n1 t_f_slots_m
+      ret s6_cli_run true
+    end
+    if eq_arg1 ulong n1 t_f_q38
+      ret s8_q38_cli_run false
+    end
+    if eq_arg1 ulong n1 t_f_q38_m
+      ret s8_q38_cli_run true
+    end
+    if eq_arg1 ulong n1 t_f_tg
+      ret s9_tg_cli_run false
+    end
+    if eq_arg1 ulong n1 t_f_tg_m
+      ret s9_tg_cli_run true
+    end
+    wr_str t_usage
+    ret 2
   end
   if eq ac 3
     n1 = argread 1 g_arg 0 4096

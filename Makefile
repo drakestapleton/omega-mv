@@ -1536,34 +1536,73 @@ test-divsqrt-sweep:
 
 # E1 row 10: GB10 realizations of the frozen transcendental sequences (EXP2
 # LOG2 SIGMOID TANH SIN COS ERF GELU RSQRT, bit-identical to
-# src/omega_numeric_transc.c; natural EXP and LOG, bit-identical to
-# omega_math_exp / omega_math_log of src/omega_numeric.c). Kernels live in
-# src/omega_numeric_divsqrt_gb10.c (same frame as DIV/SQRT; nvdisasm
-# provenance via test-divsqrt-nvdisasm). Host tier needs no device; the chip
-# run (all 2^32 inputs per op) is tools/run_numeric_transc_gate.sh only.
-# test-numeric-transc-gb10-mutants: OMEGA_DS_MUTATE=1 (EXP c2 +1 ulp) and 2
-# (LOG c1 +1 ulp) must each fail a host-model check, not only the digest one.
+# src/omega_numeric_transc.om; natural EXP and LOG, bit-identical to
+# omega_math_exp / omega_math_log of src/omega_numeric.om).
+# Host tier and EXP/LOG 1-ULP mutants cut over to pure seeded OM-2
+# (tests/test_omega_numeric_transc_gb10.om + gate_gpu_stage2_host.om);
+# build/test_omega_numeric_transc_gb10_cpu stays ONLY for the chip manifest
+# tools/manifests/numeric_transc.chiprun + tests/test_chip_run_transc_manifest.sh.
 TRANSC_GB10_SRCS = tests/test_omega_numeric_transc_gb10.c src/omega_numeric_divsqrt_gb10.c \
                    src/omega_numeric_transc.c src/omega_numeric.c src/omega_numeric_provenance.c \
                    $(NUMERIC_BW_SRCS)
 TRANSC_GB10_CC = gcc -std=gnu11 -O2 -Wall -Wextra -Werror -ffp-contract=off -fno-fast-math -Isrc -DOMEGA_NUMERIC_CPU_ONLY -pthread
+TRANSC_GB10_OM_DEPS = \
+	src/omega_numeric_transc.om om/sha256/sha256-om2.om gpu/nvidia/native/nvrm/context.om \
+	om/gpu/bw_qmd.om om/gpu/bw_vecadd.om src/omega_gpu_code_alloc.om src/omega_gpu_hostmath.om \
+	src/omega_gpu_platform.om src/omega_gpu_platform_linux.om src/omega_gpu_mem_cached.om \
+	src/omega_gpu_engine.om src/omega_blackwell_engine.om src/omega_blackwell_submit.om \
+	src/omega_gpu_session.om src/omega_gpu_cmdlist.om src/omega_numeric.om
+TRANSC_GB10_OM_TAIL = tests/test_omega_numeric_transc_gb10.om
+TRANSC_GB10_OM_BIN = $(OUT_DIR)/test_omega_numeric_transc_gb10_om
+GPU_STAGE2_HOST_BIN = $(OUT_DIR)/gate_gpu_stage2_host
 TRANSC_GB10_MUTANTS = 1:EXP 2:LOG
 .PHONY: test-numeric-transc-gb10-host test-numeric-transc-gb10-mutants
+$(GPU_STAGE2_HOST_BIN): tests/gpu_om/gate_gpu_stage2_host.om seed/out/omc | $(OUT_DIR)
+	seed/out/omc < tests/gpu_om/gate_gpu_stage2_host.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+$(TRANSC_GB10_OM_BIN): $(TRANSC_GB10_OM_DEPS) src/omega_numeric_divsqrt_gb10.om $(TRANSC_GB10_OM_TAIL) seed/out/omc | $(OUT_DIR)
+	{ printf 'om2\n'; \
+	  sed -n '23,27p' om/sha256/sha256-om2.om; \
+	  sed -e '/^om2$$/d' -e 's/^export fn /fn /' src/omega_numeric_transc.om; \
+	  sed -e '/^om2$$/d' -e '23,27d' -e 's/^export fn /fn /' om/sha256/sha256-om2.om; \
+	  sed -e '/^om2$$/d' -e 's/^export fn /fn /' gpu/nvidia/native/nvrm/context.om om/gpu/bw_qmd.om om/gpu/bw_vecadd.om \
+	    src/omega_gpu_code_alloc.om src/omega_gpu_hostmath.om src/omega_gpu_platform.om src/omega_gpu_platform_linux.om \
+	    src/omega_gpu_mem_cached.om src/omega_gpu_engine.om src/omega_blackwell_engine.om src/omega_blackwell_submit.om \
+	    src/omega_gpu_session.om src/omega_gpu_cmdlist.om src/omega_numeric.om src/omega_numeric_divsqrt_gb10.om \
+	    $(TRANSC_GB10_OM_TAIL); } | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 build/test_omega_numeric_transc_gb10_cpu: $(TRANSC_GB10_SRCS) $(DIVSQRT_HDRS) src/omega_numeric_transc.h
 	@mkdir -p build
 	$(TRANSC_GB10_CC) -o $@ $(TRANSC_GB10_SRCS)
-test-numeric-transc-gb10-host: build/test_omega_numeric_transc_gb10_cpu
-	./build/test_omega_numeric_transc_gb10_cpu
-test-numeric-transc-gb10-mutants: $(TRANSC_GB10_SRCS) $(DIVSQRT_HDRS) src/omega_numeric_transc.h
-	@mkdir -p build
+test-numeric-transc-gb10-host: $(TRANSC_GB10_OM_BIN) $(GPU_STAGE2_HOST_BIN)
+	./$(TRANSC_GB10_OM_BIN)
+	./$(GPU_STAGE2_HOST_BIN) --transc-gb10
+test-numeric-transc-gb10-mutants: $(TRANSC_GB10_OM_DEPS) src/omega_numeric_divsqrt_gb10.om $(TRANSC_GB10_OM_TAIL) $(GPU_STAGE2_HOST_BIN) seed/out/omc | $(OUT_DIR)
 	@for mo in $(TRANSC_GB10_MUTANTS); do m=$${mo%%:*}; op=$${mo#*:}; \
-	  $(TRANSC_GB10_CC) -DOMEGA_DS_MUTATE=$$m -o build/test_omega_numeric_transc_gb10_mut$$m $(TRANSC_GB10_SRCS) || exit 1; \
-	  ./build/test_omega_numeric_transc_gb10_mut$$m > build/test_omega_numeric_transc_gb10_mut$$m.log 2>&1; \
-	  if grep -q "^\[FAIL\] TG_$${op}_HOST_MODEL_" build/test_omega_numeric_transc_gb10_mut$$m.log; then \
-	    echo "mutant $$m ($$op) killed: $$(grep -m1 "^\[FAIL\] TG_$${op}_HOST_MODEL_" build/test_omega_numeric_transc_gb10_mut$$m.log)"; \
-	  else echo "MUTANT $$m ($$op) SURVIVED (no host-model check failed)"; exit 1; fi; \
+	  case $$m in \
+	    1) find='ds_movi 8 uint 0x3d2aaaab'; repl='ds_movi 8 uint 0x3d2aaaac' ;; \
+	    2) find='ds_movi 11 uint 0x3eaaaaab'; repl='ds_movi 11 uint 0x3eaaaaac' ;; \
+	  esac; \
+	  sed "s/$$find/$$repl/" src/omega_numeric_divsqrt_gb10.om > $(OUT_DIR)/divsqrt_mut$$m.om; \
+	  if cmp -s src/omega_numeric_divsqrt_gb10.om $(OUT_DIR)/divsqrt_mut$$m.om; then echo "MUTANT $$m ($$op) CHANGED NOTHING"; exit 1; fi; \
+	  { printf 'om2\n'; \
+	    sed -n '23,27p' om/sha256/sha256-om2.om; \
+	    sed -e '/^om2$$/d' -e 's/^export fn /fn /' src/omega_numeric_transc.om; \
+	    sed -e '/^om2$$/d' -e '23,27d' -e 's/^export fn /fn /' om/sha256/sha256-om2.om; \
+	    sed -e '/^om2$$/d' -e 's/^export fn /fn /' gpu/nvidia/native/nvrm/context.om om/gpu/bw_qmd.om om/gpu/bw_vecadd.om \
+	      src/omega_gpu_code_alloc.om src/omega_gpu_hostmath.om src/omega_gpu_platform.om src/omega_gpu_platform_linux.om \
+	      src/omega_gpu_mem_cached.om src/omega_gpu_engine.om src/omega_blackwell_engine.om src/omega_blackwell_submit.om \
+	      src/omega_gpu_session.om src/omega_gpu_cmdlist.om src/omega_numeric.om $(OUT_DIR)/divsqrt_mut$$m.om \
+	      $(TRANSC_GB10_OM_TAIL); } | seed/out/omc > $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.tmp.$$$$ || exit 1; \
+	  chmod +x $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.tmp.$$$$ && mv -f $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.tmp.$$$$ $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m; \
+	  ./$(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m > $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.log 2>&1 || true; \
+	  if grep -q "^\[FAIL\] TG_$${op}_HOST_MODEL_" $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.log; then \
+	    echo "mutant $$m ($$op) killed: $$(grep -m1 "^\[FAIL\] TG_$${op}_HOST_MODEL_" $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.log)"; \
+	  else echo "MUTANT $$m ($$op) SURVIVED (no host-model check failed)"; cat $(OUT_DIR)/test_omega_numeric_transc_gb10_mut$$m.log; exit 1; fi; \
 	done
-	@echo "test-numeric-transc-gb10-mutants: PASS (all $(words $(TRANSC_GB10_MUTANTS)) mutants killed)"
+	@if ./$(GPU_STAGE2_HOST_BIN) --transc-gb10-mutant > $(OUT_DIR)/transc_gb10_stage2_mut.log 2>&1; then \
+	  echo "STAGE2 MUTANT SURVIVED"; exit 1; \
+	fi
+	@echo "stage2 control caught: $$(cat $(OUT_DIR)/transc_gb10_stage2_mut.log)"
+	@echo "test-numeric-transc-gb10-mutants: PASS (all $(words $(TRANSC_GB10_MUTANTS)) pure OM-2 mutants + Stage 2 control killed)"
 
 # C3: host-only detector for the intermittent unwritten-output event. Pure seeded
 # OM-2 (mk/unwritten-trap.mk). The GB10 harness is tests/test_omega_unwritten_trap_gb10.c.
@@ -2101,6 +2140,7 @@ $(GPU_L2_REUSE_TEST): tests/gpu_l2_reuse_test.c src/omega_gpu_fp8_api.h src/omeg
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_l2_reuse_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 
 # sc #642 (2026-10-18): Qwen3.8-27B decode graph host check, pure seeded OM-2.
+# $(GPU_Q38_GRAPH_TEST) stays ONLY for chip NVRM scripts tools/run_gpu_q38_graph_chip.sh + tools/l136_channel_gates.sh.
 .PHONY: test-gpu-q38-graph-host
 GPU_Q38_GRAPH_TEST = $(OUT_DIR)/gpu_q38_graph_test
 GPU_Q38_GRAPH_HOST_TEST = $(TR2_Q38_HOST_BIN)
@@ -2109,9 +2149,14 @@ $(GPU_Q38_GRAPH_TEST): tests/gpu_q38_graph_test.c src/omega_gpu_q38_graph.h $(OU
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_graph_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 $(GPU_Q38_STROKE_EXACT_TEST): tests/gpu_q38_stroke_exact_test.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_stroke_exact_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-q38-graph-host: $(GPU_Q38_GRAPH_TEST) $(GPU_Q38_GRAPH_HOST_TEST)
-	./$(GPU_Q38_GRAPH_TEST) --host-only
+test-gpu-q38-graph-host: $(GPU_Q38_GRAPH_HOST_TEST) $(GB10_GRAPHS_HOST_BIN) $(GPU_STAGE2_HOST_BIN)
 	./$(GPU_Q38_GRAPH_HOST_TEST)
+	./$(GB10_GRAPHS_HOST_BIN)
+	./$(GPU_STAGE2_HOST_BIN) --q38-graph
+	@if ./$(GPU_STAGE2_HOST_BIN) --q38-graph-mutant > $(OUT_DIR)/q38_graph_mutant.log 2>&1; then \
+	  echo "Q38 GRAPH MUTANT SURVIVED"; exit 1; \
+	fi
+	@echo "q38-graph negative control caught: $$(cat $(OUT_DIR)/q38_graph_mutant.log)"
 
 # HUM L314 exact two-pass lm_head (XBOUND simulator proofs; the chip run comes with the export)
 GPU_EXACT_HEAD_TEST = $(OUT_DIR)/gpu_exact_head_test
@@ -2137,12 +2182,17 @@ $(GPU_GEMM_TEST): tests/gpu_gemm_test.c tests/bw_warp_sim_tc.h tests/bw_hmma_mod
 test-gpu-gemm: $(GPU_GEMM_TEST)
 	./$(GPU_GEMM_TEST) --sim
 
-# Expert Ribbon P1 (aienix#4 / omega#533, 2026-10-18): versioned replaceable FP8 expert slots (omega_gpu_fp8_slots.h).
-# test-gpu-fp8-slots is host-only (slot state machine, threaded race, mutant); the chip gate is
-# tools/run_gpu_fp8_slots_chip.sh under the GB10 lock (parity vs resident, churn, reader fence via a command list, negative control).
+# Expert Ribbon P1 (aienix#4 / omega#533, 2026-10-18): versioned replaceable FP8 expert slots (omega_gpu_fp8_slots.om).
+# test-gpu-fp8-slots is cut over to pure seeded OM-2 (test-gb10-gpu-2-host + gate_gpu_stage2_host.om --fp8-slots + --fp8-slots-mutant). Zero gcc.
+# $(GPU_FP8_SLOTS_TEST) stays ONLY for the NVRM chip gate tools/run_gpu_fp8_slots_chip.sh under the GB10 lock.
 .PHONY: test-gpu-fp8-slots
 GPU_FP8_SLOTS_TEST = $(OUT_DIR)/gpu_fp8_slots_test
 $(GPU_FP8_SLOTS_TEST): tests/gpu_fp8_slots_test.c src/omega_gpu_fp8_slots.h src/omega_fp8_slot_table.h src/omega_gpu_fp8_api.h src/omega_gpu_cmdlist.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_fp8_slots_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-fp8-slots: $(GPU_FP8_SLOTS_TEST)
-	./$(GPU_FP8_SLOTS_TEST) --host-only
+test-gpu-fp8-slots: $(GB10_GPU_2_HOST_BIN) $(GPU_STAGE2_HOST_BIN)
+	./$(GB10_GPU_2_HOST_BIN)
+	./$(GPU_STAGE2_HOST_BIN) --fp8-slots
+	@if ./$(GPU_STAGE2_HOST_BIN) --fp8-slots-mutant > $(OUT_DIR)/fp8_slots_mutant.log 2>&1; then \
+	  echo "FP8 SLOTS MUTANT SURVIVED"; exit 1; \
+	fi
+	@echo "fp8-slots negative control caught: $$(cat $(OUT_DIR)/fp8_slots_mutant.log)"
