@@ -50,8 +50,7 @@ Substitute `apps/si2-live/gate_si2_live.om` for `si2_live_main.om` to build `/tm
 ### 2. Cross-compile MacBook Apple Silicon (`a64macos` Mach-O) peer via Omega NG
 
 ```bash
-cat seed/ng/src/ir.om seed/ng/sha256.om seed/ng/src/front.om seed/ng/src/opt.om \
-    seed/ng/src/a64.om seed/ng/src/main.om | /tmp/omc-pin > /tmp/ng && chmod +x /tmp/ng
+awk '{print $2}' seed/ng/ng.units | xargs cat | /tmp/omc-pin > /tmp/ng && chmod +x /tmp/ng
 
 {
   printf '@ng front-ir\ntarget macos\nom2\n'
