@@ -57,9 +57,9 @@ Verified on Spark (`Lean 4.36.0`, `lean -DwarningAsError=true`) with zero warnin
 ## Reproducible Build & Verification Commands (AArch64 Linux Host)
 
 ```bash
-# 1. Build ng and ngcheck from seed/ng/
-cat si/directives/om2.om seed/ng/src/ir.om seed/ng/src/check.om seed/ng/src/ngcheck_main.om | seed/out/omc > ngcheck && chmod +x ngcheck
-cat si/directives/om2.om seed/ng/src/ir.om seed/ng/src/opt.om seed/ng/src/a64.om seed/ng/src/main.om | seed/out/omc > ng && chmod +x ng
+# 1. Build ngcheck and ng from seed/ng/ manifests (requires seeded seed/out/omc via `sh seed/omega-from-seed.sh`)
+awk '{print $2}' seed/ng/ngcheck.units | xargs cat | seed/out/omc > ngcheck && chmod +x ngcheck
+awk '{print $2}' seed/ng/ng.units | xargs cat | seed/out/omc > ng && chmod +x ng
 
 # 2. Build static @ng a64 worker (ca_worker) via emit_ca_ir.om
 seed/out/omc < apps/omega-ca/emit_ca_ir.om > emit_ca_ir && chmod +x emit_ca_ir
@@ -76,7 +76,7 @@ cat si/directives/om2.om seed/ng/sha256.om apps/omega-ca/ca_engine.om | seed/out
 cat si/directives/om2.om apps/omega-ca/gate_ca.om | seed/out/omc > gate_ca && chmod +x gate_ca
 
 # 4. Run end-to-end gate, selftest, med9 benchmark, and Lean proof check
-./gate_ca --omc seed/out/omc --ng ./ng --ngcheck ./ngcheck --srcdir apps/omega-ca --om2 si/directives/om2.om --sha seed/ng/sha256.om --workdir /tmp/ca-gate
+mkdir -p /tmp/ca-gate && ./gate_ca --omc seed/out/omc --ng ./ng --ngcheck ./ngcheck --srcdir apps/omega-ca --om2 si/directives/om2.om --sha seed/ng/sha256.om --workdir /tmp/ca-gate
 ./ca_engine selftest --worker ./ca_worker
 ./ca_engine bench --worker ./ca_worker
 ~/.elan/bin/lean -DwarningAsError=true seed/helix/proofs/CaReversibleSoundness.lean
