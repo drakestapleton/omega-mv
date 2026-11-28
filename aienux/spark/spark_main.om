@@ -37,7 +37,7 @@ const SPK_FMC_HASH_SZ ulong 48
 const SPK_FMC_PKEY_SZ ulong 384
 const SPK_FMC_SIG_SZ ulong 384
 
-note Error codes emitted by spk_fail(stage, code):
+note Error codes emitted by spk_fail_d(stage, code, subc, aux):
 const SPK_E_GIC ulong 101
 const SPK_E_ITS ulong 102
 const SPK_E_SMP ulong 103
@@ -106,7 +106,9 @@ text spk_fl " failed="
 text spk_ms " boot_ms="
 text spk_fail_a "[SPARK FAIL stage="
 text spk_fail_b " code="
-text spk_fail_c "]\n"
+text spk_fail_c "]"
+text spk_fail_sub " sub="
+text spk_fail_aux " aux=0x"
 text spk_bnd_path "/aienos/spark-bundle.img"
 text spk_q_s3net "[SPARK QEMU] stage 3 bundle verified; RTL8127/TCP STUB (no QEMU model)\n"
 text spk_q_stop "SPARK_QEMU_E2E_PASS real=stage1,stage2(pcie+smmuv3+streams+bme),stage3(nvme+gpt+ext4+omfwbnd1-sha256) stubbed=gb20b-regs,stage3-net,stage4,stage5,stage6\n"
@@ -330,12 +332,29 @@ note ========================================================================
 note Fail-Closed Helper (NEVER touches dead UEFI Boot Services post-EBS)
 note ========================================================================
 
-fn spk_fail stage ulong code ulong to void
+note Convert signed driver return codes without triggering OM-2 Trap 5 (negative -> ulong cast).
+fn spk_err_u v long to ulong
+if lt v 0
+ret or 0x8000000000000000 ulong add add v 9223372036854775807 1
+end
+ret ulong v
+end
+
+fn spk_err_i v int to ulong
+ret spk_err_u long v
+end
+
+fn spk_fail_d stage ulong code ulong subc ulong aux ulong to void
 uart_puts spk_fail_a
 uart_putdec stage
 uart_puts spk_fail_b
 uart_putdec code
 uart_puts spk_fail_c
+uart_puts spk_fail_sub
+uart_putdec subc
+uart_puts spk_fail_aux
+uart_puthex aux
+uart_puts u_nl
 arm64_psci_reset get acpi_info 7
 i = ulong 0
 while lt i 9223372036854775807 bound 9223372036854775807
@@ -405,7 +424,7 @@ uart_puts spk_mcfg
 uart_putdec get acpi_info 12
 uart_puts u_nl
 if not gicv3_init get acpi_info 2 get acpi_info 3 get acpi_info 4 get acpi_info 5
-spk_fail 1 SPK_E_GIC
+spk_fail_d 1 SPK_E_GIC 1 get gic_state 12
 ret false
 end
 uart_puts spk_gic
@@ -413,12 +432,12 @@ uart_putdec get gic_state 4
 uart_puts u_nl
 if ne get acpi_info 5 0
 if not gic_its_init
-spk_fail 1 SPK_E_ITS
+spk_fail_d 1 SPK_E_ITS 1 get gic_state 3
 ret false
 end
 db = gic_its_map_msix 0x100 8 lpi_out
 if or ne db add get acpi_info 5 GITS_TRANSLATER ne get lpi_out 0 8192
-spk_fail 1 SPK_E_ITS
+spk_fail_d 1 SPK_E_ITS 2 db
 ret false
 end
 uart_puts spk_its
@@ -436,7 +455,7 @@ uart_puts spk_ms
 uart_putdec arm64_time_ms
 uart_puts u_nl
 if ne get smp_stats 2 0
-spk_fail 1 SPK_E_SMP
+spk_fail_d 1 SPK_E_SMP 1 get smp_stats 2
 ret false
 end
 ret true
@@ -726,80 +745,82 @@ put spk_dev di 0
 end
 nsegs = spk_register_mcfg_segs
 if eq nsegs 0
-spk_fail 2 SPK_E_NO_MCFG
+spk_fail_d 2 SPK_E_NO_MCFG 1 get acpi_info 12
 ret false
 end
 note Probe PCIe ECAM Bus 0..1 for GB20B (0x10de). Fails closed cleanly on QEMU virt (absent GPU).
 if not spk_probe_gb20b
-spk_fail 2 SPK_E_NO_GB20B
+spk_fail_d 2 SPK_E_NO_GB20B 1 get pcie_nsegs 0
 ret false
 end
 gbar = get spk_gb20b_bar 0
 if not mmio_map_device gbar SPK_PLAT_GPU_BAR_SZ
-spk_fail 2 SPK_E_BAR0_MAP
+spk_fail_d 2 SPK_E_BAR0_MAP 1 gbar
 ret false
 end
 hb = bmmio_register gbar gbar SPK_PLAT_GPU_BAR_SZ BMMIO_ATTR_NGNRNE
 if le hb 0
-spk_fail 2 SPK_E_BAR0_MAP
+spk_fail_d 2 SPK_E_BAR0_MAP 2 spk_err_u hb
 ret false
 end
 put spk_st 0 ulong hb
 if not spk_plat_verify_gpu hb
-spk_fail 2 SPK_E_GB20B_ID
+spk_fail_d 2 SPK_E_GB20B_ID 1 bmmio_r32 hb 0
 ret false
 end
 note NVMe is mandatory everywhere; RTL8127 is mandatory on GB10 (SPK_PLAT_NEED_RTL). No device found ->
 note fail closed instead of touching a hard-coded BAR.
 if eq and get spk_dev 6 2 0
-spk_fail 2 SPK_E_BAR0_MAP
+spk_fail_d 2 SPK_E_BAR0_MAP 3 get spk_dev 6
 ret false
 end
 if not mmio_map_device get spk_nvme_bar 0 SPARK_NVME_BAR0_SZ
-spk_fail 2 SPK_E_BAR0_MAP
+spk_fail_d 2 SPK_E_BAR0_MAP 4 get spk_nvme_bar 0
 ret false
 end
 if eq and get spk_dev 6 4 0
 if eq SPK_PLAT_NEED_RTL 1
-spk_fail 2 SPK_E_BAR0_MAP
+spk_fail_d 2 SPK_E_BAR0_MAP 5 get spk_dev 6
 ret false
 end
 else
 if not mmio_map_device get spk_rtl_bar 0 SPARK_RTL8127_BAR2_SZ
-spk_fail 2 SPK_E_BAR0_MAP
+spk_fail_d 2 SPK_E_BAR0_MAP 6 get spk_rtl_bar 0
 ret false
 end
 end
-if lt pcie_quiesce_unused 0
-spk_fail 2 SPK_E_QUIESCE
+rc = pcie_quiesce_unused
+if lt rc 0
+spk_fail_d 2 SPK_E_QUIESCE 1 spk_err_u rc
 ret false
 end
 note Initialize IORT + SMMUv3 A/B/C + open disjoint streams (GB20B + 3 RMRs, NVMe, RTL8127)
 note BEFORE any NVMe/RTL8127/GB20B DMA is enabled.
 if not spk_init_iort
-spk_fail 2 SPK_E_SMMU
+spk_fail_d 2 SPK_E_SMMU 1 get acpi_info 11
 ret false
 end
 if not spk_check_smmu_bases
-spk_fail 2 SPK_E_SMMU_BASE
+spk_fail_d 2 SPK_E_SMMU_BASE 1 get iort_meta 0
 ret false
 end
 if not spk_init_smmu_abc
-spk_fail 2 SPK_E_SMMU
+spk_fail_d 2 SPK_E_SMMU 2 get smmu_inst_state 0
 ret false
 end
 if not spk_open_smmu_streams
-spk_fail 2 SPK_E_SMMU
+spk_fail_d 2 SPK_E_SMMU 3 get smmu_str_n 0
 ret false
 end
 spk_plat_note_stage2
 if not spk_enable_endpoints
-spk_fail 2 SPK_E_PCIE_EN
+spk_fail_d 2 SPK_E_PCIE_EN 1 get spk_dev 6
 ret false
 end
 if eq SPK_PLAT_QEMU 0
-if ne ibm_bind hb 1 0
-spk_fail 2 SPK_E_IRQ_BIND
+rc = ibm_bind hb 1
+if ne rc 0
+spk_fail_d 2 SPK_E_IRQ_BIND 1 spk_err_u rc
 ret false
 end
 end
@@ -816,7 +837,7 @@ spk_nvdma = dma_alloc_nc 16 4096
 sec_pa = dma_alloc_nc 1 4096
 bnd_pa = dma_alloc_nc 20480 65536
 if or eq spk_nvdma 0 or eq sec_pa 0 eq bnd_pa 0
-spk_fail 3 SPK_E_NVME_INIT
+spk_fail_d 3 SPK_E_NVME_INIT 1 bnd_pa
 ret false
 end
 put spk_st 3 spk_nvdma
@@ -826,34 +847,40 @@ put spk_st 6 SPK_BND_CAP
 put spk_st 7 0
 note Map NVMe DMA queues + bounce page on NVMe SMMUv3 stream before nvme_init
 snvme = long get spk_st 2
-if ne smmu_map_span snvme spk_nvdma 65536 0 SMMU_OK
-spk_fail 3 SPK_E_NVME_INIT
+rc = smmu_map_span snvme spk_nvdma 65536 0
+if ne rc SMMU_OK
+spk_fail_d 3 SPK_E_NVME_INIT 2 spk_err_u rc
 ret false
 end
-if ne smmu_map_span snvme sec_pa 4096 0 SMMU_OK
-spk_fail 3 SPK_E_NVME_INIT
+rc = smmu_map_span snvme sec_pa 4096 0
+if ne rc SMMU_OK
+spk_fail_d 3 SPK_E_NVME_INIT 3 spk_err_u rc
 ret false
 end
-if ne nvme_init get spk_nvme_bar 0 spk_nvdma 1 0
-spk_fail 3 SPK_E_NVME_INIT
+rci = nvme_init get spk_nvme_bar 0 spk_nvdma 1
+if ne rci 0
+spk_fail_d 3 SPK_E_NVME_INIT 4 spk_err_i rci
 ret false
 end
-if ne gpt_ro_parse nvme_ns_blocks 0
-spk_fail 3 SPK_E_GPT
+rci = gpt_ro_parse nvme_ns_blocks
+if ne rci 0
+spk_fail_d 3 SPK_E_GPT 1 spk_err_i rci
 ret false
 end
-if ne gpt_ro_select_linux_root 0
-spk_fail 3 SPK_E_GPT
+rci = gpt_ro_select_linux_root
+if ne rci 0
+spk_fail_d 3 SPK_E_GPT 2 spk_err_i rci
 ret false
 end
 p_lba = gpt_ro_first_lba
 p_secs = gpt_ro_sectors
 if or eq p_lba 0 eq p_secs 0
-spk_fail 3 SPK_E_GPT
+spk_fail_d 3 SPK_E_GPT 3 p_secs
 ret false
 end
-if ne ext4_ro_mount p_lba p_secs 0
-spk_fail 3 SPK_E_EXT4
+rci = ext4_ro_mount p_lba p_secs
+if ne rci 0
+spk_fail_d 3 SPK_E_EXT4 1 spk_err_i rci
 ret false
 end
 ret true
@@ -887,7 +914,7 @@ end
 ret true
 end
 
-fn spk_stage3_bundle to bool
+fn spk_bundle_prep_path to ulong
 for k ulong 8
 put spk_kpa k 0
 put spk_ksz k 0
@@ -898,63 +925,77 @@ while lt pi plen bound 256
 put e4_path pi get spk_bnd_path pi
 pi = add pi 1
 end
-if ne ext4_ro_lookup plen 0
-spk_fail 3 SPK_E_BUNDLE
-ret false
+ret plen
 end
-fsz = ext4_ro_file_size
-if or lt fsz 4096 gt fsz SPK_BND_CAP
-spk_fail 3 SPK_E_BUNDLE
-ret false
-end
-if ne ext4_ro_stream 0 fsz 0 0
-spk_fail 3 SPK_E_BUNDLE
-ret false
-end
-if ne bundle_parse_toc fsz 0
-spk_fail 3 SPK_E_BUNDLE
-ret false
-end
-cnt = get e4_bnd_meta 2
-bpa = get spk_st 5
-if or eq cnt 0 gt cnt 8
-spk_fail 3 SPK_E_BUNDLE
-ret false
-end
-i = ulong 0
-while lt i cnt bound 8
+
+fn spk_bundle_verify_slot i ulong bpa ulong to bool
 ek = get e4_bnd_kind i
 eo = get e4_bnd_off i
 es = get e4_bnd_size i
 if not spk_verify_bnd_entry i add bpa eo es
-spk_fail 3 SPK_E_BUNDLE
 ret false
 end
 if and ge ek 1 le ek 7
 put spk_kpa ek add bpa eo
 put spk_ksz ek es
 end
+ret true
+end
+
+fn spk_stage3_bundle to bool
+rci = ext4_ro_lookup spk_bundle_prep_path
+if ne rci 0
+spk_fail_d 3 SPK_E_BUNDLE 1 spk_err_i rci
+ret false
+end
+fsz = ext4_ro_file_size
+if or lt fsz 4096 gt fsz SPK_BND_CAP
+spk_fail_d 3 SPK_E_BUNDLE 2 fsz
+ret false
+end
+rci = ext4_ro_stream 0 fsz 0
+if ne rci 0
+spk_fail_d 3 SPK_E_BUNDLE 3 spk_err_i rci
+ret false
+end
+rci = bundle_parse_toc fsz
+if ne rci 0
+spk_fail_d 3 SPK_E_BUNDLE 4 spk_err_i rci
+ret false
+end
+cnt = get e4_bnd_meta 2
+bpa = get spk_st 5
+if or eq cnt 0 gt cnt 8
+spk_fail_d 3 SPK_E_BUNDLE 5 cnt
+ret false
+end
+i = ulong 0
+while lt i cnt bound 8
+if not spk_bundle_verify_slot i bpa
+spk_fail_d 3 SPK_E_BUNDLE 6 i
+ret false
+end
 i = add i 1
 end
 note Require kinds 1..6 (gsp.bin, bl.img, fmc.img, fmc.hash, fmc.pubkey, fmc.sig) present & verified
 for req ulong 6
 if or eq get spk_kpa add req 1 0 eq get spk_ksz add req 1 0
-spk_fail 3 SPK_E_BUNDLE
+spk_fail_d 3 SPK_E_BUNDLE 7 add req 1
 ret false
 end
 end
 note abcotmk (arena_bm.om) reads fixed 48 B fmc.hash, 384 B fmc.pubkey, 384 B fmc.sig from these PAs:
 note refuse undersized entries so the COT packet never reads past a verified entry.
 if lt get spk_ksz 4 SPK_FMC_HASH_SZ
-spk_fail 3 SPK_E_BUNDLE
+spk_fail_d 3 SPK_E_BUNDLE 8 get spk_ksz 4
 ret false
 end
 if lt get spk_ksz 5 SPK_FMC_PKEY_SZ
-spk_fail 3 SPK_E_BUNDLE
+spk_fail_d 3 SPK_E_BUNDLE 9 get spk_ksz 5
 ret false
 end
 if lt get spk_ksz 6 SPK_FMC_SIG_SZ
-spk_fail 3 SPK_E_BUNDLE
+spk_fail_d 3 SPK_E_BUNDLE 10 get spk_ksz 6
 ret false
 end
 ret true
@@ -963,21 +1004,24 @@ end
 fn spk_stage3_net to bool
 rtl_dma = dma_alloc_nc 32 4096
 if eq rtl_dma 0
-spk_fail 3 SPK_E_RTL
+spk_fail_d 3 SPK_E_RTL 1 0
 ret false
 end
 put spk_st 4 rtl_dma
 snic = long get spk_st 15
-if ne smmu_map_span snic rtl_dma 131072 0 SMMU_OK
-spk_fail 3 SPK_E_RTL
+rc = smmu_map_span snic rtl_dma 131072 0
+if ne rc SMMU_OK
+spk_fail_d 3 SPK_E_RTL 2 spk_err_u rc
 ret false
 end
-if ne rtl_bare_setup get spk_rtl_bar 0 rtl_dma 0
-spk_fail 3 SPK_E_RTL
+rci = rtl_bare_setup get spk_rtl_bar 0 rtl_dma
+if ne rci 0
+spk_fail_d 3 SPK_E_RTL 3 spk_err_i rci
 ret false
 end
-if ne rtlinit rtl_dma 0
-spk_fail 3 SPK_E_RTL
+ru = rtlinit rtl_dma
+if ne ru 0
+spk_fail_d 3 SPK_E_RTL 4 ru
 ret false
 end
 for mi ulong 6
@@ -1064,46 +1108,55 @@ end
 
 fn spk_stage4_gsp to bool
 frq = fwsys 3
-if ne bminit 1 get spk_gb20b_bar 0 SPARK_GB20B_BAR0_SZ dma_pool_base dma_pool_size frq BMOK
-spk_fail 4 SPK_E_BMHAL
+rc = bminit 1 get spk_gb20b_bar 0 SPARK_GB20B_BAR0_SZ dma_pool_base dma_pool_size frq
+if ne rc BMOK
+spk_fail_d 4 SPK_E_BMHAL 1 spk_err_u rc
 ret false
 end
 put gspmode 0 2
 put gspd0ok 0 1
 put gsppns 0 10000
 if not spk_stage4_sysinfo
-spk_fail 4 SPK_E_FWELF
+spk_fail_d 4 SPK_E_FWELF 1 get spk_gb20b_bar 0
 ret false
 end
 note Parse verified bundle entry 1 (gsp.bin ELF64) and bind entries 2..6 (bl, fmc, hash, pubkey, sig)
-if ne fbparseelf get spk_kpa 1 get spk_ksz 1 FBOK
-spk_fail 4 SPK_E_FWELF
+rc = fbparseelf get spk_kpa 1 get spk_ksz 1
+if ne rc FBOK
+spk_fail_d 4 SPK_E_FWELF 2 spk_err_u rc
 ret false
 end
-if ne fbbindblobs get spk_kpa 2 get spk_ksz 2 get spk_kpa 3 get spk_ksz 3 get spk_kpa 4 get spk_kpa 5 FBOK
-spk_fail 4 SPK_E_FWELF
+rc = fbbindblobs get spk_kpa 2 get spk_ksz 2 get spk_kpa 3 get spk_ksz 3 get spk_kpa 4 get spk_kpa 5
+if ne rc FBOK
+spk_fail_d 4 SPK_E_FWELF 3 spk_err_u rc
 ret false
 end
-if ne fbbindsig get spk_kpa 6 get e4_bnd_meta 1 FBOK
-spk_fail 4 SPK_E_FWELF
+rc = fbbindsig get spk_kpa 6 get e4_bnd_meta 1
+if ne rc FBOK
+spk_fail_d 4 SPK_E_FWELF 4 spk_err_u rc
 ret false
 end
 note Allocate 80 MiB GSP arena + 133 MiB WPR2 heap inside Normal-NC pool & map on GB20B SMMU stream
 arena_pa = dma_alloc_nc 20480 65536
 heap_pa = dma_alloc_nc 34048 65536
 if or eq arena_pa 0 eq heap_pa 0
-spk_fail 4 SPK_E_ARENA
+spk_fail_d 4 SPK_E_ARENA 1 arena_pa
 ret false
 end
 put spk_st 8 arena_pa
 put spk_st 9 heap_pa
 sgpu = long get spk_st 1
-if or ne smmu_map_span sgpu arena_pa SPK_ARENA_CAP 0 SMMU_OK ne smmu_map_span sgpu heap_pa 139460608 0 SMMU_OK
-spk_fail 4 SPK_E_ARENA
+rc = smmu_map_span sgpu arena_pa SPK_ARENA_CAP 0
+if eq rc SMMU_OK
+rc = smmu_map_span sgpu heap_pa 139460608 0
+end
+if ne rc SMMU_OK
+spk_fail_d 4 SPK_E_ARENA 2 spk_err_u rc
 ret false
 end
-if ne abbuild arena_pa SPK_ARENA_CAP heap_pa 139460608 ABOK
-spk_fail 4 SPK_E_ARENA
+rc = abbuild arena_pa SPK_ARENA_CAP heap_pa 139460608
+if ne rc ABOK
+spk_fail_d 4 SPK_E_ARENA 3 spk_err_u rc
 ret false
 end
 note Phase 3 #77 reminder: configure seqcore CORE_RESUME libosArgsPA + appVersion after abbuild!
@@ -1120,8 +1173,9 @@ end
 for si ulong 7
 put s2cfg si 100000
 end
-if ne s2boot uint GB20B_VAL_BOOT42 EOK
-spk_fail 4 SPK_E_SEC2
+rc = s2boot uint GB20B_VAL_BOOT42
+if ne rc EOK
+spk_fail_d 4 SPK_E_SEC2 1 spk_err_u rc
 ret false
 end
 note abbuild already pre-queued RPC 72 (siout) into rqcmd & abcmdpa via abpre;
@@ -1130,12 +1184,13 @@ put bstate 0 4
 put bbudget 0 100000
 put bstaticn 0 64
 put bgen 0 1
-if ne tbattach get abcmdpa 0 get abstatpa 0 uint GB20B_VAL_BOOT42 0
-spk_fail 4 SPK_E_GSPBOOT
+rc = tbattach get abcmdpa 0 get abstatpa 0 uint GB20B_VAL_BOOT42
+if ne rc 0
+spk_fail_d 4 SPK_E_GSPBOOT 1 spk_err_u rc
 ret false
 end
 if not spk_stage4_bootloop
-spk_fail 4 SPK_E_GSPBOOT
+spk_fail_d 4 SPK_E_GSPBOOT 2 get bstate 0
 ret false
 end
 ret true
@@ -1226,20 +1281,23 @@ end
 
 fn spk_stage4_chan to bool
 if not spk_stage4_gmmu_init
-spk_fail 4 SPK_E_GMMU
+spk_fail_d 4 SPK_E_GMMU 1 get mmwgen 0
 ret false
 end
 chinit
-if ne chprep 0 42 3 64 CHOK
-spk_fail 4 SPK_E_RMCHAN
+rc = chprep 0 42 3 64
+if ne rc CHOK
+spk_fail_d 4 SPK_E_RMCHAN 1 spk_err_u rc
 ret false
 end
-if ne cminit CMOK
-spk_fail 4 SPK_E_CMBIND
+rc = cminit
+if ne rc CMOK
+spk_fail_d 4 SPK_E_CMBIND 1 spk_err_u rc
 ret false
 end
-if ne gmalloc 4096 1 GMHPOLL GMOK
-spk_fail 4 SPK_E_CMBIND
+rc = gmalloc 4096 1 GMHPOLL
+if ne rc GMOK
+spk_fail_d 4 SPK_E_CMBIND 2 spk_err_u rc
 ret false
 end
 semslot = get gmout 0
@@ -1251,40 +1309,46 @@ put iqstate 0 0
 put iqgen 0 0
 put iqhalt 0 0
 put iqmode 0 2
-if ne iqinit gen 0
-spk_fail 4 SPK_E_CMBIND
+rc = iqinit gen
+if ne rc 0
+spk_fail_d 4 SPK_E_CMBIND 3 spk_err_u rc
 ret false
 end
 note Bind completion semaphore to marker_va + 16 (VA == PA, matching Piece 5 C3 marker2 tail)
-if ne cmbind 0 semslot 16 gen CMOK
-spk_fail 4 SPK_E_CMBIND
+rc = cmbind 0 semslot 16 gen
+if ne rc CMOK
+spk_fail_d 4 SPK_E_CMBIND 4 spk_err_u rc
 ret false
 end
-if ne rminit RMOK
-spk_fail 4 SPK_E_RMCHAN
+rc = rminit
+if ne rc RMOK
+spk_fail_d 4 SPK_E_RMCHAN 2 spk_err_u rc
 ret false
 end
 rmcfg 1001 1002 1003 1004 1005 1006
 rmcfgch 1007 42 1 99
 rmcfg20 true 1008
-if ne rmbind 0 gen RMOK
-spk_fail 4 SPK_E_RMCHAN
+rc = rmbind 0 gen
+if ne rc RMOK
+spk_fail_d 4 SPK_E_RMCHAN 3 spk_err_u rc
 ret false
 end
-if ne rmstart 100000 RMOK
-spk_fail 4 SPK_E_RMCHAN
+rc = rmstart 100000
+if ne rc RMOK
+spk_fail_d 4 SPK_E_RMCHAN 4 spk_err_u rc
 ret false
 end
 s1 = ulong 0
 while and ne get rmst 0 RMSREADY lt s1 64 bound 64
-if lt rmstep 0
-spk_fail 4 SPK_E_RMCHAN
+rc = rmstep
+if lt rc 0
+spk_fail_d 4 SPK_E_RMCHAN 5 spk_err_u rc
 ret false
 end
 s1 = add s1 1
 end
 if ne get rmst 0 RMSREADY
-spk_fail 4 SPK_E_RMCHAN
+spk_fail_d 4 SPK_E_RMCHAN 6 get rmst 0
 ret false
 end
 note RPC 54 SET_PAGE_DIRECTORY: bind GMMU root PDB to VAS 1004 before scheduling channel
@@ -1297,48 +1361,55 @@ put pain 3 get mmroot 0
 put pain 4 512
 put pain 5 2
 put pain 7 1004
-if ne pasetpd 48
-spk_fail 4 SPK_E_GMMU
+rc = pasetpd
+if ne rc 48
+spk_fail_d 4 SPK_E_GMMU 2 spk_err_u rc
 ret false
 end
-if ne bsetpd 100000 0
-spk_fail 4 SPK_E_GMMU
+rc = bsetpd 100000
+if ne rc 0
+spk_fail_d 4 SPK_E_GMMU 3 spk_err_u rc
 ret false
 end
 sp = ulong 0
 while and ne get bstate 0 9 lt sp 50000 bound 50000
-if lt bpoll 0
-spk_fail 4 SPK_E_GMMU
+rc = bpoll
+if lt rc 0
+spk_fail_d 4 SPK_E_GMMU 4 spk_err_u rc
 ret false
 end
 sp = add sp 1
 end
 if ne get bstate 0 9
-spk_fail 4 SPK_E_GMMU
+spk_fail_d 4 SPK_E_GMMU 5 get bstate 0
 ret false
 end
-if ne rmsched 100000 RMOK
-spk_fail 4 SPK_E_RMCHAN
+rc = rmsched 100000
+if ne rc RMOK
+spk_fail_d 4 SPK_E_RMCHAN 7 spk_err_u rc
 ret false
 end
 s2 = ulong 0
 while and ne get rmst 0 RMSACTV lt s2 32 bound 32
-if lt rmstep 0
-spk_fail 4 SPK_E_RMCHAN
+rc = rmstep
+if lt rc 0
+spk_fail_d 4 SPK_E_RMCHAN 8 spk_err_u rc
 ret false
 end
 s2 = add s2 1
 end
 if ne get rmst 0 RMSACTV
-spk_fail 4 SPK_E_RMCHAN
+spk_fail_d 4 SPK_E_RMCHAN 9 get rmst 0
 ret false
 end
-if ne rmpub gen RMOK
-spk_fail 4 SPK_E_RMCHAN
+rc = rmpub gen
+if ne rc RMOK
+spk_fail_d 4 SPK_E_RMCHAN 10 spk_err_u rc
 ret false
 end
-if ne mminval 10000 MMOK
-spk_fail 4 SPK_E_GMMU
+rc = mminval 10000
+if ne rc MMOK
+spk_fail_d 4 SPK_E_GMMU 6 spk_err_u rc
 ret false
 end
 ret true
@@ -1398,53 +1469,55 @@ end
 fn spk_stage5 to bool
 uart_puts spk_s5
 cbpbinit
-if ne cbpbsetup18 uint CBCCMP CBOK
-spk_fail 5 SPK_E_COMPUTE
+rc = cbpbsetup18 uint CBCCMP
+if ne rc CBOK
+spk_fail_d 5 SPK_E_COMPUTE 1 spk_err_u rc
 ret false
 end
-if ne q3_init get spk_st 12 get spk_st 13 get spk_st 10 get spk_st 11 SPK_MAX_CTX Q3OK
-spk_fail 5 SPK_E_Q3INIT
+rc = q3_init get spk_st 12 get spk_st 13 get spk_st 10 get spk_st 11 SPK_MAX_CTX
+if ne rc Q3OK
+spk_fail_d 5 SPK_E_Q3INIT 1 spk_err_u rc
 ret false
 end
 note Emit, regalloc, encode, flush, and bind the 7 pure-.om sm_121 glue kernels
 if not spk_emit_one_sass Q3KNORM 0 1 5120 0
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 1 Q3KNORM
 ret false
 end
 if not spk_emit_one_sass Q3KADDNORM 0 3 5120 0
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 2 Q3KADDNORM
 ret false
 end
 if not spk_emit_one_sass Q3KSWIGLU 1 0 17408 0
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 3 Q3KSWIGLU
 ret false
 end
 if not spk_emit_one_sass Q3KGATHER 2 0 14336 14336
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 4 Q3KGATHER
 ret false
 end
 if not spk_emit_one_sass Q3KGATE 3 0 0 0
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 5 Q3KGATE
 ret false
 end
 if not spk_emit_one_sass Q3KAM0 4 0 0 0
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 6 Q3KAM0
 ret false
 end
 if not spk_emit_one_sass Q3KAM1 4 1 0 0
-spk_fail 5 SPK_E_SASS
+spk_fail_d 5 SPK_E_SASS 7 Q3KAM1
 ret false
 end
 note Fail closed cleanly if full 14-kernel + 64-layer Qwen3.8-27B weight set is not yet bound
 for k ulong Q3KCOUNT
 if eq get q3kset k 0
-spk_fail 5 SPK_E_WEIGHTS
+spk_fail_d 5 SPK_E_WEIGHTS 1 k
 ret false
 end
 end
 for l ulong Q3LAYERS
 if eq get q3lset l 0
-spk_fail 5 SPK_E_WEIGHTS
+spk_fail_d 5 SPK_E_WEIGHTS 2 l
 ret false
 end
 end
