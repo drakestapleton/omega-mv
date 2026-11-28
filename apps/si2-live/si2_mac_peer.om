@@ -1,0 +1,1098 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/si2-live/si2_mac_peer.om
+note Sovereign Intelligence 2.0 MacBook Apple Silicon (`a64macos` Mach-O) Mesh Peer & Live Verifier.
+note Pure seeded OM-2 compiled via Omega NG (`@ng front-ir` -> `@ng opt` -> `@ng a64 macho` + ad-hoc codesign).
+note Zero C, zero Python, zero Objective-C wrappers; talks directly to Darwin libSystem via libfn/libptr/libcall.
+note
+note Build on Spark ng compiler -> Apple Silicon Mach-O:
+note   { printf '@ng front-ir\ntarget macos\nom2\n'; cat seed/ng/sha256.om \
+note       protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om \
+note       protocol/uor-gpu/ed_sign.om seed/ng/target/target_desc.om \
+note       seed/ng/pack/sem_pack.om apps/si2-live/si2_mac_peer.om; } | ng --stage front-ir ... > si2_mac_peer
+note
+note Environment variables (all optional; sane defaults):
+note   SI2_MAC_MODE=selfcheck   -> offline OMPK v2 + Ed25519 OMRC0001 roundtrip + forged-sig & quarantine checks
+note   SI2_SPARK_IP=192.168.1.108 SI2_SPARK_PORT=18595
+note   SI2_HUB_IP=192.168.1.192   SI2_HUB_PORT=18596
+
+const MC_AF_INET ulong 2
+const MC_SOCK_STREAM ulong 1
+const MC_SOL_SOCKET ulong 65535
+const MC_SO_SNDTIMEO ulong 4101
+const MC_SO_RCVTIMEO ulong 4102
+const MC_CLOCK_MONO_RAW ulong 4
+const MC_RTLD_DEFAULT ulong 18446744073709551614
+
+const MC_OMSH_HDR_LEN ulong 32
+const MC_OMSH_VER ulong 1
+const MC_MSG_REQ ulong 1
+const MC_MSG_RESP ulong 2
+const MC_MAX_WIRE ulong 33024
+const MC_RCPT_BODY_LEN ulong 192
+const MC_RCPT_LEN ulong 288
+
+const MC_FLAG_SIM_OVERTEMP ulong 8
+const MC_FLAG_FAULT_TAMPER_RCPT ulong 16
+
+const MC_DEC_MEMO_HIT ulong 1
+const MC_DEC_SPEC_EXEC ulong 2
+const MC_DEC_OOD_ROLLBACK ulong 3
+
+const MC_ERR_FRAME_SIG ulong 19
+const MC_ERR_UNAUTH_PEER ulong 14
+const MC_ERR_OVERTEMP ulong 13
+const MC_OK ulong 0
+const MC_ERR_BAD_SIG ulong 13
+const MC_ERR_QUAR ulong 12
+const MC_ERR_BINDING ulong 14
+
+global mc_rg uchar 128
+global mc_sym uchar 64
+global mc_sa uchar 16
+global mc_tv uchar 16
+global mc_out uchar 16384
+global mc_out_pos ulong 1
+global mc_env uchar 256
+global mc_num_tmp uchar 32
+
+note Resolved libSystem function pointers:
+note [0]=write [1]=getenv [2]=strlen [3]=memcpy [4]=socket [5]=setsockopt
+note [6]=connect [7]=send [8]=recv [9]=close [10]=clock_gettime_nsec_np
+global mc_fns ulong 16
+
+global mc_cli_seed uchar 32
+global mc_cli_pk uchar 32
+global mc_rogue_seed uchar 32
+global mc_rogue_pk uchar 32
+global mc_srv_pk uchar 32
+global mc_hub_pk uchar 32
+
+global mc_ed_seed uchar 32
+global mc_ed_pk uchar 32
+global mc_ed_sig uchar 64
+global mc_ed_msg uchar 33024
+
+global mc_peer_pk uchar 64
+global mc_peer_quar ulong 2
+global mc_seen_nonce ulong 64
+global mc_seen_cnt ulong 1
+
+global mc_wire uchar 33024
+global mc_wire_len ulong 1
+global mc_in_buf uchar 64
+global mc_in_sha uchar 32
+global mc_rcpt uchar 288
+global mc_val_buf uchar 64
+global mc_val_len ulong 1
+global mc_aux_buf uchar 128
+global mc_aux_len ulong 1
+global mc_resp_meta ulong 8
+global mc_saved_out uchar 64
+
+text mc_fn_write "write"
+text mc_fn_getenv "getenv"
+text mc_fn_strlen "strlen"
+text mc_fn_memcpy "memcpy"
+text mc_fn_socket "socket"
+text mc_fn_setsockopt "setsockopt"
+text mc_fn_connect "connect"
+text mc_fn_send "send"
+text mc_fn_recv "recv"
+text mc_fn_close "close"
+text mc_fn_clock "clock_gettime_nsec_np"
+
+text mc_env_mode "SI2_MAC_MODE"
+text mc_env_sp_ip "SI2_SPARK_IP"
+text mc_env_sp_pt "SI2_SPARK_PORT"
+text mc_env_hb_ip "SI2_HUB_IP"
+text mc_env_hb_pt "SI2_HUB_PORT"
+text mc_val_selfcheck "selfcheck"
+
+text mc_tag_cli "OM-SI2-MAC-CLIENT-V1"
+text mc_tag_srv "OM-SI2-SPARK-SRV-V1"
+text mc_tag_hub "OM-SI2-HUB-SRV-V1"
+text mc_tag_rogue "OM-SI2-ROGUE-CLIENT-V1"
+text mc_ir_src "omega.si2.pure.exact.affine_route.v1"
+text mc_omsh "OMSH"
+text mc_rcpt_magic "OMRC0001"
+
+text mc_l_self "SI2-MAC SELFCHECK PASS ompk_v2=1 ed25519=1 tamper_quarantine=1 hw_writes=0\n"
+text mc_l_call1 "MAC->SPARK CALL1 y="
+text mc_l_call2 "MAC->SPARK CALL2 decision=OMEGA_MEMO_HIT recompute="
+text mc_l_call3 "MAC->SPARK CALL3 decision=OOD_ROLLBACK y="
+text mc_l_rechk "MAC->SPARK MEMO_UNPOISONED decision=OMEGA_MEMO_HIT recompute="
+text mc_l_n1 "MAC->SPARK NEG_OVERTEMP rc="
+text mc_l_n2 "MAC->SPARK NEG_FORGED_SIG rc="
+text mc_l_n3 "MAC->SPARK NEG_UNKNOWN_PEER rc="
+text mc_l_n4 "MAC->SPARK NEG_TAMPER_OMRC verify_rc="
+text mc_l_n5 "MAC->SPARK NEG_QUARANTINED verify_rc="
+text mc_l_hub1 "MAC->HUB CALL1 y="
+text mc_l_hub2 "MAC->HUB CALL2 decision=OMEGA_MEMO_HIT recompute="
+text mc_l_fail "SI2-MAC FAIL step="
+text mc_l_pass "SI2-MAC PASS checks="
+text mc_l_dec " dec="
+text mc_l_be " byte_exact="
+text mc_l_td " t_die_mc="
+text mc_l_ps " p_safe_mw="
+text mc_l_fv " fab_ver="
+text mc_l_oj " otkj="
+text mc_l_al " slab_alarm="
+text mc_l_rw " ckpt_rewound="
+text mc_l_hw " hw_writes="
+text mc_l_ns " rtt_ns="
+text mc_l_q " quarantined="
+text mc_l_nl "\n"
+
+fn mc_rg64 o ulong v ulong to void
+for i ulong 8
+put mc_rg add o i uchar and shr v mul i 8 255
+end
+end
+
+fn mc_tv64 o ulong v ulong to void
+for i ulong 8
+put mc_tv add o i uchar and shr v mul i 8 255
+end
+end
+
+fn mc_w_put16 o ulong v ulong to void
+put mc_wire o uchar and v 255
+put mc_wire add o 1 uchar and shr v 8 255
+end
+
+fn mc_w_put32 o ulong v ulong to void
+for i ulong 4
+put mc_wire add o i uchar and shr v mul i 8 255
+end
+end
+
+fn mc_w_put64 o ulong v ulong to void
+for i ulong 8
+put mc_wire add o i uchar and shr v mul i 8 255
+end
+end
+
+fn mc_w_get16 o ulong to ulong
+ret or ulong get mc_wire o shl ulong get mc_wire add o 1 8
+end
+
+fn mc_w_get32 o ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get mc_wire add o i mul i 8
+end
+ret v
+end
+
+fn mc_w_get64 o ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get mc_wire add o i mul i 8
+end
+ret v
+end
+
+fn mc_dlsym nm view uchar * to ulong
+n = len nm
+for i ulong n bound 60
+put mc_sym i get nm i
+end
+put mc_sym n 0
+mc_rg64 0 MC_RTLD_DEFAULT
+mc_rg64 8 ulong libptr mc_sym 0 64
+ret ulong libcall ulong libfn 1 mc_rg 0 128
+end
+
+fn mc_init_syms to void
+put mc_fns 0 mc_dlsym mc_fn_write
+put mc_fns 1 mc_dlsym mc_fn_getenv
+put mc_fns 2 mc_dlsym mc_fn_strlen
+put mc_fns 3 mc_dlsym mc_fn_memcpy
+put mc_fns 4 mc_dlsym mc_fn_socket
+put mc_fns 5 mc_dlsym mc_fn_setsockopt
+put mc_fns 6 mc_dlsym mc_fn_connect
+put mc_fns 7 mc_dlsym mc_fn_send
+put mc_fns 8 mc_dlsym mc_fn_recv
+put mc_fns 9 mc_dlsym mc_fn_close
+put mc_fns 10 mc_dlsym mc_fn_clock
+end
+
+fn mc_flush to void
+u = get mc_out_pos 0
+if eq u 0
+ret
+end
+mc_rg64 0 1
+mc_rg64 8 ulong libptr mc_out 0 16384
+mc_rg64 16 u
+z = libcall get mc_fns 0 mc_rg 0 128
+put mc_out_pos 0 0
+end
+
+fn mc_putb b uchar to void
+u = get mc_out_pos 0
+if ge u 16384
+mc_flush
+u = get mc_out_pos 0
+end
+put mc_out u b
+put mc_out_pos 0 add u 1
+end
+
+fn mc_puts s view uchar * to void
+for i ulong len s bound 256
+mc_putb get s i
+end
+end
+
+fn mc_put_u64 v ulong to void
+if eq v 0
+mc_putb 48
+ret
+end
+n = ulong 0
+x = v
+while gt x 0 bound 32
+put mc_num_tmp n uchar add 48 rem x 10
+n = add n 1
+x = div x 10
+end
+while gt n 0 bound 32
+n = sub n 1
+mc_putb get mc_num_tmp n
+end
+end
+
+fn mc_wrt s view uchar * to void
+mc_puts s
+mc_flush
+end
+
+fn mc_num v ulong to void
+mc_put_u64 v
+mc_flush
+end
+
+fn mc_now_ns to ulong
+mc_rg64 0 MC_CLOCK_MONO_RAW
+ret ulong libcall get mc_fns 10 mc_rg 0 128
+end
+
+fn mc_getenv nm view uchar * to ulong
+n = len nm
+for i ulong n bound 60
+put mc_sym i get nm i
+end
+put mc_sym n 0
+mc_rg64 0 ulong libptr mc_sym 0 64
+p = ulong libcall get mc_fns 1 mc_rg 0 128
+if eq p 0
+ret 0
+end
+mc_rg64 0 p
+sl = ulong libcall get mc_fns 2 mc_rg 0 128
+if or eq sl 0 gt sl 250
+ret 0
+end
+mc_rg64 0 ulong libptr mc_env 0 256
+mc_rg64 8 p
+mc_rg64 16 sl
+z = libcall get mc_fns 3 mc_rg 0 128
+put mc_env sl 0
+ret sl
+end
+
+fn mc_env_eq nm view uchar * want view uchar * to bool
+el = mc_getenv nm
+if ne el len want
+ret false
+end
+for i ulong el bound 64
+if ne get mc_env i get want i
+ret false
+end
+end
+ret true
+end
+
+fn mc_parse_env_ipv4 nm view uchar * def_ip ulong to ulong
+n = mc_getenv nm
+if eq n 0
+ret def_ip
+end
+oct = ulong 0
+acc = ulong 0
+has_d = ulong 0
+ip = ulong 0
+for i ulong n bound 64
+ch = get mc_env i
+if eq ch 46
+if or eq has_d 0 gt oct 255
+ret def_ip
+end
+ip = or shl ip 8 oct
+oct = 0
+has_d = 0
+acc = add acc 1
+else
+if or lt ch 48 gt ch 57
+ret def_ip
+end
+oct = add mul oct 10 ulong sub ch 48
+if gt oct 255
+ret def_ip
+end
+has_d = 1
+end
+end
+if or ne acc 3 or eq has_d 0 gt oct 255
+ret def_ip
+end
+ret or shl ip 8 oct
+end
+
+fn mc_parse_env_u64 nm view uchar * def_v ulong to ulong
+n = mc_getenv nm
+if eq n 0
+ret def_v
+end
+v = ulong 0
+for i ulong n bound 32
+ch = get mc_env i
+if or lt ch 48 gt ch 57
+ret def_v
+end
+v = add mul v 10 ulong sub ch 48
+end
+ret v
+end
+
+fn mc_derive_seed tag view uchar * idx ulong to void
+n = len tag
+for i ulong n bound 128
+put sh_dat i get tag i
+end
+for j ulong 8
+put sh_dat add n j uchar and shr idx mul j 8 255
+end
+sh_all add n 8
+for i ulong 32
+put mc_ed_seed i get sh_dig i
+end
+end
+
+fn mc_rcpt_put64 off ulong v ulong to void
+for j ulong 8
+put mc_rcpt add off j uchar and shr v mul j 8 255
+end
+end
+
+fn mc_pubkey_from_seed to void
+sd = new uchar 32 0
+pk = new uchar 32 0
+for i ulong 32
+put sd i get mc_ed_seed i
+end
+ues_pubkey sd pk
+for i ulong 32
+put mc_ed_pk i get pk i
+end
+end
+
+fn mc_ed_sign_wire sig_off ulong to void
+sd = new uchar 32 0
+m = new uchar 65536 0
+sg = new uchar 64 0
+for i ulong 32
+put sd i get mc_ed_seed i
+end
+for i ulong sig_off bound 65504
+put m i get mc_wire i
+end
+ues_sign sd m sig_off sg
+for i ulong 64
+put mc_wire add sig_off i get sg i
+end
+end
+
+fn mc_ed_verify_rcpt to bool
+pk = new uchar 32 0
+m = new uchar 65536 0
+sg = new uchar 64 0
+for i ulong 32
+put pk i get mc_rcpt add 192 i
+end
+for i ulong MC_RCPT_BODY_LEN
+put m i get mc_rcpt i
+end
+for i ulong 64
+put sg i get mc_rcpt add 224 i
+end
+ok = edverify pk m MC_RCPT_BODY_LEN sg 0
+ret eq ok 1
+end
+
+fn mc_init_identities to void
+tdInitAll
+tdCacheInit
+pk_reset_all
+put mc_seen_cnt 0 0
+put mc_peer_quar 0 0
+put mc_peer_quar 1 0
+mc_derive_seed mc_tag_cli 1
+mc_pubkey_from_seed
+for i ulong 32
+put mc_cli_seed i get mc_ed_seed i
+put mc_cli_pk i get mc_ed_pk i
+end
+mc_derive_seed mc_tag_srv 1
+mc_pubkey_from_seed
+for i ulong 32
+put mc_srv_pk i get mc_ed_pk i
+put mc_peer_pk i get mc_ed_pk i
+end
+mc_derive_seed mc_tag_hub 2
+mc_pubkey_from_seed
+for i ulong 32
+put mc_hub_pk i get mc_ed_pk i
+put mc_peer_pk add 32 i get mc_ed_pk i
+end
+mc_derive_seed mc_tag_rogue 9
+mc_pubkey_from_seed
+for i ulong 32
+put mc_rogue_seed i get mc_ed_seed i
+put mc_rogue_pk i get mc_ed_pk i
+end
+end
+
+fn mc_build_ompk to ulong
+pk_reset_builder
+n = len mc_ir_src
+for i ulong n bound 128
+z = pk_ir_push get mc_ir_src i
+end
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 0
+pk_set_contract 1 1 1 0 5000 65000
+pk_compute_poly_func_id 4 42 8 0
+ret pk_pack
+end
+
+fn mc_stage_inputs a0 ulong a1 ulong a2 ulong a3 ulong to void
+for j ulong 8
+put mc_in_buf j uchar and shr a0 mul j 8 255
+put mc_in_buf add 8 j uchar and shr a1 mul j 8 255
+put mc_in_buf add 16 j uchar and shr a2 mul j 8 255
+put mc_in_buf add 24 j uchar and shr a3 mul j 8 255
+end
+for i ulong 32
+put sh_dat i get mc_in_buf i
+end
+sh_all 32
+for i ulong 32
+put mc_in_sha i get sh_dig i
+end
+end
+
+fn mc_sock_connect ip ulong port ulong to long
+mc_rg64 0 MC_AF_INET
+mc_rg64 8 MC_SOCK_STREAM
+mc_rg64 16 0
+fd = libcall get mc_fns 4 mc_rg 0 128
+if or lt fd 0 ge and fd 0xffffffff 0x80000000
+ret -1
+end
+cfd = ulong and fd 0xffffffff
+mc_tv64 0 5
+mc_tv64 8 0
+mc_rg64 0 cfd
+mc_rg64 8 MC_SOL_SOCKET
+mc_rg64 16 MC_SO_RCVTIMEO
+mc_rg64 24 ulong libptr mc_tv 0 16
+mc_rg64 32 16
+sr1 = libcall get mc_fns 5 mc_rg 0 128
+mc_rg64 0 cfd
+mc_rg64 8 MC_SOL_SOCKET
+mc_rg64 16 MC_SO_SNDTIMEO
+mc_rg64 24 ulong libptr mc_tv 0 16
+mc_rg64 32 16
+sr2 = libcall get mc_fns 5 mc_rg 0 128
+for i ulong 16
+put mc_sa i 0
+end
+put mc_sa 0 16
+put mc_sa 1 2
+put mc_sa 2 uchar and shr port 8 255
+put mc_sa 3 uchar and port 255
+put mc_sa 4 uchar and shr ip 24 255
+put mc_sa 5 uchar and shr ip 16 255
+put mc_sa 6 uchar and shr ip 8 255
+put mc_sa 7 uchar and ip 255
+mc_rg64 0 cfd
+mc_rg64 8 ulong libptr mc_sa 0 16
+mc_rg64 16 16
+cr = libcall get mc_fns 6 mc_rg 0 128
+if ne and cr 0xffffffff 0
+mc_rg64 0 cfd
+z = libcall get mc_fns 9 mc_rg 0 128
+ret -1
+end
+ret long cfd
+end
+
+fn mc_sock_send_all fd ulong tot ulong to bool
+off = ulong 0
+while lt off tot bound 4096
+mc_rg64 0 fd
+mc_rg64 8 add ulong libptr mc_wire 0 33024 off
+mc_rg64 16 sub tot off
+mc_rg64 24 0
+k = libcall get mc_fns 7 mc_rg 0 128
+if le k 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn mc_sock_recv_exact fd ulong start ulong need ulong to bool
+got = ulong 0
+while lt got need bound 8192
+mc_rg64 0 fd
+mc_rg64 8 add ulong libptr mc_wire 0 33024 add start got
+mc_rg64 16 sub need got
+mc_rg64 24 0
+k = libcall get mc_fns 8 mc_rg 0 128
+if le k 0
+ret false
+end
+got = add got ulong k
+end
+ret true
+end
+
+fn mc_sock_recv_frame fd ulong to bool
+if not mc_sock_recv_exact fd 0 MC_OMSH_HDR_LEN
+ret false
+end
+for i ulong 4
+if ne get mc_wire i get mc_omsh i
+ret false
+end
+end
+if ne mc_w_get16 4 MC_OMSH_VER
+ret false
+end
+if ne mc_w_get16 6 MC_MSG_RESP
+ret false
+end
+plen = mc_w_get32 8
+if gt plen 32768
+ret false
+end
+if not mc_sock_recv_exact fd MC_OMSH_HDR_LEN plen
+ret false
+end
+put mc_wire_len 0 add MC_OMSH_HDR_LEN plen
+ret true
+end
+
+fn mc_encode_and_sign_req nonce ulong flags ulong use_rogue bool corrupt_sig bool to void
+ompk_l = get pk_len 0
+in_l = ulong 32
+plen = add add 96 ompk_l add in_l 64
+for i ulong 4
+put mc_wire i get mc_omsh i
+end
+mc_w_put16 4 MC_OMSH_VER
+mc_w_put16 6 MC_MSG_REQ
+mc_w_put32 8 plen
+mc_w_put32 12 flags
+mc_w_put64 16 nonce
+mc_w_put64 24 1
+for i ulong 32
+if use_rogue
+put mc_wire add 32 i get mc_rogue_pk i
+else
+put mc_wire add 32 i get mc_cli_pk i
+end
+put mc_wire add 64 i get mc_in_sha i
+end
+mc_w_put32 96 ompk_l
+mc_w_put32 100 in_l
+mc_w_put32 104 1
+mc_w_put32 108 1
+mc_w_put64 112 0
+mc_w_put64 120 0
+for i ulong ompk_l bound 4768
+put mc_wire add 128 i get pk_buf i
+end
+p_in = add 128 ompk_l
+for i ulong in_l bound 64
+put mc_wire add p_in i get mc_in_buf i
+end
+sig_off = add p_in in_l
+for i ulong 32
+if use_rogue
+put mc_ed_seed i get mc_rogue_seed i
+else
+put mc_ed_seed i get mc_cli_seed i
+end
+end
+mc_ed_sign_wire sig_off
+if corrupt_sig
+put mc_wire sig_off xor get mc_wire sig_off 1
+end
+put mc_wire_len 0 add sig_off 64
+end
+
+fn mc_decode_resp to bool
+status = mc_w_get32 32
+olen = mc_w_get32 36
+aux_l = mc_w_get32 40
+put mc_resp_meta 0 status
+put mc_resp_meta 1 olen
+put mc_resp_meta 2 aux_l
+for i ulong MC_RCPT_LEN
+put mc_rcpt i get mc_wire add 48 i
+end
+p_out = add 48 MC_RCPT_LEN
+for i ulong olen bound 64
+put mc_val_buf i get mc_wire add p_out i
+end
+put mc_val_len 0 olen
+p_aux = add p_out olen
+for i ulong aux_l bound 128
+put mc_aux_buf i get mc_wire add p_aux i
+end
+put mc_aux_len 0 aux_l
+ret true
+end
+
+fn mc_val_u64 idx ulong to ulong
+off = mul idx 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mc_val_buf add off j mul j 8
+end
+ret v
+end
+
+fn mc_aux_u64 idx ulong to ulong
+off = mul idx 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mc_aux_buf add off j mul j 8
+end
+ret v
+end
+
+fn mc_rcpt_u32 off ulong to ulong
+v = ulong 0
+for j ulong 4
+v = or v shl ulong get mc_rcpt add off j mul j 8
+end
+ret v
+end
+
+fn mc_rcpt_u64 off ulong to ulong
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get mc_rcpt add off j mul j 8
+end
+ret v
+end
+
+fn mc_find_peer_slot to ulong
+for s ulong 2
+ok = true
+base = mul s 32
+for i ulong 32
+if ne get mc_rcpt add 192 i get mc_peer_pk add base i
+ok = false
+break
+end
+end
+if ok
+ret s
+end
+end
+ret 999
+end
+
+fn mc_verify_omrc slot ulong exp_nonce ulong to ulong
+for i ulong 8
+if ne get mc_rcpt i get mc_rcpt_magic i
+ret 10
+end
+end
+ps = mc_find_peer_slot
+if ne ps slot
+ret 11
+end
+if ne get mc_peer_quar ps 0
+ret MC_ERR_QUAR
+end
+for i ulong 32
+if ne get mc_rcpt add 8 i get pk_buf add 8 i
+ret MC_ERR_BINDING
+end
+if ne get mc_rcpt add 40 i get pk_buf add 40 i
+ret MC_ERR_BINDING
+end
+if ne get mc_rcpt add 72 i get mc_in_sha i
+ret MC_ERR_BINDING
+end
+end
+if ne mc_rcpt_u64 160 exp_nonce
+ret 15
+end
+olen = get mc_val_len 0
+if ne mc_rcpt_u64 176 olen
+ret 17
+end
+for i ulong olen bound 64
+put sh_dat i get mc_val_buf i
+end
+sh_all olen
+for i ulong 32
+if ne get sh_dig i get mc_rcpt add 104 i
+ret 17
+end
+end
+if not mc_ed_verify_rcpt
+put mc_peer_quar ps 1
+ret MC_ERR_BAD_SIG
+end
+ret MC_OK
+end
+
+fn mc_rpc ip ulong port ulong nonce ulong flags ulong use_rogue bool corrupt_sig bool to ulong
+t0 = mc_now_ns
+mc_encode_and_sign_req nonce flags use_rogue corrupt_sig
+lfd = mc_sock_connect ip port
+if lt lfd 0
+ret 90
+end
+fd = ulong lfd
+ok = mc_sock_send_all fd get mc_wire_len 0
+if ok
+ok = mc_sock_recv_frame fd
+end
+mc_rg64 0 fd
+z = libcall get mc_fns 9 mc_rg 0 128
+if not ok
+ret 91
+end
+z2 = mc_decode_resp
+t1 = mc_now_ns
+put mc_resp_meta 3 sub t1 t0
+ret 0
+end
+
+fn mc_sign_rcpt_srv to void
+sd = new uchar 32 0
+m = new uchar 65536 0
+sg = new uchar 64 0
+for i ulong 32
+put sd i get mc_ed_seed i
+end
+for i ulong MC_RCPT_BODY_LEN
+put m i get mc_rcpt i
+end
+ues_sign sd m MC_RCPT_BODY_LEN sg
+for i ulong 64
+put mc_rcpt add 224 i get sg i
+end
+end
+
+fn mc_run_selfcheck to int
+if ne mc_build_ompk PK_OK
+mc_wrt mc_l_fail
+mc_num 1
+mc_wrt mc_l_nl
+ret 1
+end
+mc_stage_inputs 42 8 0 0
+mc_encode_and_sign_req 1 0 false false
+for i ulong 8
+put mc_rcpt i get mc_rcpt_magic i
+end
+for i ulong 32
+put mc_rcpt add 8 i get pk_buf add 8 i
+put mc_rcpt add 40 i get pk_buf add 40 i
+put mc_rcpt add 72 i get mc_in_sha i
+put mc_rcpt add 192 i get mc_srv_pk i
+end
+for i ulong 32
+put mc_val_buf i 1
+put sh_dat i 1
+end
+put mc_val_len 0 32
+sh_all 32
+for i ulong 32
+put mc_rcpt add 104 i get sh_dig i
+end
+mc_rcpt_put64 160 1
+mc_rcpt_put64 168 1
+mc_rcpt_put64 176 32
+mc_derive_seed mc_tag_srv 1
+mc_pubkey_from_seed
+mc_sign_rcpt_srv
+if ne mc_verify_omrc 0 1 MC_OK
+mc_wrt mc_l_fail
+mc_num 2
+mc_wrt mc_l_nl
+ret 2
+end
+put mc_rcpt 224 xor get mc_rcpt 224 1
+if ne mc_verify_omrc 0 1 MC_ERR_BAD_SIG
+mc_wrt mc_l_fail
+mc_num 3
+mc_wrt mc_l_nl
+ret 3
+end
+if ne mc_verify_omrc 0 1 MC_ERR_QUAR
+mc_wrt mc_l_fail
+mc_num 4
+mc_wrt mc_l_nl
+ret 4
+end
+mc_wrt mc_l_self
+ret 0
+end
+
+fn mc_log_telemetry tag view uchar * yv ulong be ulong to void
+mc_wrt tag
+mc_num yv
+mc_wrt mc_l_dec
+mc_num mc_aux_u64 0
+mc_wrt mc_l_td
+mc_num mc_aux_u64 2
+mc_wrt mc_l_ps
+mc_num mc_aux_u64 3
+mc_wrt mc_l_fv
+mc_num mc_aux_u64 7
+mc_wrt mc_l_oj
+mc_num mc_aux_u64 8
+mc_wrt mc_l_al
+mc_num mc_aux_u64 9
+mc_wrt mc_l_rw
+mc_num mc_aux_u64 10
+mc_wrt mc_l_hw
+mc_num mc_aux_u64 11
+mc_wrt mc_l_be
+mc_num be
+mc_wrt mc_l_ns
+mc_num get mc_resp_meta 3
+mc_wrt mc_l_nl
+end
+
+fn mc_fail step ulong to int
+mc_wrt mc_l_fail
+mc_num step
+mc_wrt mc_l_nl
+ret int step
+end
+
+fn mc_run_spark ip ulong port ulong to int
+note Call 1: 42, 8, 0, 0 -> Spec Exec + Stage 2 Journal + OMRC0001 + OMEGA-MEMO admit
+mc_stage_inputs 42 8 0 0
+if ne mc_rpc ip port 1 0 false false 0
+ret mc_fail 10
+end
+if or ne get mc_resp_meta 0 0 ne mc_val_u64 0 1008
+ret mc_fail 11
+end
+if ne mc_aux_u64 0 MC_DEC_SPEC_EXEC
+ret mc_fail 12
+end
+if ne mc_verify_omrc 0 1 MC_OK
+ret mc_fail 13
+end
+for i ulong 32
+put mc_saved_out i get mc_val_buf i
+end
+mc_log_telemetry mc_l_call1 mc_val_u64 0 1
+
+note Call 2: 42, 8, 0, 0 -> OMEGA_MEMO_HIT recompute=0 byte-exact
+if ne mc_rpc ip port 2 0 false false 0
+ret mc_fail 20
+end
+if or ne get mc_resp_meta 0 0 ne mc_aux_u64 0 MC_DEC_MEMO_HIT
+ret mc_fail 21
+end
+if ne mc_aux_u64 1 0
+ret mc_fail 22
+end
+if ne mc_verify_omrc 0 2 MC_OK
+ret mc_fail 23
+end
+for i ulong 32
+if ne get mc_val_buf i get mc_saved_out i
+ret mc_fail 24
+end
+end
+mc_wrt mc_l_call2
+mc_num mc_aux_u64 1
+mc_wrt mc_l_be
+mc_num 1
+mc_wrt mc_l_ns
+mc_num get mc_resp_meta 3
+mc_wrt mc_l_nl
+
+note Call 3: OOD drift (42, 9, 2, 1) -> trap 14 -> SLAB rollback + Stage 2 rewind -> safe baseline
+mc_stage_inputs 42 9 2 1
+if ne mc_rpc ip port 3 0 false false 0
+ret mc_fail 30
+end
+if or ne get mc_resp_meta 0 0 ne mc_val_u64 0 3335
+ret mc_fail 31
+end
+if ne mc_aux_u64 0 MC_DEC_OOD_ROLLBACK
+ret mc_fail 32
+end
+if or ne mc_aux_u64 9 1 ne mc_aux_u64 10 1
+ret mc_fail 33
+end
+if ne mc_verify_omrc 0 3 MC_OK
+ret mc_fail 34
+end
+mc_log_telemetry mc_l_call3 mc_val_u64 0 1
+
+note Call 4: Verify Call 1/2 OMEGA-MEMO was NOT poisoned by OOD Call 3
+mc_stage_inputs 42 8 0 0
+if ne mc_rpc ip port 4 0 false false 0
+ret mc_fail 35
+end
+if or ne mc_aux_u64 0 MC_DEC_MEMO_HIT ne mc_aux_u64 1 0
+ret mc_fail 36
+end
+if ne mc_verify_omrc 0 4 MC_OK
+ret mc_fail 37
+end
+mc_wrt mc_l_rechk
+mc_num mc_aux_u64 1
+mc_wrt mc_l_nl
+
+note Neg 1: Synthetic thermal overload WattCBF fail-closed (rc=13)
+if ne mc_rpc ip port 5 MC_FLAG_SIM_OVERTEMP false false 0
+ret mc_fail 40
+end
+if ne get mc_resp_meta 0 MC_ERR_OVERTEMP
+ret mc_fail 41
+end
+mc_wrt mc_l_n1
+mc_num get mc_resp_meta 0
+mc_wrt mc_l_nl
+
+note Neg 2: Forged client Ed25519 signature over LAN (rc=19)
+if ne mc_rpc ip port 6 0 false true 0
+ret mc_fail 42
+end
+if ne get mc_resp_meta 0 MC_ERR_FRAME_SIG
+ret mc_fail 43
+end
+mc_wrt mc_l_n2
+mc_num get mc_resp_meta 0
+mc_wrt mc_l_nl
+
+note Neg 3: Unknown client pubkey over LAN (rc=14)
+if ne mc_rpc ip port 7 0 true false 0
+ret mc_fail 44
+end
+if ne get mc_resp_meta 0 MC_ERR_UNAUTH_PEER
+ret mc_fail 45
+end
+mc_wrt mc_l_n3
+mc_num get mc_resp_meta 0
+mc_wrt mc_l_nl
+
+note Neg 4: Tampered OMRC0001 from server -> bad sig caught & peer slot 0 quarantined
+if ne mc_rpc ip port 8 MC_FLAG_FAULT_TAMPER_RCPT false false 0
+ret mc_fail 46
+end
+v4 = mc_verify_omrc 0 8
+if ne v4 MC_ERR_BAD_SIG
+ret mc_fail 47
+end
+mc_wrt mc_l_n4
+mc_num v4
+mc_wrt mc_l_q
+mc_num get mc_peer_quar 0
+mc_wrt mc_l_nl
+
+note Neg 5: Quarantined peer follow-up refused fail-closed (rc=12)
+v5 = mc_verify_omrc 0 8
+if ne v5 MC_ERR_QUAR
+ret mc_fail 48
+end
+mc_wrt mc_l_n5
+mc_num v5
+mc_wrt mc_l_nl
+ret 0
+end
+
+fn mc_run_hub ip ulong port ulong to int
+mc_stage_inputs 42 8 0 0
+if ne mc_rpc ip port 201 0 false false 0
+ret mc_fail 60
+end
+if or ne get mc_resp_meta 0 0 ne mc_val_u64 0 1008
+ret mc_fail 61
+end
+if ne mc_verify_omrc 1 201 MC_OK
+ret mc_fail 62
+end
+mc_log_telemetry mc_l_hub1 mc_val_u64 0 1
+if ne mc_rpc ip port 202 0 false false 0
+ret mc_fail 63
+end
+if or ne mc_aux_u64 0 MC_DEC_MEMO_HIT ne mc_aux_u64 1 0
+ret mc_fail 64
+end
+if ne mc_verify_omrc 1 202 MC_OK
+ret mc_fail 65
+end
+mc_wrt mc_l_hub2
+mc_num mc_aux_u64 1
+mc_wrt mc_l_be
+mc_num 1
+mc_wrt mc_l_hw
+mc_num mc_aux_u64 11
+mc_wrt mc_l_nl
+ret 0
+end
+
+fn main to int
+mc_init_syms
+mc_init_identities
+if mc_env_eq mc_env_mode mc_val_selfcheck
+ret mc_run_selfcheck
+end
+if ne mc_build_ompk PK_OK
+ret mc_fail 5
+end
+sp_ip = mc_parse_env_ipv4 mc_env_sp_ip 3232235884
+sp_pt = mc_parse_env_u64 mc_env_sp_pt 18595
+sr = mc_run_spark sp_ip sp_pt
+if ne sr 0
+ret sr
+end
+hb_ip = mc_parse_env_ipv4 mc_env_hb_ip 0
+if ne hb_ip 0
+hb_pt = mc_parse_env_u64 mc_env_hb_pt 18596
+hr = mc_run_hub hb_ip hb_pt
+if ne hr 0
+ret hr
+end
+end
+mc_wrt mc_l_pass
+if ne hb_ip 0
+mc_num 11
+else
+mc_num 9
+end
+mc_wrt mc_l_nl
+ret 0
+end
