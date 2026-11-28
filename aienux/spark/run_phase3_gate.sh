@@ -61,10 +61,10 @@ compile_host_om1() {
   sign_bin "$out"
 }
 
-echo "=== [1/12] Unified SPARK.EFI PE32+ Build (target a64efi) ==="
+echo "=== [1/13] Unified SPARK.EFI PE32+ Build (target a64efi) ==="
 OMC="$EFI_OMC" sh "$ROOT/aienux/spark/build_spark_efi.sh" "$TMP/SPARK.EFI"
 
-echo "=== [2/12] Boot Unified SPARK.EFI in 20-core 4 GiB QEMU virt EDK2 ==="
+echo "=== [2/13] Boot Unified SPARK.EFI in 20-core 4 GiB QEMU virt EDK2 ==="
 code=${A64EFI_CODE:-}
 for f in /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
          /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
@@ -96,7 +96,7 @@ if grep -q 'PANIC' "$TMP/qemu.log"; then
 fi
 echo "PASS qemu_20core_unified_spark_efi (Stage 1 20/20 SMP + Stage 2 fail-closed on absent GB20B)"
 
-echo "=== [3/12] Full-Stack Host E2E Simulation (test_spark_e2e.om + Linux ELF compile) ==="
+echo "=== [3/13] Full-Stack Host E2E Simulation (test_spark_e2e.om + Linux ELF compile) ==="
 E2E_UNITS="
   $ROOT/aienux/kernel/hal/iort.om
   $ROOT/aienux/kernel/hal/bar0_mmio.om
@@ -139,7 +139,7 @@ compile_host_om2 "$TMP/test_spark_e2e" $E2E_UNITS
 { printf 'om2\n'; cat $E2E_UNITS; } | "$EFI_OMC" > "$TMP/test_spark_e2e.elf"
 echo "PASS test_spark_e2e (host run + Linux AArch64 ELF compile $(wc -c < "$TMP/test_spark_e2e.elf" | tr -d ' ') B)"
 
-echo "=== [4/12] Slice A Regression (host_test.om) ==="
+echo "=== [4/13] Slice A Regression (host_test.om) ==="
 compile_host_om2 "$TMP/slice_a_host" \
   "$ROOT/aienux/kernel/core/scheduler.om" \
   "$ROOT/aienux/kernel/core/ipc.om" \
@@ -147,7 +147,7 @@ compile_host_om2 "$TMP/slice_a_host" \
   "$ROOT/aienux/kernel/arm64/host_test.om"
 "$TMP/slice_a_host"
 
-echo "=== [5/12] Slice B Regression (pcie_smmu_test.om) ==="
+echo "=== [5/13] Slice B Regression (pcie_smmu_test.om) ==="
 compile_host_om2 "$TMP/pcie_smmu_test" \
   "$ROOT/aienux/kernel/hal/iort.om" \
   "$ROOT/aienux/kernel/hal/bar0_mmio.om" \
@@ -160,7 +160,7 @@ compile_host_om2 "$TMP/pcie_smmu_test" \
   "$ROOT/aienux/kernel/hal/pcie_smmu_test.om"
 "$TMP/pcie_smmu_test"
 
-echo "=== [6/12] Slice C Regression (slice_c_gate.om) ==="
+echo "=== [6/13] Slice C Regression (slice_c_gate.om) ==="
 compile_host_om1 "$TMP/slice_c_gate" \
   "$ROOT/gpu/driver/gsp/bm_hal.om" \
   "$ROOT/gpu/driver/gsp/profile.om" \
@@ -184,19 +184,46 @@ compile_host_om1 "$TMP/slice_c_gate" \
   "$ROOT/gpu/driver/tests/slice_c_gate.om"
 "$TMP/slice_c_gate"
 
-echo "=== [7/12] Slice D Regression (run_slice_d.sh 7/7) ==="
+echo "=== [7/13] Slice D Regression (run_slice_d.sh 7/7) ==="
 OMC="$HOST_OMC" sh "$ROOT/aienux/disk/tests/run_slice_d.sh"
 
-echo "=== [8/12] Slice E Regression (q38_run_test.om + q38_sass_parity.sh) ==="
+echo "=== [8/13] Slice E Regression (q38_run_test.om + pure-OM2 sm_121 SASS determinism & parity) ==="
 compile_host_om1 "$TMP/q38_run_test" \
   "$ROOT/gpu/driver/tests/q38_run_shim.om" \
   "$ROOT/gpu/driver/gsp/compute.om" \
   "$ROOT/gpu/driver/gsp/q38_run.om" \
   "$ROOT/gpu/driver/tests/q38_run_test.om"
 "$TMP/q38_run_test"
-(cd "$ROOT" && OMC="$HOST_OMC" sh gpu/driver/tests/q38_sass_parity.sh)
+compile_host_om1 "$TMP/q38_sass_emit_1" \
+  "$ROOT/gpu/nvidia/om/codegen/cg_dec_emit.om" \
+  "$ROOT/gpu/nvidia/om/codegen/cg_dec.om" \
+  "$ROOT/gpu/driver/tests/q38_sass_emit.om"
+compile_host_om1 "$TMP/q38_sass_emit_2" \
+  "$ROOT/gpu/nvidia/om/codegen/cg_dec_emit.om" \
+  "$ROOT/gpu/nvidia/om/codegen/cg_dec.om" \
+  "$ROOT/gpu/driver/tests/q38_sass_emit.om"
+cmp -s "$TMP/q38_sass_emit_1" "$TMP/q38_sass_emit_2" || { echo "FAIL: q38_sass_emit non-deterministic" >&2; exit 1; }
+compile_host_om1 "$TMP/q38_sass_enc_1" \
+  "$ROOT/gpu/nvidia/om/components/bw_alloc.om" \
+  "$ROOT/gpu/nvidia/om/encoder/bw_enc_sm121.om" \
+  "$ROOT/gpu/driver/tests/q38_sass_encode.om"
+compile_host_om1 "$TMP/q38_sass_enc_2" \
+  "$ROOT/gpu/nvidia/om/components/bw_alloc.om" \
+  "$ROOT/gpu/nvidia/om/encoder/bw_enc_sm121.om" \
+  "$ROOT/gpu/driver/tests/q38_sass_encode.om"
+cmp -s "$TMP/q38_sass_enc_1" "$TMP/q38_sass_enc_2" || { echo "FAIL: q38_sass_encode non-deterministic" >&2; exit 1; }
+compile_host_om1 "$TMP/q38_sass_enc_canon" \
+  "$ROOT/gpu/nvidia/om/components/bw_alloc.om" \
+  "$ROOT/om/encoder/bw_enc_sm121.om" \
+  "$ROOT/gpu/driver/tests/q38_sass_encode.om"
+"$TMP/q38_sass_emit_1" > "$TMP/q38_ir.bin"
+"$TMP/q38_sass_enc_1" < "$TMP/q38_ir.bin" > "$TMP/q38_sass_gpu.bin"
+"$TMP/q38_sass_enc_canon" < "$TMP/q38_ir.bin" > "$TMP/q38_sass_canon.bin"
+cmp -s "$TMP/q38_sass_gpu.bin" "$TMP/q38_sass_canon.bin" || { echo "FAIL: bw_enc_sm121 parity mismatch vs om/encoder/bw_enc_sm121.om" >&2; exit 1; }
+[ "$(wc -c < "$TMP/q38_sass_gpu.bin" | tr -d ' ')" -gt 0 ] || { echo "FAIL: empty SASS output" >&2; exit 1; }
+echo "PASS q38_sass_pure_om_parity (7/7 kernels, $(wc -c < "$TMP/q38_sass_gpu.bin" | tr -d ' ') B, 2x deterministic + om/encoder/bw_enc_sm121.om parity)"
 
-echo "=== [9/12] Slice F Regression (test_loopback.om) ==="
+echo "=== [9/13] Slice F Regression (test_loopback.om) ==="
 compile_host_om2 "$TMP/test_loopback" \
   "$ROOT/aienux/net/tcp/tcp.om" \
   "$ROOT/aienux/net/wire/omtk.om" \
@@ -204,13 +231,19 @@ compile_host_om2 "$TMP/test_loopback" \
   "$ROOT/aienux/net/wire/test_loopback.om"
 "$TMP/test_loopback"
 
-echo "=== [10/12] SMMUv3 mode-1 on QEMU virt,iommu=smmuv3 (smmu_qemu_test.om + edu DMA) ==="
+echo "=== [10/13] SMMUv3 mode-1 on QEMU virt,iommu=smmuv3 (smmu_qemu_test.om + edu DMA) ==="
 sh "$ROOT/aienux/kernel/hal/run_smmu_qemu.sh" "$EFI_OMC"
 
-echo "=== [11/12] Real spark_main.om under QEMU (PLAT=qemu: Stage 1-3 + SMMUv3 + NVMe/GPT/ext4/bundle) ==="
+echo "=== [11/13] Real spark_main.om under QEMU (PLAT=qemu: Stage 1-3 + SMMUv3 + NVMe/GPT/ext4/bundle) ==="
 sh "$ROOT/aienux/spark/run_spark_qemu_e2e.sh" "$EFI_OMC"
 
-echo "=== [12/12] Spark boot-tool safety (stage_bootnext.sh with stubbed ssh/sudo/efibootmgr; offline) ==="
+echo "=== [12/13] Spark boot-tool safety (stage_bootnext.sh with stubbed dry-run/apply harness; offline) ==="
 sh "$ROOT/tools/spark-boot/tests/test_stage_bootnext.sh"
 
-echo "PHASE_3_SPARK_GLUE_GATE_PASS 12/12"
+echo "=== [13/13] Pure OM-2 Spec-Audit Gate (spec_audit.om + 84 error codes + 7 neg controls) ==="
+compile_host_om2 "$TMP/spec_audit_1" "$ROOT/aienux/spark/spec_audit.om"
+compile_host_om2 "$TMP/spec_audit_2" "$ROOT/aienux/spark/spec_audit.om"
+cmp -s "$TMP/spec_audit_1" "$TMP/spec_audit_2" || { echo "FAIL: spec_audit non-deterministic build" >&2; exit 1; }
+(cd "$ROOT" && "$TMP/spec_audit_1")
+
+echo "PHASE_3_SPARK_GLUE_GATE_PASS 13/13"
