@@ -1,0 +1,901 @@
+om3
+note SPDX-License-Identifier: Apache-2.0
+note gpu/driver/om3/gb20b_om3_dma.om: Pure OM-3 Zero-Pointer Linear Silicon Capability GB20B Driver.
+note Verified statically by seed/helix/strand5_aegis/om3_aegis.om -> OMEGA-MEMO -> zero-overhead om2 -> seed/out/omc.
+note Enforces all proven GB20B invariants with zero raw pointers:
+note   1. 6 exclusive hardware domains (CPU_HOST=1, CPU_KERNEL_SLAB=2, GPU_DEVICE_DMA=3,
+note      GPU_PT_GMMU=4, MMIO_BAR0=5, SHARED_UNCACHED=6); CPU_KERNEL_SLAB is never GPU-mapped.
+note   2. Mandatory 4-step linear DMA reclaim fence: @unmap -> @tlbinval -> @fence_drain -> @vma_revoke -> @reclaim.
+note   3. Proven GB20B silicon constants: 9 MSI-X vectors, sysmem flush buffer 0x008a1d58/5c,
+note      VER3 PTE PCF=0x11 GPU-uncached GR context buffers (MAIN, PATCH, PAM, GCB[0..6]),
+note      vaBase = 2 GiB (0x80000000), SC_PDB(0) patching + global GR promotion, and strict
+note      disjointness from the 3 ACPI IORT RMR carveouts (0xa1600000..0xb97fffff, 0x280000000..0x302ffffff).
+
+note ---- Static OM-3 Hardware Carveouts (Disjoint Physical Domains, Never GPU-Mapped) ----
+@region rmr0_low386m 6 0xa1600000 0x18200000
+@region rmr1_mid2g 6 0x280000000 0x80000000
+@region rmr2_hi48m 6 0x300000000 0x03000000
+@region msi_its_win 6 0x08000000 0x00100000
+@region vfs_inode_slab 2 0x90000000 0x01000000
+@region gb20b_bar0 5 0x24000000 0x04000000
+@region sysmem_flush_buf 6 0x92000000 0x1000
+@region host_cpu_ring 1 0x94000000 0x10000
+
+@access gb20b_bar0 0x008a1d58 8
+@access sysmem_flush_buf 0 4096
+@access host_cpu_ring 0 4096
+
+note ---- Hardware Domain & Linear State Constants ----
+const DM_DOM_CPU_HOST ulong 1
+const DM_DOM_KERNEL_SLAB ulong 2
+const DM_DOM_GPU_DMA ulong 3
+const DM_DOM_GPU_PT ulong 4
+const DM_DOM_MMIO_BAR0 ulong 5
+const DM_DOM_SHARED_NC ulong 6
+
+const DM_MAP_NONE ulong 0
+const DM_MAP_MAPPED ulong 1
+const DM_MAP_PTE_CLR ulong 2
+const DM_MAP_TLB_FL ulong 3
+
+const DM_ST_NONE ulong 0
+const DM_ST_LIVE ulong 1
+const DM_ST_RECLAIMED ulong 2
+
+note ---- Proven GB20B Constants (verified against open-gpu-kernel-modules 580.173.02 & Window 0/1) ----
+const DM_PCI_VENDOR ulong 0x10de
+const DM_PCI_DEVICE ulong 0x2e12
+const DM_BOOT0_GB20B ulong 0x1bb000a1
+const DM_BOOT42_GB20B ulong 0x1bba1000
+const DM_BAR0_PA ulong 0x24000000
+const DM_BAR0_SZ ulong 0x04000000
+
+const DM_FLUSH_LO_OFF ulong 0x008a1d58
+const DM_FLUSH_HI_OFF ulong 0x008a1d5c
+
+const DM_GSP_VA_LO ulong 0x100000000
+const DM_GSP_VA_HI ulong 0x120000000
+const DM_DMA_LIMIT ulong 0x10000000000
+const DM_KVA_BASE ulong 0x200000000
+const DM_PA_MASK ulong 0x000ffffffffff000
+
+note Configurable driver policy parameters (mutated in negative-control tests to verify runtime enforcement)
+const DM_CFG_MSIX ulong 9
+const DM_CFG_VA_BASE ulong 0x80000000
+const DM_CFG_GR_PCF ulong 17
+const DM_CFG_SC_PATCH ulong 1
+
+note Canonical hardware enforcement targets
+const DM_REQ_MSIX ulong 9
+const DM_REQ_VA_BASE ulong 0x80000000
+const DM_REQ_GR_PCF ulong 17
+const DM_REQ_AP_SYS ulong 2
+
+note 3 ACPI IORT RMR Carveouts (IORT RMR_NODE idx=50 flags=0x10 remap_permitted=0)
+const DM_RMR0_BASE ulong 0xa1600000
+const DM_RMR0_LEN ulong 0x18200000
+const DM_RMR1_BASE ulong 0x280000000
+const DM_RMR1_LEN ulong 0x80000000
+const DM_RMR2_BASE ulong 0x300000000
+const DM_RMR2_LEN ulong 0x03000000
+const DM_MSI_BASE ulong 0x08000000
+const DM_MSI_LEN ulong 0x00100000
+
+note GR context buffer slots (10 total: MAIN=0, PATCH=1, PAM=2, GCB[0..6]=3..9)
+const DM_GR_NBUF ulong 10
+const DM_MAX_REG ulong 32
+
+note Error codes returned by runtime checks (negative)
+const DM_OK long 0
+const DM_ERR_ARG long -1
+const DM_ERR_SLAB long -2
+const DM_ERR_RMR long -3
+const DM_ERR_VA long -4
+const DM_ERR_PCF long -5
+const DM_ERR_MSIX long -6
+const DM_ERR_FLUSH long -7
+const DM_ERR_SCPDB long -8
+const DM_ERR_FENCE long -9
+const DM_ERR_PROMOTE long -10
+const DM_ERR_OVERLAP long -11
+
+note ---- Driver State Globals ----
+global dm_msix ulong 1
+global dm_flush_pa ulong 1
+global dm_sc_pdb_lo ulong 1
+global dm_sc_pdb_hi ulong 1
+global dm_sc_patched ulong 1
+global dm_pam_init ulong 1
+global dm_gcb_init ulong 1
+global dm_boot_ok ulong 1
+
+global dm_rcnt ulong 1
+global dm_rdom ulong 32
+global dm_rpbase ulong 32
+global dm_rpsize ulong 32
+global dm_rva ulong 32
+global dm_rvlen ulong 32
+global dm_rmap ulong 32
+global dm_repoch ulong 32
+global dm_rdrain ulong 32
+global dm_rvma ulong 32
+global dm_rstate ulong 32
+global dm_rpte ulong 32
+
+global dm_gr_rid ulong 10
+global dm_gr_hwid ulong 10
+global dm_gr_prom ulong 10
+global dm_gr_binit ulong 10
+global dm_gr_pte ulong 10
+global dm_dig uchar 24
+
+text dm_s_pass "GB20B_OM3_DMA PASS domains=6 msix=9 flush=0x008a1d58/5c pcf=0x11 vabase=0x80000000 rmrs=3 gr_ctx=10 sc_pdb0=1 fence=4step\n"
+text dm_s_fail "GB20B_OM3_DMA FAIL rc="
+text dm_s_nl "\n"
+
+fn dm_wrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn dm_num fd int v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put dm_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd dm_dig p sub 24 p
+ret
+end
+end
+end
+
+fn dm_add_ovf a ulong b ulong to bool
+s = add a b
+ret lt s a
+end
+
+fn dm_ovl a0 ulong al ulong b0 ulong bl ulong to bool
+if or eq al 0 eq bl 0
+ret false
+end
+if or dm_add_ovf a0 al dm_add_ovf b0 bl
+ret true
+end
+ae = add a0 al
+be = add b0 bl
+if and lt a0 be lt b0 ae
+ret true
+end
+ret false
+end
+
+fn dm_hits_rmr pbase ulong psize ulong to bool
+if dm_ovl pbase psize DM_RMR0_BASE DM_RMR0_LEN
+ret true
+end
+if dm_ovl pbase psize DM_RMR1_BASE DM_RMR1_LEN
+ret true
+end
+if dm_ovl pbase psize DM_RMR2_BASE DM_RMR2_LEN
+ret true
+end
+if dm_ovl pbase psize DM_MSI_BASE DM_MSI_LEN
+ret true
+end
+ret false
+end
+
+fn dm_va_valid va ulong vlen ulong to bool
+if or eq va 0 eq vlen 0
+ret false
+end
+if dm_add_ovf va vlen
+ret false
+end
+if lt va DM_REQ_VA_BASE
+ret false
+end
+if gt add va vlen DM_DMA_LIMIT
+ret false
+end
+if dm_ovl va vlen DM_GSP_VA_LO sub DM_GSP_VA_HI DM_GSP_VA_LO
+ret false
+end
+if ne and va 4095 0
+ret false
+end
+if ne and vlen 4095 0
+ret false
+end
+ret true
+end
+
+fn dm_ver3_pte_encode pa ulong ap ulong pcf ulong to ulong
+requires eq and pa 4095 0
+requires lt pa DM_DMA_LIMIT
+requires le ap 3
+requires le pcf 31
+ensures eq and result 1 1
+v = or ulong 1 shl and ap 3 1
+v = or v shl and pcf 31 3
+ret or v and pa DM_PA_MASK
+end
+
+fn dm_ver3_pte_is_gr_uncached pte ulong to bool
+valid = and pte 1
+ap = and shr pte 1 3
+pcf = and shr pte 3 31
+pa = and pte DM_PA_MASK
+if ne valid 1
+ret false
+end
+if ne ap DM_REQ_AP_SYS
+ret false
+end
+if ne pcf DM_REQ_GR_PCF
+ret false
+end
+if or eq pa 0 ge pa DM_DMA_LIMIT
+ret false
+end
+if dm_hits_rmr pa 4096
+ret false
+end
+ret true
+end
+
+fn dm_init to void
+put dm_msix 0 0
+put dm_flush_pa 0 0
+put dm_sc_pdb_lo 0 0
+put dm_sc_pdb_hi 0 0
+put dm_sc_patched 0 0
+put dm_pam_init 0 0
+put dm_gcb_init 0 0
+put dm_boot_ok 0 0
+put dm_rcnt 0 0
+for i ulong DM_MAX_REG
+put dm_rdom i 0
+put dm_rpbase i 0
+put dm_rpsize i 0
+put dm_rva i 0
+put dm_rvlen i 0
+put dm_rmap i DM_MAP_NONE
+put dm_repoch i 0
+put dm_rdrain i 0
+put dm_rvma i 0
+put dm_rstate i DM_ST_NONE
+put dm_rpte i 0
+end
+for j ulong DM_GR_NBUF
+put dm_gr_rid j DM_MAX_REG
+put dm_gr_hwid j 0
+put dm_gr_prom j 0
+put dm_gr_binit j 0
+put dm_gr_pte j 0
+end
+note Hardware GR promote bufferIds: MAIN=0, PATCH=2, PAM=10, GCB[0..6]=3..9
+put dm_gr_hwid 0 0
+put dm_gr_hwid 1 2
+put dm_gr_hwid 2 10
+for k ulong 7
+put dm_gr_hwid add 3 k add 3 k
+end
+end
+
+fn dm_preboot_arm nvec ulong flush_pa ulong flush_lo_reg ulong flush_hi_reg ulong to long
+if ne nvec DM_REQ_MSIX
+ret DM_ERR_MSIX
+end
+if or ne flush_lo_reg DM_FLUSH_LO_OFF ne flush_hi_reg DM_FLUSH_HI_OFF
+ret DM_ERR_FLUSH
+end
+if or eq flush_pa 0 ne and flush_pa 255 0
+ret DM_ERR_FLUSH
+end
+if ge add flush_pa 4096 DM_DMA_LIMIT
+ret DM_ERR_FLUSH
+end
+if dm_hits_rmr flush_pa 4096
+ret DM_ERR_RMR
+end
+put dm_msix 0 nvec
+put dm_flush_pa 0 flush_pa
+put dm_boot_ok 0 1
+ret DM_OK
+end
+
+fn dm_reg_alloc dom ulong pbase ulong psize ulong to long
+if or lt dom DM_DOM_CPU_HOST gt dom DM_DOM_SHARED_NC
+ret DM_ERR_ARG
+end
+if or eq psize 0 dm_add_ovf pbase psize
+ret DM_ERR_ARG
+end
+if ne and pbase 4095 0
+ret DM_ERR_ARG
+end
+if dm_hits_rmr pbase psize
+ret DM_ERR_RMR
+end
+rc = get dm_rcnt 0
+if ge rc DM_MAX_REG
+ret DM_ERR_ARG
+end
+for i ulong rc bound 32
+if eq get dm_rstate i DM_ST_LIVE
+if dm_ovl pbase psize get dm_rpbase i get dm_rpsize i
+ret DM_ERR_OVERLAP
+end
+end
+end
+put dm_rdom rc dom
+put dm_rpbase rc pbase
+put dm_rpsize rc psize
+put dm_rva rc 0
+put dm_rvlen rc 0
+put dm_rmap rc DM_MAP_NONE
+put dm_repoch rc 0
+put dm_rdrain rc 0
+put dm_rvma rc 0
+put dm_rstate rc DM_ST_LIVE
+put dm_rpte rc 0
+put dm_rcnt 0 add rc 1
+ret long rc
+end
+
+fn dm_reg_map rid ulong va ulong vlen ulong pcf ulong is_gr bool to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if ne get dm_rstate rid DM_ST_LIVE
+ret DM_ERR_FENCE
+end
+if eq get dm_rdom rid DM_DOM_KERNEL_SLAB
+ret DM_ERR_SLAB
+end
+if ne get dm_rmap rid DM_MAP_NONE
+ret DM_ERR_OVERLAP
+end
+if or lt va DM_CFG_VA_BASE not dm_va_valid va vlen
+ret DM_ERR_VA
+end
+if gt vlen get dm_rpsize rid
+ret DM_ERR_VA
+end
+rc = get dm_rcnt 0
+for i ulong rc bound 32
+if eq get dm_rstate i DM_ST_LIVE
+if gt get dm_rvlen i 0
+if dm_ovl va vlen get dm_rva i get dm_rvlen i
+ret DM_ERR_OVERLAP
+end
+end
+end
+end
+pa = get dm_rpbase rid
+pte = dm_ver3_pte_encode pa DM_REQ_AP_SYS pcf
+if is_gr
+if not dm_ver3_pte_is_gr_uncached pte
+ret DM_ERR_PCF
+end
+end
+put dm_rva rid va
+put dm_rvlen rid vlen
+put dm_rmap rid DM_MAP_MAPPED
+put dm_rpte rid pte
+ret DM_OK
+end
+
+fn dm_reg_pin rid ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if or ne get dm_rstate rid DM_ST_LIVE eq get dm_rdom rid DM_DOM_KERNEL_SLAB
+ret DM_ERR_SLAB
+end
+mp = get dm_rmap rid
+if or eq mp DM_MAP_PTE_CLR eq mp DM_MAP_TLB_FL
+ret DM_ERR_FENCE
+end
+put dm_rvma rid add get dm_rvma rid 1
+ret DM_OK
+end
+
+fn dm_reg_submit rid ulong ep ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if or ne get dm_rstate rid DM_ST_LIVE eq get dm_rdom rid DM_DOM_KERNEL_SLAB
+ret DM_ERR_SLAB
+end
+if or ne get dm_rmap rid DM_MAP_MAPPED le ep get dm_repoch rid
+ret DM_ERR_FENCE
+end
+put dm_repoch rid ep
+ret DM_OK
+end
+
+fn dm_reg_unmap rid ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if or ne get dm_rstate rid DM_ST_LIVE ne get dm_rmap rid DM_MAP_MAPPED
+ret DM_ERR_FENCE
+end
+put dm_rmap rid DM_MAP_PTE_CLR
+put dm_rpte rid 0
+ret DM_OK
+end
+
+fn dm_reg_tlbinval rid ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if or ne get dm_rstate rid DM_ST_LIVE ne get dm_rmap rid DM_MAP_PTE_CLR
+ret DM_ERR_FENCE
+end
+put dm_rmap rid DM_MAP_TLB_FL
+ret DM_OK
+end
+
+fn dm_reg_drain rid ulong ep ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if or ne get dm_rstate rid DM_ST_LIVE ne get dm_rmap rid DM_MAP_TLB_FL
+ret DM_ERR_FENCE
+end
+if lt ep get dm_repoch rid
+ret DM_ERR_FENCE
+end
+put dm_rdrain rid ep
+ret DM_OK
+end
+
+fn dm_reg_vma_revoke rid ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if or ne get dm_rstate rid DM_ST_LIVE eq get dm_rvma rid 0
+ret DM_ERR_FENCE
+end
+put dm_rvma rid sub get dm_rvma rid 1
+ret DM_OK
+end
+
+fn dm_reg_reclaim rid ulong to long
+if ge rid get dm_rcnt 0
+ret DM_ERR_ARG
+end
+if ne get dm_rstate rid DM_ST_LIVE
+ret DM_ERR_FENCE
+end
+mp = get dm_rmap rid
+if or eq mp DM_MAP_MAPPED eq mp DM_MAP_PTE_CLR
+ret DM_ERR_FENCE
+end
+if or gt get dm_repoch rid get dm_rdrain rid gt get dm_rvma rid 0
+ret DM_ERR_FENCE
+end
+put dm_rstate rid DM_ST_RECLAIMED
+put dm_rva rid 0
+put dm_rvlen rid 0
+ret DM_OK
+end
+
+fn dm_patch_sc_pdb0 old_sc_lo ulong root_pa ulong do_patch ulong to long
+if ne do_patch 1
+ret DM_ERR_SCPDB
+end
+if or eq root_pa 0 ne and root_pa 4095 0
+ret DM_ERR_SCPDB
+end
+if ge root_pa DM_DMA_LIMIT
+ret DM_ERR_SCPDB
+end
+if eq and old_sc_lo 4095 1
+ret DM_ERR_SCPDB
+end
+if dm_hits_rmr root_pa 4096
+ret DM_ERR_RMR
+end
+new_lo = or and root_pa 4294963200 and old_sc_lo 4095
+new_hi = shr root_pa 32
+put dm_sc_pdb_lo 0 new_lo
+put dm_sc_pdb_hi 0 new_hi
+put dm_sc_patched 0 1
+ret DM_OK
+end
+
+fn dm_promote_gr_slot slot ulong rid ulong to long
+if ge slot DM_GR_NBUF
+ret DM_ERR_ARG
+end
+if ne get dm_sc_patched 0 1
+ret DM_ERR_SCPDB
+end
+if or ge rid get dm_rcnt 0 ne get dm_rmap rid DM_MAP_MAPPED
+ret DM_ERR_PROMOTE
+end
+pte = get dm_rpte rid
+if not dm_ver3_pte_is_gr_uncached pte
+ret DM_ERR_PCF
+end
+binit = ulong 0
+if or eq slot 0 eq slot 1
+binit = 1
+end
+if and eq slot 2 eq get dm_pam_init 0 0
+binit = 1
+put dm_pam_init 0 1
+end
+if and ge slot 8 eq get dm_gcb_init 0 0
+binit = 1
+if eq slot 9
+put dm_gcb_init 0 1
+end
+end
+put dm_gr_rid slot rid
+put dm_gr_binit slot binit
+put dm_gr_pte slot pte
+put dm_gr_prom slot 1
+ret DM_OK
+end
+
+fn dm_verify_all_gr_promoted to long
+if or ne get dm_boot_ok 0 1 ne get dm_sc_patched 0 1
+ret DM_ERR_SCPDB
+end
+for s ulong DM_GR_NBUF
+if ne get dm_gr_prom s 1
+ret DM_ERR_PROMOTE
+end
+if not dm_ver3_pte_is_gr_uncached get dm_gr_pte s
+ret DM_ERR_PCF
+end
+end
+ret DM_OK
+end
+
+note ---- OM-3 Compile-Time Verified Lifecycle: GCB[0] (clean single-line mutant anchor) ----
+fn dm_om3_gcb0_lifecycle to int
+@region gr_gcb0 3 0x93300000 0x10000
+@map gr_gcb0 0x200600000 0x10000
+@vma_pin gr_gcb0
+@gpu_submit gr_gcb0 1
+@access gr_gcb0 0 4096
+@unmap gr_gcb0
+@tlbinval gr_gcb0
+@fence_drain gr_gcb0 1
+@vma_revoke gr_gcb0
+@reclaim gr_gcb0
+ret 0
+end
+
+note ---- OM-3 Compile-Time Verified Full GB20B Context & GMMU Lifecycle (with CFG early-abort soundness) ----
+fn dm_om3_full_ctx_lifecycle err_inject ulong to int
+@region gmmu_pt_pd0 4 0x92010000 0x10000
+@region gr_main 3 0x93000000 0x100000
+@region gr_patch 3 0x93100000 0x10000
+@region gr_pam 3 0x93200000 0x10000
+@region gr_gcb1 3 0x93310000 0x10000
+@region gr_gcb2 3 0x93320000 0x10000
+@region gr_gcb3 3 0x93330000 0x10000
+@region gr_gcb4 3 0x93340000 0x10000
+@region gr_gcb5 3 0x93350000 0x10000
+@region gr_gcb6 3 0x93360000 0x10000
+
+@map gr_main 0x200000000 0x100000
+@map gr_patch 0x200200000 0x10000
+@map gr_pam 0x200400000 0x10000
+@map gr_gcb1 0x200800000 0x10000
+@map gr_gcb2 0x200a00000 0x10000
+@map gr_gcb3 0x200c00000 0x10000
+@map gr_gcb4 0x200e00000 0x10000
+@map gr_gcb5 0x201000000 0x10000
+@map gr_gcb6 0x201200000 0x10000
+@map gmmu_pt_pd0 0x201400000 0x10000
+
+@vma_pin gr_main
+@gpu_submit gr_main 1
+@access gr_main 0 4096
+@access gr_patch 0 4096
+@access gr_pam 0 4096
+@access gmmu_pt_pd0 0 4096
+
+if ne err_inject 0
+@unmap gr_main
+@tlbinval gr_main
+@fence_drain gr_main 1
+@vma_revoke gr_main
+@reclaim gr_main
+@unmap gr_patch
+@tlbinval gr_patch
+@fence_drain gr_patch 0
+@reclaim gr_patch
+@unmap gr_pam
+@tlbinval gr_pam
+@fence_drain gr_pam 0
+@reclaim gr_pam
+@unmap gr_gcb1
+@tlbinval gr_gcb1
+@fence_drain gr_gcb1 0
+@reclaim gr_gcb1
+@unmap gr_gcb2
+@tlbinval gr_gcb2
+@fence_drain gr_gcb2 0
+@reclaim gr_gcb2
+@unmap gr_gcb3
+@tlbinval gr_gcb3
+@fence_drain gr_gcb3 0
+@reclaim gr_gcb3
+@unmap gr_gcb4
+@tlbinval gr_gcb4
+@fence_drain gr_gcb4 0
+@reclaim gr_gcb4
+@unmap gr_gcb5
+@tlbinval gr_gcb5
+@fence_drain gr_gcb5 0
+@reclaim gr_gcb5
+@unmap gr_gcb6
+@tlbinval gr_gcb6
+@fence_drain gr_gcb6 0
+@reclaim gr_gcb6
+@unmap gmmu_pt_pd0
+@tlbinval gmmu_pt_pd0
+@fence_drain gmmu_pt_pd0 0
+@reclaim gmmu_pt_pd0
+ret 1
+end
+
+@gpu_submit gr_gcb1 1
+@gpu_submit gr_gcb2 1
+@gpu_submit gr_gcb3 1
+@gpu_submit gr_gcb4 1
+@gpu_submit gr_gcb5 1
+@gpu_submit gr_gcb6 1
+@access gr_gcb1 0 4096
+@access gr_gcb6 0 4096
+
+@unmap gr_main
+@tlbinval gr_main
+@fence_drain gr_main 1
+@vma_revoke gr_main
+@reclaim gr_main
+
+@unmap gr_patch
+@tlbinval gr_patch
+@fence_drain gr_patch 0
+@reclaim gr_patch
+
+@unmap gr_pam
+@tlbinval gr_pam
+@fence_drain gr_pam 0
+@reclaim gr_pam
+
+@unmap gr_gcb1
+@tlbinval gr_gcb1
+@fence_drain gr_gcb1 1
+@reclaim gr_gcb1
+
+@unmap gr_gcb2
+@tlbinval gr_gcb2
+@fence_drain gr_gcb2 1
+@reclaim gr_gcb2
+
+@unmap gr_gcb3
+@tlbinval gr_gcb3
+@fence_drain gr_gcb3 1
+@reclaim gr_gcb3
+
+@unmap gr_gcb4
+@tlbinval gr_gcb4
+@fence_drain gr_gcb4 1
+@reclaim gr_gcb4
+
+@unmap gr_gcb5
+@tlbinval gr_gcb5
+@fence_drain gr_gcb5 1
+@reclaim gr_gcb5
+
+@unmap gr_gcb6
+@tlbinval gr_gcb6
+@fence_drain gr_gcb6 1
+@reclaim gr_gcb6
+
+@unmap gmmu_pt_pd0
+@tlbinval gmmu_pt_pd0
+@fence_drain gmmu_pt_pd0 0
+@reclaim gmmu_pt_pd0
+ret 0
+end
+
+fn dm_runtime_verify to long
+dm_init
+rc = dm_preboot_arm DM_CFG_MSIX 0x92000000 DM_FLUSH_LO_OFF DM_FLUSH_HI_OFF
+if ne rc DM_OK
+ret rc
+end
+r_slab = dm_reg_alloc DM_DOM_KERNEL_SLAB 0x90000000 0x01000000
+if lt r_slab 0
+ret r_slab
+end
+r_flush = dm_reg_alloc DM_DOM_SHARED_NC 0x92000000 0x1000
+if lt r_flush 0
+ret r_flush
+end
+r_pt = dm_reg_alloc DM_DOM_GPU_PT 0x92010000 0x10000
+if lt r_pt 0
+ret r_pt
+end
+rc = dm_reg_map ulong r_pt 0x201400000 0x10000 DM_REQ_GR_PCF false
+if ne rc DM_OK
+ret rc
+end
+rc = dm_patch_sc_pdb0 0xc288ac07 0x92010000 DM_CFG_SC_PATCH
+if ne rc DM_OK
+ret rc
+end
+r_vab = dm_reg_alloc DM_DOM_GPU_DMA 0x92030000 0x10000
+if lt r_vab 0
+ret r_vab
+end
+rc = dm_reg_map ulong r_vab DM_CFG_VA_BASE 0x10000 DM_REQ_GR_PCF false
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_unmap ulong r_vab
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_tlbinval ulong r_vab
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_drain ulong r_vab 0
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_reclaim ulong r_vab
+if ne rc DM_OK
+ret rc
+end
+note Negative runtime self-assertions (must fail closed inside runtime state machine)
+if ne dm_reg_map ulong r_slab 0x202000000 0x10000 DM_CFG_GR_PCF true DM_ERR_SLAB
+ret DM_ERR_SLAB
+end
+if ne dm_reg_alloc DM_DOM_GPU_DMA 0xa1600000 0x10000 DM_ERR_RMR
+ret DM_ERR_RMR
+end
+if ne dm_reg_alloc DM_DOM_GPU_DMA 0x280000000 0x10000 DM_ERR_RMR
+ret DM_ERR_RMR
+end
+if ne dm_reg_alloc DM_DOM_GPU_DMA 0x300000000 0x10000 DM_ERR_RMR
+ret DM_ERR_RMR
+end
+r_tst = dm_reg_alloc DM_DOM_GPU_DMA 0x92020000 0x10000
+if lt r_tst 0
+ret r_tst
+end
+if ne dm_reg_map ulong r_tst 0x100000000 0x10000 DM_CFG_GR_PCF false DM_ERR_VA
+ret DM_ERR_VA
+end
+if ne dm_reg_map ulong r_tst 0x40000000 0x10000 DM_CFG_GR_PCF false DM_ERR_VA
+ret DM_ERR_VA
+end
+if ne dm_reg_map ulong r_tst 0x201400000 0x10000 DM_CFG_GR_PCF false DM_ERR_OVERLAP
+ret DM_ERR_OVERLAP
+end
+rc = dm_reg_reclaim ulong r_tst
+if ne rc DM_OK
+ret rc
+end
+
+note Allocate, map (VER3 PTE PCF=0x11), pin, submit, promote, and 4-step reclaim all 10 GR buffers
+rids = new ulong 10 0
+for s ulong DM_GR_NBUF
+pa = add 0x93000000 mul s 0x100000
+va = add DM_KVA_BASE mul s 0x200000
+sz = ulong 0x10000
+if eq s 0
+sz = 0x100000
+end
+rid = dm_reg_alloc DM_DOM_GPU_DMA pa sz
+if lt rid 0
+ret rid
+end
+put rids s ulong rid
+rc = dm_reg_map ulong rid va sz DM_CFG_GR_PCF true
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_pin ulong rid
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_submit ulong rid 1
+if ne rc DM_OK
+ret rc
+end
+rc = dm_promote_gr_slot s ulong rid
+if ne rc DM_OK
+ret rc
+end
+end
+
+rc = dm_verify_all_gr_promoted
+if ne rc DM_OK
+ret rc
+end
+
+note Verify 4-step linear fence blocks premature reclaim
+r0 = get rids 0
+if ne dm_reg_reclaim r0 DM_ERR_FENCE
+ret DM_ERR_FENCE
+end
+for s ulong DM_GR_NBUF
+rid = get rids s
+rc = dm_reg_unmap rid
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_tlbinval rid
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_drain rid 1
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_vma_revoke rid
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_reclaim rid
+if ne rc DM_OK
+ret rc
+end
+end
+
+rc = dm_reg_unmap ulong r_pt
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_tlbinval ulong r_pt
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_drain ulong r_pt 0
+if ne rc DM_OK
+ret rc
+end
+rc = dm_reg_reclaim ulong r_pt
+if ne rc DM_OK
+ret rc
+end
+ret DM_OK
+end
+
+fn main to int
+if ne dm_om3_gcb0_lifecycle 0
+ret 1
+end
+if ne dm_om3_full_ctx_lifecycle 0 0
+ret 2
+end
+if ne dm_om3_full_ctx_lifecycle 1 1
+ret 3
+end
+rc = dm_runtime_verify
+if ne rc DM_OK
+dm_wrt 2 dm_s_fail
+dm_num 2 ulong neg rc
+dm_wrt 2 dm_s_nl
+ret int neg rc
+end
+dm_wrt 1 dm_s_pass
+ret 0
+end
