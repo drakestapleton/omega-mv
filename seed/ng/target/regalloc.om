@@ -1,10 +1,19 @@
 note SPDX-License-Identifier: Apache-2.0
-note seed/ng/target/regalloc.om: Shared target-parameterized live-range register allocator + whole-program IPRA.
-note Parameterized purely by TargetDesc (ngpr, two_addr, caller_save_mask) -- works across A64, x86-64, RV64, Thumb-2, SM121.
+note seed/ng/target/regalloc.om: Shared target-parameterized live-range register allocator + spill-slot allocator + whole-program IPRA.
+note Parameterized purely by TargetDesc / chips.tsv (ngpr, nScratch, fixed regs) -- works across A64, Apple-M, x86-64, RV64, Thumb-2, SM121.
+note Supports >16 live values with zero-spill fast path, sorted linear-scan ordering, furthest-end eviction,
+note live-interval spill-slot reuse, and zero-UB bounds enforcement.
 
 const RA_MAX_VALS ulong 256
 const RA_MAX_FNS ulong 32
+const RA_MAX_SLOTS ulong 256
+const RA_MAX_REGS ulong 64
 const RA_SPILL ulong 65535
+
+const RA_OK ulong 0
+const RA_ERR_CAP ulong 1
+const RA_ERR_NGPR ulong 2
+const RA_ERR_RANGE ulong 3
 
 note Input live intervals per SSA value: [raStart[v], raEnd[v]]
 global raNVal ulong 1
@@ -12,15 +21,27 @@ global raStart ulong 256
 global raEnd ulong 256
 global raFixed ulong 256
 
-note Output assignment: raPhys[v] = physical reg (0..ngpr-1) or RA_SPILL; raSlot[v] = spill slot
+note Output assignment: raPhys[v] = physical reg (0..avail-1) or RA_SPILL; raSlot[v] = spill slot
 global raPhys ulong 256
 global raSlot ulong 256
 global raNSpill ulong 1
+global raNSlots ulong 1
 global raUsedMask ulong 1
+global raFastUsed ulong 1
+global raPeakLive ulong 1
+global raLastNgpr ulong 1
+global raLastAvail ulong 1
+global raLastScratch ulong 1
+global raErr ulong 1
+
+note Internal sorted interval permutation & spill-slot liveness (max 256 values / slots)
+global raOrder ulong 256
+global raSlotEnd ulong 256
 
 note Internal active-set tracking (max 64 physical regs)
 global raBusy ulong 64
 global raBusyEnd ulong 64
+global raBusyVal ulong 64
 
 note Whole-program IPRA tables (per function: direct clobbers, callee edges, propagated clobbers)
 global raFnCnt ulong 1
@@ -31,167 +52,580 @@ global raEdgeDst ulong 64
 global raEdgeCnt ulong 1
 
 fn raReset to void
-put raNVal 0 0
-put raNSpill 0 0
-put raUsedMask 0 0
-for i ulong 64
-put raBusy i 0
-put raBusyEnd i 0
-end
+  put raNVal 0 0
+  put raNSpill 0 0
+  put raNSlots 0 0
+  put raUsedMask 0 0
+  put raFastUsed 0 0
+  put raPeakLive 0 0
+  put raLastNgpr 0 64
+  put raLastAvail 0 64
+  put raLastScratch 0 0
+  put raErr 0 RA_OK
+  for i ulong 64
+    put raBusy i 0
+    put raBusyEnd i 0
+    put raBusyVal i RA_SPILL
+  end
+  for j ulong 256
+    put raOrder j j
+    put raSlotEnd j 0
+  end
 end
 
 fn raAddInterval s ulong e ulong fixedReg ulong to ulong
-id = get raNVal 0
-put raStart id s
-put raEnd id e
-put raFixed id fixedReg
-put raPhys id RA_SPILL
-put raSlot id 0
-put raNVal 0 add id 1
-ret id
+  id = get raNVal 0
+  if ge id RA_MAX_VALS
+    put raErr 0 RA_ERR_CAP
+    ret RA_SPILL
+  end
+  if gt s e
+    put raErr 0 RA_ERR_RANGE
+    put raStart id e
+    put raEnd id s
+  else
+    put raStart id s
+    put raEnd id e
+  end
+  put raFixed id fixedReg
+  put raPhys id RA_SPILL
+  put raSlot id 0
+  put raOrder id id
+  put raNVal 0 add id 1
+  ret id
+end
+
+fn raTouchDef v ulong pos ulong to void
+  if ge v get raNVal 0
+    put raErr 0 RA_ERR_CAP
+    ret
+  end
+  put raStart v pos
+  if gt pos get raEnd v
+    put raEnd v pos
+  end
+end
+
+fn raTouchUse v ulong pos ulong to void
+  if ge v get raNVal 0
+    put raErr 0 RA_ERR_CAP
+    ret
+  end
+  if lt pos get raStart v
+    put raStart v pos
+  end
+  if gt pos get raEnd v
+    put raEnd v pos
+  end
+end
+
+fn raExtendLoop hdrPos ulong backPos ulong to void
+  if gt hdrPos backPos
+    ret
+  end
+  n = get raNVal 0
+  for i ulong n bound 256
+    s = get raStart i
+    e = get raEnd i
+    if and le s backPos ge e hdrPos
+      if lt hdrPos s
+        put raStart i hdrPos
+      end
+      if gt backPos e
+        put raEnd i backPos
+      end
+    end
+  end
+end
+
+fn raNeedSwap a ulong b ulong to bool
+  sa = get raStart a
+  sb = get raStart b
+  if gt sa sb
+    ret true
+  end
+  if lt sa sb
+    ret false
+  end
+  ret gt get raEnd a get raEnd b
+end
+
+fn raSortOrder to void
+  n = get raNVal 0
+  for i ulong n bound 256
+    put raOrder i i
+  end
+  for i ulong n bound 256
+    if gt i 0
+      j = i
+      while gt j 0 bound 256
+        jm = sub j 1
+        ojm = get raOrder jm
+        oj = get raOrder j
+        if not raNeedSwap ojm oj
+          break
+        end
+        put raOrder jm oj
+        put raOrder j ojm
+        j = jm
+      end
+    end
+  end
+end
+
+fn raComputePeakLive to ulong
+  n = get raNVal 0
+  peak = ulong 0
+  for i ulong n bound 256
+    pos = get raStart i
+    live = ulong 0
+    for j ulong n bound 256
+      if and le get raStart j pos ge get raEnd j pos
+        live = add live 1
+      end
+    end
+    if gt live peak
+      peak = live
+    end
+  end
+  put raPeakLive 0 peak
+  ret peak
+end
+
+fn raAllocSlot s ulong e ulong to ulong
+  ns = get raNSlots 0
+  for k ulong ns bound 256
+    if lt get raSlotEnd k s
+      put raSlotEnd k e
+      ret k
+    end
+  end
+  if ge ns RA_MAX_SLOTS
+    put raErr 0 RA_ERR_CAP
+    ret 0
+  end
+  put raSlotEnd ns e
+  put raNSlots 0 add ns 1
+  ret ns
 end
 
 fn raExpireAt pos ulong ngpr ulong to void
-for r ulong ngpr bound 64
-if and eq get raBusy r 1 lt get raBusyEnd r pos
-put raBusy r 0
-end
-end
+  lim = ngpr
+  if gt lim RA_MAX_REGS
+    lim = RA_MAX_REGS
+  end
+  for r ulong lim bound 64
+    if and eq get raBusy r 1 lt get raBusyEnd r pos
+      put raBusy r 0
+      put raBusyEnd r 0
+      put raBusyVal r RA_SPILL
+    end
+  end
 end
 
 fn raFindFree ngpr ulong to ulong
-for r ulong ngpr bound 64
-if eq get raBusy r 0
-ret r
+  lim = ngpr
+  if gt lim RA_MAX_REGS
+    lim = RA_MAX_REGS
+  end
+  for r ulong lim bound 64
+    if eq get raBusy r 0
+      ret r
+    end
+  end
+  ret RA_SPILL
 end
+
+fn raBindReg v ulong r ulong e ulong to void
+  put raBusy r 1
+  put raBusyEnd r e
+  put raBusyVal r v
+  put raPhys v r
+  if lt r 64
+    put raUsedMask 0 or get raUsedMask 0 shl ulong 1 r
+  end
 end
-ret RA_SPILL
+
+fn raSpillVal v ulong to void
+  s = get raStart v
+  e = get raEnd v
+  sl = raAllocSlot s e
+  put raPhys v RA_SPILL
+  put raSlot v sl
+  put raNSpill 0 add get raNSpill 0 1
+end
+
+fn raEvictReg r ulong to void
+  w = get raBusyVal r
+  put raBusy r 0
+  put raBusyEnd r 0
+  put raBusyVal r RA_SPILL
+  if lt w get raNVal 0
+    raSpillVal w
+  end
+end
+
+fn raFindFurthestEvict ngpr ulong curEnd ulong to ulong
+  bestR = RA_SPILL
+  bestEnd = curEnd
+  for r ulong ngpr bound 64
+    if eq get raBusy r 1
+      w = get raBusyVal r
+      if lt w get raNVal 0
+        if eq get raFixed w RA_SPILL
+          we = get raBusyEnd r
+          if gt we bestEnd
+            bestEnd = we
+            bestR = r
+          end
+        end
+      end
+    end
+  end
+  ret bestR
+end
+
+fn raAllocFixed v ulong fx ulong ngpr ulong to bool
+  e = get raEnd v
+  if eq get raBusy fx 0
+    raBindReg v fx e
+    ret true
+  end
+  w = get raBusyVal fx
+  if ge w get raNVal 0
+    ret false
+  end
+  if ne get raFixed w RA_SPILL
+    ret false
+  end
+  alt = raFindFree ngpr
+  if ne alt RA_SPILL
+    we = get raBusyEnd fx
+    raBindReg w alt we
+    raBindReg v fx e
+    ret true
+  end
+  raEvictReg fx
+  raBindReg v fx e
+  ret true
 end
 
 fn raAllocOne v ulong ngpr ulong to void
-s = get raStart v
-e = get raEnd v
-raExpireAt s ngpr
-fx = get raFixed v
-if and ne fx RA_SPILL lt fx ngpr
-if eq get raBusy fx 0
-put raBusy fx 1
-put raBusyEnd fx e
-put raPhys v fx
-if lt fx 64
-put raUsedMask 0 or get raUsedMask 0 shl ulong 1 fx
+  s = get raStart v
+  e = get raEnd v
+  raExpireAt s ngpr
+  fx = get raFixed v
+  if and ne fx RA_SPILL lt fx ngpr
+    if raAllocFixed v fx ngpr
+      ret
+    end
+    raSpillVal v
+    ret
+  end
+  r = raFindFree ngpr
+  if ne r RA_SPILL
+    raBindReg v r e
+    ret
+  end
+  evR = raFindFurthestEvict ngpr e
+  if ne evR RA_SPILL
+    raEvictReg evR
+    raBindReg v evR e
+    ret
+  end
+  raSpillVal v
 end
-ret
+
+fn raFixedPairConflict i ulong fx ulong n ulong to bool
+  si = get raStart i
+  ei = get raEnd i
+  for j ulong n bound 256
+    if and gt j i eq get raFixed j fx
+      if and le si get raEnd j le get raStart j ei
+        ret true
+      end
+    end
+  end
+  ret false
 end
+
+fn raHasFixedConflict avail ulong to bool
+  n = get raNVal 0
+  for i ulong n bound 256
+    fx = get raFixed i
+    if ne fx RA_SPILL
+      if ge fx avail
+        ret true
+      end
+      if raFixedPairConflict i fx n
+        ret true
+      end
+    end
+  end
+  ret false
 end
-r = raFindFree ngpr
-if ne r RA_SPILL
-put raBusy r 1
-put raBusyEnd r e
-put raPhys v r
-if lt r 64
-put raUsedMask 0 or get raUsedMask 0 shl ulong 1 r
+
+fn raFastPass avail ulong to bool
+  n = get raNVal 0
+  for k ulong n bound 256
+    v = get raOrder k
+    s = get raStart v
+    e = get raEnd v
+    raExpireAt s avail
+    fx = get raFixed v
+    if ne fx RA_SPILL
+      if ne get raBusy fx 0
+        ret false
+      end
+      raBindReg v fx e
+    else
+      r = raFindFree avail
+      if eq r RA_SPILL
+        ret false
+      end
+      raBindReg v r e
+    end
+  end
+  ret true
 end
-ret
+
+fn raClearRunState to void
+  put raNSpill 0 0
+  put raNSlots 0 0
+  put raUsedMask 0 0
+  put raFastUsed 0 0
+  for r ulong 64
+    put raBusy r 0
+    put raBusyEnd r 0
+    put raBusyVal r RA_SPILL
+  end
+  for k ulong 256
+    put raSlotEnd k 0
+    put raPhys k RA_SPILL
+    put raSlot k 0
+  end
 end
-sl = get raNSpill 0
-put raPhys v RA_SPILL
-put raSlot v sl
-put raNSpill 0 add sl 1
+
+fn raRunWithBudget ngpr ulong nScratch ulong to ulong
+  if or eq ngpr 0 gt ngpr RA_MAX_REGS
+    put raErr 0 RA_ERR_NGPR
+    put raLastNgpr 0 0
+    put raLastAvail 0 0
+    ret 0
+  end
+  if ge nScratch ngpr
+    put raErr 0 RA_ERR_NGPR
+    put raLastNgpr 0 ngpr
+    put raLastAvail 0 0
+    ret 0
+  end
+  if ne get raErr 0 RA_OK
+    ret 0
+  end
+  avail = sub ngpr nScratch
+  put raLastNgpr 0 ngpr
+  put raLastAvail 0 avail
+  put raLastScratch 0 nScratch
+  raClearRunState
+  raSortOrder
+  peak = raComputePeakLive
+  if and le peak avail not raHasFixedConflict avail
+    if raFastPass avail
+      put raFastUsed 0 1
+      ret 0
+    end
+    raClearRunState
+  end
+  n = get raNVal 0
+  for k ulong n bound 256
+    v = get raOrder k
+    raAllocOne v avail
+  end
+  ret get raNSpill 0
+end
+
+fn raRunForNgpr ngpr ulong to ulong
+  eff = ngpr
+  if gt eff RA_MAX_REGS
+    eff = RA_MAX_REGS
+  end
+  ret raRunWithBudget eff 0
 end
 
 note Run target-parameterized linear-scan allocation for any TargetDesc tid!
 fn raRunForTarget tid ulong to ulong
-ngpr = tdGet tid TDF_NGPR
-if gt ngpr 64
-ngpr = ulong 64
-end
-put raNSpill 0 0
-put raUsedMask 0 0
-for r ulong 64
-put raBusy r 0
-put raBusyEnd r 0
-end
-n = get raNVal 0
-for v ulong n bound 256
-raAllocOne v ngpr
-end
-ret get raNSpill 0
+  if ge tid get tdCount 0
+    put raErr 0 RA_ERR_NGPR
+    ret 0
+  end
+  ngpr = tdGet tid TDF_NGPR
+  if gt ngpr RA_MAX_REGS
+    ngpr = RA_MAX_REGS
+  end
+  ret raRunWithBudget ngpr 0
 end
 
-note Graph-coloring invariant verifier: returns 0 iff NO two overlapping intervals share a physical reg!
+fn raSlotCount to ulong
+  ret get raNSlots 0
+end
+
+fn raIsFastPath to bool
+  ret eq get raFastUsed 0 1
+end
+
+fn raPeak to ulong
+  ret get raPeakLive 0
+end
+
+note Graph-coloring invariant verifier: returns 0 iff NO two overlapping intervals share a physical reg,
+note all assigned physical regs are in 0..raLastAvail-1, and fixed-reg constraints hold!
 fn raVerifyColoring to ulong
-n = get raNVal 0
-bad = ulong 0
-for i ulong n bound 256
-pi = get raPhys i
-if ne pi RA_SPILL
-si = get raStart i
-ei = get raEnd i
-for j ulong n bound 256
-if gt j i
-if eq get raPhys j pi
-sj = get raStart j
-ej = get raEnd j
-if and le si ej le sj ei
-bad = add bad 1
+  n = get raNVal 0
+  avail = get raLastAvail 0
+  bad = ulong 0
+  for i ulong n bound 256
+    pi = get raPhys i
+    if ne pi RA_SPILL
+      if ge pi avail
+        bad = add bad 1
+      end
+      fx = get raFixed i
+      if and ne fx RA_SPILL ne pi fx
+        bad = add bad 1
+      end
+      si = get raStart i
+      ei = get raEnd i
+      for j ulong n bound 256
+        if gt j i
+          if eq get raPhys j pi
+            sj = get raStart j
+            ej = get raEnd j
+            if and le si ej le sj ei
+              bad = add bad 1
+            end
+          end
+        end
+      end
+    end
+  end
+  ret bad
 end
+
+note Spill-slot invariant verifier: returns 0 iff every spilled value has a valid slot < raNSlots
+note and NO two overlapping spilled intervals share the same spill slot!
+fn raVerifySpillSlots to ulong
+  n = get raNVal 0
+  ns = get raNSlots 0
+  bad = ulong 0
+  for i ulong n bound 256
+    if eq get raPhys i RA_SPILL
+      sli = get raSlot i
+      if ge sli ns
+        bad = add bad 1
+      end
+      si = get raStart i
+      ei = get raEnd i
+      for j ulong n bound 256
+        if and gt j i eq get raPhys j RA_SPILL
+          if eq get raSlot j sli
+            sj = get raStart j
+            ej = get raEnd j
+            if and le si ej le sj ei
+              bad = add bad 1
+            end
+          end
+        end
+      end
+    end
+  end
+  ret bad
 end
-end
-end
-end
-end
-ret bad
+
+fn raVerifyComplete ngpr ulong to ulong
+  bad = ulong 0
+  if ne get raErr 0 RA_OK
+    bad = add bad 1
+  end
+  if ne get raLastNgpr 0 ngpr
+    bad = add bad 1
+  end
+  bad = add bad raVerifyColoring
+  bad = add bad raVerifySpillSlots
+  n = get raNVal 0
+  sp = ulong 0
+  for i ulong n bound 256
+    if eq get raPhys i RA_SPILL
+      sp = add sp 1
+    end
+  end
+  if ne sp get raNSpill 0
+    bad = add bad 1
+  end
+  ret bad
 end
 
 note Whole-program IPRA: propagate clobber bitmasks bottom-up across the call graph to fixed point!
 fn raIpraReset nFns ulong to void
-put raFnCnt 0 nFns
-put raEdgeCnt 0 0
-for i ulong nFns bound 32
-put raFnDirect i 0
-put raFnProp i 0
-end
+  cnt = nFns
+  if gt cnt RA_MAX_FNS
+    put raErr 0 RA_ERR_CAP
+    cnt = RA_MAX_FNS
+  end
+  put raFnCnt 0 cnt
+  put raEdgeCnt 0 0
+  for i ulong cnt bound 32
+    put raFnDirect i 0
+    put raFnProp i 0
+  end
 end
 
 fn raIpraSetDirect fnId ulong mask ulong to void
-put raFnDirect fnId mask
-put raFnProp fnId mask
+  if ge fnId get raFnCnt 0
+    put raErr 0 RA_ERR_CAP
+    ret
+  end
+  put raFnDirect fnId mask
+  put raFnProp fnId mask
 end
 
 fn raIpraAddCall caller ulong callee ulong to void
-e = get raEdgeCnt 0
-put raEdgeSrc e caller
-put raEdgeDst e callee
-put raEdgeCnt 0 add e 1
+  e = get raEdgeCnt 0
+  nf = get raFnCnt 0
+  if or ge e 64 or ge caller nf ge callee nf
+    put raErr 0 RA_ERR_CAP
+    ret
+  end
+  put raEdgeSrc e caller
+  put raEdgeDst e callee
+  put raEdgeCnt 0 add e 1
 end
 
 fn raIpraSolve to void
-ec = get raEdgeCnt 0
-for iter ulong 32
-chg = ulong 0
-for e ulong ec bound 64
-u = get raEdgeSrc e
-v = get raEdgeDst e
-old = get raFnProp u
-nw = or old get raFnProp v
-if ne nw old
-put raFnProp u nw
-chg = ulong 1
-end
-end
-if eq chg 0
-ret
-end
-end
+  ec = get raEdgeCnt 0
+  for iter ulong 32
+    chg = ulong 0
+    for e ulong ec bound 64
+      u = get raEdgeSrc e
+      v = get raEdgeDst e
+      old = get raFnProp u
+      nw = or old get raFnProp v
+      if ne nw old
+        put raFnProp u nw
+        chg = ulong 1
+      end
+    end
+    if eq chg 0
+      ret
+    end
+  end
 end
 
 fn raPopcount m ulong to ulong
-x = m
-c = ulong 0
-for i ulong 64
-c = add c and x 1
-x = shr x 1
-end
-ret c
+  x = m
+  c = ulong 0
+  for i ulong 64
+    c = add c and x 1
+    x = shr x 1
+  end
+  ret c
 end
