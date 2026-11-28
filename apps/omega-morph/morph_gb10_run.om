@@ -1,0 +1,873 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-morph/morph_gb10_run.om
+note Coordinator Phase 2 Silicon Pass A: Fail-closed OMMP01 verifier + live GB10 SM121 Zero-CUDA runner.
+note Compose after:
+note   si/directives/om2.om apps/omega-wattd/watt_sense.om apps/omega-wattd/watt_cbf.om
+note   seed/ng/sha256.om protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om
+note   seed/ng/target/target_desc.om seed/ng/target/chips_tsv.om seed/ng/verify/egp3_checker.om
+note   gpu/nvidia/native/nvrm/context.om gpu/nvidia/native/blackwell/vector.om
+note   gpu/nvidia/native/blackwell/launch.om om/encoder/bw_enc_sm121.om
+note   apps/omega-morph/morph_gb10_run.om
+
+const MG_HDR_LEN ulong 224
+const MG_VERSION ulong 1
+const MG_FLAGS_REQ ulong 7
+const MG_OM3_TAG ulong 825445711
+const MG_WATT_MAX_MW ulong 80000
+const MG_WATT_MAX_TCEIL ulong 90000
+const MG_NONE ulong 18446744073709551615
+const MG_SENTINEL ulong 3735928559
+
+const MG_OIR_ADD ulong 1
+const MG_OIR_SUB ulong 2
+const MG_OIR_MUL ulong 3
+
+const MG_ERR_FORMAT int 60
+const MG_ERR_ED25519 int 61
+const MG_ERR_SHA256 int 62
+const MG_ERR_SEM_ID int 63
+const MG_ERR_EGP3 int 64
+const MG_ERR_OM3 int 65
+const MG_ERR_WATTCBF int 66
+const MG_ERR_USAGE int 70
+const MG_ERR_TARGET int 71
+const MG_ERR_CONTRACT int 72
+const MG_ERR_IO int 74
+const MG_ERR_GPU int 75
+
+global mg_pkg uchar 32768
+global mg_pkg_len ulong 1
+global mg_oir uchar 8192
+global mg_oir_len ulong 1
+global mg_oir_cur ulong 1
+global mg_egp uchar 16384
+global mg_egp_len ulong 1
+global mg_sem uchar 32
+global mg_csha uchar 32
+
+global mg_p_in uchar 4096
+global mg_p_in_n ulong 1
+global mg_p_chips uchar 4096
+global mg_p_chips_n ulong 1
+global mg_abuf uchar 4096
+
+note cfg: 0=argA, 1=argB, 2=argC, 3=op1, 4=op2, 5=reqSmem, 6=reqRegs, 7=reqL2, 8=reqMma, 9=reqFeat, 10=pwrMw, 11=tceilMc
+global mg_cfg ulong 16
+global mg_ins ulong 8192
+global mg_phys ulong 288
+global mg_code uchar 16384
+global mg_out_map long 1
+global mg_cmd_len uint 1
+global mg_dig uchar 24
+
+text mg_t_magic "OMMP01"
+text mg_t_oir_magic "OSC1IR"
+text mg_t_oir_tag "omega.ng.ir.v2"
+text mg_t_sem_pfx "omega.ng.sem.fn.v2:"
+text mg_t_sm121 "sm121"
+text mg_t_def_chips "seed/ng/target/chips.tsv"
+
+text mg_m_use "usage: morph_gb10_run <PKG_OMMP> [CHIPS_TSV]\n"
+text mg_m_fail "MORPH_GB10_REFUSE code="
+text mg_m_auth "MORPH_GB10 AUTH_OK=1 live_tgpu_mc="
+text mg_m_pwr " pwr_mw="
+text mg_m_exp " exp="
+text mg_m_pass "MORPH_GB10_PASS got="
+text mg_m_sbyt " sass_bytes="
+text mg_m_nl "\n"
+
+fn mg_wrt fd int s view uchar * to void
+  p = ulong 0
+  n = len s
+  while lt p n bound 4096
+    k = write fd s p sub n p
+    if le k 0
+      ret
+    end
+    p = add p ulong k
+  end
+end
+
+fn mg_wrt_u fd int v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put mg_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      w = write fd mg_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn mg_fail code int to void
+  mg_wrt 2 mg_m_fail
+  mg_wrt_u 2 ulong code
+  mg_wrt 2 mg_m_nl
+  exit code
+end
+
+fn mg_u16 o ulong to ulong
+  b0 = ulong get mg_pkg o
+  b1 = shl ulong get mg_pkg add o 1 8
+  ret or b0 b1
+end
+
+fn mg_u32 o ulong to ulong
+  b0 = ulong get mg_pkg o
+  b1 = shl ulong get mg_pkg add o 1 8
+  b2 = shl ulong get mg_pkg add o 2 16
+  b3 = shl ulong get mg_pkg add o 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn mg_u64 o ulong to ulong
+  lo = mg_u32 o
+  hi = mg_u32 add o 4
+  ret or lo shl hi 32
+end
+
+fn mg_read_pkg to bool
+  pn = get mg_p_in_n 0
+  if eq pn 0
+    ret false
+  end
+  p = new uchar 4096 0
+  for i ulong pn bound 4096
+    put p i get mg_p_in i
+  end
+  fd = fopen p 0 pn 0 0
+  if lt fd 0
+    ret false
+  end
+  ifd = int fd
+  tot = ulong 0
+  done = false
+  while not done bound 256
+    if ge tot 32768
+      zc = fclose ifd
+      ret false
+    end
+    r = read ifd mg_pkg tot sub 32768 tot
+    if lt r 0
+      zc = fclose ifd
+      ret false
+    end
+    if eq r 0
+      done = true
+    else
+      tot = add tot ulong r
+    end
+  end
+  zc = fclose ifd
+  if not done
+    ret false
+  end
+  put mg_pkg_len 0 tot
+  ret true
+end
+
+fn mg_ed_ok to bool
+  pk = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get mg_pkg add 128 i
+  end
+  for i ulong 128
+    put m i get mg_pkg i
+  end
+  for i ulong 64
+    put sg i get mg_pkg add 160 i
+  end
+  ret eq edverify pk m 128 sg 0 1
+end
+
+fn mg_sha_ok to bool
+  for i ulong 96
+    put sh_dat i get mg_pkg i
+  end
+  plen = sub get mg_pkg_len 0 MG_HDR_LEN
+  for i ulong plen bound 32768
+    put sh_dat add 96 i get mg_pkg add MG_HDR_LEN i
+  end
+  sh_all add 96 plen
+  for i ulong 32
+    if ne get sh_dig i get mg_pkg add 96 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mg_oir_u8 n ulong to ulong
+  c = get mg_oir_cur 0
+  if gt add c 1 n
+    ret MG_NONE
+  end
+  put mg_oir_cur 0 add c 1
+  ret ulong get mg_oir c
+end
+
+fn mg_oir_u32 n ulong to ulong
+  c = get mg_oir_cur 0
+  if gt add c 4 n
+    ret MG_NONE
+  end
+  v = ulong 0
+  for j ulong 4
+    v = or v shl ulong get mg_oir add c j mul j 8
+  end
+  put mg_oir_cur 0 add c 4
+  ret v
+end
+
+fn mg_oir_u64 n ulong to ulong
+  lo = mg_oir_u32 n
+  hi = mg_oir_u32 n
+  if or eq lo MG_NONE eq hi MG_NONE
+    ret MG_NONE
+  end
+  ret or lo shl hi 32
+end
+
+fn mg_oir_to_op c ulong to ulong
+  if eq c 10
+    ret MG_OIR_ADD
+  end
+  if eq c 11
+    ret MG_OIR_SUB
+  end
+  if eq c 12
+    ret MG_OIR_MUL
+  end
+  ret 0
+end
+
+fn mg_op_to_egp op ulong to ulong
+  if eq op MG_OIR_ADD
+    ret 3
+  end
+  if eq op MG_OIR_SUB
+    ret 4
+  end
+  ret 5
+end
+
+fn mg_oir_chk_hdr n ulong to bool
+  if lt n 36
+    ret false
+  end
+  for j ulong 6
+    if ne get mg_oir j get mg_t_oir_magic j
+      ret false
+    end
+  end
+  if or ne get mg_oir 6 0 ne get mg_oir 7 10
+    ret false
+  end
+  for j ulong 14
+    if ne get mg_oir add 8 j get mg_t_oir_tag j
+      ret false
+    end
+  end
+  if or ne get mg_oir 22 0 ne get mg_oir 23 0
+    ret false
+  end
+  put mg_oir_cur 0 24
+  if or ne mg_oir_u32 n 0 ne mg_oir_u32 n 0
+    ret false
+  end
+  ret eq mg_oir_u32 n 2
+end
+
+fn mg_oir_chk_contract n ulong pwr ulong to bool
+  pur = mg_oir_u8 n
+  prc = mg_oir_u8 n
+  hd = mg_oir_u8 n
+  rsv = mg_oir_u8 n
+  err = mg_oir_u64 n
+  dl = mg_oir_u64 n
+  pw = mg_oir_u64 n
+  if or ne pur 1 or ne prc 1 or ne hd 0 ne rsv 0
+    ret false
+  end
+  ret and eq err 0 and eq dl 0 eq pw pwr
+end
+
+fn mg_oir_parse_fn0 n ulong pwr ulong to bool
+  if or ne mg_oir_u8 n 0 ne mg_oir_u8 n 0
+    ret false
+  end
+  if ne mg_oir_u32 n 3
+    ret false
+  end
+  for j ulong 4
+    if ne mg_oir_u32 n 5
+      ret false
+    end
+  end
+  if not mg_oir_chk_contract n pwr
+    ret false
+  end
+  if or ne mg_oir_u32 n 1 ne mg_oir_u32 n 0
+    ret false
+  end
+  if ne mg_oir_u32 n 3
+    ret false
+  end
+  op1 = mg_oir_to_op mg_oir_u8 n
+  if or eq op1 0 ne mg_oir_u32 n 5
+    ret false
+  end
+  if or ne mg_oir_u32 n 1 ne mg_oir_u32 n 2
+    ret false
+  end
+  op2 = mg_oir_to_op mg_oir_u8 n
+  if or eq op2 0 ne mg_oir_u32 n 5
+    ret false
+  end
+  if or ne mg_oir_u32 n 4 ne mg_oir_u32 n 3
+    ret false
+  end
+  if or ne mg_oir_u8 n 63 ne mg_oir_u32 n 0
+    ret false
+  end
+  if or ne mg_oir_u32 n 0 ne mg_oir_u32 n 5
+    ret false
+  end
+  put mg_cfg 3 op1
+  put mg_cfg 4 op2
+  ret true
+end
+
+fn mg_oir_parse_fn1 n ulong pwr ulong to bool
+  if or ne mg_oir_u8 n 2 ne mg_oir_u8 n 0
+    ret false
+  end
+  if or ne mg_oir_u32 n 0 ne mg_oir_u32 n 8
+    ret false
+  end
+  if not mg_oir_chk_contract n pwr
+    ret false
+  end
+  if or ne mg_oir_u32 n 1 ne mg_oir_u32 n 0
+    ret false
+  end
+  if ne mg_oir_u32 n 6
+    ret false
+  end
+  for k ulong 3
+    if or ne mg_oir_u8 n 1 ne mg_oir_u32 n 5
+      ret false
+    end
+    av = mg_oir_u64 n
+    if eq av MG_NONE
+      ret false
+    end
+    put mg_cfg k av
+  end
+  if or ne mg_oir_u8 n 64 ne mg_oir_u32 n 5
+    ret false
+  end
+  if or ne mg_oir_u32 n 3 ne mg_oir_u32 n 0
+    ret false
+  end
+  if ne mg_oir_u32 n 0
+    ret false
+  end
+  if or ne mg_oir_u32 n 1 or ne mg_oir_u32 n 2 ne mg_oir_u32 n 3
+    ret false
+  end
+  if or ne mg_oir_u8 n 36 ne mg_oir_u32 n 8
+    ret false
+  end
+  if or ne mg_oir_u64 n 0 ne mg_oir_u32 n 5
+    ret false
+  end
+  if or ne mg_oir_u8 n 63 ne mg_oir_u32 n 0
+    ret false
+  end
+  if or ne mg_oir_u32 n 4 ne mg_oir_u32 n 6
+    ret false
+  end
+  ret eq get mg_oir_cur 0 n
+end
+
+fn mg_sem_ok pwr ulong to bool
+  n = get mg_oir_len 0
+  if not mg_oir_chk_hdr n
+    ret false
+  end
+  if not mg_oir_parse_fn0 n pwr
+    ret false
+  end
+  if not mg_oir_parse_fn1 n pwr
+    ret false
+  end
+  p = len mg_t_sem_pfx
+  for i ulong p bound 64
+    put sh_dat i get mg_t_sem_pfx i
+  end
+  for i ulong n bound 8192
+    put sh_dat add p i get mg_oir i
+  end
+  sh_all add p n
+  for i ulong 32
+    if ne get sh_dig i get mg_pkg add 64 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mg_egp_ast_ok ra ulong nc ulong to bool
+  if or ge ra nc ne get vc3_op ra mg_op_to_egp get mg_cfg 4
+    ret false
+  end
+  cl = get vc3_a ra
+  cr = get vc3_b ra
+  if or ge cl nc ge cr nc
+    ret false
+  end
+  if ne get vc3_op cl mg_op_to_egp get mg_cfg 3
+    ret false
+  end
+  if or ne get vc3_op cr 2 ne get vc3_vraw cr 2
+    ret false
+  end
+  la = get vc3_a cl
+  lb = get vc3_b cl
+  if or ge la nc ge lb nc
+    ret false
+  end
+  if or ne get vc3_op la 2 ne get vc3_vraw la 0
+    ret false
+  end
+  ret and eq get vc3_op lb 2 eq get vc3_vraw lb 1
+end
+
+fn mg_egp_ok to bool
+  en = get mg_egp_len 0
+  if or lt en 36 gt en 16384
+    ret false
+  end
+  for i ulong en bound 16384
+    put vc3_buf i get mg_egp i
+  end
+  if ne vc3_verify en 0
+    ret false
+  end
+  if or eq get vc3_stat 0 0 eq get vc3_stat 1 0
+    ret false
+  end
+  mg_rb = vc3_rdu32 24
+  mg_ra = vc3_rdu32 28
+  if eq mg_rb mg_ra
+    ret false
+  end
+  ret mg_egp_ast_ok mg_ra get vc3_nc 0
+end
+
+fn mg_om3_ok to bool
+  fl = mg_u32 8
+  tag = mg_u32 12
+  ret and eq fl MG_FLAGS_REQ eq tag MG_OM3_TAG
+end
+
+fn mg_watt_ok pwrMw ulong tceilMc ulong to bool
+  if or eq pwrMw 0 ge pwrMw MG_WATT_MAX_MW
+    ret false
+  end
+  if or eq tceilMc 0 gt tceilMc MG_WATT_MAX_TCEIL
+    ret false
+  end
+  ws_sense_zones
+  st = new WattThermal 0 0 0
+  if not ws_fill_thermal_state st
+    ret false
+  end
+  pol = new WattPolicy 120000 80000 long tceilMc 2
+  if wc_must_fail_closed st pol
+    ret false
+  end
+  pr = new WattProp long pwrMw 15000 5000 50
+  cmd = new WattCmd 0 0 0 0 0 0
+  wc_cbf_filter st pol pr cmd
+  if or ne get cmd fail_closed 0 ne get cmd p_gpu long pwrMw
+    ret false
+  end
+  dt = wc_next_die_delta st get cmd p_gpu get cmd p_cpu get cmd p_unc
+  bh = wc_barrier_h get pol t_ceil get st t_die get pol tau dt
+  ret ge bh 0
+end
+
+fn mg_contract_ok to bool
+  pn = get mg_p_chips_n 0
+  p = new uchar 4096 0
+  for i ulong pn bound 4096
+    put p i get mg_p_chips i
+  end
+  if ne ctLoadFile p pn 0
+    ret false
+  end
+  cid = ctFindChip mg_t_sm121 5
+  if eq cid CT_MISSING
+    ret false
+  end
+  rc = ctCheckRecipe cid get mg_cfg 5 get mg_cfg 6 get mg_cfg 7 get mg_cfg 8 get mg_cfg 9
+  ret eq rc TDK_OK
+end
+
+fn mg_verify_all to int
+  n = get mg_pkg_len 0
+  if or lt n 260 gt n 32768
+    ret MG_ERR_FORMAT
+  end
+  for j ulong 6
+    if ne get mg_pkg j get mg_t_magic j
+      ret MG_ERR_FORMAT
+    end
+  end
+  if ne mg_u16 6 MG_VERSION
+    ret MG_ERR_FORMAT
+  end
+  on = mg_u32 56
+  en = mg_u32 60
+  if or lt on 32 gt on 8192
+    ret MG_ERR_FORMAT
+  end
+  if or lt en 36 gt en 16384
+    ret MG_ERR_FORMAT
+  end
+  if ne add MG_HDR_LEN add on en n
+    ret MG_ERR_FORMAT
+  end
+  if not mg_ed_ok
+    ret MG_ERR_ED25519
+  end
+  if not mg_sha_ok
+    ret MG_ERR_SHA256
+  end
+  for i ulong on bound 8192
+    put mg_oir i get mg_pkg add MG_HDR_LEN i
+  end
+  put mg_oir_len 0 on
+  pwrMw = mg_u32 16
+  if not mg_sem_ok pwrMw
+    ret MG_ERR_SEM_ID
+  end
+  eoff = add MG_HDR_LEN on
+  for i ulong en bound 16384
+    put mg_egp i get mg_pkg add eoff i
+  end
+  put mg_egp_len 0 en
+  if not mg_egp_ok
+    ret MG_ERR_EGP3
+  end
+  if not mg_om3_ok
+    ret MG_ERR_OM3
+  end
+  tceilMc = mg_u32 20
+  if not mg_watt_ok pwrMw tceilMc
+    ret MG_ERR_WATTCBF
+  end
+  put mg_cfg 5 mg_u64 24
+  put mg_cfg 6 mg_u32 32
+  put mg_cfg 7 mg_u32 36
+  put mg_cfg 8 mg_u64 40
+  put mg_cfg 9 mg_u64 48
+  put mg_cfg 10 pwrMw
+  put mg_cfg 11 tceilMc
+  if not mg_contract_ok
+    ret MG_ERR_CONTRACT
+  end
+  ret 0
+end
+
+fn mg_eval_op op ulong a ulong b ulong to ulong
+  if eq op MG_OIR_ADD
+    ret and add a b 4294967295
+  end
+  if eq op MG_OIR_MUL
+    ret and mul a b 4294967295
+  end
+  ret and sub a b 4294967295
+end
+
+fn mg_sass_op op ulong to ulong
+  if eq op MG_OIR_ADD
+    ret 14
+  end
+  if eq op MG_OIR_MUL
+    ret 8
+  end
+  ret 0
+end
+
+fn mg_qcw st ulong wb ulong rbar ulong wt ulong yld ulong to ulong
+  a = or shl st 9 shl yld 13
+  b = or shl wb 14 shl rbar 17
+  ret or or a b shl wt 20
+end
+
+fn mg_set_ins idx ulong op ulong d ulong s1 ulong s2 ulong to void
+  b = mul idx 8
+  put mg_ins b op
+  put mg_ins add b 1 d
+  put mg_ins add b 2 s1
+  put mg_ins add b 3 s2
+  put mg_ins add b 4 MG_NONE
+  put mg_ins add b 5 MG_NONE
+  put mg_ins add b 6 0
+  put mg_ins add b 7 0
+end
+
+fn mg_set_ctl idx ulong s3 ulong uregv ulong immv ulong ctw ulong to void
+  b = mul idx 8
+  put mg_ins add b 4 s3
+  put mg_ins add b 5 uregv
+  put mg_ins add b 6 or and immv 4294967295 shl ctw 32
+end
+
+fn mg_emit_sm121_sass to ulong
+  for i ulong 288
+    put mg_phys i i
+  end
+  sop1 = mg_sass_op get mg_cfg 3
+  sop2 = mg_sass_op get mg_cfg 4
+  if or eq sop1 0 eq sop2 0
+    ret 0
+  end
+  cAlu = mg_qcw 6 7 7 0 0
+  mg_set_ins 0 7 4 MG_NONE MG_NONE
+  mg_set_ctl 0 MG_NONE 4 856 mg_qcw 4 2 7 0 1
+  mg_set_ins 1 5 0 MG_NONE MG_NONE
+  mg_set_ctl 1 MG_NONE 4 896 mg_qcw 4 0 7 0 1
+  mg_set_ins 2 0 MG_NONE MG_NONE MG_NONE
+  mg_set_ctl 2 MG_NONE MG_NONE 0 mg_qcw 6 7 7 7 0
+  mg_set_ins 3 2 4 MG_NONE MG_NONE
+  mg_set_ctl 3 MG_NONE MG_NONE get mg_cfg 0 cAlu
+  mg_set_ins 4 2 8 MG_NONE MG_NONE
+  mg_set_ctl 4 MG_NONE MG_NONE get mg_cfg 1 cAlu
+  mg_set_ins 5 2 12 MG_NONE MG_NONE
+  mg_set_ctl 5 MG_NONE MG_NONE get mg_cfg 2 cAlu
+  s3a = ulong MG_NONE
+  if eq sop1 8
+    s3a = ulong 255
+  end
+  mg_set_ins 6 sop1 16 4 8
+  mg_set_ctl 6 s3a MG_NONE 0 cAlu
+  s3b = ulong MG_NONE
+  if eq sop2 8
+    s3b = ulong 255
+  end
+  mg_set_ins 7 sop2 20 16 12
+  mg_set_ctl 7 s3b MG_NONE 0 cAlu
+  mg_set_ins 8 12 MG_NONE 0 20
+  mg_set_ctl 8 MG_NONE 4 0 mg_qcw 4 7 1 0 1
+  mg_set_ins 9 0 MG_NONE MG_NONE MG_NONE
+  mg_set_ctl 9 MG_NONE MG_NONE 0 mg_qcw 6 7 7 2 0
+  mg_set_ins 10 45 MG_NONE MG_NONE MG_NONE
+  mg_set_ctl 10 MG_NONE MG_NONE 0 1042944
+  lins = new ulong 8192 0
+  lphys = new ulong 288 0
+  lcode = new uchar 16384 0
+  for i ulong 88
+    put lins i get mg_ins i
+  end
+  for i ulong 288
+    put lphys i get mg_phys i
+  end
+  lnb = bw_enc_sm121 lins lphys 11 1 lcode
+  for i ulong lnb bound 16384
+    put mg_code i get lcode i
+  end
+  ret lnb
+end
+
+fn mg_gpu_init_and_load nb ulong to bool
+  if not nvfull
+    ret false
+  end
+  if not nvchan
+    ret false
+  end
+  for i ulong 5
+    m = nvalloc 65536 false
+    if le m 0
+      ret false
+    end
+    put gbmem i m
+  end
+  om = nvalloc 65536 true
+  if le om 0
+    ret false
+  end
+  put mg_out_map 0 om
+  put gbmem 5 om
+  put gbmem 6 om
+  put gbmem 7 om
+  ret eq mapwrite get gbmem 4 0 mg_code 0 nb long nb
+end
+
+fn mg_gpu_build_cmd to bool
+  gbqmd 1
+  a = mapaddr get gbmem 4
+  put gbq1 32 gblo shr a 4
+  put gbq1 33 or uint and shr a 36 2097151 20971520
+  put gbq1 59 gblo shr a 8
+  put gbq1 34 or uint 65536 uint 32
+  put gbq1 35 or uint 131073 shl uint 64 8
+  put gbq1 36 78923784
+  put gbq1 37 0
+  put gbq1 39 1
+  put gbq1 40 1
+  put gbq1 41 1
+  put gbcb 216 32
+  put gbcb 220 1
+  put gbcb 221 1
+  put gbcb 222 1
+  cb = mapaddr get gbmem 1
+  endva = add cb 908
+  put gbcb 212 gbhi endva
+  put gbcb 213 gblo endva
+  put gbused 0 0
+  gbsetup
+  gbmth 0 40 4
+  gbemit 0
+  gbemit 0
+  gbemit 0
+  gbemit 2281701376
+  gbdma cb 224
+  for j ulong 224
+    gbemit get gbcb j
+  end
+  outVa = mapaddr get mg_out_map 0
+  gbdma add cb 896 3
+  gbemit gblo outVa
+  gbemit gbhi outVa
+  gbemit 0
+  q = mapaddr get gbmem 2
+  gbinline q false
+  gbdma add q 8192 1
+  gbemit 1
+  gbinline add q 4096 true
+  gbrel add mapaddr get gbmem 3 32 6
+  gbtail
+  nb = get gbused 0
+  if ne mapwrite get gbmem 0 0 gbcmd 0 nb long nb
+    ret false
+  end
+  put mg_cmd_len 0 uint div nb 4
+  ret true
+end
+
+fn mg_gpu_exec_wait to bool
+  r0 = mapset get mg_out_map 0 0 4 MG_SENTINEL
+  r1 = mapset get gbmem 2 8192 4 0
+  r2 = mapset get gbmem 3 0 4 0
+  r3 = mapset get gbmem 3 16 4 0
+  if not nvsend get gbmem 0 0 get mg_cmd_len 0
+    ret false
+  end
+  t0 = monons
+  while lt ulong sub monons t0 5000000000 bound 2000000
+    if eq mapget get gbmem 3 16 4 1179010630
+      put nvret 0 get nvput 0
+      ret eq mapget get gbmem 3 0 4 1145324612
+    end
+    rs = sleepns long 5000
+  end
+  ret false
+end
+
+fn mg_copy_arg idx ulong to bool
+  if ge idx ulong argcnt
+    ret false
+  end
+  n = argread idx mg_abuf 0 4095
+  if le n 0
+    ret false
+  end
+  un = ulong n
+  for i ulong un bound 4096
+    put mg_p_in i get mg_abuf i
+  end
+  put mg_p_in_n 0 un
+  ret true
+end
+
+fn mg_copy_chips to void
+  if gt argcnt 2
+    n = argread 2 mg_abuf 0 4095
+    if gt n 0
+      un = ulong n
+      for i ulong un bound 4096
+        put mg_p_chips i get mg_abuf i
+      end
+      put mg_p_chips_n 0 un
+      ret
+    end
+  end
+  dn = len mg_t_def_chips
+  for i ulong dn bound 256
+    put mg_p_chips i get mg_t_def_chips i
+  end
+  put mg_p_chips_n 0 dn
+end
+
+fn main to int
+  if not mg_copy_arg 1
+    mg_wrt 2 mg_m_use
+    ret MG_ERR_USAGE
+  end
+  mg_copy_chips
+  if not mg_read_pkg
+    mg_fail MG_ERR_IO
+  end
+  vrc = mg_verify_all
+  if ne vrc 0
+    mg_fail vrc
+  end
+  t1 = mg_eval_op get mg_cfg 3 get mg_cfg 0 get mg_cfg 1
+  expV = mg_eval_op get mg_cfg 4 t1 get mg_cfg 2
+  nb = mg_emit_sm121_sass
+  if eq nb 0
+    mg_fail MG_ERR_CONTRACT
+  end
+  mg_wrt 1 mg_m_auth
+  mg_wrt_u 1 ulong get g_wmeta 5
+  mg_wrt 1 mg_m_pwr
+  mg_wrt_u 1 get mg_cfg 10
+  mg_wrt 1 mg_m_exp
+  mg_wrt_u 1 expV
+  mg_wrt 1 mg_m_nl
+  if not mg_gpu_init_and_load nb
+    st0 = nvstop
+    mg_fail MG_ERR_GPU
+  end
+  if not mg_gpu_build_cmd
+    st1 = nvstop
+    mg_fail MG_ERR_GPU
+  end
+  if not mg_gpu_exec_wait
+    st2 = nvstop
+    mg_fail MG_ERR_GPU
+  end
+  got = ulong mapget get mg_out_map 0 0 4
+  st3 = nvstop
+  if ne got expV
+    mg_fail MG_ERR_GPU
+  end
+  mg_wrt 1 mg_m_pass
+  mg_wrt_u 1 got
+  mg_wrt 1 mg_m_exp
+  mg_wrt_u 1 expV
+  mg_wrt 1 mg_m_sbyt
+  mg_wrt_u 1 nb
+  mg_wrt 1 mg_m_nl
+  ret 0
+end
