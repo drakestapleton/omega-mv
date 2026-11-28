@@ -1,0 +1,429 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/omega-mindmesh/mindmesh_gb10_run.om
+note Coordinator Phase 2 Silicon Pass D: Cryptographically bind sealed 3-host OMMM01
+note convergence manifest + Stage 1 OMMP01 + live WattCBF (< 80 W) BEFORE launching
+note morph_gb10_run on the physical DGX Spark GB10 SM121 GPU.
+note
+note Compose after:
+note   si/directives/om2.om
+note   apps/omega-wattd/watt_sense.om
+note   apps/omega-wattd/watt_cbf.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note
+note Usage:
+note   mindmesh_gb10_run <mindmesh.ommm> <k1.ommp> <morph_gb10_run_bin> <chips.tsv>
+note Exits:
+note   0  = OMMM01 verified, s1_ommp_sha256 matched, live WattCBF < 80 W OK, GB10 PASS
+note   2  = usage error (zero /dev/nvidia* opens)
+note   10 = file I/O error (zero /dev/nvidia* opens)
+note   12 = WattCBF fail-closed refusal >= 80 W or sensor error (zero /dev/nvidia* opens)
+note   18 = OMMM01 manifest verification failure (zero /dev/nvidia* opens)
+note   19 = s1_ommp_sha256 binding mismatch against k1.ommp (zero /dev/nvidia* opens)
+note   20 = morph_gb10_run child failure
+
+const MGB_OK int 0
+const MGB_ERR_USE int 2
+const MGB_ERR_IO int 10
+const MGB_ERR_WATTCBF int 12
+const MGB_ERR_MAN int 18
+const MGB_ERR_BIND int 19
+const MGB_ERR_GPU int 20
+
+const MGB_MAN_LEN ulong 512
+const MGB_MAX_OMMP ulong 65536
+const MGB_MAX_WATT ulong 79999
+
+global g_mgb_man uchar 512
+global g_mgb_ommp uchar 65536
+global g_mgb_io uchar 65536
+global g_mgb_paths uchar 8192
+global g_mgb_plen ulong 4
+global g_mgb_pkt uchar 8192
+global g_mgb_pktlen ulong 1
+global g_mgb_numbuf uchar 64
+global g_mgb_hex uchar 64
+global g_mgb_st ulong 4
+
+text mgb_t_magic "OMMM01"
+text mgb_dom_body "OMMM01-BODY-V1"
+text mgb_t_hex "0123456789abcdef"
+text mgb_m_use "usage: mindmesh_gb10_run <mindmesh.ommm> <k1.ommp> <morph_gb10_run_bin> <chips.tsv>\n"
+text mgb_m_pass1 "MINDMESH_GB10_PASS ommm01=OK s1_bind=OK watt_mw="
+text mgb_m_pass2 " tdie_mc="
+text mgb_m_pass3 " morph_exit=0 c6="
+text mgb_m_nl "\n"
+
+fn mgb_puts fd int s view uchar * to void
+  pos = ulong 0
+  n = len s
+  while lt pos n bound 1024
+    w = write fd s pos sub n pos
+    if le w 0
+      ret
+    end
+    pos = add pos ulong w
+  end
+end
+
+fn mgb_putn v ulong to void
+  if eq v 0
+    put g_mgb_numbuf 0 48
+    w = write int 1 g_mgb_numbuf 0 1
+    ret
+  end
+  idx = ulong 0
+  cur = v
+  while gt cur 0 bound 32
+    put g_mgb_numbuf idx uchar add 48 rem cur 10
+    idx = add idx 1
+    cur = div cur 10
+  end
+  for i ulong idx bound 32
+    put g_mgb_numbuf add 32 i get g_mgb_numbuf sub sub idx 1 i
+  end
+  w2 = write int 1 g_mgb_numbuf 32 idx
+end
+
+fn mgb_put_c6 to void
+  for i ulong 32
+    b = ulong get g_mgb_man add 256 i
+    put g_mgb_hex mul i 2 get mgb_t_hex shr b 4
+    put g_mgb_hex add mul i 2 1 get mgb_t_hex and b 15
+  end
+  w = write int 1 g_mgb_hex 0 64
+end
+
+fn mgb_read_arg slot ulong argi ulong to bool
+  tmp = new uchar 2048 0
+  sn = argread argi tmp 0 2040
+  if le sn 0
+    ret false
+  end
+  n = ulong sn
+  base = mul slot 2048
+  for i ulong n bound 2040
+    put g_mgb_paths add base i get tmp i
+  end
+  put g_mgb_paths add base n 0
+  put g_mgb_plen slot n
+  ret true
+end
+
+fn mgb_read_exact slot ulong dst ulong cap ulong to long
+  fd = fopen g_mgb_paths mul slot 2048 get g_mgb_plen slot 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while true bound 256
+    k = read int fd g_mgb_io 0 65536
+    if lt k 0
+      r = fclose int fd
+      ret -1
+    end
+    if eq k 0
+      break
+    end
+    nk = ulong k
+    if gt add tot nk cap
+      r = fclose int fd
+      ret -1
+    end
+    for i ulong nk bound 65536
+      if eq dst 0
+        put g_mgb_man add tot i get g_mgb_io i
+      else
+        put g_mgb_ommp add tot i get g_mgb_io i
+      end
+    end
+    tot = add tot nk
+  end
+  r2 = fclose int fd
+  ret long tot
+end
+
+fn mgb_u16 off ulong to ulong
+  b0 = ulong get g_mgb_man off
+  b1 = ulong get g_mgb_man add off 1
+  ret or b0 shl b1 8
+end
+
+fn mgb_u32 off ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    v = or v shl ulong get g_mgb_man add off i mul i 8
+  end
+  ret v
+end
+
+fn mgb_u64 off ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get g_mgb_man add off i mul i 8
+  end
+  ret v
+end
+
+fn mgb_verify_man_fields to int
+  for i ulong 6
+    if ne get g_mgb_man i get mgb_t_magic i
+      ret MGB_ERR_MAN
+    end
+  end
+  if ne mgb_u16 6 1
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 12 63
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 84 0
+    ret MGB_ERR_MAN
+  end
+  wmw = mgb_u64 16
+  if eq wmw 0
+    ret MGB_ERR_MAN
+  end
+  if gt wmw MGB_MAX_WATT
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 32 48
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 36 1
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 40 0
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 44 1
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 64 3
+    ret MGB_ERR_MAN
+  end
+  if eq mgb_u32 68 0
+    ret MGB_ERR_MAN
+  end
+  if le mgb_u32 76 mgb_u32 72
+    ret MGB_ERR_MAN
+  end
+  if ne mgb_u32 80 5
+    ret MGB_ERR_MAN
+  end
+  put g_mgb_st 0 wmw
+  ret MGB_OK
+end
+
+fn mgb_verify_man_commits to int
+  for s ulong 6
+    base = add 96 mul s 32
+    nz = false
+    for j ulong 32
+      if ne get g_mgb_man add base j 0
+        nz = true
+        break
+      end
+    end
+    if not nz
+      ret MGB_ERR_MAN
+    end
+  end
+  dn = len mgb_dom_body
+  for i ulong dn bound 32
+    put sh_dat i get mgb_dom_body i
+  end
+  put sh_dat dn 0
+  bo = add dn 1
+  for i ulong 384
+    put sh_dat add bo i get g_mgb_man i
+  end
+  sh_all add bo 384
+  for i ulong 32
+    if ne get g_mgb_man add 384 i get sh_dig i
+      ret MGB_ERR_MAN
+    end
+  end
+  ret MGB_OK
+end
+
+fn mgb_verify_man_sig to int
+  pk = new uchar 32 0
+  msg = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get g_mgb_man add 416 i
+  end
+  for i ulong 416
+    put msg i get g_mgb_man i
+  end
+  for i ulong 64
+    put sg i get g_mgb_man add 448 i
+  end
+  if ne edverify pk msg 416 sg 0 1
+    ret MGB_ERR_MAN
+  end
+  ret MGB_OK
+end
+
+fn mgb_verify_man n ulong to int
+  if ne n MGB_MAN_LEN
+    ret MGB_ERR_MAN
+  end
+  rc1 = mgb_verify_man_fields
+  if ne rc1 MGB_OK
+    ret rc1
+  end
+  rc2 = mgb_verify_man_commits
+  if ne rc2 MGB_OK
+    ret rc2
+  end
+  ret mgb_verify_man_sig
+end
+
+fn mgb_verify_ommp_bind ommp_n ulong to int
+  if lt ommp_n 224
+    ret MGB_ERR_BIND
+  end
+  for i ulong ommp_n bound 65536
+    put sh_dat i get g_mgb_ommp i
+  end
+  sh_all ommp_n
+  for i ulong 32
+    if ne get g_mgb_man add 288 i get sh_dig i
+      ret MGB_ERR_BIND
+    end
+  end
+  ret MGB_OK
+end
+
+fn mgb_check_watt prop_mw ulong to int
+  ws_sense_all
+  if ne get g_wmeta 12 0
+    ret MGB_ERR_WATTCBF
+  end
+  st = new WattThermal 0 0 0
+  live_ok = ws_fill_thermal_state st
+  if not live_ok
+    ret MGB_ERR_WATTCBF
+  end
+  pol = new WattPolicy 140000 79999 88000 2
+  prop = new WattProp long prop_mw 25000 10000 75
+  cmd = new WattCmd 0 0 0 0 0 0
+  if wc_must_fail_closed st pol
+    ret MGB_ERR_WATTCBF
+  end
+  wc_cbf_filter st pol prop cmd
+  if ne get cmd fail_closed 0
+    ret MGB_ERR_WATTCBF
+  end
+  if ne get cmd clamped 0
+    ret MGB_ERR_WATTCBF
+  end
+  if le get cmd p_gpu 0
+    ret MGB_ERR_WATTCBF
+  end
+  if gt get cmd p_gpu 79999
+    ret MGB_ERR_WATTCBF
+  end
+  td = get st t_die
+  if lt td 0
+    td = 0
+  end
+  put g_mgb_st 1 ulong td
+  ret MGB_OK
+end
+
+fn mgb_pkt_push slot ulong to void
+  ln = get g_mgb_plen slot
+  pos = get g_mgb_pktlen 0
+  put g_mgb_pkt pos uchar and ln 255
+  put g_mgb_pkt add pos 1 uchar and shr ln 8 255
+  pos = add pos 2
+  sb = mul slot 2048
+  for i ulong ln bound 2048
+    put g_mgb_pkt add pos i get g_mgb_paths add sb i
+  end
+  put g_mgb_pktlen 0 add pos ln
+end
+
+fn mgb_launch_morph to int
+  put g_mgb_pkt 0 3
+  put g_mgb_pkt 1 0
+  put g_mgb_pktlen 0 2
+  mgb_pkt_push 2
+  mgb_pkt_push 1
+  mgb_pkt_push 3
+  pid = fork
+  if lt pid 0
+    ret MGB_ERR_GPU
+  end
+  if eq pid 0
+    xr = execprog g_mgb_pkt 0 get g_mgb_pktlen 0
+    exit int 254
+  end
+  st = new uchar 4 0
+  wr = waitpid int pid st 0 4 0
+  if ne wr pid
+    ret MGB_ERR_GPU
+  end
+  if ne get st 0 0
+    ret MGB_ERR_GPU
+  end
+  if ne get st 1 0
+    ret MGB_ERR_GPU
+  end
+  ret MGB_OK
+end
+
+fn main to int
+  if ne argcnt 5
+    mgb_puts 2 mgb_m_use
+    ret MGB_ERR_USE
+  end
+  if not mgb_read_arg 0 1
+    ret MGB_ERR_IO
+  end
+  if not mgb_read_arg 1 2
+    ret MGB_ERR_IO
+  end
+  if not mgb_read_arg 2 3
+    ret MGB_ERR_IO
+  end
+  if not mgb_read_arg 3 4
+    ret MGB_ERR_IO
+  end
+  mn = mgb_read_exact 0 0 MGB_MAN_LEN
+  if lt mn 0
+    ret MGB_ERR_IO
+  end
+  kn = mgb_read_exact 1 1 MGB_MAX_OMMP
+  if lt kn 0
+    ret MGB_ERR_IO
+  end
+  rc1 = mgb_verify_man ulong mn
+  if ne rc1 MGB_OK
+    ret rc1
+  end
+  rc2 = mgb_verify_ommp_bind ulong kn
+  if ne rc2 MGB_OK
+    ret rc2
+  end
+  rc3 = mgb_check_watt get g_mgb_st 0
+  if ne rc3 MGB_OK
+    ret rc3
+  end
+  rc4 = mgb_launch_morph
+  if ne rc4 MGB_OK
+    ret rc4
+  end
+  mgb_puts 1 mgb_m_pass1
+  mgb_putn get g_mgb_st 0
+  mgb_puts 1 mgb_m_pass2
+  mgb_putn get g_mgb_st 1
+  mgb_puts 1 mgb_m_pass3
+  mgb_put_c6
+  mgb_puts 1 mgb_m_nl
+  ret MGB_OK
+end
