@@ -1,0 +1,1524 @@
+note emit_vsa_ir.om: Pure seeded-OM-2 OmegaIR generator for vsa_worker (10,240-bit OMVSA1 NEON SIMD).
+note Concatenated after seed/ng/src/ir.om and compiled strictly by pinned omc.
+note Features:
+note   - 128-bit NEON SIMD (vec f32 4): FMUL.4S bipolar XOR/bind, 4-accumulator FMLA.4S
+note     similarity accumulation, FADD.4S bundle superposition.
+note   - 64-bit packed SWAR XOR + Hamming popcount kernel (cmd=4) for dual parity & comparison.
+note   - Constant-bound loop & array guards unlocking Bounds-Check Elimination (BCE),
+note     LICM constant hoisting, and loop rotation (ROT) via `@ng opt`.
+
+global vs_t uint 32
+global vs_g uint 32
+global vs_fn uint 32
+global vs_b uint 16
+global vs_v uint 128
+global vs_l uint 16
+
+note ---- Low-level IR construction helpers (<= 6 params, minimal locals) ----
+
+fn vs_k b uint ty uint v ulong to uint
+  o = ir_op b 1 ty v 0
+  ret ir_res o
+end
+
+fn vs_b2 b uint op uint ty uint x uint y uint to uint
+  o = ir_op b op ty 0 2
+  ir_set o 0 x
+  ir_set o 1 y
+  ret ir_res o
+end
+
+fn vs_u1 b uint op uint ty uint im ulong x uint to uint
+  o = ir_op b op ty im 1
+  ir_set o 0 x
+  ret ir_res o
+end
+
+fn vs_sel b uint ty uint c uint x uint y uint to uint
+  o = ir_op b 2 ty 0 3
+  ir_set o 0 c
+  ir_set o 1 x
+  ir_set o 2 y
+  ret ir_res o
+end
+
+fn vs_ga b uint rty uint gid uint to uint
+  o = ir_op b 52 rty ulong gid 0
+  ret ir_res o
+end
+
+fn vs_bnd b uint t uint r uint idx uint nel ulong to uint
+  o = vs_k b 5 nel
+  x = ir_op b 79 0 3 4
+  ir_set x 0 t
+  ir_set x 1 r
+  ir_set x 2 idx
+  ir_set x 3 o
+  ret ir_otok x
+end
+
+fn vs_slc b uint t uint r uint off uint n uint to uint
+  o = ir_op b 80 0 3 4
+  ir_set o 0 t
+  ir_set o 1 r
+  ir_set o 2 off
+  ir_set o 3 n
+  ret ir_otok o
+end
+
+fn vs_ld b uint ty uint t uint r uint idx uint to uint
+  o = ir_op b 42 ty 0 3
+  ir_set o 0 t
+  ir_set o 1 r
+  ir_set o 2 idx
+  ret ir_res o
+end
+
+fn vs_st b uint t uint r uint idx uint val uint to uint
+  o = ir_op b 43 0 0 4
+  ir_set o 0 t
+  ir_set o 1 r
+  ir_set o 2 idx
+  ir_set o 3 val
+  ret ir_otok o
+end
+
+fn vs_vld b uint vty uint t uint r uint idx uint to uint
+  o = ir_op b 58 vty 0 3
+  ir_set o 0 t
+  ir_set o 1 r
+  ir_set o 2 idx
+  ret ir_res o
+end
+
+fn vs_vst b uint t uint r uint idx uint val uint to uint
+  o = ir_op b 59 0 0 4
+  ir_set o 0 t
+  ir_set o 1 r
+  ir_set o 2 idx
+  ir_set o 3 val
+  ret ir_otok o
+end
+
+fn vs_vsplt b uint vty uint x uint to uint
+  o = ir_op b 100 vty 0 1
+  ir_set o 0 x
+  ret ir_res o
+end
+
+fn vs_vext b uint ety uint lane ulong v uint to uint
+  o = ir_op b 101 ety lane 1
+  ir_set o 0 v
+  ret ir_res o
+end
+
+fn vs_fma b uint vty uint a uint x uint c uint to uint
+  o = ir_op b 46 vty 0 3
+  ir_set o 0 a
+  ir_set o 1 x
+  ir_set o 2 c
+  ret ir_res o
+end
+
+fn vs_bd_ld b uint ty uint t uint r uint idx uint to uint
+  x = vs_bnd b t r idx 1
+  put vs_l 0 x
+  ret vs_ld b ty x r idx
+end
+
+fn vs_bd_st b uint t uint r uint idx uint val uint to uint
+  x = vs_bnd b t r idx 1
+  ret vs_st b x r idx val
+end
+
+fn vs_bd_vld b uint vty uint t uint r uint idx uint to uint
+  x = vs_bnd b t r idx 4
+  put vs_l 0 x
+  ret vs_vld b vty x r idx
+end
+
+fn vs_bd_vst b uint t uint r uint idx uint val uint to uint
+  x = vs_bnd b t r idx 4
+  ret vs_vst b x r idx val
+end
+
+fn vs_cbr b uint t uint c uint bt uint bf uint to void
+  o = ir_op b 61 0 0 4
+  ir_set o 0 t
+  ir_set o 1 c
+  ir_set o 2 bt
+  ir_set o 3 bf
+end
+
+fn vs_br0 b uint dst uint t uint to void
+  o = ir_op b 60 0 0 2
+  ir_set o 0 dst
+  ir_set o 1 t
+end
+
+fn vs_br1 b uint dst uint t uint v1 uint to void
+  o = ir_op b 60 0 0 3
+  ir_set o 0 dst
+  ir_set o 1 t
+  ir_set o 2 v1
+end
+
+fn vs_br2 b uint dst uint t uint v1 uint v2 uint to void
+  o = ir_op b 60 0 0 4
+  ir_set o 0 dst
+  ir_set o 1 t
+  ir_set o 2 v1
+  ir_set o 3 v2
+end
+
+fn vs_brn b uint dst uint t uint n uint to void
+  o = ir_op b 60 0 0 add n 2
+  ir_set o 0 dst
+  ir_set o 1 t
+  for k ulong ulong n bound 12
+    ir_set o uint add k 2 get vs_v add 80 k
+  end
+end
+
+fn vs_ret b uint t uint to void
+  o = ir_op b 62 0 0 1
+  ir_set o 0 t
+end
+
+fn vs_retv b uint t uint v uint to void
+  o = ir_op b 63 0 0 2
+  ir_set o 0 t
+  ir_set o 1 v
+end
+
+fn vs_exit b uint t uint code ulong to void
+  x = vs_k b 8 code
+  o = ir_op b 66 0 0 2
+  ir_set o 0 t
+  ir_set o 1 x
+end
+
+fn vs_host_rw b uint t uint wid ulong rf uint off uint cnt uint to uint
+  x = vs_slc b t rf off cnt
+  o = ir_op b 110 9 wid 5
+  ir_set o 0 x
+  ir_set o 1 get vs_l 1
+  ir_set o 2 rf
+  ir_set o 3 off
+  ir_set o 4 cnt
+  ret o
+end
+
+fn vs_call0 b uint t uint f_h uint rty uint to uint
+  o = ir_op b 64 rty 0 2
+  ir_set o 0 t
+  ir_set o 1 f_h
+  ret o
+end
+
+fn vs_call1 b uint t uint f_h uint rty uint a0 uint to uint
+  o = ir_op b 64 rty 0 3
+  ir_set o 0 t
+  ir_set o 1 f_h
+  ir_set o 2 a0
+  ret o
+end
+
+fn vs_call2 b uint t uint f_h uint rty uint a0 uint a1 uint to uint
+  o = ir_op b 64 rty 0 4
+  ir_set o 0 t
+  ir_set o 1 f_h
+  ir_set o 2 a0
+  ir_set o 3 a1
+  ret o
+end
+
+note ---- Types & Globals ----
+fn vs_mk_ag e ulong cnt ulong ts ulong gs ulong to void
+  ar = ir_tarr uint e uint cnt
+  put vs_t ts ir_tref ar 1 0
+  put vs_g gs ir_glob ar 0
+end
+
+fn vs_init_tg to void
+  put vs_t 0 ir_tvec 13 4
+  vs_mk_ag 2 65536 1 0
+  vs_mk_ag 5 16 2 1
+  vs_mk_ag 5 10240 3 2
+  put vs_g 3 ir_glob ir_tarr 5 10240 0
+  put vs_g 4 ir_glob ir_tarr 5 10240 0
+  put vs_g 5 ir_glob ir_tarr 5 10240 0
+  vs_mk_ag 5 256 4 6
+  vs_mk_ag 13 163840 5 7
+  for k ulong 3 bound 4
+    put vs_g add 8 k ir_glob ir_tarr 13 163840 0
+  end
+  vs_mk_ag 13 2560 6 11
+  for k ulong 15 bound 16
+    put vs_g add 12 k ir_glob ir_tarr 13 2560 0
+  end
+  vs_mk_ag 5 160 7 27
+end
+
+note ---- Pipe I/O functions (<= 6 locals per fn) ----
+fn vs_mk_io_exact wid ulong fd_c ulong e_code ulong to uint
+  f = ir_fnew 0 0 0
+  put vs_v 0 ir_fpar f 5
+  for i ulong 6 bound 7
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  put vs_v 1 vs_ga b get vs_t 1 get vs_g 0
+  put vs_v 2 vs_k b 8 fd_c
+  x = vs_k b 5 0
+  vs_br1 b get vs_b 1 ir_ftok f x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 3 x
+  y = vs_b2 b 32 1 x get vs_v 0
+  vs_cbr b ir_btok b y get vs_b 2 get vs_b 5
+
+  b = get vs_b 2
+  x = vs_b2 b 11 5 get vs_v 0 get vs_v 3
+  put vs_l 1 get vs_v 2
+  x = vs_host_rw b ir_btok b wid get vs_v 1 get vs_v 3 x
+  put vs_v 4 ir_res x
+  y = vs_k b 9 0
+  y = vs_b2 b 33 1 get vs_v 4 y
+  t = ir_otok x
+  vs_cbr b t y get vs_b 4 get vs_b 3
+
+  b = get vs_b 4
+  vs_exit b ir_btok b e_code
+
+  b = get vs_b 3
+  x = vs_u1 b 36 5 0 get vs_v 4
+  y = vs_b2 b 10 5 get vs_v 3 x
+  vs_br1 b get vs_b 1 ir_btok b y
+
+  b = get vs_b 5
+  vs_ret b ir_btok b
+  ret f
+end
+
+fn vs_mk_unpack_u64 to uint
+  f = ir_fnew 0 0 5
+  off = ir_fpar f 5
+  b = ir_blk f
+  rf = vs_ga b get vs_t 1 get vs_g 0
+  t = ir_ftok f
+  acc = vs_k b 5 0
+  for k ulong 8 bound 9
+    x = off
+    if gt k 0
+      y = vs_k b 5 k
+      x = vs_b2 b 10 5 off y
+    end
+    y = vs_bd_ld b 2 t rf x
+    t = get vs_l 0
+    x = vs_u1 b 36 5 0 y
+    if gt k 0
+      y = vs_k b 5 mul k 8
+      x = vs_b2 b 20 5 x y
+    end
+    acc = vs_b2 b 17 5 acc x
+  end
+  vs_retv b t acc
+  ret f
+end
+
+fn vs_mk_pack_u64 to uint
+  f = ir_fnew 0 0 0
+  off = ir_fpar f 5
+  val = ir_fpar f 5
+  b = ir_blk f
+  rf = vs_ga b get vs_t 1 get vs_g 0
+  t = ir_ftok f
+  for k ulong 8 bound 9
+    x = off
+    y = val
+    if gt k 0
+      z = vs_k b 5 k
+      x = vs_b2 b 10 5 off z
+      z = vs_k b 5 mul k 8
+      y = vs_b2 b 21 5 val z
+    end
+    y = vs_u1 b 36 2 0 y
+    t = vs_bd_st b t rf x y
+  end
+  vs_ret b t
+  ret f
+end
+
+fn vs_mk_rd_u64_arr ty_slot ulong g_slot ulong max_sz ulong to uint
+  f = ir_fnew 0 0 0
+  put vs_v 4 ir_fpar f 5
+  put vs_v 5 ir_fpar f 5
+  for i ulong 8 bound 9
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 0
+  vs_br1 b get vs_b 1 ir_ftok f x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 6 x
+  y = vs_b2 b 32 1 x get vs_v 5
+  vs_cbr b ir_btok b y get vs_b 2 get vs_b 6
+
+  b = get vs_b 2
+  x = vs_b2 b 11 5 get vs_v 5 get vs_v 6
+  y = vs_k b 5 4096
+  z = vs_b2 b 34 1 x y
+  x = vs_sel b 5 z y x
+  put vs_v 0 x
+  y = vs_k b 5 8
+  x = vs_b2 b 12 5 x y
+  x = vs_call1 b ir_btok b get vs_fn 0 0 x
+  y = vs_k b 5 0
+  t = ir_otok x
+  vs_br1 b get vs_b 3 t y
+
+  b = get vs_b 3
+  x = ir_bpar b 5
+  put vs_v 1 x
+  y = vs_b2 b 32 1 x get vs_v 0
+  vs_cbr b ir_btok b y get vs_b 4 get vs_b 5
+
+  b = get vs_b 4
+  y = vs_k b 5 8
+  x = vs_b2 b 12 5 get vs_v 1 y
+  x = vs_call1 b ir_btok b get vs_fn 2 5 x
+  put vs_v 2 ir_res x
+  t = ir_otok x
+  y = vs_b2 b 10 5 get vs_v 6 get vs_v 1
+  y = vs_b2 b 10 5 get vs_v 4 y
+  put vs_v 3 y
+  z = vs_k b 5 max_sz
+  y = vs_b2 b 32 1 y z
+  vs_cbr b t y get vs_b 7 get vs_b 6
+
+  b = get vs_b 7
+  x = vs_ga b get vs_t ty_slot get vs_g g_slot
+  t = vs_bd_st b ir_btok b x get vs_v 3 get vs_v 2
+  y = vs_k b 5 1
+  x = vs_b2 b 10 5 get vs_v 1 y
+  vs_br1 b get vs_b 3 t x
+
+  b = get vs_b 5
+  x = vs_b2 b 10 5 get vs_v 6 get vs_v 0
+  vs_br1 b get vs_b 1 ir_btok b x
+
+  b = get vs_b 6
+  vs_ret b ir_btok b
+  ret f
+end
+
+fn vs_mk_wr_u64_arr ty_slot ulong g_slot ulong max_sz ulong to uint
+  f = ir_fnew 0 0 0
+  put vs_v 4 ir_fpar f 5
+  put vs_v 5 ir_fpar f 5
+  for i ulong 8 bound 9
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 0
+  vs_br1 b get vs_b 1 ir_ftok f x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 6 x
+  y = vs_b2 b 32 1 x get vs_v 5
+  vs_cbr b ir_btok b y get vs_b 2 get vs_b 6
+
+  b = get vs_b 2
+  x = vs_b2 b 11 5 get vs_v 5 get vs_v 6
+  y = vs_k b 5 4096
+  z = vs_b2 b 34 1 x y
+  x = vs_sel b 5 z y x
+  put vs_v 0 x
+  y = vs_k b 5 0
+  vs_br1 b get vs_b 3 ir_btok b y
+
+  b = get vs_b 3
+  x = ir_bpar b 5
+  put vs_v 1 x
+  y = vs_b2 b 32 1 x get vs_v 0
+  vs_cbr b ir_btok b y get vs_b 4 get vs_b 5
+
+  b = get vs_b 4
+  y = vs_b2 b 10 5 get vs_v 6 get vs_v 1
+  y = vs_b2 b 10 5 get vs_v 4 y
+  put vs_v 2 y
+  z = vs_k b 5 max_sz
+  y = vs_b2 b 32 1 y z
+  vs_cbr b ir_btok b y get vs_b 7 get vs_b 6
+
+  b = get vs_b 7
+  x = vs_ga b get vs_t ty_slot get vs_g g_slot
+  y = vs_bd_ld b 5 ir_btok b x get vs_v 2
+  t = get vs_l 0
+  z = vs_k b 5 8
+  x = vs_b2 b 12 5 get vs_v 1 z
+  x = vs_call2 b t get vs_fn 3 0 x y
+  z = vs_k b 5 1
+  y = vs_b2 b 10 5 get vs_v 1 z
+  t = ir_otok x
+  vs_br1 b get vs_b 3 t y
+
+  b = get vs_b 5
+  y = vs_k b 5 8
+  x = vs_b2 b 12 5 get vs_v 0 y
+  x = vs_call1 b ir_btok b get vs_fn 1 0 x
+  y = vs_b2 b 10 5 get vs_v 6 get vs_v 0
+  t = ir_otok x
+  vs_br1 b get vs_b 1 t y
+
+  b = get vs_b 6
+  vs_ret b ir_btok b
+  ret f
+end
+
+note ---- Unpack 160 u64 words into 4 interleaved f32 banks ----
+fn vs_emit_u1 b uint t uint bk ulong to uint
+  x = get vs_v 19
+  y = vs_b2 b 16 5 x get vs_v 20
+  z = vs_b2 b 30 1 y get vs_v 21
+  y = vs_sel b 13 z get vs_v 22 get vs_v 23
+  z = add get vs_l 6 uint bk
+  x = get vs_t get vs_l 5
+  z = get vs_g z
+  x = vs_ga b x z
+  z = get vs_v 18
+  ret vs_bd_st b t x z y
+end
+
+fn vs_emit_unpack_4bits b uint t uint word uint to uint
+  put vs_v 20 vs_k b 5 1
+  put vs_v 21 vs_k b 5 0
+  put vs_v 22 vs_k b 13 ulong bitcast uint f32 1
+  put vs_v 23 vs_k b 13 ulong bitcast uint f32 -1
+  put vs_v 19 word
+  t = vs_emit_u1 b t 0
+  for bk ulong 3 bound 4
+    sh = vs_k b 5 add bk 1
+    put vs_v 19 vs_b2 b 21 5 word sh
+    t = vs_emit_u1 b t add bk 1
+  end
+  ret t
+end
+
+fn vs_mk_unpack_vec to uint
+  f = ir_fnew 0 0 0
+  put vs_v 8 ir_fpar f 5
+  put vs_v 9 ir_fpar f 5
+  for i ulong 10 bound 11
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 160
+  put vs_v 10 vs_b2 b 12 5 get vs_v 8 x
+  x = get vs_v 9
+  y = vs_k b 5 2560
+  put vs_v 11 vs_b2 b 12 5 x y
+  x = vs_k b 5 0
+  y = get vs_b 1
+  z = ir_ftok f
+  vs_br1 b y z x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 12 x
+  y = vs_k b 5 160
+  z = vs_b2 b 32 1 x y
+  x = get vs_b 2
+  y = get vs_b 8
+  t = ir_btok b
+  vs_cbr b t z x y
+
+  b = get vs_b 2
+  x = vs_b2 b 10 5 get vs_v 10 get vs_v 12
+  put vs_v 13 x
+  y = vs_k b 5 ulong get vs_l 4
+  z = vs_b2 b 32 1 x y
+  x = get vs_b 3
+  y = get vs_b 9
+  t = ir_btok b
+  vs_cbr b t z x y
+
+  b = get vs_b 3
+  x = get vs_t get vs_l 2
+  y = get vs_g get vs_l 3
+  x = vs_ga b x y
+  y = vs_bd_ld b 5 ir_btok b x get vs_v 13
+  put vs_v 14 y
+  y = vs_k b 5 16
+  z = vs_b2 b 12 5 get vs_v 12 y
+  put vs_v 15 vs_b2 b 10 5 get vs_v 11 z
+  x = vs_k b 5 0
+  y = get vs_b 4
+  t = get vs_l 0
+  z = get vs_v 14
+  vs_br2 b y t x z
+
+  b = get vs_b 4
+  x = ir_bpar b 5
+  y = ir_bpar b 5
+  put vs_v 16 x
+  put vs_v 17 y
+  z = vs_k b 5 16
+  y = vs_b2 b 32 1 x z
+  x = get vs_b 5
+  z = get vs_b 7
+  t = ir_btok b
+  vs_cbr b t y x z
+
+  b = get vs_b 5
+  x = vs_b2 b 10 5 get vs_v 15 get vs_v 16
+  put vs_v 18 x
+  y = vs_k b 5 ulong get vs_l 7
+  z = vs_b2 b 32 1 x y
+  x = get vs_b 6
+  y = get vs_b 9
+  t = ir_btok b
+  vs_cbr b t z x y
+
+  b = get vs_b 6
+  x = get vs_v 17
+  t = vs_emit_unpack_4bits b ir_btok b x
+  x = vs_k b 5 4
+  y = vs_b2 b 21 5 get vs_v 17 x
+  x = vs_k b 5 1
+  z = vs_b2 b 10 5 get vs_v 16 x
+  x = get vs_b 4
+  vs_br2 b x t z y
+
+  b = get vs_b 7
+  x = vs_k b 5 1
+  y = vs_b2 b 10 5 get vs_v 12 x
+  x = get vs_b 1
+  t = ir_btok b
+  vs_br1 b x t y
+
+  b = get vs_b 8
+  vs_ret b ir_btok b
+
+  b = get vs_b 9
+  vs_exit b ir_btok b 29
+  ret f
+end
+
+fn vs_mk_unpack_cfg u_ty ulong u_g ulong u_max ulong f_ty ulong f0_g ulong f_max ulong to uint
+  put vs_l 2 uint u_ty
+  put vs_l 3 uint u_g
+  put vs_l 4 uint u_max
+  put vs_l 5 uint f_ty
+  put vs_l 6 uint f0_g
+  put vs_l 7 uint f_max
+  ret vs_mk_unpack_vec
+end
+
+note ---- 128-bit NEON Bind (FMUL.4S) + Pack NEON result back to g_unb_u ----
+fn vs_emit_nb_pack b uint to void
+  put vs_v 26 vs_k b 13 0
+  put vs_v 27 vs_k b 5 1
+  put vs_v 28 vs_k b 5 0
+  t = ir_btok b
+  acc = get vs_v 24
+  x = vs_k b 5 4
+  put vs_v 30 vs_b2 b 12 5 get vs_v 23 x
+  for bk ulong 4 bound 5
+    x = vs_ga b get vs_t 6 get vs_g add 19 bk
+    y = vs_bd_ld b 13 t x get vs_v 29
+    t = get vs_l 0
+    z = vs_b2 b 32 1 y get vs_v 26
+    x = get vs_v 27
+    y = get vs_v 28
+    y = vs_sel b 5 z x y
+    x = get vs_v 30
+    if gt bk 0
+      z = vs_k b 5 bk
+      x = vs_b2 b 10 5 x z
+    end
+    z = vs_b2 b 20 5 y x
+    acc = vs_b2 b 17 5 acc z
+  end
+  x = vs_b2 b 10 5 get vs_v 23 get vs_v 27
+  y = get vs_b 6
+  vs_br2 b y t x acc
+end
+
+fn vs_mk_neon_bind to uint
+  f = ir_fnew 0 0 0
+  x = ir_fpar f 5
+  for i ulong 13 bound 14
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  y = vs_k b 5 160
+  put vs_v 20 vs_b2 b 12 5 x y
+  x = vs_k b 5 0
+  vs_br1 b get vs_b 1 ir_ftok f x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 21 x
+  y = vs_k b 5 2557
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 2 get vs_b 3
+
+  b = get vs_b 2
+  t = ir_btok b
+  for k ulong 4 bound 5
+    x = vs_ga b get vs_t 6 get vs_g add 11 k
+    y = vs_bd_vld b get vs_t 0 t x get vs_v 21
+    t = get vs_l 0
+    put vs_v 26 y
+    x = vs_ga b get vs_t 6 get vs_g add 15 k
+    y = vs_bd_vld b get vs_t 0 t x get vs_v 21
+    t = get vs_l 0
+    z = vs_b2 b 12 get vs_t 0 get vs_v 26 y
+    x = vs_ga b get vs_t 6 get vs_g add 19 k
+    t = vs_bd_vst b t x get vs_v 21 z
+  end
+  y = vs_k b 5 4
+  x = vs_b2 b 10 5 get vs_v 21 y
+  vs_br1 b get vs_b 1 t x
+
+  b = get vs_b 3
+  x = vs_k b 5 0
+  vs_br1 b get vs_b 4 ir_btok b x
+
+  b = get vs_b 4
+  x = ir_bpar b 5
+  put vs_v 21 x
+  y = vs_k b 5 160
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 5 get vs_b 9
+
+  b = get vs_b 5
+  y = vs_k b 5 16
+  put vs_v 22 vs_b2 b 12 5 get vs_v 21 y
+  x = vs_k b 5 0
+  vs_br2 b get vs_b 6 ir_btok b x x
+
+  b = get vs_b 6
+  x = ir_bpar b 5
+  y = ir_bpar b 5
+  put vs_v 23 x
+  put vs_v 24 y
+  z = vs_k b 5 16
+  y = vs_b2 b 32 1 x z
+  vs_cbr b ir_btok b y get vs_b 12 get vs_b 8
+
+  b = get vs_b 12
+  x = vs_b2 b 10 5 get vs_v 22 get vs_v 23
+  put vs_v 29 x
+  y = vs_k b 5 2560
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 7 get vs_b 11
+
+  vs_emit_nb_pack get vs_b 7
+
+  b = get vs_b 8
+  x = vs_b2 b 10 5 get vs_v 20 get vs_v 21
+  put vs_v 25 x
+  y = vs_k b 5 10240
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 10 get vs_b 11
+
+  b = get vs_b 10
+  x = vs_ga b get vs_t 3 get vs_g 5
+  t = vs_bd_st b ir_btok b x get vs_v 25 get vs_v 24
+  y = vs_k b 5 1
+  x = vs_b2 b 10 5 get vs_v 21 y
+  vs_br1 b get vs_b 4 t x
+
+  b = get vs_b 9
+  vs_ret b ir_btok b
+
+  b = get vs_b 11
+  vs_exit b ir_btok b 29
+  ret f
+end
+
+note ---- Exact u64 XOR Bind for SWAR path (cmd=4) ----
+fn vs_mk_u64_bind to uint
+  f = ir_fnew 0 0 0
+  x = ir_fpar f 5
+  for i ulong 6 bound 7
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  y = vs_k b 5 160
+  put vs_v 26 vs_b2 b 12 5 x y
+  x = vs_k b 5 0
+  vs_br1 b get vs_b 1 ir_ftok f x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 27 x
+  y = vs_k b 5 160
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 2 get vs_b 3
+
+  b = get vs_b 2
+  x = vs_b2 b 10 5 get vs_v 26 get vs_v 27
+  put vs_v 28 x
+  y = vs_k b 5 10240
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 4 get vs_b 5
+
+  b = get vs_b 4
+  t = ir_btok b
+  x = vs_ga b get vs_t 3 get vs_g 3
+  y = vs_bd_ld b 5 t x get vs_v 28
+  t = get vs_l 0
+  put vs_v 29 y
+  x = vs_ga b get vs_t 3 get vs_g 4
+  y = vs_bd_ld b 5 t x get vs_v 28
+  t = get vs_l 0
+  z = vs_b2 b 18 5 get vs_v 29 y
+  x = vs_ga b get vs_t 3 get vs_g 5
+  t = vs_bd_st b t x get vs_v 28 z
+  y = vs_k b 5 1
+  x = vs_b2 b 10 5 get vs_v 27 y
+  vs_br1 b get vs_b 1 t x
+
+  b = get vs_b 3
+  vs_ret b ir_btok b
+
+  b = get vs_b 5
+  vs_exit b ir_btok b 29
+  ret f
+end
+
+note ---- 128-bit NEON Similarity Accumulation (4 x FMLA.4S) -> Exact Hamming Distance ----
+fn vs_emit_ns_done b uint to void
+  x = vs_b2 b 10 get vs_t 0 get vs_v 32 get vs_v 33
+  y = vs_b2 b 10 get vs_t 0 get vs_v 34 get vs_v 35
+  z = vs_b2 b 10 get vs_t 0 x y
+  x = vs_vext b 13 0 z
+  y = vs_vext b 13 1 z
+  put vs_v 36 vs_b2 b 10 13 x y
+  x = vs_vext b 13 2 z
+  y = vs_vext b 13 3 z
+  y = vs_b2 b 10 13 x y
+  x = vs_b2 b 10 13 get vs_v 36 y
+  y = vs_u1 b 36 9 0 x
+  z = vs_k b 9 10240
+  y = vs_b2 b 11 9 z y
+  x = vs_u1 b 36 5 0 y
+  y = vs_k b 5 1
+  z = vs_b2 b 21 5 x y
+  vs_retv b ir_btok b z
+end
+
+fn vs_emit_ns_k b uint t uint k ulong to uint
+  x = vs_ga b get vs_t 6 get vs_g add 19 k
+  put vs_v 36 vs_bd_vld b get vs_t 0 t x get vs_v 30
+  t = get vs_l 0
+  x = vs_ga b get vs_t 5 get vs_g add 7 k
+  y = vs_bd_vld b get vs_t 0 t x get vs_v 31
+  t = get vs_l 0
+  x = get vs_v 36
+  z = get vs_v add 32 k
+  x = vs_fma b get vs_t 0 x y z
+  put vs_v add 82 k x
+  ret t
+end
+
+fn vs_mk_neon_sim to uint
+  f = ir_fnew 0 0 5
+  x = ir_fpar f 5
+  for i ulong 6 bound 7
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  y = vs_k b 13 0
+  z = vs_vsplt b get vs_t 0 y
+  y = vs_k b 5 2560
+  put vs_v 80 vs_k b 5 0
+  put vs_v 81 vs_b2 b 12 5 x y
+  put vs_v 82 z
+  put vs_v 83 z
+  put vs_v 84 z
+  put vs_v 85 z
+  vs_brn b get vs_b 1 ir_ftok f 6
+
+  b = get vs_b 1
+  put vs_v 30 ir_bpar b 5
+  put vs_v 31 ir_bpar b 5
+  for k ulong 4 bound 5
+    put vs_v add 32 k ir_bpar b get vs_t 0
+  end
+  y = vs_k b 5 2557
+  z = vs_b2 b 32 1 get vs_v 30 y
+  vs_cbr b ir_btok b z get vs_b 2 get vs_b 4
+
+  b = get vs_b 2
+  y = vs_k b 5 163837
+  z = vs_b2 b 32 1 get vs_v 31 y
+  vs_cbr b ir_btok b z get vs_b 3 get vs_b 5
+
+  b = get vs_b 3
+  t = ir_btok b
+  for k ulong 4 bound 5
+    t = vs_emit_ns_k b t k
+  end
+  z = vs_k b 5 4
+  put vs_v 80 vs_b2 b 10 5 get vs_v 30 z
+  put vs_v 81 vs_b2 b 10 5 get vs_v 31 z
+  vs_brn b get vs_b 1 t 6
+
+  vs_emit_ns_done get vs_b 4
+
+  b = get vs_b 5
+  vs_exit b ir_btok b 29
+  ret f
+end
+
+note ---- 64-bit SWAR Popcount & Loop ----
+fn vs_emit_swar64 b uint x uint to uint
+  y = vs_k b 5 1
+  z = vs_b2 b 21 5 x y
+  y = vs_k b 5 0x5555555555555555
+  z = vs_b2 b 16 5 z y
+  x = vs_b2 b 11 5 x z
+  put vs_v 46 x
+  y = vs_k b 5 0x3333333333333333
+  z = vs_b2 b 16 5 x y
+  put vs_v 47 z
+  z = vs_k b 5 2
+  x = vs_b2 b 21 5 get vs_v 46 z
+  x = vs_b2 b 16 5 x y
+  x = vs_b2 b 10 5 get vs_v 47 x
+  z = vs_k b 5 4
+  y = vs_b2 b 21 5 x z
+  x = vs_b2 b 10 5 x y
+  y = vs_k b 5 0x0f0f0f0f0f0f0f0f
+  x = vs_b2 b 16 5 x y
+  y = vs_k b 5 0x0101010101010101
+  x = vs_b2 b 12 5 x y
+  y = vs_k b 5 56
+  ret vs_b2 b 21 5 x y
+end
+
+fn vs_mk_swar_sim to uint
+  f = ir_fnew 0 0 5
+  x = ir_fpar f 5
+  y = ir_fpar f 5
+  for i ulong 7 bound 8
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  z = vs_k b 5 160
+  put vs_v 40 vs_b2 b 12 5 x z
+  put vs_v 41 vs_b2 b 12 5 y z
+  z = vs_k b 5 0
+  vs_br2 b get vs_b 1 ir_ftok f z z
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  y = ir_bpar b 5
+  put vs_v 42 x
+  put vs_v 43 y
+  z = vs_k b 5 160
+  y = vs_b2 b 32 1 x z
+  vs_cbr b ir_btok b y get vs_b 2 get vs_b 5
+
+  b = get vs_b 2
+  x = vs_b2 b 10 5 get vs_v 40 get vs_v 42
+  put vs_v 44 x
+  y = vs_k b 5 10240
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 3 get vs_b 6
+
+  b = get vs_b 3
+  x = vs_b2 b 10 5 get vs_v 41 get vs_v 42
+  put vs_v 45 x
+  y = vs_k b 5 10240
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 4 get vs_b 6
+
+  b = get vs_b 4
+  t = ir_btok b
+  x = vs_ga b get vs_t 3 get vs_g 5
+  y = vs_bd_ld b 5 t x get vs_v 44
+  t = get vs_l 0
+  put vs_v 48 y
+  x = vs_ga b get vs_t 3 get vs_g 2
+  y = vs_bd_ld b 5 t x get vs_v 45
+  t = get vs_l 0
+  x = vs_b2 b 18 5 get vs_v 48 y
+  x = vs_emit_swar64 b x
+  y = vs_b2 b 10 5 get vs_v 43 x
+  z = vs_k b 5 1
+  x = vs_b2 b 10 5 get vs_v 42 z
+  vs_br2 b get vs_b 1 t x y
+
+  b = get vs_b 5
+  vs_retv b ir_btok b get vs_v 43
+
+  b = get vs_b 6
+  vs_exit b ir_btok b 29
+  ret f
+end
+
+note ---- Batch Nearest-Neighbor Associative Recall ----
+fn vs_emit_rec_step b uint use_neon bool to void
+  t = ir_btok b
+  x = t
+  if use_neon
+    x = vs_call1 b t get vs_fn 10 5 get vs_v 53
+  else
+    x = vs_call2 b t get vs_fn 11 5 get vs_v 52 get vs_v 53
+  end
+  y = ir_res x
+  t = ir_otok x
+  put vs_v 57 y
+  z = vs_b2 b 32 1 y get vs_v 55
+  put vs_v 58 z
+  x = vs_b2 b 32 1 y get vs_v 56
+  put vs_v 59 x
+  put vs_v 82 vs_sel b 5 z y get vs_v 55
+  z = vs_sel b 5 x y get vs_v 56
+  x = get vs_v 58
+  y = get vs_v 55
+  put vs_v 83 vs_sel b 5 x y z
+  x = get vs_v 58
+  y = get vs_v 53
+  z = get vs_v 54
+  put vs_v 81 vs_sel b 5 x y z
+  x = vs_k b 5 1
+  put vs_v 80 vs_b2 b 10 5 get vs_v 53 x
+  y = get vs_b 3
+  vs_brn b y t 4
+end
+
+fn vs_mk_recall use_neon bool to uint
+  f = ir_fnew 0 0 0
+  for i ulong 8 bound 9
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_ga b get vs_t 2 get vs_g 1
+  y = vs_k b 5 0
+  put vs_v 50 vs_bd_ld b 5 ir_ftok f x y
+  t = get vs_l 0
+  y = vs_k b 5 1
+  put vs_v 51 vs_bd_ld b 5 t x y
+  t = get vs_l 0
+  y = vs_k b 5 0
+  vs_br1 b get vs_b 1 t y
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 52 x
+  y = vs_b2 b 32 1 x get vs_v 51
+  vs_cbr b ir_btok b y get vs_b 2 get vs_b 6
+
+  b = get vs_b 2
+  t = ir_btok b
+  if use_neon
+    y = vs_k b 5 0
+    x = vs_call2 b t get vs_fn 7 0 get vs_v 52 y
+    x = vs_call2 b ir_otok x get vs_fn 8 0 get vs_v 52 y
+    x = vs_call1 b ir_otok x get vs_fn 9 0 get vs_v 52
+    t = ir_otok x
+  else
+    x = vs_call1 b t get vs_fn 26 0 get vs_v 52
+    t = ir_otok x
+  end
+  y = vs_k b 5 0
+  z = vs_k b 5 999999
+  put vs_v 80 y
+  put vs_v 81 y
+  put vs_v 82 z
+  put vs_v 83 z
+  vs_brn b get vs_b 3 t 4
+
+  b = get vs_b 3
+  put vs_v 53 ir_bpar b 5
+  put vs_v 54 ir_bpar b 5
+  put vs_v 55 ir_bpar b 5
+  put vs_v 56 ir_bpar b 5
+  x = vs_b2 b 32 1 get vs_v 53 get vs_v 50
+  vs_cbr b ir_btok b x get vs_b 4 get vs_b 5
+
+  vs_emit_rec_step get vs_b 4 use_neon
+
+  b = get vs_b 5
+  y = vs_k b 5 64
+  x = vs_b2 b 32 1 get vs_v 52 y
+  vs_cbr b ir_btok b x get vs_b 7 get vs_b 6
+
+  b = get vs_b 7
+  x = vs_ga b get vs_t 4 get vs_g 6
+  y = vs_k b 5 3
+  z = vs_b2 b 12 5 get vs_v 52 y
+  put vs_v 57 z
+  t = vs_bd_st b ir_btok b x z get vs_v 54
+  y = vs_k b 5 1
+  z = vs_b2 b 10 5 get vs_v 57 y
+  t = vs_bd_st b t x z get vs_v 55
+  y = vs_k b 5 2
+  z = vs_b2 b 10 5 get vs_v 57 y
+  t = vs_bd_st b t x z get vs_v 56
+  y = vs_k b 5 1
+  z = vs_b2 b 10 5 get vs_v 52 y
+  vs_br1 b get vs_b 1 t z
+
+  b = get vs_b 6
+  vs_ret b ir_btok b
+  ret f
+end
+
+note ---- NEON Bundle Superposition (FADD.4S) ----
+fn vs_emit_ba_loop b uint is_add bool idx uint hdr_b uint to void
+  t = ir_btok b
+  for k ulong 4 bound 5
+    x = vs_ga b get vs_t 6 get vs_g add 11 k
+    y = vs_bd_vld b get vs_t 0 t x idx
+    t = get vs_l 0
+    if is_add
+      put vs_v 65 y
+      x = vs_ga b get vs_t 6 get vs_g add 23 k
+      z = vs_bd_vld b get vs_t 0 t x idx
+      t = get vs_l 0
+      y = vs_b2 b 10 get vs_t 0 z get vs_v 65
+    end
+    x = vs_ga b get vs_t 6 get vs_g add 23 k
+    t = vs_bd_vst b t x idx y
+  end
+  y = vs_k b 5 4
+  z = vs_b2 b 10 5 idx y
+  vs_br1 b hdr_b t z
+end
+
+fn vs_mk_neon_bundle_add to uint
+  f = ir_fnew 0 0 0
+  x = ir_fpar f 5
+  for i ulong 8 bound 9
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  y = vs_k b 5 0
+  z = vs_b2 b 31 1 x y
+  vs_cbr b ir_ftok f z get vs_b 1 get vs_b 4
+
+  b = get vs_b 1
+  x = vs_k b 5 0
+  y = get vs_b 2
+  t = ir_btok b
+  vs_br1 b y t x
+
+  b = get vs_b 2
+  x = ir_bpar b 5
+  put vs_v 66 x
+  y = vs_k b 5 2557
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 3 get vs_b 7
+
+  vs_emit_ba_loop get vs_b 3 false get vs_v 66 get vs_b 2
+
+  b = get vs_b 4
+  x = vs_k b 5 0
+  y = get vs_b 5
+  t = ir_btok b
+  vs_br1 b y t x
+
+  b = get vs_b 5
+  x = ir_bpar b 5
+  put vs_v 67 x
+  y = vs_k b 5 2557
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 6 get vs_b 7
+
+  vs_emit_ba_loop get vs_b 6 true get vs_v 67 get vs_b 5
+
+  b = get vs_b 7
+  vs_ret b ir_btok b
+  ret f
+end
+
+fn vs_emit_bf_pack b uint to void
+  put vs_v 65 vs_k b 13 0
+  put vs_v 66 vs_k b 5 1
+  put vs_v 67 vs_k b 5 0
+  t = ir_btok b
+  acc = get vs_v 63
+  y = vs_k b 5 4
+  put vs_v 68 vs_b2 b 12 5 get vs_v 62 y
+  for bk ulong 4 bound 5
+    x = vs_ga b get vs_t 6 get vs_g add 23 bk
+    y = vs_bd_ld b 13 t x get vs_v 64
+    t = get vs_l 0
+    z = vs_b2 b 32 1 y get vs_v 65
+    put vs_v 69 z
+    y = vs_b2 b 30 1 y get vs_v 65
+    x = get vs_v 67
+    if ne and bk 1 0
+      x = get vs_v 66
+    end
+    y = vs_sel b 5 y x get vs_v 67
+    x = get vs_v 69
+    z = get vs_v 66
+    z = vs_sel b 5 x z y
+    x = get vs_v 68
+    if gt bk 0
+      y = vs_k b 5 bk
+      x = vs_b2 b 10 5 x y
+    end
+    y = vs_b2 b 20 5 z x
+    acc = vs_b2 b 17 5 acc y
+  end
+  x = vs_b2 b 10 5 get vs_v 62 get vs_v 66
+  y = get vs_b 3
+  vs_br2 b y t x acc
+end
+
+fn vs_mk_neon_bundle_finish to uint
+  f = ir_fnew 0 0 0
+  for i ulong 8 bound 9
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 0
+  y = get vs_b 1
+  z = ir_ftok f
+  vs_br1 b y z x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 60 x
+  y = vs_k b 5 160
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 2 get vs_b 5
+
+  b = get vs_b 2
+  y = vs_k b 5 16
+  put vs_v 61 vs_b2 b 12 5 get vs_v 60 y
+  x = vs_k b 5 0
+  vs_br2 b get vs_b 3 ir_btok b x x
+
+  b = get vs_b 3
+  x = ir_bpar b 5
+  y = ir_bpar b 5
+  put vs_v 62 x
+  put vs_v 63 y
+  z = vs_k b 5 16
+  y = vs_b2 b 32 1 x z
+  vs_cbr b ir_btok b y get vs_b 4 get vs_b 6
+
+  b = get vs_b 4
+  x = vs_b2 b 10 5 get vs_v 61 get vs_v 62
+  put vs_v 64 x
+  y = vs_k b 5 2560
+  z = vs_b2 b 32 1 x y
+  vs_cbr b ir_btok b z get vs_b 7 get vs_b 5
+
+  vs_emit_bf_pack get vs_b 7
+
+  b = get vs_b 6
+  x = vs_ga b get vs_t 7 get vs_g 27
+  t = vs_bd_st b ir_btok b x get vs_v 60 get vs_v 63
+  y = vs_k b 5 1
+  x = vs_b2 b 10 5 get vs_v 60 y
+  vs_br1 b get vs_b 1 t x
+
+  b = get vs_b 5
+  vs_ret b ir_btok b
+  ret f
+end
+
+fn vs_mk_neon_bundle_run to uint
+  f = ir_fnew 0 0 0
+  put vs_v 71 ir_fpar f 5
+  for i ulong 4 bound 5
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 0
+  y = get vs_b 1
+  z = ir_ftok f
+  vs_br1 b y z x
+
+  b = get vs_b 1
+  x = ir_bpar b 5
+  put vs_v 70 x
+  y = vs_b2 b 32 1 x get vs_v 71
+  vs_cbr b ir_btok b y get vs_b 2 get vs_b 3
+
+  b = get vs_b 2
+  y = vs_k b 5 0
+  x = vs_call2 b ir_btok b get vs_fn 27 0 get vs_v 70 y
+  t = ir_otok x
+  z = vs_b2 b 30 1 get vs_v 70 y
+  x = vs_k b 5 1
+  z = vs_sel b 5 z x y
+  x = vs_call1 b t get vs_fn 14 0 z
+  t = ir_otok x
+  y = vs_k b 5 1
+  z = vs_b2 b 10 5 get vs_v 70 y
+  vs_br1 b get vs_b 1 t z
+
+  b = get vs_b 3
+  x = vs_call0 b ir_btok b get vs_fn 15 0
+  vs_ret b ir_otok x
+  ret f
+end
+
+note ---- Command handlers ----
+fn vs_mk_do_cmd1 to uint
+  f = ir_fnew 0 0 0
+  for i ulong 6 bound 7
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 0
+  y = vs_k b 5 1
+  z = vs_call2 b ir_ftok f get vs_fn 4 0 x y
+  t = ir_otok z
+  x = vs_ga b get vs_t 2 get vs_g 1
+  y = vs_k b 5 0
+  z = vs_bd_ld b 5 t x y
+  put vs_v 72 z
+  t = get vs_l 0
+  x = vs_b2 b 34 1 z y
+  y = vs_k b 5 64
+  z = vs_b2 b 33 1 z y
+  x = vs_b2 b 16 1 x z
+  vs_cbr b t x get vs_b 1 get vs_b 5
+
+  b = get vs_b 1
+  y = vs_k b 5 160
+  x = vs_b2 b 12 5 get vs_v 72 y
+  y = vs_k b 5 0
+  z = vs_call2 b ir_btok b get vs_fn 5 0 y x
+  t = ir_otok z
+  y = vs_k b 5 0
+  vs_br1 b get vs_b 2 t y
+
+  b = get vs_b 2
+  x = ir_bpar b 5
+  put vs_v 73 x
+  y = vs_b2 b 32 1 x get vs_v 72
+  vs_cbr b ir_btok b y get vs_b 3 get vs_b 4
+
+  b = get vs_b 3
+  x = get vs_v 73
+  x = vs_call2 b ir_btok b get vs_fn 6 0 x x
+  t = ir_otok x
+  y = vs_k b 5 1
+  y = vs_b2 b 10 5 get vs_v 73 y
+  vs_br1 b get vs_b 2 t y
+
+  b = get vs_b 4
+  x = vs_ga b get vs_t 1 get vs_g 0
+  y = vs_k b 5 0
+  z = vs_k b 2 1
+  t = vs_bd_st b ir_btok b x y z
+  y = vs_k b 5 1
+  x = vs_call1 b t get vs_fn 1 0 y
+  vs_ret b ir_otok x
+
+  b = get vs_b 5
+  vs_exit b ir_btok b 25
+  ret f
+end
+
+fn vs_mk_do_cmd_recall use_neon bool to uint
+  f = ir_fnew 0 0 0
+  for i ulong 3 bound 4
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 1
+  z = vs_call2 b ir_ftok f get vs_fn 4 0 x x
+  t = ir_otok z
+  x = vs_ga b get vs_t 2 get vs_g 1
+  y = vs_k b 5 1
+  z = vs_bd_ld b 5 t x y
+  put vs_v 74 z
+  t = get vs_l 0
+  y = vs_k b 5 0
+  x = vs_b2 b 34 1 z y
+  y = vs_k b 5 64
+  z = vs_b2 b 33 1 z y
+  x = vs_b2 b 16 1 x z
+  vs_cbr b t x get vs_b 1 get vs_b 2
+
+  b = get vs_b 1
+  y = vs_k b 5 160
+  x = vs_b2 b 12 5 get vs_v 74 y
+  put vs_v 75 x
+  y = vs_k b 5 0
+  z = vs_call2 b ir_btok b get vs_fn 17 0 y x
+  t = ir_otok z
+  z = vs_call2 b t get vs_fn 18 0 y get vs_v 75
+  t = ir_otok z
+  x = get vs_fn 13
+  if use_neon
+    x = get vs_fn 12
+  end
+  z = vs_call0 b t x 0
+  t = ir_otok z
+  x = vs_k b 5 3
+  x = vs_b2 b 12 5 get vs_v 74 x
+  z = vs_call2 b t get vs_fn 19 0 y x
+  t = ir_otok z
+  z = vs_call2 b t get vs_fn 20 0 y get vs_v 75
+  vs_ret b ir_otok z
+
+  b = get vs_b 2
+  vs_exit b ir_btok b 26
+  ret f
+end
+
+fn vs_mk_do_cmd3 to uint
+  f = ir_fnew 0 0 0
+  for i ulong 3 bound 4
+    put vs_b i ir_blk f
+  end
+  b = get vs_b 0
+  x = vs_k b 5 5
+  y = vs_k b 5 1
+  z = vs_call2 b ir_ftok f get vs_fn 4 0 x y
+  t = ir_otok z
+  x = vs_ga b get vs_t 2 get vs_g 1
+  y = vs_k b 5 5
+  z = vs_bd_ld b 5 t x y
+  put vs_v 76 z
+  t = get vs_l 0
+  y = vs_k b 5 0
+  x = vs_b2 b 34 1 z y
+  y = vs_k b 5 64
+  z = vs_b2 b 33 1 z y
+  x = vs_b2 b 16 1 x z
+  vs_cbr b t x get vs_b 1 get vs_b 2
+
+  b = get vs_b 1
+  y = vs_k b 5 160
+  x = vs_b2 b 12 5 get vs_v 76 y
+  y = vs_k b 5 0
+  z = vs_call2 b ir_btok b get vs_fn 18 0 y x
+  t = ir_otok z
+  z = vs_call1 b t get vs_fn 16 0 get vs_v 76
+  t = ir_otok z
+  x = vs_k b 5 160
+  z = vs_call2 b t get vs_fn 21 0 y x
+  vs_ret b ir_otok z
+
+  b = get vs_b 2
+  vs_exit b ir_btok b 27
+  ret f
+end
+
+note ---- Main Pipe Command Loop ----
+fn vs_mk_main to void
+  f = ir_fnew 2 0 8
+  for i ulong 12 bound 13
+    put vs_b i ir_blk f
+  end
+
+  b = get vs_b 0
+  vs_br0 b get vs_b 1 ir_ftok f
+
+  b = get vs_b 1
+  x = vs_k b 5 1
+  y = vs_call1 b ir_btok b get vs_fn 0 0 x
+  t = ir_otok y
+  x = vs_ga b get vs_t 1 get vs_g 0
+  y = vs_k b 5 0
+  z = vs_bd_ld b 2 t x y
+  put vs_v 90 z
+  t = get vs_l 0
+  y = vs_k b 2 0
+  x = vs_b2 b 30 1 z y
+  vs_cbr b t x get vs_b 2 get vs_b 3
+
+  b = get vs_b 2
+  x = vs_k b 8 0
+  vs_retv b ir_btok b x
+
+  b = get vs_b 3
+  y = vs_k b 2 1
+  x = vs_b2 b 30 1 get vs_v 90 y
+  vs_cbr b ir_btok b x get vs_b 4 get vs_b 5
+
+  b = get vs_b 4
+  x = vs_call0 b ir_btok b get vs_fn 22 0
+  vs_br0 b get vs_b 1 ir_otok x
+
+  b = get vs_b 5
+  y = vs_k b 2 2
+  x = vs_b2 b 30 1 get vs_v 90 y
+  vs_cbr b ir_btok b x get vs_b 6 get vs_b 7
+
+  b = get vs_b 6
+  x = vs_call0 b ir_btok b get vs_fn 23 0
+  vs_br0 b get vs_b 1 ir_otok x
+
+  b = get vs_b 7
+  y = vs_k b 2 3
+  x = vs_b2 b 30 1 get vs_v 90 y
+  vs_cbr b ir_btok b x get vs_b 8 get vs_b 9
+
+  b = get vs_b 8
+  x = vs_call0 b ir_btok b get vs_fn 25 0
+  vs_br0 b get vs_b 1 ir_otok x
+
+  b = get vs_b 9
+  y = vs_k b 2 4
+  x = vs_b2 b 30 1 get vs_v 90 y
+  vs_cbr b ir_btok b x get vs_b 10 get vs_b 11
+
+  b = get vs_b 10
+  x = vs_call0 b ir_btok b get vs_fn 24 0
+  vs_br0 b get vs_b 1 ir_otok x
+
+  b = get vs_b 11
+  vs_exit b ir_btok b 24
+end
+
+fn main to int
+  ir_init
+  vs_init_tg
+  put vs_fn 0 vs_mk_io_exact 53 0 21
+  put vs_fn 1 vs_mk_io_exact 54 1 22
+  put vs_fn 2 vs_mk_unpack_u64
+  put vs_fn 3 vs_mk_pack_u64
+  put vs_fn 4 vs_mk_rd_u64_arr 2 1 16
+  put vs_fn 5 vs_mk_rd_u64_arr 3 2 10240
+  put vs_fn 6 vs_mk_unpack_cfg 3 2 10240 5 7 163840
+  put vs_fn 7 vs_mk_unpack_cfg 3 3 10240 6 11 2560
+  put vs_fn 8 vs_mk_unpack_cfg 3 4 10240 6 15 2560
+  put vs_fn 27 vs_mk_unpack_cfg 3 4 10240 6 11 2560
+  put vs_fn 9 vs_mk_neon_bind
+  put vs_fn 10 vs_mk_neon_sim
+  put vs_fn 11 vs_mk_swar_sim
+  put vs_fn 26 vs_mk_u64_bind
+  put vs_fn 12 vs_mk_recall true
+  put vs_fn 13 vs_mk_recall false
+  put vs_fn 14 vs_mk_neon_bundle_add
+  put vs_fn 15 vs_mk_neon_bundle_finish
+  put vs_fn 16 vs_mk_neon_bundle_run
+  put vs_fn 17 vs_mk_rd_u64_arr 3 3 10240
+  put vs_fn 18 vs_mk_rd_u64_arr 3 4 10240
+  put vs_fn 19 vs_mk_wr_u64_arr 4 6 256
+  put vs_fn 20 vs_mk_wr_u64_arr 3 5 10240
+  put vs_fn 21 vs_mk_wr_u64_arr 7 27 160
+  put vs_fn 22 vs_mk_do_cmd1
+  put vs_fn 23 vs_mk_do_cmd_recall true
+  put vs_fn 24 vs_mk_do_cmd_recall false
+  put vs_fn 25 vs_mk_do_cmd3
+  vs_mk_main
+  m = ir_wr
+  if eq ar_out 1 1 0 m 0
+    ret 27
+  end
+  ret 0
+end
