@@ -10,11 +10,11 @@ Think of boolean satisfiability like checking a huge wiring puzzle or Sudoku: **
 
 | Component | File | Plain-English Role | Code Shared With Solver |
 | :--- | :--- | :--- | :--- |
-| CDCL Solver & Prover | [sat_cdcl.om](file:///apps/omega-sat/sat_cdcl.om) | 2-watched-literal CDCL solver, 1-UIP clause learning, VSIDS heap, Luby restarts, clause deletion (`op=2`), `OMSAT1`/`OMDR01`/`OMSR01` emitter | Solver binary (`2056` lines) |
-| Zero-Shared-Code Verifier | [sat_check.om](file:///apps/omega-sat/sat_check.om) | Independent DIMACS parser, direct SAT evaluator, independent occurrence-list RUP/DRAT/LRAT checker (`op=1`/`op=2`), Ed25519 + SHA-256 verifier (no solver, no `ed_sign.om`) | **None (`0` lines shared)** |
-| Verification Gate | [gate_sat.om](file:///apps/omega-sat/gate_sat.om) | Checks `seed/out/omc.sha256` pin (`exit 69` on mismatch), builds both binaries 2x byte-identically, verifies 7 SAT/UNSAT benchmarks, 16 container/DRAT attacks, and 6 live `omc`-recompiled solver-bypass mutants | Harness (`1864` lines) |
-| Lean 4 Soundness Proof | [OmegaSatSoundness.lean](file:///seed/helix/proofs/OmegaSatSoundness.lean) | Proves unit propagation soundness, RUP equisatisfiability, RAT equisatisfiability, multi-step empty-clause refutation -> `Unsatisfiable`, and 5 `decide` negative witnesses (`0` warnings, `0` `sorry`, zero Mathlib) | Independent formal kernel (`738` lines) |
-| Wave 5 Receipt & Sums | [RECEIPT.txt](file:///evidence/WAVE5-SAT-DRAT-20261127/RECEIPT.txt) | Exact observed outputs, SHA-256 hashes, `readelf -d` checks, and `SHA256SUMS.txt` | Additive evidence |
+| CDCL Solver & Prover | [sat_cdcl.om](sat_cdcl.om) | 2-watched-literal CDCL solver, 1-UIP clause learning, VSIDS heap, Luby restarts, clause deletion (`op=2`), `OMSAT1`/`OMDR01`/`OMSR01` emitter | Solver binary (`2056` lines) |
+| Zero-Shared-Code Verifier | [sat_check.om](sat_check.om) | Independent DIMACS parser, direct SAT evaluator, independent occurrence-list RUP/DRAT/LRAT checker (`op=1`/`op=2`), Ed25519 + SHA-256 verifier (no solver, no `ed_sign.om`) | **None (`0` lines shared)** |
+| Verification Gate | [gate_sat.om](gate_sat.om) | Checks `seed/out/omc.sha256` pin (`exit 69` on mismatch), builds both binaries 2x byte-identically, verifies 7 SAT/UNSAT benchmarks, 16 container/DRAT attacks, and 6 live `omc`-recompiled solver-bypass mutants | Harness (`1864` lines) |
+| Lean 4 Soundness Proof | [OmegaSatSoundness.lean](../../seed/helix/proofs/OmegaSatSoundness.lean) | Proves unit propagation soundness, RUP equisatisfiability, RAT equisatisfiability, multi-step empty-clause refutation -> `Unsatisfiable`, and 5 `decide` negative witnesses (`0` warnings, `0` `sorry`, zero Mathlib) | Independent formal kernel (`738` lines) |
+| Wave 5 Receipt & Sums | [RECEIPT.txt](../../evidence/WAVE5-SAT-DRAT-20261127/RECEIPT.txt) | Exact observed outputs, SHA-256 hashes, `readelf -d` checks, and `SHA256SUMS.txt` | Additive evidence |
 
 ## Scope & Honest Status
 
