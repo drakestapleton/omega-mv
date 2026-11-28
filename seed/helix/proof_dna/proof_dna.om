@@ -1,0 +1,2500 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/proof_dna/proof_dna.om
+note Wave 2 Breakthrough #4: Self-Healing Adversarial Proof-DNA Immune Evolution (OMDNA1).
+note Pure seeded OM-2 (zero C, zero GCC, zero Python, zero CUDA, zero hw_writes).
+note
+note Compose after:
+note   si/directives/om2.om
+note   seed/ng/sha256.om
+note   protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om
+note   protocol/uor-gpu/ed_sign.om
+note
+note Usage:
+note   proof_dna seed-init <out_corpus.omdna>
+note   proof_dna verify-corpus <corpus.omdna> [min_ratchet]
+note   proof_dna replay <corpus.omdna> [mutant_mask]
+note   proof_dna check-ratchet <old_corpus.omdna> <new_corpus.omdna>
+note   proof_dna evolve <in.omdna> <out.omdna> [rounds] [rng_seed] [bft_fault_mask] [veto_mask]
+note   proof_dna admit-one <in.omdna> <out.omdna> <surf> <cls> <rule> <p0> <p1> <p2> <p3> <p4> <p5> <bft_fault> <veto>
+note
+note OMDNA1 Binary Corpus Format (Header 64B + N*256B Records + Trailer 64B):
+note   Header [0..64):
+note     [0..5]   "OMDNA1"
+note     [6..7]   u16 LE version (1)
+note     [8..11]  u32 LE record_size (256)
+note     [12..15] u32 LE count (1..240)
+note     [16..23] u64 LE epoch (>= 1)
+note     [24..31] u64 LE ratchet_floor (>= count)
+note     [32..63] pubkey[32] (RFC 8032 Ed25519 authority pubkey)
+note   Record [0..256) per antibody:
+note     [0..3]     "ABDY"
+note     [4..7]     u32 LE antibody_id (1..count)
+note     [8..11]    u32 LE surface_id (1=OM3, 2=SM121, 3=EGP3, 4=WATTCBF, 5=OMSH)
+note     [12..15]   u32 LE attack_class
+note     [16..19]   u32 LE rule_id (1..63)
+note     [20..23]   u32 LE bft_votes (3..4)
+note     [24..27]   u32 LE bft_mask (4-bit Monk|Predator|Trickster|Ascetic)
+note     [28..31]   u32 LE veto_mask (MUST be 0)
+note     [32..39]   u64 LE discovered_epoch
+note     [40..47]   u64 LE rng_seed
+note     [48..55]   u64 LE expected_kill_rc (> 0)
+note     [56..103]  u64 LE param0..param5 (6 * 8B)
+note     [104..107] u32 LE payload_len (0..20)
+note     [108..127] payload[20] (unused bytes MUST be 0)
+note     [128..159] attack_sha256[32] = SHA-256("OMDNA1-REC\0" || rec[0..128))
+note     [160..191] chain_sha256[32]  = SHA-256(prev_chain[32] || attack_sha256[32])
+note     [192..255] ed25519_sig[64]   = Ed25519(auth_seed, rec[0..192))
+note   Trailer [64 + count*256 .. +64):
+note     corpus_sig[64] = Ed25519(auth_seed, header[0..64) || last_chain[32])
+
+const PD_HDR_LEN ulong 64
+const PD_REC_LEN ulong 256
+const PD_TLR_LEN ulong 64
+const PD_MAX_RECS ulong 240
+const PD_MAX_FILE ulong 65536
+const PD_MAX_PAY ulong 20
+
+const PD_SURF_OM3 ulong 1
+const PD_SURF_SM121 ulong 2
+const PD_SURF_EGP3 ulong 3
+const PD_SURF_WATT ulong 4
+const PD_SURF_OMSH ulong 5
+
+const PD_ERR_IO ulong 101
+const PD_ERR_FORMAT ulong 102
+const PD_ERR_BAD_SIG ulong 103
+const PD_ERR_BFT_NO_QUORUM ulong 104
+const PD_ERR_SAFETY_VETO ulong 105
+const PD_ERR_RATCHET ulong 106
+const PD_ERR_BOGUS_REPLAY ulong 107
+const PD_ERR_BAD_ARG ulong 108
+const PD_ERR_REGRESSION ulong 109
+
+const PD_BASE_RULES ulong 2201172838402
+
+global pd_buf uchar 65536
+global pd_len ulong 1
+global pd_prev uchar 65536
+global pd_prev_len ulong 1
+
+global pd_count ulong 1
+global pd_epoch ulong 1
+global pd_floor ulong 1
+global pd_rules ulong 1
+global pd_mutant ulong 1
+
+global pd_auth_sd uchar 32
+global pd_auth_pk uchar 32
+
+global pd_dig uchar 24
+global pd_arg uchar 1024
+global pd_path1 uchar 1024
+global pd_path2 uchar 1024
+global pd_plen1 ulong 1
+global pd_plen2 ulong 1
+global pd_tmp_path uchar 1040
+global pd_ren_pkt uchar 2200
+global pd_probe uchar 4
+global pd_io uchar 512
+
+global pd_p ulong 8
+global pd_pay uchar 32
+global pd_psave ulong 8
+global pd_paysave uchar 32
+global pd_cand ulong 8
+global pd_chain uchar 32
+global pd_prev_chain uchar 32
+global pd_hash uchar 32
+global pd_sig uchar 64
+
+global pd_rng ulong 2
+global pd_stat ulong 16
+global pd_svote ulong 4
+global pd_srule ulong 4
+global pd_oct ulong 4
+global pd_cst ulong 4
+global pd_tok uchar 128
+
+text pd_auth_dom "HELIX-PROOF-DNA-OMDNA1-AUTHORITY-V1"
+text pd_gen_tag "OMDNA1-GENESIS"
+text pd_rec_tag "OMDNA1-REC"
+text pd_magic "OMDNA1"
+text pd_rec_magic "ABDY"
+text pd_tmp_sfx ".tmp"
+
+text pd_c_seed "seed-init"
+text pd_c_ver "verify-corpus"
+text pd_c_rep "replay"
+text pd_c_rat "check-ratchet"
+text pd_c_evo "evolve"
+text pd_c_adm "admit-one"
+
+text pd_use "usage: proof_dna seed-init|verify-corpus|replay|check-ratchet|evolve|admit-one ...\n"
+text pd_nl "\n"
+text pd_ok_seed "PROOF_DNA SEED_INIT PASS antibodies="
+text pd_ok_ver "PROOF_DNA VERIFY_CORPUS PASS antibodies="
+text pd_ok_rep "PROOF_DNA REPLAY PASS antibodies="
+text pd_ok_rat "PROOF_DNA CHECK_RATCHET PASS old="
+text pd_ok_evo "PROOF_DNA EVOLVE PASS initial="
+text pd_ok_adm "PROOF_DNA ADMIT_ONE PASS antibody_id="
+text pd_k_new " new="
+text pd_k_crys " crystallized="
+text pd_k_tot " total="
+text pd_k_kill " killed="
+text pd_k_pos " positive=5/5"
+text pd_k_surf " surfaces=5/5"
+text pd_k_os " os_rng_bytes="
+text pd_k_ep " epoch="
+text pd_ref_pfx "PROOF_DNA REFUSED code="
+text pd_ref_rsn " reason="
+
+text pd_r_101 "IO_ERROR"
+text pd_r_102 "MALFORMED_OMDNA1"
+text pd_r_103 "ED25519_OR_HASH_TAMPER"
+text pd_r_104 "BFT_INSUFFICIENT_QUORUM"
+text pd_r_105 "SAFETY_VETO_OVERRIDE_BLOCKED"
+text pd_r_106 "MONOTONIC_RATCHET_VIOLATION"
+text pd_r_107 "NON_REPRODUCIBLE_OR_BOGUS_REPLAY"
+text pd_r_108 "INVALID_ARGUMENT_OR_OVERFLOW"
+text pd_r_109 "VERIFIER_MUTANT_REGRESSION_CAUGHT"
+
+text pd_w_fwld "fwld"
+text pd_w_fwst "fwst"
+text pd_w_fwadr "fwadr"
+text pd_w_fwcall "fwcall"
+text pd_w_rawptr "rawptr"
+text pd_w_putpg "put_page"
+text pd_w_mapnew "mapnew"
+text pd_w_devcall "devcall"
+text pd_w_execp "execprog"
+text pd_w_target "target"
+
+text pd_ip_wild4 "0.0.0.0"
+text pd_ip_wild6 "::"
+text pd_ip_loc6 "::1"
+text pd_ip_l2 "l2:0x88b5"
+text pd_ip_oct1 "0127.0.0.1"
+text pd_ip_oct2 "100.064.0.2"
+text pd_ip_pub "8.8.8.8"
+text pd_ip_inj "127.0.0.1;id"
+text pd_ip_good "192.168.1.108"
+text pd_ip_cgnat "100.128.0.1"
+
+text pd_cmd_pkill "pkill"
+text pd_cmd_full "--full"
+text pd_cmd_rm "rm"
+text pd_cmd_rec "--recursive"
+text pd_cmd_bad1 "pkill -9 -f python3"
+text pd_cmd_bad2 "rm -rf /"
+text pd_cmd_bad3 "sudo efibootmgr -v"
+text pd_cmd_bad4 "sudo insmod aien_gpu.ko"
+text pd_cmd_ok "uname -a"
+text pd_cmd_efi "efibootmgr"
+text pd_cmd_efiv "efivars"
+text pd_cmd_ins "insmod"
+text pd_cmd_fin "finit_module"
+
+note ---- Output, Formatting & Integer Helpers ----
+
+fn pd_wrt fd int s view uchar * to void
+  r = write fd s 0 len s
+end
+
+fn pd_num fd int v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put pd_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      r = write fd pd_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn pd_refuse code ulong to int
+  pd_wrt 2 pd_ref_pfx
+  pd_num 2 code
+  pd_wrt 2 pd_ref_rsn
+  if eq code PD_ERR_IO
+    pd_wrt 2 pd_r_101
+  end
+  if eq code PD_ERR_FORMAT
+    pd_wrt 2 pd_r_102
+  end
+  if eq code PD_ERR_BAD_SIG
+    pd_wrt 2 pd_r_103
+  end
+  if eq code PD_ERR_BFT_NO_QUORUM
+    pd_wrt 2 pd_r_104
+  end
+  if eq code PD_ERR_SAFETY_VETO
+    pd_wrt 2 pd_r_105
+  end
+  if eq code PD_ERR_RATCHET
+    pd_wrt 2 pd_r_106
+  end
+  if eq code PD_ERR_BOGUS_REPLAY
+    pd_wrt 2 pd_r_107
+  end
+  if eq code PD_ERR_BAD_ARG
+    pd_wrt 2 pd_r_108
+  end
+  if eq code PD_ERR_REGRESSION
+    pd_wrt 2 pd_r_109
+  end
+  pd_wrt 2 pd_nl
+  ret int code
+end
+
+fn pd_rd_u16 o ulong to ulong
+  b0 = ulong get pd_buf o
+  b1 = shl ulong get pd_buf add o 1 8
+  ret or b0 b1
+end
+
+fn pd_wr_u16 o ulong v ulong to void
+  put pd_buf o uchar and v 255
+  put pd_buf add o 1 uchar and shr v 8 255
+end
+
+fn pd_rd_u32 o ulong to ulong
+  b0 = ulong get pd_buf o
+  b1 = shl ulong get pd_buf add o 1 8
+  b2 = shl ulong get pd_buf add o 2 16
+  b3 = shl ulong get pd_buf add o 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn pd_wr_u32 o ulong v ulong to void
+  put pd_buf o uchar and v 255
+  put pd_buf add o 1 uchar and shr v 8 255
+  put pd_buf add o 2 uchar and shr v 16 255
+  put pd_buf add o 3 uchar and shr v 24 255
+end
+
+fn pd_rd_u64 o ulong to ulong
+  lo = pd_rd_u32 o
+  hi = pd_rd_u32 add o 4
+  ret or lo shl hi 32
+end
+
+fn pd_wr_u64 o ulong v ulong to void
+  pd_wr_u32 o and v 4294967295
+  pd_wr_u32 add o 4 shr v 32
+end
+
+fn pd_sh_u64 o ulong v ulong to void
+  for j ulong 8
+    put sh_dat add o j uchar and shr v mul j 8 255
+  end
+end
+
+fn pd_eq_arg s view uchar * n ulong to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 64
+    if ne get pd_arg i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pd_parse_arg_u idx ulong to ulong
+  bad = not ulong 0
+  al = argread idx pd_arg 0 32
+  if lt al 1
+    ret bad
+  end
+  n = ulong al
+  if gt n 20
+    ret bad
+  end
+  v = ulong 0
+  for i ulong n bound 20
+    c = ulong get pd_arg i
+    if lt c 48
+      ret bad
+    end
+    if gt c 57
+      ret bad
+    end
+    if gt v 1844674407370955161
+      ret bad
+    end
+    p10 = mul v 10
+    nxt = add p10 sub c 48
+    if lt nxt p10
+      ret bad
+    end
+    v = nxt
+  end
+  ret v
+end
+
+fn pd_has_rule mask ulong r ulong to bool
+  if or eq r 0 ge r 64
+    ret false
+  end
+  ret ne and mask shl ulong 1 r 0
+end
+
+fn pd_min a ulong b ulong to ulong
+  if le a b
+    ret a
+  end
+  ret b
+end
+
+fn pd_smin a long b long to long
+  if le a b
+    ret a
+  end
+  ret b
+end
+
+fn pd_ceil_div a long b long to long
+  if lt a 0
+    ret div a b
+  end
+  q = div a b
+  r = rem a b
+  if gt r 0
+    ret add q 1
+  end
+  ret q
+end
+
+note ---- RFC 8032 Ed25519 Authority & OMDNA1 Crypto Core ----
+
+fn pd_derive_auth to void
+  m0 = new uchar 65536 0
+  h0 = new uchar 64 0
+  dl = len pd_auth_dom
+  for i ulong dl bound 64
+    put m0 i get pd_auth_dom i
+  end
+  s512hash m0 dl h0
+  sd = new uchar 32 0
+  pk = new uchar 32 0
+  for i ulong 32
+    b = get h0 i
+    put pd_auth_sd i b
+    put sd i b
+  end
+  ues_pubkey sd pk
+  for i ulong 32
+    put pd_auth_pk i get pk i
+  end
+end
+
+fn pd_ed_sign_shdat n ulong to void
+  sd = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put sd i get pd_auth_sd i
+  end
+  for i ulong n bound 512
+    put m i get sh_dat i
+  end
+  ues_sign sd m n sg
+  for i ulong 64
+    put pd_sig i get sg i
+  end
+end
+
+fn pd_ed_verify_shdat n ulong to bool
+  pk = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put pk i get pd_buf add 32 i
+  end
+  for i ulong n bound 512
+    put m i get sh_dat i
+  end
+  for i ulong 64
+    put sg i get pd_sig i
+  end
+  ok = edverify pk m n sg 0
+  ret eq ok 1
+end
+
+fn pd_genesis_chain to void
+  tl = len pd_gen_tag
+  for i ulong tl bound 32
+    put sh_dat i get pd_gen_tag i
+  end
+  put sh_dat tl 0
+  o = add tl 1
+  for i ulong 32
+    put sh_dat add o i get pd_buf add 32 i
+  end
+  sh_all add o 32
+  for i ulong 32
+    put pd_chain i get sh_dig i
+  end
+end
+
+fn pd_compute_rec_hashes base ulong to void
+  tl = len pd_rec_tag
+  for i ulong tl bound 32
+    put sh_dat i get pd_rec_tag i
+  end
+  put sh_dat tl 0
+  o = add tl 1
+  for i ulong 128
+    put sh_dat add o i get pd_buf add base i
+  end
+  sh_all add o 128
+  for i ulong 32
+    put pd_hash i get sh_dig i
+  end
+  for i ulong 32
+    put sh_dat i get pd_chain i
+    put sh_dat add 32 i get pd_hash i
+  end
+  sh_all 64
+  for i ulong 32
+    put pd_chain i get sh_dig i
+  end
+end
+
+fn pd_prep_trailer_msg to void
+  for i ulong 64
+    put sh_dat i get pd_buf i
+  end
+  for i ulong 32
+    put sh_dat add 64 i get pd_chain i
+  end
+end
+
+fn pd_sign_trailer to void
+  pd_prep_trailer_msg
+  pd_ed_sign_shdat 96
+  c = pd_rd_u32 12
+  toff = add PD_HDR_LEN mul c PD_REC_LEN
+  for i ulong 64
+    put pd_buf add toff i get pd_sig i
+  end
+  put pd_len 0 add toff PD_TLR_LEN
+end
+
+fn pd_write_header cnt ulong ep ulong flr ulong to void
+  for i ulong 6
+    put pd_buf i get pd_magic i
+  end
+  pd_wr_u16 6 1
+  pd_wr_u32 8 PD_REC_LEN
+  pd_wr_u32 12 cnt
+  pd_wr_u64 16 ep
+  pd_wr_u64 24 flr
+  for i ulong 32
+    put pd_buf add 32 i get pd_auth_pk i
+  end
+end
+
+fn pd_popcount4 m ulong to ulong
+  c = ulong 0
+  for i ulong 4
+    if ne and shr m i 1 0
+      c = add c 1
+    end
+  end
+  ret c
+end
+
+note ---- File I/O (Fail-Closed EOF Probe & Atomic Rename) ----
+
+fn pd_read_path1 to ulong
+  fd = fopen pd_path1 0 get pd_plen1 0 0 0
+  if lt fd 0
+    ret PD_ERR_IO
+  end
+  n = ulong 0
+  eof = false
+  while lt n PD_MAX_FILE bound 1024
+    remc = sub PD_MAX_FILE n
+    if gt remc 512
+      remc = ulong 512
+    end
+    k = read int fd pd_buf n remc
+    if lt k 0
+      c1 = fclose int fd
+      ret PD_ERR_IO
+    end
+    if eq k 0
+      eof = true
+      break
+    end
+    n = add n ulong k
+  end
+  if not eof
+    ex = read int fd pd_probe 0 1
+    if ne ex 0
+      c2 = fclose int fd
+      ret PD_ERR_FORMAT
+    end
+  end
+  c3 = fclose int fd
+  put pd_len 0 n
+  ret 0
+end
+
+fn pd_write_path2_atomic to ulong
+  pl = get pd_plen2 0
+  if or eq pl 0 gt pl 1000
+    ret PD_ERR_IO
+  end
+  for i ulong pl bound 1024
+    put pd_tmp_path i get pd_path2 i
+  end
+  for j ulong 4
+    put pd_tmp_path add pl j get pd_tmp_sfx j
+  end
+  tl = add pl 4
+  fd = fopen pd_tmp_path 0 tl 577 420
+  if lt fd 0
+    ret PD_ERR_IO
+  end
+  tot = get pd_len 0
+  off = ulong 0
+  while lt off tot bound 1024
+    want = sub tot off
+    if gt want 512
+      want = ulong 512
+    end
+    k = write int fd pd_buf off want
+    if le k 0
+      c1 = fclose int fd
+      u1 = unlink pd_tmp_path 0 tl
+      ret PD_ERR_IO
+    end
+    off = add off ulong k
+  end
+  c2 = fclose int fd
+  put pd_ren_pkt 0 2
+  put pd_ren_pkt 1 0
+  put pd_ren_pkt 2 uchar and tl 255
+  put pd_ren_pkt 3 uchar and shr tl 8 255
+  for i ulong tl bound 1040
+    put pd_ren_pkt add 4 i get pd_tmp_path i
+  end
+  p = add 4 tl
+  put pd_ren_pkt p uchar and pl 255
+  put pd_ren_pkt add p 1 uchar and shr pl 8 255
+  p = add p 2
+  for i ulong pl bound 1024
+    put pd_ren_pkt add p i get pd_path2 i
+  end
+  p = add p pl
+  rr = renames pd_ren_pkt 0 p 0
+  if ne rr 0
+    u2 = unlink pd_tmp_path 0 tl
+    ret PD_ERR_IO
+  end
+  ret 0
+end
+
+note ---- Surface 1: OM-3 Linear DMA Fence & NO_RAW_PTR ----
+
+fn pd_pay_has pat view uchar * to bool
+  bl = get pd_p 6
+  pl = len pat
+  if lt bl pl
+    ret false
+  end
+  lim = add sub bl pl 1
+  b0 = get pat 0
+  for i ulong lim bound 32
+    if eq get pd_pay i b0
+      ok = true
+      for j ulong pl bound 20
+        if ne get pd_pay add i j get pat j
+          ok = false
+          break
+        end
+      end
+      if ok
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn pd_om3_has_base_ptr to bool
+  if pd_pay_has pd_w_fwld
+    ret true
+  end
+  if pd_pay_has pd_w_fwst
+    ret true
+  end
+  if pd_pay_has pd_w_fwadr
+    ret true
+  end
+  if pd_pay_has pd_w_fwcall
+    ret true
+  end
+  ret pd_pay_has pd_w_rawptr
+end
+
+fn pd_om3_has_ext_ptr to bool
+  if pd_pay_has pd_w_putpg
+    ret true
+  end
+  if pd_pay_has pd_w_mapnew
+    ret true
+  end
+  if pd_pay_has pd_w_devcall
+    ret true
+  end
+  if pd_pay_has pd_w_execp
+    ret true
+  end
+  ret pd_pay_has pd_w_target
+end
+
+fn pd_s1_c2 rules ulong to ulong
+  p0 = get pd_p 0
+  p2 = get pd_p 2
+  p3 = get pd_p 3
+  if pd_has_rule rules 2
+    if eq p3 0
+      ret 103
+    end
+    s = add p2 p3
+    if or lt s p2 gt s p0
+      ret 103
+    end
+  else
+    if gt add p2 p3 p0
+      ret 103
+    end
+  end
+  ret 0
+end
+
+fn pd_s1_c3 rules ulong to ulong
+  if ne get pd_p 4 1
+    ret 109
+  end
+  if not pd_has_rule rules 3
+    ret 0
+  end
+  p0 = get pd_p 0
+  if eq get pd_p 5 1
+    if eq p0 1
+      ret 104
+    end
+    if eq p0 2
+      ret 105
+    end
+    if lt get pd_p 2 get pd_p 1
+      ret 106
+    end
+    if gt get pd_p 3 0
+      ret 107
+    end
+  else
+    if and ne p0 1 ne p0 3
+      ret 104
+    end
+  end
+  ret 0
+end
+
+fn pd_s1_c4 rules ulong to ulong
+  p1 = get pd_p 1
+  p3 = get pd_p 3
+  p4 = get pd_p 4
+  if pd_has_rule rules 4
+    if and eq get pd_p 0 2 ne get pd_p 5 0
+      ret 110
+    end
+    if eq get pd_p 5 1
+      p2 = get pd_p 2
+      if gt p2 p1
+        ret 103
+      end
+      s2 = add p3 p4
+      if or lt s2 p3 gt s2 p2
+        ret 103
+      end
+    end
+  else
+    if gt add p3 p4 p1
+      ret 103
+    end
+  end
+  ret 0
+end
+
+fn pd_eval_s1_om3 cls ulong rules ulong to ulong
+  if eq cls 1
+    if pd_has_rule rules 1
+      if pd_om3_has_base_ptr
+        ret 101
+      end
+    end
+    if pd_has_rule rules 5
+      if pd_om3_has_ext_ptr
+        ret 101
+      end
+    end
+    ret 0
+  end
+  if eq cls 2
+    ret pd_s1_c2 rules
+  end
+  if eq cls 3
+    ret pd_s1_c3 rules
+  end
+  if eq cls 4
+    ret pd_s1_c4 rules
+  end
+  ret 0
+end
+
+note ---- Surface 2: SM121 SASS Scoreboard & rawFloor >= 6 ----
+
+fn pd_s2_c4 rules ulong to ulong
+  if pd_has_rule rules 14
+    p0 = get pd_p 0
+    flr = ulong 6
+    if eq p0 2
+      flr = ulong 22
+    end
+    if eq p0 3
+      flr = ulong 29
+    end
+    if lt get pd_p 2 pd_min get pd_p 1 flr
+      ret 17
+    end
+  else
+    if lt get pd_p 2 pd_min get pd_p 1 6
+      ret 17
+    end
+  end
+  ret 0
+end
+
+fn pd_eval_s2_sm121 cls ulong rules ulong to ulong
+  if eq cls 1
+    if pd_has_rule rules 11
+      if and gt get pd_p 0 0 eq get pd_p 1 0
+        ret 17
+      end
+    end
+    ret 0
+  end
+  if eq cls 2
+    if pd_has_rule rules 12
+      if and le get pd_p 2 16 lt get pd_p 1 pd_min get pd_p 0 6
+        ret 17
+      end
+    else
+      if and le get pd_p 2 16 lt get pd_p 1 4
+        ret 17
+      end
+    end
+    ret 0
+  end
+  if eq cls 3
+    req2 = pd_min get pd_p 0 6
+    if pd_has_rule rules 13
+      if or lt get pd_p 1 req2 lt get pd_p 2 req2
+        ret 17
+      end
+    else
+      if lt get pd_p 1 req2
+        ret 17
+      end
+    end
+    ret 0
+  end
+  if eq cls 4
+    ret pd_s2_c4 rules
+  end
+  if eq cls 5
+    if pd_has_rule rules 15
+      if ne get pd_p 3 0
+        ret 15
+      end
+      want = and get pd_p 0 not and get pd_p 1 63
+      if ne get pd_p 2 want
+        ret 17
+      end
+    end
+    ret 0
+  end
+  ret 0
+end
+
+note ---- Surface 3: EGP3 E-Graph Rewrite Soundness ----
+
+fn pd_eval_s3_egp3 cls ulong rules ulong to ulong
+  p0 = get pd_p 0
+  p1 = get pd_p 1
+  if eq cls 1
+    if pd_has_rule rules 21
+      if or eq p0 0 gt p0 18
+        ret 8
+      end
+    end
+    ret 0
+  end
+  if eq cls 2
+    if and ne p0 32 ne p0 64
+      ret 4
+    end
+    if pd_has_rule rules 22
+      if ge p1 p0
+        ret 9
+      end
+    end
+    ret 0
+  end
+  if eq cls 3
+    if and ne p0 32 ne p0 64
+      ret 4
+    end
+    if pd_has_rule rules 23
+      if ge p1 p0
+        ret 9
+      end
+      if ne get pd_p 2 shl ulong 1 p1
+        ret 9
+      end
+    end
+    ret 0
+  end
+  if eq cls 4
+    if pd_has_rule rules 24
+      nc = get pd_p 2
+      if or eq nc 0 or gt nc 4096 ge get pd_p 3 nc
+        ret 5
+      end
+      if and eq p0 3 ne p1 0
+        ret 9
+      end
+      if and eq p0 5 ne p1 1
+        ret 9
+      end
+    end
+    ret 0
+  end
+  ret 0
+end
+
+note ---- Surface 4: WattCBF < 80 W Thermal & Overflow Boundaries ----
+
+fn pd_eval_s4_watt_therm to ulong
+  p0 = get pd_p 0
+  p1 = get pd_p 1
+  p2 = get pd_p 2
+  if gt p2 90000
+    ret 151
+  end
+  if or ge p0 p2 ge p1 p2
+    if eq get pd_p 5 0
+      ret 151
+    end
+    ret 0
+  end
+  heat = mul long 25 long get pd_p 4
+  cool = mul long 100 sub long p0 long p1
+  dt = pd_ceil_div sub heat cool 1000
+  h = sub sub long p2 long p0 mul long get pd_p 3 dt
+  if and lt h 0 eq get pd_p 5 0
+    ret 151
+  end
+  ret 0
+end
+
+fn pd_s4_c2 rules ulong to ulong
+  p0 = get pd_p 0
+  if pd_has_rule rules 32
+    if gt p0 80000
+      ret 152
+    end
+    cap = pd_min get pd_p 3 140000
+    s1 = add p0 get pd_p 1
+    if lt s1 p0
+      ret 152
+    end
+    s2 = add s1 get pd_p 2
+    if or lt s2 s1 gt s2 cap
+      ret 152
+    end
+  else
+    if gt p0 85000
+      ret 152
+    end
+  end
+  ret 0
+end
+
+fn pd_s4_c4 rules ulong to ulong
+  if not pd_has_rule rules 34
+    ret 0
+  end
+  slim = ulong 9223372036854775808
+  if ge get pd_p 0 slim
+    ret 152
+  end
+  p2 = get pd_p 2
+  if or eq p2 0 ge p2 slim
+    ret 152
+  end
+  if gt get pd_p 3 1000000
+    ret 152
+  end
+  ret 0
+end
+
+fn pd_eval_s4_watt cls ulong rules ulong to ulong
+  if eq cls 1
+    if pd_has_rule rules 31
+      p0 = get pd_p 0
+      if or gt p0 85000 gt p0 get pd_p 1
+        ret 152
+      end
+    end
+    ret 0
+  end
+  if eq cls 2
+    ret pd_s4_c2 rules
+  end
+  if eq cls 3
+    if pd_has_rule rules 33
+      ret pd_eval_s4_watt_therm
+    else
+      if gt get pd_p 0 104800
+        ret 151
+      end
+    end
+    ret 0
+  end
+  if eq cls 4
+    ret pd_s4_c4 rules
+  end
+  ret 0
+end
+
+note ---- Surface 5: OMSH / OMRC0001 Framing & IPv4/Command Validation ----
+
+fn pd_pay_eq s view uchar * to bool
+  n = get pd_p 6
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 24
+    if ne get pd_pay i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pd_parse_ipv4 to bool
+  n = get pd_p 6
+  if or lt n 7 gt n 15
+    ret false
+  end
+  p = ulong 0
+  for oi ulong 4
+    if ge p n
+      ret false
+    end
+    v = ulong 0
+    d = ulong 0
+    fz = false
+    while lt p n bound 16
+      c = ulong get pd_pay p
+      if eq c 46
+        break
+      end
+      if or lt c 48 gt c 57
+        ret false
+      end
+      if and eq d 0 eq c 48
+        fz = true
+      end
+      if ge d 3
+        ret false
+      end
+      v = add mul v 10 sub c 48
+      d = add d 1
+      p = add p 1
+    end
+    if eq d 0
+      ret false
+    end
+    if and fz gt d 1
+      ret false
+    end
+    if gt v 255
+      ret false
+    end
+    put pd_oct oi v
+    if lt oi 3
+      if ge p n
+        ret false
+      end
+      if ne get pd_pay p 46
+        ret false
+      end
+      p = add p 1
+    end
+  end
+  ret eq p n
+end
+
+fn pd_ipv4_is_owned to bool
+  if not pd_parse_ipv4
+    ret false
+  end
+  o0 = get pd_oct 0
+  o1 = get pd_oct 1
+  o2 = get pd_oct 2
+  if eq o0 127
+    ret true
+  end
+  if and eq o0 192 and eq o1 168 eq o2 1
+    ret true
+  end
+  if and eq o0 100 and ge o1 64 le o1 127
+    ret true
+  end
+  ret false
+end
+
+fn pd_tok_eq s view uchar * tl ulong to bool
+  if ne tl len s
+    ret false
+  end
+  for i ulong tl bound 64
+    if ne get pd_tok i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pd_tok_has tl ulong ch uchar to bool
+  for i ulong tl bound 64
+    if eq get pd_tok i ch
+      ret true
+    end
+  end
+  ret false
+end
+
+fn pd_cmd_check_tok tl ulong to bool
+  if eq tl 0
+    ret false
+  end
+  if pd_tok_eq pd_cmd_pkill tl
+    put pd_cst 0 1
+    ret false
+  end
+  if pd_tok_eq pd_cmd_rm tl
+    put pd_cst 1 1
+    ret false
+  end
+  if eq get pd_cst 0 1
+    if pd_tok_eq pd_cmd_full tl
+      ret true
+    end
+    if and ge tl 2 and eq get pd_tok 0 45 ne get pd_tok 1 45
+      if pd_tok_has tl 102
+        ret true
+      end
+    end
+  end
+  if eq get pd_cst 1 1
+    if and ge tl 2 eq get pd_tok 0 45
+      if or pd_tok_has tl 114 pd_tok_has tl 82
+        put pd_cst 2 1
+      end
+      if pd_tok_eq pd_cmd_rec tl
+        put pd_cst 2 1
+      end
+    end
+    if and eq tl 1 eq get pd_tok 0 47
+      put pd_cst 3 1
+    end
+    if and eq get pd_cst 2 1 eq get pd_cst 3 1
+      ret true
+    end
+  end
+  ret false
+end
+
+fn pd_cmd_unsafe to bool
+  if or pd_pay_has pd_cmd_efi pd_pay_has pd_cmd_efiv
+    ret true
+  end
+  if or pd_pay_has pd_cmd_ins pd_pay_has pd_cmd_fin
+    ret true
+  end
+  for k ulong 4
+    put pd_cst k 0
+  end
+  bl = get pd_p 6
+  p = ulong 0
+  while lt p bl bound 24
+    c = ulong get pd_pay p
+    if or eq c 32 eq c 9
+      p = add p 1
+      continue
+    end
+    if or eq c 59 or eq c 38 eq c 124
+      for k2 ulong 4
+        put pd_cst k2 0
+      end
+      p = add p 1
+      continue
+    end
+    tl = ulong 0
+    while lt p bl bound 24
+      ch = get pd_pay p
+      if or eq ch 32 or eq ch 9 or eq ch 59 eq ch 38
+        break
+      end
+      if lt tl 64
+        put pd_tok tl ch
+        tl = add tl 1
+      end
+      p = add p 1
+    end
+    if pd_cmd_check_tok tl
+      ret true
+    end
+  end
+  ret false
+end
+
+fn pd_s5_c2 rules ulong to ulong
+  p3 = get pd_p 3
+  if pd_has_rule rules 42
+    if ne get pd_p 0 1213418831
+      ret 10
+    end
+    if ne get pd_p 1 1
+      ret 10
+    end
+    p2 = get pd_p 2
+    if or eq p2 0 gt p2 3
+      ret 10
+    end
+    if gt p3 32768
+      ret 10
+    end
+    if ne get pd_p 4 add 32 p3
+      ret 10
+    end
+  else
+    if lt get pd_p 4 add 32 p3
+      ret 10
+    end
+  end
+  ret 0
+end
+
+fn pd_eval_s5_omsh cls ulong rules ulong to ulong
+  if eq cls 1
+    if pd_has_rule rules 41
+      if or pd_pay_eq pd_ip_wild4 pd_pay_eq pd_ip_wild6
+        ret 171
+      end
+    end
+    ret 0
+  end
+  if eq cls 2
+    ret pd_s5_c2 rules
+  end
+  if eq cls 3
+    if pd_has_rule rules 43
+      if or pd_pay_eq pd_ip_wild4 pd_pay_eq pd_ip_wild6
+        ret 171
+      end
+      if or pd_pay_eq pd_ip_loc6 pd_pay_eq pd_ip_l2
+        ret 0
+      end
+      if not pd_ipv4_is_owned
+        ret 172
+      end
+    end
+    ret 0
+  end
+  if eq cls 4
+    if pd_has_rule rules 44
+      p0 = get pd_p 0
+      if eq p0 0
+        if gt get pd_p 2 get pd_p 1
+          ret 16
+        end
+      end
+      if eq p0 1
+        if or ne get pd_p 3 0 lt get pd_p 4 get pd_p 5
+          ret 15
+        end
+      end
+      if eq p0 2
+        if pd_cmd_unsafe
+          ret 173
+        end
+      end
+    end
+    ret 0
+  end
+  ret 0
+end
+
+fn pd_eval_surface surf ulong cls ulong rules ulong to ulong
+  if eq surf PD_SURF_OM3
+    ret pd_eval_s1_om3 cls rules
+  end
+  if eq surf PD_SURF_SM121
+    ret pd_eval_s2_sm121 cls rules
+  end
+  if eq surf PD_SURF_EGP3
+    ret pd_eval_s3_egp3 cls rules
+  end
+  if eq surf PD_SURF_WATT
+    ret pd_eval_s4_watt cls rules
+  end
+  if eq surf PD_SURF_OMSH
+    ret pd_eval_s5_omsh cls rules
+  end
+  ret 0
+end
+
+note ---- Positive Non-Vacuity Witnesses Across All 5 Surfaces ----
+
+fn pd_clear_params to void
+  for i ulong 8
+    put pd_p i 0
+  end
+  for i ulong 32
+    put pd_pay i 0
+  end
+end
+
+fn pd_set_pay s view uchar * to void
+  n = len s
+  if gt n PD_MAX_PAY
+    n = PD_MAX_PAY
+  end
+  put pd_p 6 n
+  for i ulong 20
+    put pd_pay i 0
+  end
+  for i ulong n bound 20
+    put pd_pay i get s i
+  end
+end
+
+fn pd_verify_positive_surf surf ulong rules ulong to bool
+  pd_clear_params
+  if eq surf PD_SURF_OM3
+    put pd_p 0 3
+    put pd_p 1 16384
+    put pd_p 2 16384
+    put pd_p 3 0
+    put pd_p 4 4096
+    put pd_p 5 1
+    if ne pd_eval_surface 1 4 rules 0
+      ret false
+    end
+    put pd_p 0 3
+    put pd_p 1 1
+    put pd_p 2 1
+    put pd_p 3 0
+    put pd_p 4 1
+    put pd_p 5 1
+    ret eq pd_eval_surface 1 3 rules 0
+  end
+  if eq surf PD_SURF_SM121
+    put pd_p 0 6
+    put pd_p 1 6
+    put pd_p 2 8
+    if ne pd_eval_surface 2 2 rules 0
+      ret false
+    end
+    put pd_p 0 6
+    put pd_p 1 2
+    put pd_p 2 4
+    put pd_p 3 0
+    ret eq pd_eval_surface 2 5 rules 0
+  end
+  if eq surf PD_SURF_EGP3
+    put pd_p 0 64
+    put pd_p 1 3
+    put pd_p 2 8
+    if ne pd_eval_surface 3 3 rules 0
+      ret false
+    end
+    put pd_p 0 3
+    put pd_p 1 0
+    put pd_p 2 8
+    put pd_p 3 7
+    ret eq pd_eval_surface 3 4 rules 0
+  end
+  if eq surf PD_SURF_WATT
+    put pd_p 0 65000
+    put pd_p 1 20000
+    put pd_p 2 10000
+    put pd_p 3 120000
+    if ne pd_eval_surface 4 2 rules 0
+      ret false
+    end
+    put pd_p 0 60000
+    put pd_p 1 52000
+    put pd_p 2 78000
+    put pd_p 3 2
+    put pd_p 4 65000
+    put pd_p 5 0
+    ret eq pd_eval_surface 4 3 rules 0
+  end
+  if eq surf PD_SURF_OMSH
+    put pd_p 0 1213418831
+    put pd_p 1 1
+    put pd_p 2 1
+    put pd_p 3 64
+    put pd_p 4 96
+    if ne pd_eval_surface 5 2 rules 0
+      ret false
+    end
+    pd_set_pay pd_ip_good
+    if ne pd_eval_surface 5 3 rules 0
+      ret false
+    end
+    pd_set_pay pd_cmd_ok
+    put pd_p 0 2
+    ret eq pd_eval_surface 5 4 rules 0
+  end
+  ret false
+end
+
+fn pd_verify_all_positives rules ulong to bool
+  for s ulong 5
+    if not pd_verify_positive_surf add s 1 rules
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- 4-Strand BFT Tribunal (Monk | Predator | Trickster | Ascetic) + 1-of-K Safety Veto ----
+
+fn pd_save_params to void
+  for i ulong 8
+    put pd_psave i get pd_p i
+  end
+  for i ulong 24
+    put pd_paysave i get pd_pay i
+  end
+end
+
+fn pd_restore_params to void
+  for i ulong 8
+    put pd_p i get pd_psave i
+  end
+  for i ulong 24
+    put pd_pay i get pd_paysave i
+  end
+end
+
+fn pd_strand3_watt_ok to bool
+  if gt get pd_p 0 80000
+    ret false
+  end
+  cap = pd_min get pd_p 3 140000
+  s1 = add get pd_p 0 get pd_p 1
+  if lt s1 get pd_p 0
+    ret false
+  end
+  s2 = add s1 get pd_p 2
+  if lt s2 s1
+    ret false
+  end
+  ret le s2 cap
+end
+
+fn pd_strand_oracle strand ulong surf ulong cls ulong cand_rule ulong to ulong
+  full = not ulong 0
+  rc = pd_eval_surface surf cls full
+  if eq rc 0
+    ret 0
+  end
+  rule_bit = shl ulong 1 cand_rule
+  rc_only = pd_eval_surface surf cls or PD_BASE_RULES rule_bit
+  if ne rc_only rc
+    ret 0
+  end
+  if eq strand 1
+    pd_save_params
+    okp = pd_verify_positive_surf surf or PD_BASE_RULES rule_bit
+    pd_restore_params
+    if not okp
+      ret 0
+    end
+  end
+  if eq strand 3
+    if and eq surf PD_SURF_WATT eq cls 2
+      if pd_strand3_watt_ok
+        ret 0
+      end
+    end
+  end
+  ret rc
+end
+
+fn pd_bft_cast_votes surf ulong cls ulong cand_rule ulong bft_fault_mask ulong to void
+  for s ulong 4
+    if ne and shr bft_fault_mask s 1 0
+      put pd_svote s 0
+      put pd_srule s 0
+    else
+      v = pd_strand_oracle s surf cls cand_rule
+      put pd_svote s v
+      if ne v 0
+        put pd_srule s cand_rule
+      else
+        put pd_srule s 0
+      end
+    end
+  end
+end
+
+fn pd_bft_count_i i ulong to ulong
+  vi = get pd_svote i
+  if eq vi 0
+    ret 0
+  end
+  ri = get pd_srule i
+  c = ulong 0
+  for j ulong 4
+    if eq get pd_svote j vi
+      if eq get pd_srule j ri
+        c = add c 1
+      end
+    end
+  end
+  ret c
+end
+
+fn pd_bft_tribunal surf ulong cls ulong cand_rule ulong bft_fault_mask ulong to ulong
+  pd_bft_cast_votes surf cls cand_rule bft_fault_mask
+  best_v = ulong 0
+  best_c = ulong 0
+  for i ulong 4
+    c = pd_bft_count_i i
+    if gt c best_c
+      best_c = c
+      best_v = get pd_svote i
+    end
+  end
+  if lt best_c 3
+    put pd_cand 3 0
+    put pd_cand 4 best_c
+    put pd_cand 5 0
+    ret PD_ERR_BFT_NO_QUORUM
+  end
+  mask = ulong 0
+  for k ulong 4
+    if eq get pd_svote k best_v
+      mask = or mask shl ulong 1 k
+    end
+  end
+  put pd_cand 3 best_v
+  put pd_cand 4 best_c
+  put pd_cand 5 mask
+  ret 0
+end
+
+fn pd_safety_veto_check surf ulong cand_rule ulong ext_veto ulong to ulong
+  if ne ext_veto 0
+    ret PD_ERR_SAFETY_VETO
+  end
+  if or lt surf 1 gt surf 5
+    ret PD_ERR_SAFETY_VETO
+  end
+  if or eq cand_rule 0 ge cand_rule 64
+    ret PD_ERR_SAFETY_VETO
+  end
+  if gt get pd_p 6 PD_MAX_PAY
+    ret PD_ERR_SAFETY_VETO
+  end
+  if or pd_pay_has pd_cmd_efi pd_pay_has pd_cmd_efiv
+    if ne surf PD_SURF_OMSH
+      ret PD_ERR_SAFETY_VETO
+    end
+  end
+  ret 0
+end
+
+note ---- Corpus Parsing, Full Ed25519 Verification, Ratchet & Record Admission ----
+
+fn pd_save_prev_snapshot to void
+  n = get pd_len 0
+  for i ulong n bound 65536
+    put pd_prev i get pd_buf i
+  end
+  put pd_prev_len 0 n
+end
+
+fn pd_prefix_eq prev_cnt ulong to bool
+  total_b = mul prev_cnt PD_REC_LEN
+  for b ulong total_b bound 61440
+    idx = add PD_HDR_LEN b
+    if ne get pd_buf idx get pd_prev idx
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pd_check_ratchet prev_cnt ulong prev_ep ulong prev_flr ulong to ulong
+  if lt pd_rd_u32 12 prev_cnt
+    ret PD_ERR_RATCHET
+  end
+  if lt pd_rd_u64 16 prev_ep
+    ret PD_ERR_RATCHET
+  end
+  if lt pd_rd_u64 24 prev_flr
+    ret PD_ERR_RATCHET
+  end
+  if gt prev_cnt 0
+    need = add add PD_HDR_LEN mul prev_cnt PD_REC_LEN PD_TLR_LEN
+    if lt get pd_prev_len 0 need
+      ret PD_ERR_RATCHET
+    end
+    if not pd_prefix_eq prev_cnt
+      ret PD_ERR_RATCHET
+    end
+  end
+  ret 0
+end
+
+fn pd_load_rec_params base ulong to void
+  for k ulong 6
+    put pd_p k pd_rd_u64 add base add 56 mul k 8
+  end
+  pl = pd_rd_u32 add base 104
+  put pd_p 6 pl
+  for i ulong 20
+    if lt i pl
+      put pd_pay i get pd_buf add base add 108 i
+    else
+      put pd_pay i 0
+    end
+  end
+end
+
+fn pd_verify_rec_fields base ulong idx ulong to ulong
+  for i ulong 4
+    if ne get pd_buf add base i get pd_rec_magic i
+      ret PD_ERR_FORMAT
+    end
+  end
+  if ne pd_rd_u32 add base 4 add idx 1
+    ret PD_ERR_RATCHET
+  end
+  v = pd_rd_u32 add base 8
+  if or lt v 1 gt v 5
+    ret PD_ERR_FORMAT
+  end
+  v = pd_rd_u32 add base 12
+  if or eq v 0 gt v 32
+    ret PD_ERR_FORMAT
+  end
+  v = pd_rd_u32 add base 16
+  if or eq v 0 ge v 64
+    ret PD_ERR_FORMAT
+  end
+  v = pd_rd_u32 add base 20
+  if or lt v 3 gt v 4
+    ret PD_ERR_BFT_NO_QUORUM
+  end
+  bm = pd_rd_u32 add base 24
+  if or gt bm 15 ne pd_popcount4 bm v
+    ret PD_ERR_BFT_NO_QUORUM
+  end
+  if ne pd_rd_u32 add base 28 0
+    ret PD_ERR_SAFETY_VETO
+  end
+  if or eq pd_rd_u64 add base 32 0 eq pd_rd_u64 add base 48 0
+    ret PD_ERR_FORMAT
+  end
+  v = pd_rd_u32 add base 104
+  if gt v PD_MAX_PAY
+    ret PD_ERR_FORMAT
+  end
+  p0 = add base add 108 v
+  rem_p = sub PD_MAX_PAY v
+  for j ulong rem_p bound 20
+    if ne get pd_buf add p0 j 0
+      ret PD_ERR_FORMAT
+    end
+  end
+  ret 0
+end
+
+fn pd_verify_record idx ulong to ulong
+  base = add PD_HDR_LEN mul idx PD_REC_LEN
+  frc = pd_verify_rec_fields base idx
+  if ne frc 0
+    ret frc
+  end
+  pd_compute_rec_hashes base
+  for i ulong 32
+    if ne get pd_hash i get pd_buf add base add 128 i
+      ret PD_ERR_BAD_SIG
+    end
+    if ne get pd_chain i get pd_buf add base add 160 i
+      ret PD_ERR_BAD_SIG
+    end
+  end
+  for i ulong 192
+    put sh_dat i get pd_buf add base i
+  end
+  for i ulong 64
+    put pd_sig i get pd_buf add base add 192 i
+  end
+  if not pd_ed_verify_shdat 192
+    ret PD_ERR_BAD_SIG
+  end
+  ret 0
+end
+
+fn pd_verify_corpus_buf min_ratchet ulong to ulong
+  nlen = get pd_len 0
+  if or lt nlen add add PD_HDR_LEN PD_REC_LEN PD_TLR_LEN gt nlen PD_MAX_FILE
+    ret PD_ERR_FORMAT
+  end
+  for i ulong 6
+    if ne get pd_buf i get pd_magic i
+      ret PD_ERR_FORMAT
+    end
+  end
+  if ne pd_rd_u16 6 1
+    ret PD_ERR_FORMAT
+  end
+  if ne pd_rd_u32 8 PD_REC_LEN
+    ret PD_ERR_FORMAT
+  end
+  cnt = pd_rd_u32 12
+  if or eq cnt 0 gt cnt PD_MAX_RECS
+    ret PD_ERR_FORMAT
+  end
+  if lt cnt min_ratchet
+    ret PD_ERR_RATCHET
+  end
+  ep = pd_rd_u64 16
+  flr = pd_rd_u64 24
+  if or eq ep 0 lt flr cnt
+    ret PD_ERR_FORMAT
+  end
+  want_len = add add PD_HDR_LEN mul cnt PD_REC_LEN PD_TLR_LEN
+  if ne nlen want_len
+    ret PD_ERR_FORMAT
+  end
+  for i ulong 32
+    if ne get pd_buf add 32 i get pd_auth_pk i
+      ret PD_ERR_BAD_SIG
+    end
+  end
+  pd_genesis_chain
+  rmask = ulong 0
+  for idx ulong cnt bound 240
+    rc = pd_verify_record idx
+    if ne rc 0
+      ret rc
+    end
+    base = add PD_HDR_LEN mul idx PD_REC_LEN
+    rule = pd_rd_u32 add base 16
+    rmask = or rmask shl ulong 1 rule
+  end
+  for i ulong 64
+    put pd_sig i get pd_buf add sub want_len PD_TLR_LEN i
+  end
+  pd_prep_trailer_msg
+  if not pd_ed_verify_shdat 96
+    ret PD_ERR_BAD_SIG
+  end
+  put pd_count 0 cnt
+  put pd_epoch 0 ep
+  put pd_floor 0 flr
+  put pd_rules 0 rmask
+  ret 0
+end
+
+fn pd_replay_corpus mutant_mask ulong to ulong
+  cnt = get pd_count 0
+  eff = and get pd_rules 0 not mutant_mask
+  for idx ulong cnt bound 240
+    base = add PD_HDR_LEN mul idx PD_REC_LEN
+    surf = pd_rd_u32 add base 8
+    cls = pd_rd_u32 add base 12
+    want_rc = pd_rd_u64 add base 48
+    pd_load_rec_params base
+    got_rc = pd_eval_surface surf cls eff
+    if eq got_rc 0
+      ret PD_ERR_REGRESSION
+    end
+    if ne got_rc want_rc
+      ret PD_ERR_REGRESSION
+    end
+  end
+  if not pd_verify_all_positives eff
+    ret PD_ERR_REGRESSION
+  end
+  ret 0
+end
+
+fn pd_seal_rec_slot base ulong to void
+  pl = get pd_p 6
+  pd_wr_u32 add base 104 pl
+  p0 = add base 108
+  for i ulong 20
+    if lt i pl
+      put pd_buf add p0 i get pd_pay i
+    else
+      put pd_buf add p0 i 0
+    end
+  end
+  pd_compute_rec_hashes base
+  p1 = add base 128
+  p2 = add base 160
+  for i ulong 32
+    put pd_buf add p1 i get pd_hash i
+    put pd_buf add p2 i get pd_chain i
+  end
+  for i ulong 192
+    put sh_dat i get pd_buf add base i
+  end
+  pd_ed_sign_shdat 192
+  p3 = add base 192
+  for i ulong 64
+    put pd_buf add p3 i get pd_sig i
+  end
+end
+
+fn pd_write_params_slot base ulong to void
+  for k ulong 6
+    off = add base add 56 mul k 8
+    pd_wr_u64 off get pd_p k
+  end
+end
+
+fn pd_append_signed_record surf ulong cls ulong rule ulong kill_rc ulong to ulong
+  cnt = get pd_count 0
+  if ge cnt PD_MAX_RECS
+    ret PD_ERR_FORMAT
+  end
+  pd_save_prev_snapshot
+  old_ep = get pd_epoch 0
+  old_flr = get pd_floor 0
+  base = add PD_HDR_LEN mul cnt PD_REC_LEN
+  for i ulong 4
+    put pd_buf add base i get pd_rec_magic i
+  end
+  pd_wr_u32 add base 4 add cnt 1
+  pd_wr_u32 add base 8 surf
+  pd_wr_u32 add base 12 cls
+  pd_wr_u32 add base 16 rule
+  pd_wr_u32 add base 20 get pd_cand 4
+  pd_wr_u32 add base 24 get pd_cand 5
+  pd_wr_u32 add base 28 0
+  pd_wr_u64 add base 32 add old_ep 1
+  pd_wr_u64 add base 40 get pd_p 7
+  pd_wr_u64 add base 48 kill_rc
+  pd_write_params_slot base
+  pd_seal_rec_slot base
+  new_flr = old_flr
+  if gt add cnt 1 new_flr
+    new_flr = add cnt 1
+  end
+  pd_wr_u32 12 add cnt 1
+  pd_wr_u64 16 add old_ep 1
+  pd_wr_u64 24 new_flr
+  pd_sign_trailer
+  rrc = pd_check_ratchet cnt old_ep old_flr
+  if ne rrc 0
+    ret rrc
+  end
+  put pd_count 0 add cnt 1
+  put pd_epoch 0 add old_ep 1
+  put pd_floor 0 new_flr
+  put pd_rules 0 or get pd_rules 0 shl ulong 1 rule
+  ret 0
+end
+
+fn pd_admit_candidate surf ulong cls ulong cand_rule ulong rseed ulong bft_fault ulong ext_veto ulong to ulong
+  rc = pd_eval_surface surf cls get pd_rules 0
+  if ne rc 0
+    ret PD_ERR_BOGUS_REPLAY
+  end
+  new_rules = or get pd_rules 0 shl ulong 1 cand_rule
+  rc = pd_eval_surface surf cls new_rules
+  if eq rc 0
+    put pd_stat 6 add get pd_stat 6 1
+    ret PD_ERR_BOGUS_REPLAY
+  end
+  pd_save_params
+  ok_pos = pd_verify_positive_surf surf new_rules
+  pd_restore_params
+  if not ok_pos
+    put pd_stat 6 add get pd_stat 6 1
+    ret PD_ERR_BOGUS_REPLAY
+  end
+  rc = pd_bft_tribunal surf cls cand_rule bft_fault
+  if ne rc 0
+    put pd_stat 4 add get pd_stat 4 1
+    ret rc
+  end
+  rc = pd_safety_veto_check surf cand_rule ext_veto
+  if ne rc 0
+    put pd_stat 5 add get pd_stat 5 1
+    ret rc
+  end
+  rc = pd_eval_surface surf cls new_rules
+  if ne rc get pd_cand 3
+    put pd_stat 6 add get pd_stat 6 1
+    ret PD_ERR_BOGUS_REPLAY
+  end
+  put pd_p 7 rseed
+  ret pd_append_signed_record surf cls cand_rule get pd_cand 3
+end
+
+note ---- Seed Corpus Construction & Deterministic+OS-Random Boundary Mutagen ----
+
+fn pd_seed_init_corpus to ulong
+  pd_write_header 0 1 0
+  pd_genesis_chain
+  put pd_count 0 0
+  put pd_epoch 0 0
+  put pd_floor 0 0
+  put pd_rules 0 0
+  put pd_cand 4 4
+  put pd_cand 5 15
+  pd_clear_params
+  pd_set_pay pd_w_fwld
+  put pd_p 7 1001
+  rc1 = pd_append_signed_record 1 1 1 101
+  if ne rc1 0
+    ret rc1
+  end
+  pd_clear_params
+  put pd_p 0 6
+  put pd_p 1 0
+  put pd_p 7 1002
+  rc2 = pd_append_signed_record 2 1 11 17
+  if ne rc2 0
+    ret rc2
+  end
+  pd_clear_params
+  put pd_p 0 99
+  put pd_p 7 1003
+  rc3 = pd_append_signed_record 3 1 21 8
+  if ne rc3 0
+    ret rc3
+  end
+  pd_clear_params
+  put pd_p 0 95000
+  put pd_p 1 120000
+  put pd_p 7 1004
+  rc4 = pd_append_signed_record 4 1 31 152
+  if ne rc4 0
+    ret rc4
+  end
+  pd_clear_params
+  pd_set_pay pd_ip_wild4
+  put pd_p 7 1005
+  rc5 = pd_append_signed_record 5 1 41 171
+  ret rc5
+end
+
+fn pd_rng_init seed_in ulong to void
+  rbuf = new uchar 8 0
+  got = random rbuf 0 8 0
+  osv = ulong 0
+  if eq got 8
+    put pd_rng 1 8
+    for i ulong 8
+      osv = or osv shl ulong get rbuf i mul i 8
+    end
+  else
+    put pd_rng 1 0
+  end
+  st = xor seed_in osv
+  if eq st 0
+    st = ulong 106875429132145921
+  end
+  put pd_rng 0 st
+end
+
+fn pd_rng_next to ulong
+  x = add get pd_rng 0 ulong 11400714819323198485
+  put pd_rng 0 x
+  z = xor x shr x 30
+  z = mul z ulong 13787848793156543929
+  z = xor z shr z 27
+  z = mul z ulong 10723151780598845931
+  ret xor z shr z 31
+end
+
+fn pd_gen_mutant_a slot ulong rv ulong to void
+  if eq slot 0
+    put pd_cand 0 1
+    put pd_cand 1 2
+    put pd_cand 2 2
+    put pd_p 0 65536
+    put pd_p 1 65536
+    put pd_p 2 add 18446744073709547520 and rv 1023
+    put pd_p 3 add 8192 and shr rv 10 255
+    ret
+  end
+  if eq slot 1
+    put pd_cand 0 1
+    put pd_cand 1 3
+    put pd_cand 2 3
+    put pd_p 0 2
+    put pd_p 1 add 2 and rv 3
+    put pd_p 2 1
+    put pd_p 3 0
+    put pd_p 4 1
+    put pd_p 5 1
+    ret
+  end
+  if eq slot 2
+    put pd_cand 0 1
+    put pd_cand 1 4
+    put pd_cand 2 4
+    put pd_p 0 3
+    put pd_p 1 16384
+    put pd_p 2 4096
+    put pd_p 3 add 2048 and rv 511
+    put pd_p 4 4096
+    put pd_p 5 1
+    ret
+  end
+  if eq slot 3
+    put pd_cand 0 1
+    put pd_cand 1 1
+    put pd_cand 2 5
+    if eq and rv 1 0
+      pd_set_pay pd_w_putpg
+    else
+      pd_set_pay pd_w_devcall
+    end
+    ret
+  end
+  if eq slot 4
+    put pd_cand 0 2
+    put pd_cand 1 2
+    put pd_cand 2 12
+    put pd_p 0 add 6 and rv 3
+    put pd_p 1 add 4 and shr rv 2 1
+    put pd_p 2 4
+    ret
+  end
+  if eq slot 5
+    put pd_cand 0 2
+    put pd_cand 1 3
+    put pd_cand 2 13
+    put pd_p 0 6
+    put pd_p 1 add 6 and rv 3
+    put pd_p 2 add 1 and shr rv 2 3
+    ret
+  end
+  put pd_cand 0 2
+  put pd_cand 1 4
+  put pd_cand 2 14
+  if eq and rv 1 0
+    put pd_p 0 2
+    put pd_p 1 22
+    put pd_p 2 add 8 and rv 7
+  else
+    put pd_p 0 3
+    put pd_p 1 29
+    put pd_p 2 add 10 and rv 15
+  end
+end
+
+fn pd_gen_mutant_b slot ulong rv ulong to void
+  if eq slot 7
+    put pd_cand 0 2
+    put pd_cand 1 5
+    put pd_cand 2 15
+    put pd_p 0 6
+    put pd_p 1 2
+    put pd_p 2 0
+    put pd_p 3 0
+    ret
+  end
+  if eq slot 8
+    put pd_cand 0 3
+    put pd_cand 1 2
+    put pd_cand 2 22
+    put pd_p 0 32
+    put pd_p 1 add 32 and rv 3
+    put pd_p 2 0
+    ret
+  end
+  if eq slot 9
+    put pd_cand 0 3
+    put pd_cand 1 3
+    put pd_cand 2 23
+    put pd_p 0 64
+    put pd_p 1 1
+    put pd_p 2 add 3 mul and rv 3 2
+    ret
+  end
+  if eq slot 10
+    put pd_cand 0 3
+    put pd_cand 1 4
+    put pd_cand 2 24
+    put pd_p 0 3
+    put pd_p 1 add 1 and rv 3
+    put pd_p 2 8
+    put pd_p 3 0
+    ret
+  end
+  if eq slot 11
+    put pd_cand 0 4
+    put pd_cand 1 2
+    put pd_cand 2 32
+    put pd_p 0 add 80001 and rv 2047
+    put pd_p 1 15000
+    put pd_p 2 8000
+    put pd_p 3 120000
+    ret
+  end
+  if eq slot 12
+    put pd_cand 0 4
+    put pd_cand 1 3
+    put pd_cand 2 33
+    put pd_p 0 77000
+    put pd_p 1 add 79000 and rv 1023
+    put pd_p 2 78000
+    put pd_p 3 2
+    put pd_p 4 1000
+    put pd_p 5 0
+    ret
+  end
+  put pd_cand 0 4
+  put pd_cand 1 4
+  put pd_cand 2 34
+  put pd_p 0 18446744073709546616
+  put pd_p 1 10000
+  put pd_p 2 100000
+  put pd_p 3 2
+end
+
+fn pd_gen_mutant_c slot ulong rv ulong to void
+  if eq slot 14
+    put pd_cand 0 5
+    put pd_cand 1 2
+    put pd_cand 2 42
+    put pd_p 0 1213418831
+    put pd_p 1 1
+    put pd_p 2 1
+    put pd_p 3 64
+    put pd_p 4 add 97 and rv 7
+    ret
+  end
+  if eq slot 15
+    put pd_cand 0 5
+    put pd_cand 1 3
+    put pd_cand 2 43
+    m = and rv 3
+    if eq m 0
+      pd_set_pay pd_ip_oct1
+    else
+      if eq m 1
+        pd_set_pay pd_ip_oct2
+      else
+        if eq m 2
+          pd_set_pay pd_ip_inj
+        else
+          pd_set_pay pd_ip_cgnat
+        end
+      end
+    end
+    ret
+  end
+  put pd_cand 0 5
+  put pd_cand 1 4
+  put pd_cand 2 44
+  if eq and rv 1 0
+    put pd_p 0 0
+    put pd_p 1 1
+    put pd_p 2 2
+  else
+    put pd_p 0 2
+    pd_set_pay pd_cmd_bad1
+  end
+end
+
+fn pd_gen_mutant round ulong to ulong
+  pd_clear_params
+  rv = pd_rng_next
+  slot = rem round 17
+  if lt slot 7
+    pd_gen_mutant_a slot rv
+  else
+    if lt slot 14
+      pd_gen_mutant_b slot rv
+    else
+      pd_gen_mutant_c slot rv
+    end
+  end
+  ret rv
+end
+
+note ---- Subcommand Handlers ----
+
+fn pd_read_arg_path idx ulong is_two bool to bool
+  if not is_two
+    k = argread idx pd_path1 0 1000
+    if lt k 1
+      ret false
+    end
+    put pd_plen1 0 ulong k
+    ret true
+  end
+  k2 = argread idx pd_path2 0 1000
+  if lt k2 1
+    ret false
+  end
+  put pd_plen2 0 ulong k2
+  ret true
+end
+
+fn pd_cmd_seed_init to int
+  if ne argcnt 3
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 2 true
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  rc = pd_seed_init_corpus
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  wrc = pd_write_path2_atomic
+  if ne wrc 0
+    ret pd_refuse wrc
+  end
+  pd_wrt 1 pd_ok_seed
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_k_ep
+  pd_num 1 get pd_epoch 0
+  pd_wrt 1 pd_nl
+  ret 0
+end
+
+fn pd_cmd_verify_corpus to int
+  if or lt argcnt 3 gt argcnt 4
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 2 false
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  min_r = ulong 0
+  if eq argcnt 4
+    min_r = pd_parse_arg_u 3
+    if eq min_r not ulong 0
+      ret pd_refuse PD_ERR_BAD_ARG
+    end
+  end
+  rrc = pd_read_path1
+  if ne rrc 0
+    ret pd_refuse rrc
+  end
+  vrc = pd_verify_corpus_buf min_r
+  if ne vrc 0
+    ret pd_refuse vrc
+  end
+  if not pd_verify_all_positives get pd_rules 0
+    ret pd_refuse PD_ERR_REGRESSION
+  end
+  pd_wrt 1 pd_ok_ver
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_k_ep
+  pd_num 1 get pd_epoch 0
+  pd_wrt 1 pd_k_pos
+  pd_wrt 1 pd_nl
+  ret 0
+end
+
+fn pd_cmd_replay to int
+  if or lt argcnt 3 gt argcnt 4
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 2 false
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  mmask = ulong 0
+  if eq argcnt 4
+    mmask = pd_parse_arg_u 3
+    if eq mmask not ulong 0
+      ret pd_refuse PD_ERR_BAD_ARG
+    end
+  end
+  rrc = pd_read_path1
+  if ne rrc 0
+    ret pd_refuse rrc
+  end
+  vrc = pd_verify_corpus_buf 0
+  if ne vrc 0
+    ret pd_refuse vrc
+  end
+  prc = pd_replay_corpus mmask
+  if ne prc 0
+    ret pd_refuse prc
+  end
+  pd_wrt 1 pd_ok_rep
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_k_kill
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_k_pos
+  pd_wrt 1 pd_nl
+  ret 0
+end
+
+fn pd_cmd_check_ratchet to int
+  if ne argcnt 4
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 2 false
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  rrc = pd_read_path1
+  if ne rrc 0
+    ret pd_refuse rrc
+  end
+  vrc = pd_verify_corpus_buf 0
+  if ne vrc 0
+    ret pd_refuse vrc
+  end
+  old_cnt = get pd_count 0
+  old_ep = get pd_epoch 0
+  old_flr = get pd_floor 0
+  pd_save_prev_snapshot
+  if not pd_read_arg_path 3 false
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  rrc2 = pd_read_path1
+  if ne rrc2 0
+    ret pd_refuse rrc2
+  end
+  vrc2 = pd_verify_corpus_buf old_cnt
+  if ne vrc2 0
+    ret pd_refuse vrc2
+  end
+  crc = pd_check_ratchet old_cnt old_ep old_flr
+  if ne crc 0
+    ret pd_refuse crc
+  end
+  pd_wrt 1 pd_ok_rat
+  pd_num 1 old_cnt
+  pd_wrt 1 pd_k_new
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_nl
+  ret 0
+end
+
+fn pd_run_evolve_loop rounds ulong bft_fault ulong ext_veto ulong to ulong
+  for rnd ulong rounds bound 128
+    rv = pd_gen_mutant rnd
+    if ne pd_eval_surface get pd_cand 0 get pd_cand 1 get pd_rules 0 0
+      put pd_stat 3 add get pd_stat 3 1
+    else
+      rc = pd_admit_candidate get pd_cand 0 get pd_cand 1 get pd_cand 2 rv bft_fault ext_veto
+      if ne rc 0
+        ret rc
+      end
+      put pd_stat 1 add get pd_stat 1 1
+      sbit = shl ulong 1 sub get pd_cand 0 1
+      put pd_stat 7 or get pd_stat 7 sbit
+    end
+  end
+  ret 0
+end
+
+fn pd_cmd_evolve to int
+  if or lt argcnt 4 gt argcnt 8
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 2 false
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 3 true
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  rounds = ulong 24
+  rseed = ulong 20261127
+  bft_fault = ulong 0
+  ext_veto = ulong 0
+  if ge argcnt 5
+    rounds = pd_parse_arg_u 4
+  end
+  if ge argcnt 6
+    rseed = pd_parse_arg_u 5
+  end
+  if ge argcnt 7
+    bft_fault = pd_parse_arg_u 6
+  end
+  if ge argcnt 8
+    ext_veto = pd_parse_arg_u 7
+  end
+  if or eq rounds not ulong 0 eq rseed not ulong 0
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  if or eq bft_fault not ulong 0 eq ext_veto not ulong 0
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  if or eq rounds 0 gt rounds 128
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  rc = pd_read_path1
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  rc = pd_verify_corpus_buf 0
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  rc = pd_replay_corpus 0
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  init_cnt = get pd_count 0
+  for k ulong 16
+    put pd_stat k 0
+  end
+  pd_rng_init rseed
+  rc = pd_run_evolve_loop rounds bft_fault ext_veto
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  rc = pd_write_path2_atomic
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  pd_wrt 1 pd_ok_evo
+  pd_num 1 init_cnt
+  pd_wrt 1 pd_k_crys
+  pd_num 1 get pd_stat 1
+  pd_wrt 1 pd_k_tot
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_k_surf
+  pd_wrt 1 pd_k_os
+  pd_num 1 get pd_rng 1
+  pd_wrt 1 pd_nl
+  ret 0
+end
+
+fn pd_cmd_admit_one to int
+  if ne argcnt 15
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 2 false
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  if not pd_read_arg_path 3 true
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  bad = not ulong 0
+  surf = pd_parse_arg_u 4
+  cls = pd_parse_arg_u 5
+  crule = pd_parse_arg_u 6
+  if or eq surf bad or eq cls bad eq crule bad
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  for k ulong 6
+    v = pd_parse_arg_u add 7 k
+    if eq v bad
+      ret pd_refuse PD_ERR_BAD_ARG
+    end
+    put pd_p k v
+  end
+  put pd_p 6 0
+  bft_f = pd_parse_arg_u 13
+  ext_v = pd_parse_arg_u 14
+  if or eq bft_f bad eq ext_v bad
+    ret pd_refuse PD_ERR_BAD_ARG
+  end
+  rc = pd_read_path1
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  rc = pd_verify_corpus_buf 0
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  rc = pd_admit_candidate surf cls crule 777 bft_f ext_v
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  rc = pd_write_path2_atomic
+  if ne rc 0
+    ret pd_refuse rc
+  end
+  pd_wrt 1 pd_ok_adm
+  pd_num 1 get pd_count 0
+  pd_wrt 1 pd_nl
+  ret 0
+end
+
+fn main to int
+  pd_derive_auth
+  if lt argcnt 2
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  cl = argread 1 pd_arg 0 64
+  if lt cl 1
+    pd_wrt 2 pd_use
+    ret int PD_ERR_BAD_ARG
+  end
+  uc = ulong cl
+  if pd_eq_arg pd_c_seed uc
+    ret pd_cmd_seed_init
+  end
+  if pd_eq_arg pd_c_ver uc
+    ret pd_cmd_verify_corpus
+  end
+  if pd_eq_arg pd_c_rep uc
+    ret pd_cmd_replay
+  end
+  if pd_eq_arg pd_c_rat uc
+    ret pd_cmd_check_ratchet
+  end
+  if pd_eq_arg pd_c_evo uc
+    ret pd_cmd_evolve
+  end
+  if pd_eq_arg pd_c_adm uc
+    ret pd_cmd_admit_one
+  end
+  pd_wrt 2 pd_use
+  ret int PD_ERR_BAD_ARG
+end
